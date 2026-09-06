@@ -1,0 +1,8 @@
+{
+  "identifier": "mobile",
+  "description": "Mobile-specific permissions for OmnesAgent",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

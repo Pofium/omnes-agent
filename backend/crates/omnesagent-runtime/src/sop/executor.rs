@@ -1,0 +1,910 @@
+//! Live SOP action executor.
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+
+use super::approval::{BrokerOutcome, ResolveOutcome};
+use super::audit::SopAuditLogger;
+use super::engine::SopEngine;
+use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
+
+use crate::agent::history::truncate_tool_result;
+use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
+
+const MAX_STEP_TOOL_CALLS: usize = 256;
+const MAX_STEP_TOOL_OUTPUT_CHARS: usize = 4096;
+
+/// Live SOP action captured by SOP tools while they run inside an agent turn.
+#[derive(Clone)]
+pub(crate) struct QueuedSopAction {
+    pub engine: Arc<Mutex<SopEngine>>,
+    pub audit: Option<Arc<SopAuditLogger>>,
+    pub action: SopRunAction,
+}
+
+pub(crate) type LiveActionQueue = Arc<Mutex<VecDeque<QueuedSopAction>>>;
+
+/// Ordered tool invocations captured while a live SOP step's nested tool
+/// loop runs. Scoped per step so concurrent runs never interleave.
+pub(crate) type StepCallSink = Arc<Mutex<Vec<StepToolCall>>>;
+
+tokio::task_local! {
+    static LIVE_SOP_ACTION_QUEUE: Option<LiveActionQueue>;
+    static LIVE_STEP_CALL_SINK: Option<StepCallSink>;
+}
+
+pub(crate) fn new_live_action_queue() -> LiveActionQueue {
+    Arc::new(Mutex::new(VecDeque::new()))
+}
+
+pub(crate) async fn scope_live_action_queue<T>(
+    queue: LiveActionQueue,
+    future: impl Future<Output = T>,
+) -> T {
+    LIVE_SOP_ACTION_QUEUE.scope(Some(queue), future).await
+}
+
+pub(crate) fn new_step_call_sink() -> StepCallSink {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+pub(crate) async fn scope_step_call_sink<T>(
+    sink: StepCallSink,
+    future: impl Future<Output = T>,
+) -> T {
+    LIVE_STEP_CALL_SINK.scope(Some(sink), future).await
+}
+
+/// Record one executed tool call into the innermost active step sink.
+/// No-op outside a live SOP step scope, so the turn loop can call this
+/// unconditionally.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_step_tool_call(
+    tool: &str,
+    args: &serde_json::Value,
+    success: bool,
+    output: String,
+    output_data: Option<serde_json::Value>,
+    error: Option<&str>,
+    duration_ms: u64,
+) {
+    let _ = LIVE_STEP_CALL_SINK.try_with(|sink| {
+        if let Some(sink) = sink
+            && let Ok(mut calls) = sink.lock()
+        {
+            if calls.len() >= MAX_STEP_TOOL_CALLS {
+                return;
+            }
+            let index = u32::try_from(calls.len()).unwrap_or(u32::MAX);
+            let scrubbed_args = scrub_credentials(&args.to_string());
+            let args = serde_json::from_str(&scrubbed_args).unwrap_or(serde_json::Value::Null);
+            let output =
+                truncate_tool_result(&scrub_credentials(&output), MAX_STEP_TOOL_OUTPUT_CHARS);
+            let output_data = output_data.map(scrub_credentials_value);
+            calls.push(StepToolCall {
+                index,
+                tool: tool.to_string(),
+                args,
+                success,
+                output,
+                output_data,
+                error: error.map(scrub_credentials),
+                duration_ms,
+            });
+        }
+    });
+}
+
+/// True when a live SOP step scope is active on this task, so the turn loop
+/// can skip the argument/output clones the capture would otherwise consume.
+pub(crate) fn step_capture_active() -> bool {
+    LIVE_STEP_CALL_SINK
+        .try_with(|sink| sink.is_some())
+        .unwrap_or(false)
+}
+
+pub(crate) fn drain_step_calls(sink: &StepCallSink) -> Vec<StepToolCall> {
+    match sink.lock() {
+        Ok(mut calls) => std::mem::take(&mut *calls),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    }
+}
+
+/// Queue a live action when the current tool call is running inside an agent
+/// turn. Agent and deterministic execution actions need a driver; all other
+/// variants are already terminal or blocked.
+pub(crate) fn enqueue_live_action(
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    action: &SopRunAction,
+) {
+    if !matches!(
+        action,
+        SopRunAction::ExecuteStep { .. } | SopRunAction::DeterministicStep { .. }
+    ) {
+        return;
+    }
+
+    let queued = QueuedSopAction {
+        engine,
+        audit,
+        action: action.clone(),
+    };
+    let _ = LIVE_SOP_ACTION_QUEUE.try_with(|queue| {
+        if let Some(queue) = queue
+            && let Ok(mut queue) = queue.lock()
+        {
+            queue.push_back(queued);
+        }
+    });
+}
+
+pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction> {
+    match queue.lock() {
+        Ok(mut queue) => queue.drain(..).collect(),
+        Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+    }
+}
+
+/// Upper bound on steps a single headless drive may execute, so a routing
+/// cycle can never pin a background task forever.
+pub(crate) const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
+
+/// Terminalize a run whose driver consumed `MAX_HEADLESS_DRIVE_STEPS`, and log
+/// the outcome. Shared by every driver — the two headless ones here and the
+/// live agent turn — so all three agree on the bound and on who owns the
+/// durable failure when it is hit.
+pub(crate) fn fail_exhausted_step_budget(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+    let terminal = {
+        let mut guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.fail_headless_step_budget(run_id)
+    };
+    match terminal {
+        Ok(_) => ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"run_id": run_id})),
+            "SOP driver: step budget exhausted; run failed"
+        ),
+        Err(e) => ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "error": e.to_string(),
+                })),
+            "SOP driver: failed to persist step-budget terminal state"
+        ),
+    }
+}
+
+/// Drive deterministic actions through a shared engine without retaining its
+/// mutex across step boundaries.
+pub(crate) async fn drive_shared_deterministic_run(
+    engine: &Arc<Mutex<SopEngine>>,
+    first_action: SopRunAction,
+) -> Result<SopRunAction> {
+    let mut action = first_action;
+    for _ in 0..MAX_HEADLESS_DRIVE_STEPS {
+        let run_id = match &action {
+            SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            terminal => return Ok(terminal.clone()),
+        };
+        let next = {
+            let mut guard = match engine.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.advance_headless_deterministic_step(&run_id, action)?
+        };
+        if !matches!(next, SopRunAction::DeterministicStep { .. }) {
+            return Ok(next);
+        }
+        action = next;
+        tokio::task::yield_now().await;
+    }
+    let run_id = match action {
+        SopRunAction::DeterministicStep { run_id, .. } => run_id,
+        terminal => return Ok(terminal),
+    };
+    let mut guard = match engine.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.fail_headless_step_budget(&run_id)
+}
+
+/// Spawn a background task that drives a resumed SOP action to its next
+/// blocking or terminal state. Gate-clearing surfaces without an ambient agent
+/// turn (HTTP decide, WS approvals, manual dashboard runs) land here:
+/// `ExecuteStep` runs through a fresh agent loop under the step's resolved
+/// agent, `DeterministicStep` routes through the engine's headless
+/// deterministic driver, and every other action is already parked or terminal.
+pub fn spawn_headless_run_driver(
+    config: omnesagent_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+) {
+    omnesagent_spawn::spawn!(async move {
+        drive_headless_run(config, engine, audit, first_action).await;
+    });
+}
+
+/// Drive a broker-approved run from a headless approval surface.
+///
+/// Every transport that resolves through `SopEngine::resolve_via_broker` calls
+/// this instead of independently extracting `Resolved(Resumed(_))`. That keeps
+/// the transport response separate from the lifecycle obligation to schedule
+/// the resumed action.
+pub fn drive_resumed_broker_action(
+    config: &omnesagent_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    outcome: &BrokerOutcome,
+) {
+    let BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) = outcome else {
+        return;
+    };
+
+    spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
+}
+
+async fn drive_headless_run(
+    config: omnesagent_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+) {
+    use crate::sop::types::SopStepStatus;
+
+    let mut action = first_action;
+    for _ in 0..MAX_HEADLESS_DRIVE_STEPS {
+        match action {
+            SopRunAction::ExecuteStep {
+                run_id,
+                step,
+                context,
+            } => {
+                let cancel_at_boundary = {
+                    let mut guard = match engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.finish_requested_cancellation(&run_id)
+                };
+                match cancel_at_boundary {
+                    Ok(Some(cancelled)) => {
+                        action = cancelled;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Fail
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                            "SOP headless driver: failed to finish requested cancellation"
+                        );
+                        return;
+                    }
+                }
+                let agent_alias = step
+                    .agent
+                    .clone()
+                    .or_else(|| config.agents.keys().min().cloned())
+                    .unwrap_or_default();
+                let started_at = crate::sop::engine::now_iso8601();
+                let session_path =
+                    std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
+                let run_result = Box::pin(crate::agent::run(
+                    config.clone(),
+                    &agent_alias,
+                    Some(context),
+                    None,
+                    None,
+                    config
+                        .model_provider_for_agent(&agent_alias)
+                        .and_then(|e| e.temperature),
+                    vec![],
+                    false,
+                    Some(session_path),
+                    None,
+                    omnesagent_api::ingress::TurnOrigin::Daemon,
+                    crate::agent::loop_::AgentRunOverrides::default(),
+                ))
+                .await;
+                let completed_at = crate::sop::engine::now_iso8601();
+                let step_result = match run_result {
+                    Ok(output) => SopStepResult {
+                        step_number: step.number,
+                        status: SopStepStatus::Completed,
+                        output,
+                        started_at,
+                        completed_at: Some(completed_at),
+                        effective_agent: Some(agent_alias.clone()),
+                        tool_calls: Vec::new(),
+                    },
+                    Err(e) => SopStepResult {
+                        step_number: step.number,
+                        status: SopStepStatus::Failed,
+                        output: e.to_string(),
+                        started_at,
+                        completed_at: Some(completed_at),
+                        effective_agent: Some(agent_alias.clone()),
+                        tool_calls: Vec::new(),
+                    },
+                };
+                match advance_sop_step(&engine, &run_id, step_result.clone()) {
+                    Ok((next, finished_run)) => {
+                        audit_sop_step(
+                            audit.as_deref(),
+                            &run_id,
+                            &step_result,
+                            finished_run.as_ref(),
+                        )
+                        .await;
+                        action = next;
+                    }
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Fail
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                            "SOP headless driver: failed to advance run"
+                        );
+                        return;
+                    }
+                }
+            }
+            SopRunAction::DeterministicStep { ref run_id, .. } => {
+                let run_id = run_id.clone();
+                let next = {
+                    let mut guard = match engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.advance_headless_deterministic_step(&run_id, action)
+                };
+                match next {
+                    Ok(next @ SopRunAction::DeterministicStep { .. }) => {
+                        action = next;
+                        // Give a waiting cancel request a scheduling point before
+                        // this task attempts to reacquire the shared engine lock.
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(next) => action = next,
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Fail
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                            "SOP headless driver: deterministic drive failed"
+                        );
+                        return;
+                    }
+                }
+            }
+            SopRunAction::WaitApproval { run_id, step, .. }
+            | SopRunAction::CheckpointWait { run_id, step, .. } => {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "step": step.number,
+                        })),
+                    "SOP headless driver: run parked at a gate"
+                );
+                return;
+            }
+            SopRunAction::Pending {
+                run_id,
+                step,
+                reason,
+                ..
+            } => {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "step": step,
+                            "reason": reason,
+                        })),
+                    "SOP headless driver: run pending on dependencies"
+                );
+                return;
+            }
+            SopRunAction::Completed { run_id, sop_name } => {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": sop_name,
+                        })),
+                    "SOP headless driver: run completed"
+                );
+                return;
+            }
+            SopRunAction::Cancelled { run_id, sop_name } => {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Cancel)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": sop_name,
+                        })),
+                    "SOP headless driver: run cancelled"
+                );
+                return;
+            }
+            SopRunAction::Failed {
+                run_id,
+                sop_name,
+                reason,
+            } => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": sop_name,
+                            "reason": reason,
+                        })),
+                    "SOP headless driver: run failed"
+                );
+                return;
+            }
+        }
+    }
+    let run_id = match &action {
+        SopRunAction::ExecuteStep { run_id, .. }
+        | SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+        _ => return,
+    };
+    fail_exhausted_step_budget(&engine, &run_id);
+}
+
+pub(crate) fn advance_sop_step(
+    engine: &Arc<Mutex<SopEngine>>,
+    run_id: &str,
+    result: SopStepResult,
+) -> Result<(SopRunAction, Option<SopRun>)> {
+    let mut engine = engine
+        .lock()
+        .map_err(|e| anyhow::Error::msg(format!("SOP engine lock poisoned: {e}")))?;
+    let action = engine
+        .advance_step(run_id, result)
+        .with_context(|| format!("failed to advance SOP run {run_id}"))?;
+    // `Cancelled` is as terminal as `Completed` / `Failed`: omitting it here means
+    // `audit_sop_step` never reaches `log_run_complete`, so a boundary cancellation
+    // leaves the in-memory audit record showing `Running` while the durable run and
+    // the engine metrics are already terminal.
+    let finished_run = match &action {
+        SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Failed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. } => engine.get_run(run_id).cloned(),
+        _ => None,
+    };
+    Ok((action, finished_run))
+}
+
+pub(crate) async fn audit_sop_step(
+    audit: Option<&SopAuditLogger>,
+    run_id: &str,
+    result: &SopStepResult,
+    finished_run: Option<&SopRun>,
+) {
+    let Some(audit) = audit else {
+        return;
+    };
+    if let Err(e) = audit.log_step_result(run_id, result).await {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+            "SOP executor: audit log_step_result failed"
+        );
+    }
+    if let Some(run) = finished_run
+        && let Err(e) = audit.log_run_complete(run).await
+    {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+            "SOP executor: audit log_run_complete failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sop::metrics::SopMetricsCollector;
+    use crate::sop::store::{InMemoryRunStore, SopRunStore};
+    use crate::sop::types::{
+        Sop, SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStep, SopStepKind,
+        SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
+    };
+    use serde_json::json;
+    use omnesagent_config::schema::SopConfig;
+
+    fn test_sop(name: &str) -> Sop {
+        Sop {
+            name: name.to_string(),
+            description: "Test SOP".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".to_string(),
+                body: "Complete the step".to_string(),
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }
+    }
+
+    fn manual_event() -> SopEvent {
+        SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: None,
+            timestamp: "2026-06-28T00:00:00Z".to_string(),
+        }
+    }
+
+    fn extract_run_id(action: &SopRunAction) -> String {
+        match action {
+            SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected ExecuteStep, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_deterministic_budget_exhaustion_fails_run_and_releases_claim() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let sop_name = "deterministic-loop";
+        let sop = Sop {
+            name: sop_name.to_string(),
+            description: "bounded deterministic loop".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Loop".to_string(),
+                kind: SopStepKind::Capability,
+                capability: Some("noop".to_string()),
+                routing: crate::sop::StepRouting {
+                    next: Some(1),
+                    ..Default::default()
+                },
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        let store_for_engine: Arc<dyn SopRunStore> = store.clone();
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store_for_engine);
+        engine.set_sops_for_test(vec![sop]);
+        let first_action = engine.start_run(sop_name, manual_event()).unwrap();
+        let run_id = match &first_action {
+            SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected deterministic step, got {other:?}"),
+        };
+        let engine = Arc::new(Mutex::new(engine));
+
+        let terminal = drive_shared_deterministic_run(&engine, first_action)
+            .await
+            .expect("budget exhaustion should persist a terminal failure");
+
+        assert!(matches!(
+            terminal,
+            SopRunAction::Failed { ref reason, .. }
+                if reason == "SOP headless driver step budget exhausted"
+        ));
+        let guard = engine.lock().unwrap();
+        assert_eq!(guard.get_run(&run_id).unwrap().status, SopRunStatus::Failed);
+        assert!(!guard.active_runs().contains_key(&run_id));
+        drop(guard);
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap(),
+            (0, 0),
+            "terminal budget failure must free the run's concurrency claim"
+        );
+    }
+
+    #[test]
+    fn live_executor_records_terminal_metrics_once() {
+        let collector = SopMetricsCollector::shared();
+        collector.reset_for_test();
+
+        let mut engine = SopEngine::new(SopConfig::default()).with_metrics(collector.clone());
+        engine.set_sops_for_test(vec![test_sop("live-once")]);
+        let action = engine.start_run("live-once", manual_event()).unwrap();
+        let run_id = extract_run_id(&action);
+        let engine = Arc::new(Mutex::new(engine));
+
+        let (action, finished_run) = advance_sop_step(
+            &engine,
+            &run_id,
+            SopStepResult {
+                effective_agent: None,
+                step_number: 1,
+                status: SopStepStatus::Completed,
+                output: "ok".to_string(),
+                started_at: "2026-06-28T00:00:00Z".to_string(),
+                completed_at: Some("2026-06-28T00:00:01Z".to_string()),
+                tool_calls: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+        assert!(finished_run.is_some());
+        assert_eq!(
+            collector.get_metric_value("sop.runs_completed"),
+            Some(json!(1u64))
+        );
+        assert_eq!(
+            collector.get_metric_value("sop.live-once.runs_completed"),
+            Some(json!(1u64))
+        );
+    }
+
+    /// Regression guard: a run cancelled at a step boundary
+    /// must be reported as a finished run, so `audit_sop_step` reaches
+    /// `log_run_complete`. `advance_sop_step` previously captured `finished_run`
+    /// only for `Completed` and `Failed`, leaving the in-memory audit record at
+    /// `Running` while the durable run and the engine metrics were already terminal.
+    #[test]
+    fn boundary_cancellation_reports_a_finished_run_for_the_audit_projection() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("cancel-at-boundary")]);
+        let action = engine
+            .start_run("cancel-at-boundary", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action);
+
+        // Operator Stop on a Running run: durable CancelRequested, run retained and
+        // still claimed until the driver reaches a safe boundary.
+        let outcome = engine
+            .cancel_run_idempotent(
+                &run_id,
+                Some("operator requested stop".to_string()),
+                Some("gateway:operator".to_string()),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, Some(crate::sop::engine::CancelOutcome::Requested)),
+            "a Running run must enter CancelRequested rather than terminalizing immediately"
+        );
+
+        let engine = Arc::new(Mutex::new(engine));
+        // The driver reaches the next step boundary and finalizes the cancellation.
+        let (action, finished_run) = advance_sop_step(
+            &engine,
+            &run_id,
+            SopStepResult {
+                effective_agent: None,
+                step_number: 1,
+                status: SopStepStatus::Completed,
+                output: "ok".to_string(),
+                started_at: "2026-06-28T00:00:00Z".to_string(),
+                completed_at: Some("2026-06-28T00:00:01Z".to_string()),
+                tool_calls: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Cancelled { .. }),
+            "the boundary must finalize the requested cancellation, got {action:?}"
+        );
+        let finished = finished_run.expect(
+            "a boundary cancellation must surface the finished run so the audit \
+             projection can log run completion",
+        );
+        assert_eq!(finished.run_id, run_id);
+        assert_eq!(
+            finished.status,
+            SopRunStatus::Cancelled,
+            "the audited run must carry the terminal Cancelled status"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_call_sink_captures_in_order_and_only_inside_scope() {
+        // Outside any scope: silently dropped.
+        record_step_tool_call(
+            "shell",
+            &json!({"command": "ls"}),
+            true,
+            "x".into(),
+            None,
+            None,
+            1,
+        );
+
+        let sink = new_step_call_sink();
+        scope_step_call_sink(sink.clone(), async {
+            record_step_tool_call(
+                "http_request",
+                &json!({"url": "https://example.com"}),
+                true,
+                "200 OK".into(),
+                Some(json!({"status": 200})),
+                None,
+                42,
+            );
+            record_step_tool_call(
+                "calculator",
+                &json!({"function": "add", "values": [1, 2]}),
+                false,
+                "bad args".into(),
+                None,
+                Some("bad args"),
+                3,
+            );
+        })
+        .await;
+
+        let calls = drain_step_calls(&sink);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].index, 0);
+        assert_eq!(calls[0].tool, "http_request");
+        assert_eq!(calls[0].output_data, Some(json!({"status": 200})));
+        assert_eq!(calls[1].index, 1);
+        assert!(!calls[1].success);
+        assert_eq!(calls[1].error.as_deref(), Some("bad args"));
+        assert_eq!(calls[1].duration_ms, 3);
+        // Drain empties the sink.
+        assert!(drain_step_calls(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_step_tool_call_scrubs_output_data_secrets() {
+        let sink = new_step_call_sink();
+        scope_step_call_sink(sink.clone(), async {
+            record_step_tool_call(
+                "http_request",
+                &json!({"url": "https://example.com/token"}),
+                true,
+                "200 OK".into(),
+                Some(json!({"body": {"access_token": "sk-live-abcdef0123456789"}})),
+                None,
+                7,
+            );
+        })
+        .await;
+
+        let calls = drain_step_calls(&sink);
+        assert_eq!(calls.len(), 1);
+        let data = calls[0].output_data.as_ref().expect("output_data present");
+        let token = data
+            .get("body")
+            .and_then(|b| b.get("access_token"))
+            .and_then(|t| t.as_str())
+            .expect("access_token present");
+        assert!(
+            token.contains("[REDACTED]"),
+            "output_data secret was not scrubbed: {token}"
+        );
+        assert!(!token.contains("abcdef0123456789"));
+    }
+
+    #[tokio::test]
+    async fn record_step_tool_call_scrubs_authorization_and_cookie_output_data() {
+        let sink = new_step_call_sink();
+        scope_step_call_sink(sink.clone(), async {
+            record_step_tool_call(
+                "http_request",
+                &json!({"url": "https://example.com/login"}),
+                true,
+                "200 OK".into(),
+                Some(json!({"body": {
+                    "authorization": "Bearer sk-live-abcdef0123456789",
+                    "cookie": "session=deadbeefcafebabe0123",
+                    "set-cookie": "sid=9f8e7d6c5b4a3210feed"
+                }})),
+                None,
+                7,
+            );
+        })
+        .await;
+
+        let calls = drain_step_calls(&sink);
+        assert_eq!(calls.len(), 1);
+        let body = calls[0]
+            .output_data
+            .as_ref()
+            .and_then(|d| d.get("body"))
+            .expect("output_data body present");
+        for (key, leaked) in [
+            ("authorization", "sk-live-abcdef0123456789"),
+            ("cookie", "deadbeefcafebabe0123"),
+            ("set-cookie", "9f8e7d6c5b4a3210feed"),
+        ] {
+            let value = body
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{key} present"));
+            assert!(
+                value.contains("[REDACTED]"),
+                "output_data {key} was not scrubbed: {value}"
+            );
+            assert!(!value.contains(leaked), "output_data {key} leaked secret");
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_step_call_scopes_do_not_leak_into_outer_sink() {
+        let outer = new_step_call_sink();
+        let inner = new_step_call_sink();
+        scope_step_call_sink(outer.clone(), async {
+            record_step_tool_call("shell", &json!({}), true, "outer".into(), None, None, 1);
+            scope_step_call_sink(inner.clone(), async {
+                record_step_tool_call("shell", &json!({}), true, "inner".into(), None, None, 1);
+            })
+            .await;
+        })
+        .await;
+
+        let outer_calls = drain_step_calls(&outer);
+        let inner_calls = drain_step_calls(&inner);
+        assert_eq!(outer_calls.len(), 1);
+        assert_eq!(outer_calls[0].output, "outer");
+        assert_eq!(inner_calls.len(), 1);
+        assert_eq!(inner_calls[0].output, "inner");
+    }
+}

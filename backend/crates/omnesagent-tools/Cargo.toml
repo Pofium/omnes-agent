@@ -1,0 +1,82 @@
+[package]
+name = "omnesagent-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tool implementations for agent-callable capabilities."
+publish = false
+
+[dependencies]
+omnesagent-log.workspace = true
+omnesagent-api.workspace = true
+omnesagent-spawn.workspace = true
+omnesagent-config = { workspace = true, default-features = false }
+omnesagent-providers.workspace = true
+omnesagent-memory.workspace = true
+omnesagent-kag.workspace = true
+omnesagent-infra.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+cap-std = "4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+directories = "6.0"
+futures-util = { version = "0.3", default-features = false }
+fluent = "0.16"
+glob = "0.3"
+hex = "0.4"
+infer = { version = "0.19", default-features = false }
+fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
+nanohtml2text = "0.2"
+parking_lot = "0.12"
+probe-rs = { version = "0.31", optional = true }
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "multipart", "stream"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+sys-locale.workspace = true
+tempfile = "3.26"
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "fs"] }
+tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", default-features = false }
+toml = "1.0"
+urlencoding = "2.1"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+which = "8.0"
+
+async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false }
+mail-parser = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.14.0"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.6"
+
+# `O_NONBLOCK` for the MCP custom-CA loader, so a special file substituted at a
+# configured `tls_ca_cert_path` cannot block MCP registry startup.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = []
+browser-native = ["dep:fantoccini"]
+probe = ["dep:probe-rs"]
+# Exposes cross-crate test-only constructors (e.g.
+# `McpRegistry::for_test_with_server_count`) so downstream test
+# suites can build registry fixtures without spawning real stdio
+# children. Intentionally not part of the default surface — the
+# constructors panic on real use and exist purely to keep
+# daemon-side tests self-contained.
+test-helpers = []
+
+[dev-dependencies]
+omnesagent-infra.workspace = true
+rcgen = "0.13"
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
+scopeguard = "1.2"
+tokio-test = "0.4"

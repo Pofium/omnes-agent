@@ -1,0 +1,854 @@
+//! WebSocket endpoint for dynamic node discovery and capability advertisement.
+
+use super::AppState;
+use axum::{
+    extract::{
+        Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    http::{HeaderMap, header},
+    response::IntoResponse,
+};
+use futures_util::{SinkExt, StreamExt};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+use omnesagent_runtime::security::pairing::{PairingGuard, constant_time_eq};
+
+pub mod mdns;
+
+/// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
+const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
+
+/// The sub-protocol we support for node connections.
+const WS_NODE_PROTOCOL: &str = "omnesagent.nodes.v1";
+
+/// A single capability advertised by a node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeCapability {
+    pub name: String,
+    pub description: String,
+    #[serde(default = "default_capability_parameters")]
+    pub parameters: serde_json::Value,
+}
+
+fn default_capability_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {}
+    })
+}
+
+/// Tracks a connected node and its capabilities.
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    pub node_id: String,
+    pub capabilities: Vec<NodeCapability>,
+    /// Channel to send invocation requests to the node's WebSocket handler.
+    pub invoke_tx: mpsc::Sender<NodeInvocation>,
+}
+
+/// An invocation request sent to a node.
+#[derive(Debug)]
+pub struct NodeInvocation {
+    pub call_id: String,
+    pub capability: String,
+    pub args: serde_json::Value,
+    pub response_tx: oneshot::Sender<NodeInvocationResult>,
+}
+
+/// The result of a node invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInvocationResult {
+    pub success: bool,
+    pub output: String,
+    pub error: Option<String>,
+}
+
+/// Registry of all connected nodes and their capabilities.
+#[derive(Debug, Default, Clone)]
+pub struct NodeRegistry {
+    nodes: Arc<RwLock<HashMap<String, NodeInfo>>>,
+    max_nodes: usize,
+}
+
+impl NodeRegistry {
+    /// Create a new registry with the given capacity limit.
+    pub fn new(max_nodes: usize) -> Self {
+        Self {
+            nodes: Arc::new(RwLock::new(HashMap::new())),
+            max_nodes,
+        }
+    }
+
+    /// Register a node with its capabilities. Returns false if at capacity.
+    pub fn register(&self, info: NodeInfo) -> bool {
+        let mut nodes = self.nodes.write();
+        if nodes.len() >= self.max_nodes && !nodes.contains_key(&info.node_id) {
+            return false;
+        }
+        nodes.insert(info.node_id.clone(), info);
+        true
+    }
+
+    /// Remove a node from the registry.
+    pub fn unregister(&self, node_id: &str) {
+        self.nodes.write().remove(node_id);
+    }
+
+    /// List all registered node IDs.
+    pub fn node_ids(&self) -> Vec<String> {
+        self.nodes.read().keys().cloned().collect()
+    }
+
+    /// Get all capabilities across all nodes, keyed by prefixed tool name.
+    pub fn all_capabilities(&self) -> Vec<(String, String, NodeCapability)> {
+        let nodes = self.nodes.read();
+        let mut caps = Vec::new();
+        for info in nodes.values() {
+            for cap in &info.capabilities {
+                caps.push((info.node_id.clone(), cap.name.clone(), cap.clone()));
+            }
+        }
+        caps
+    }
+
+    /// Get the invocation sender for a specific node.
+    pub fn invoke_tx(&self, node_id: &str) -> Option<mpsc::Sender<NodeInvocation>> {
+        self.nodes.read().get(node_id).map(|n| n.invoke_tx.clone())
+    }
+
+    /// Check if a node is registered.
+    pub fn contains(&self, node_id: &str) -> bool {
+        self.nodes.read().contains_key(node_id)
+    }
+
+    /// Number of registered nodes.
+    pub fn len(&self) -> usize {
+        self.nodes.read().len()
+    }
+
+    /// Whether the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.read().is_empty()
+    }
+}
+
+/// Messages received from a node.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum NodeMessage {
+    Register {
+        node_id: String,
+        capabilities: Vec<NodeCapability>,
+    },
+    Result {
+        call_id: String,
+        success: bool,
+        output: String,
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+/// Messages sent to a node.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum GatewayMessage {
+    #[allow(dead_code)] // Wire-format ack; only the test constructs it today.
+    Registered {
+        node_id: String,
+        capabilities_count: usize,
+    },
+    Invoke {
+        call_id: String,
+        capability: String,
+        args: serde_json::Value,
+    },
+}
+
+/// Query parameters for the `/ws/nodes` endpoint.
+#[derive(Deserialize)]
+pub struct NodeWsQuery {
+    pub token: Option<String>,
+}
+
+/// Extract a bearer token from WebSocket-compatible sources.
+fn extract_node_ws_token<'a>(
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+) -> Option<&'a str> {
+    // 1. Authorization header
+    if let Some(t) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        && !t.is_empty()
+    {
+        return Some(t);
+    }
+
+    // 2. Sec-WebSocket-Protocol: bearer.<token>
+    if let Some(t) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|protos| {
+            protos
+                .split(',')
+                .map(|p| p.trim())
+                .find_map(|p| p.strip_prefix(BEARER_SUBPROTO_PREFIX))
+        })
+        && !t.is_empty()
+    {
+        return Some(t);
+    }
+
+    // 3. ?token= query parameter
+    if let Some(t) = query_token
+        && !t.is_empty()
+    {
+        return Some(t);
+    }
+
+    None
+}
+
+pub(crate) fn check_node_auth(
+    nodes_config: &omnesagent_config::schema::NodesConfig,
+    pairing: &PairingGuard,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Option<(axum::http::StatusCode, &'static str)> {
+    if !nodes_config.enabled {
+        return Some((
+            axum::http::StatusCode::NOT_FOUND,
+            "Not Found — node discovery is disabled (set nodes.enabled=true to enable)",
+        ));
+    }
+    if let Some(ref expected_token) = nodes_config.auth_token {
+        // Fail-closed: a whitespace-only / empty configured token must not
+        // authenticate missing or arbitrary tokens (trimming both sides
+        // would produce `constant_time_eq("", "")` = true and bypass auth).
+        if expected_token.trim().is_empty() {
+            return Some((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable — nodes.auth_token must not be empty or whitespace-only",
+            ));
+        }
+        let token = extract_node_ws_token(headers, query_token).unwrap_or("");
+        // SECURITY: route through `constant_time_eq` (not `==`) to prevent
+        // a remote timing attack that could leak `nodes.auth_token` one
+        // byte at a time. Both sides are `.trim()`-normalized to match
+        // the canonical pattern at
+        // `crates/omnesagent-config/src/pairing.rs:139`.
+        if !constant_time_eq(token.trim(), expected_token.trim()) {
+            return Some((
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide a valid node auth token",
+            ));
+        }
+    } else if pairing.require_pairing() {
+        let token = extract_node_ws_token(headers, query_token).unwrap_or("");
+        if !pairing.is_authenticated(token) {
+            return Some((
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide Authorization header or ?token= query param",
+            ));
+        }
+    } else {
+        return Some((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable — node registration is disabled because no auth method is configured. \
+             Set nodes.auth_token OR enable gateway.require_pairing.",
+        ));
+    }
+    None
+}
+
+pub async fn handle_ws_nodes(
+    State(state): State<AppState>,
+    Query(params): Query<NodeWsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let nodes_config = state.config.read().nodes.clone();
+    if let Some((status, body)) = check_node_auth(
+        &nodes_config,
+        &state.pairing,
+        &headers,
+        params.token.as_deref(),
+    ) {
+        return (status, body).into_response();
+    }
+
+    // Echo sub-protocol if client requests it
+    let ws = if headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|protos| protos.split(',').any(|p| p.trim() == WS_NODE_PROTOCOL))
+    {
+        ws.protocols([WS_NODE_PROTOCOL])
+    } else {
+        ws
+    };
+
+    let registry = state.node_registry.clone();
+    ws.on_upgrade(move |socket| handle_node_socket(socket, registry))
+        .into_response()
+}
+
+async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut registered_node_id: Option<String> = None;
+
+    // Channel for forwarding invocations to this node
+    let (invoke_tx, mut invoke_rx) = mpsc::channel::<NodeInvocation>(32);
+
+    // Pending invocation responses keyed by call_id
+    let pending: Arc<RwLock<HashMap<String, oneshot::Sender<NodeInvocationResult>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    let pending_clone = Arc::clone(&pending);
+
+    // Task to forward invocations to the node via WebSocket
+    let send_task = omnesagent_spawn::spawn!(async move {
+        while let Some(invocation) = invoke_rx.recv().await {
+            let msg = GatewayMessage::Invoke {
+                call_id: invocation.call_id.clone(),
+                capability: invocation.capability,
+                args: invocation.args,
+            };
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if sender.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+                pending_clone
+                    .write()
+                    .insert(invocation.call_id, invocation.response_tx);
+            }
+        }
+    });
+
+    // Process incoming messages from node
+    while let Some(msg) = receiver.next().await {
+        let text = match msg {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => continue,
+        };
+
+        let parsed: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Try to parse as NodeMessage
+        let node_msg: NodeMessage = match serde_json::from_value(parsed) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        match node_msg {
+            NodeMessage::Register {
+                node_id,
+                capabilities,
+            } => {
+                // Validate node_id
+                if node_id.is_empty() || node_id.len() > 128 {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                        "Node registration rejected: invalid node_id length"
+                    );
+                    continue;
+                }
+
+                let caps_count = capabilities.len();
+                let info = NodeInfo {
+                    node_id: node_id.clone(),
+                    capabilities,
+                    invoke_tx: invoke_tx.clone(),
+                };
+
+                if registry.register(info) {
+                    ::omnesagent_log::record!(
+                        INFO,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_attrs(
+                                ::serde_json::json!({"node_id": node_id, "caps_count": caps_count})
+                            ),
+                        "Node registered: with capabilities"
+                    );
+                    registered_node_id = Some(node_id.clone());
+                } else {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"node_id": node_id})),
+                        "Node registration rejected: registry at capacity for"
+                    );
+                }
+            }
+            NodeMessage::Result {
+                call_id,
+                success,
+                output,
+                error,
+            } => {
+                if let Some(tx) = pending.write().remove(&call_id) {
+                    let _ = tx.send(NodeInvocationResult {
+                        success,
+                        output,
+                        error,
+                    });
+                }
+            }
+        }
+    }
+
+    // Cleanup: unregister node on disconnect
+    if let Some(node_id) = registered_node_id {
+        registry.unregister(&node_id);
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_attrs(::serde_json::json!({"node_id": node_id})),
+            "Node disconnected and unregistered"
+        );
+    }
+
+    send_task.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use omnesagent_config::schema::NodesConfig;
+    use omnesagent_runtime::security::pairing::PairingGuard;
+
+    // ── Auth matrix tests (via check_node_auth — no WS handshake required) ──
+
+    fn empty_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    fn make_pairing(require: bool) -> PairingGuard {
+        PairingGuard::new(require, &[])
+    }
+
+    #[test]
+    fn nodes_disabled_returns_404() {
+        let cfg = NodesConfig {
+            enabled: false,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn nodes_enabled_no_auth_no_pairing_returns_503() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: None,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, no token provided → 503
+    /// (fail-closed: empty-trimmed config must not match missing token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_missing_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents a token → 503
+    /// (fail-closed: empty-trimmed config must not authenticate any token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_any_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("anything");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents matching
+    /// whitespace token → 503 (same fail-closed path).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_matching_whitespace_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("   ");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set, caller presents wrong/missing token → 401.
+    #[test]
+    fn nodes_auth_token_wrong_token_returns_401() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("secret".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn nodes_auth_token_correct_token_passes() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("secret".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("secret");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert!(result.is_none(), "correct token must pass auth gate");
+    }
+
+    #[test]
+    fn nodes_pairing_required_wrong_token_returns_401() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: None,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(true), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn node_registry_register_and_unregister() {
+        let registry = NodeRegistry::new(10);
+        let (tx, _rx) = mpsc::channel(1);
+
+        let info = NodeInfo {
+            node_id: "test-node".to_string(),
+            capabilities: vec![NodeCapability {
+                name: "ping".to_string(),
+                description: "Ping test".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            invoke_tx: tx,
+        };
+
+        assert!(registry.register(info));
+        assert!(registry.contains("test-node"));
+        assert_eq!(registry.len(), 1);
+
+        registry.unregister("test-node");
+        assert!(!registry.contains("test-node"));
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn node_registry_capacity_limit() {
+        let registry = NodeRegistry::new(2);
+
+        for i in 0..2 {
+            let (tx, _rx) = mpsc::channel(1);
+            let info = NodeInfo {
+                node_id: format!("node-{i}"),
+                capabilities: vec![],
+                invoke_tx: tx,
+            };
+            assert!(registry.register(info));
+        }
+
+        let (tx, _rx) = mpsc::channel(1);
+        let info = NodeInfo {
+            node_id: "node-overflow".to_string(),
+            capabilities: vec![],
+            invoke_tx: tx,
+        };
+        assert!(!registry.register(info));
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn node_registry_re_register_same_id() {
+        let registry = NodeRegistry::new(2);
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        let info1 = NodeInfo {
+            node_id: "node-1".to_string(),
+            capabilities: vec![NodeCapability {
+                name: "old".to_string(),
+                description: "Old cap".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            invoke_tx: tx1,
+        };
+        assert!(registry.register(info1));
+
+        let info2 = NodeInfo {
+            node_id: "node-1".to_string(),
+            capabilities: vec![NodeCapability {
+                name: "new".to_string(),
+                description: "New cap".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            invoke_tx: tx2,
+        };
+        // Re-registering same node_id should succeed (update)
+        assert!(registry.register(info2));
+        assert_eq!(registry.len(), 1);
+
+        let caps = registry.all_capabilities();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].2.name, "new");
+    }
+
+    #[test]
+    fn node_registry_all_capabilities() {
+        let registry = NodeRegistry::new(10);
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
+
+        registry.register(NodeInfo {
+            node_id: "phone-1".to_string(),
+            capabilities: vec![
+                NodeCapability {
+                    name: "camera.snap".to_string(),
+                    description: "Take a photo".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+                NodeCapability {
+                    name: "gps.location".to_string(),
+                    description: "Get GPS location".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            ],
+            invoke_tx: tx1,
+        });
+
+        registry.register(NodeInfo {
+            node_id: "sensor-1".to_string(),
+            capabilities: vec![NodeCapability {
+                name: "temp.read".to_string(),
+                description: "Read temperature".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            invoke_tx: tx2,
+        });
+
+        let caps = registry.all_capabilities();
+        assert_eq!(caps.len(), 3);
+    }
+
+    #[test]
+    fn node_registry_is_empty() {
+        let registry = NodeRegistry::new(10);
+        assert!(registry.is_empty());
+
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register(NodeInfo {
+            node_id: "n".to_string(),
+            capabilities: vec![],
+            invoke_tx: tx,
+        });
+        assert!(!registry.is_empty());
+    }
+
+    #[test]
+    fn node_capability_deserialize() {
+        let json = r#"{"name":"camera.snap","description":"Take a photo"}"#;
+        let cap: NodeCapability = serde_json::from_str(json).unwrap();
+        assert_eq!(cap.name, "camera.snap");
+        assert_eq!(cap.description, "Take a photo");
+        // Default parameters
+        assert_eq!(cap.parameters["type"], "object");
+    }
+
+    #[test]
+    fn node_message_register_deserialize() {
+        let json = r#"{"type":"register","node_id":"phone-1","capabilities":[{"name":"camera.snap","description":"Take a photo","parameters":{"type":"object","properties":{"resolution":{"type":"string"}}}}]}"#;
+        let msg: NodeMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            NodeMessage::Register {
+                node_id,
+                capabilities,
+            } => {
+                assert_eq!(node_id, "phone-1");
+                assert_eq!(capabilities.len(), 1);
+                assert_eq!(capabilities[0].name, "camera.snap");
+            }
+            NodeMessage::Result { .. } => panic!("Expected Register message"),
+        }
+    }
+
+    #[test]
+    fn node_message_result_deserialize() {
+        let json = r#"{"type":"result","call_id":"abc-123","success":true,"output":"photo taken"}"#;
+        let msg: NodeMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            NodeMessage::Result {
+                call_id,
+                success,
+                output,
+                error,
+            } => {
+                assert_eq!(call_id, "abc-123");
+                assert!(success);
+                assert_eq!(output, "photo taken");
+                assert!(error.is_none());
+            }
+            NodeMessage::Register { .. } => panic!("Expected Result message"),
+        }
+    }
+
+    #[test]
+    fn gateway_message_serialize() {
+        let msg = GatewayMessage::Registered {
+            node_id: "phone-1".to_string(),
+            capabilities_count: 3,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"registered\""));
+        assert!(json.contains("\"node_id\":\"phone-1\""));
+        assert!(json.contains("\"capabilities_count\":3"));
+    }
+
+    #[test]
+    fn gateway_invoke_message_serialize() {
+        let msg = GatewayMessage::Invoke {
+            call_id: "call-1".to_string(),
+            capability: "camera.snap".to_string(),
+            args: serde_json::json!({"resolution": "1080p"}),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"invoke\""));
+        assert!(json.contains("\"capability\":\"camera.snap\""));
+    }
+
+    #[test]
+    fn extract_node_ws_token_from_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer node_tok_123".parse().unwrap());
+        assert_eq!(extract_node_ws_token(&headers, None), Some("node_tok_123"));
+    }
+
+    #[test]
+    fn extract_node_ws_token_from_query() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            extract_node_ws_token(&headers, Some("node_tok_456")),
+            Some("node_tok_456")
+        );
+    }
+
+    #[test]
+    fn extract_node_ws_token_none_when_empty() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_node_ws_token(&headers, None), None);
+    }
+
+    /// Regression for non-constant-time `nodes.auth_token` comparison.
+    ///
+    /// The old code used `if token != expected_token`, which short-circuits
+    /// on the first differing byte and leaks the configured `nodes.auth_token`
+    /// one byte at a time via response timing. The fix routes through
+    /// `constant_time_eq` (from `omnesagent_config::pairing`) and trims both
+    /// sides — matching the canonical pairing pattern at
+    /// `crates/omnesagent-config/src/pairing.rs:139`.
+    ///
+    /// We can't measure wall-clock timing in a unit test, but we can lock
+    /// in the behavior contract: trim-normalized inputs match, wrong
+    /// tokens still reject. A future refactor that drops the
+    /// `constant_time_eq` call (e.g., back to `==`) would still pass the
+    /// "wrong token rejected" half — the trim half is what proves the new
+    /// shape is in place.
+    #[test]
+    fn nodes_auth_token_compare_uses_constant_time_eq_and_trims() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("node-secret-token".into()),
+            ..NodesConfig::default()
+        };
+
+        // Whitespace-padded Authorization header still passes
+        // (trim-normalized on both sides, per the canonical pairing pattern).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer   node-secret-token   ".parse().unwrap(),
+        );
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None),
+            None,
+            "auth_token comparison must trim both sides (canonical pairing pattern)"
+        );
+
+        // Wrong token via Authorization header is rejected.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None).map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Wrong token via `?token=` query parameter is also rejected.
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("wrong-token"),
+            )
+            .map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Correct token via `?token=` (with no trim ambiguity) passes.
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("node-secret-token"),
+            ),
+            None
+        );
+    }
+}

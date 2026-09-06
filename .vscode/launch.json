@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "📱 Omnes App (Flutter Debug)",
+      "request": "launch",
+      "type": "dart",
+      "program": "frontend/lib/main.dart",
+      "cwd": "frontend",
+      "flutterMode": "debug"
+    },
+    {
+      "name": "📱 Omnes App (Flutter Release)",
+      "request": "launch",
+      "type": "dart",
+      "program": "frontend/lib/main.dart",
+      "cwd": "frontend",
+      "flutterMode": "release"
+    },
+    {
+      "name": "🦀 Omnes Gateway Daemon (Rust)",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/target/debug/omnesagent.exe",
+      "args": ["gateway", "start"],
+      "cwd": "${workspaceFolder}/backend",
+      "stopAtEntry": false
+    }
+  ],
+  "compounds": [
+    {
+      "name": "🚀 Full Stack: Omnes (Gateway + App)",
+      "configurations": [
+        "🦀 Omnes Gateway Daemon (Rust)",
+        "📱 Omnes App (Flutter Debug)"
+      ]
+    }
+  ]
+}

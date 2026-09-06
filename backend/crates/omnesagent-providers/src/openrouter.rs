@@ -1,0 +1,2343 @@
+use crate::compatible::sse_bytes_to_events;
+use crate::multimodal;
+use crate::stream_guard::AbortOnDrop;
+use crate::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    ModelInfo, ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
+};
+use async_trait::async_trait;
+use futures_util::StreamExt as _;
+use futures_util::stream;
+use reqwest::Client;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use omnesagent_api::tool::ToolSpec;
+
+pub struct OpenRouterModelProvider {
+    /// `[providers.models.<family>.<alias>]` config-key alias.
+    alias: String,
+    credential: Option<String>,
+    timeout_secs: u64,
+    max_tokens: Option<u32>,
+    extra_body: Option<serde_json::Value>,
+}
+
+/// OpenRouter's public aggregator endpoint.
+pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+pub(crate) fn endpoint_url(path: &str) -> String {
+    format!("{BASE_URL}/{}", path.trim_start_matches('/'))
+}
+const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Debug, Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct Message {
+    role: String,
+    content: MessageContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<MessagePart>),
+}
+
+#[derive(Debug, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessagePart {
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    ImageUrl {
+        image_url: ImageUrlPart,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageUrlPart {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiChatResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Choice {
+    message: ResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseMessage {
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeChatRequest {
+    model: String,
+    messages: Vec<NativeMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<NativeToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<MessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<NativeToolCall>>,
+    /// Raw reasoning content from thinking models; pass-through for model_providers
+    /// that require it in assistant tool-call history messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeToolSpec {
+    #[serde(rename = "type")]
+    kind: String,
+    function: NativeToolFunctionSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeToolFunctionSpec {
+    name: String,
+    description: String,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request
+    parameters: Arc<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    function: NativeFunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NativeFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeChatResponse {
+    choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    /// Per-category prompt-token breakdown. Only present when the upstream
+    /// provider returns cached-token accounting. Absent for providers that
+    /// do not support prompt caching.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeChoice {
+    message: NativeResponseMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    /// Reasoning/thinking models may return output in `reasoning_content`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<NativeToolCall>>,
+}
+
+/// Typed builder for [`OpenRouterModelProvider`].
+///
+/// Only `alias` is required. `credential` treats whitespace-only inputs
+/// as missing (defensive against stray config values). Timeout,
+/// max_tokens, and extra_body all have sensible defaults.
+#[must_use]
+pub struct OpenRouterBuilder {
+    alias: String,
+    credential: Option<String>,
+    timeout_secs: Option<u64>,
+    max_tokens: Option<u32>,
+    extra_body: Option<serde_json::Value>,
+}
+
+impl OpenRouterBuilder {
+    /// Explicit API credential. Whitespace-only inputs collapse to
+    /// `None`.
+    pub fn credential(mut self, credential: Option<&str>) -> Self {
+        self.credential = credential
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(ToString::to_string);
+        self
+    }
+
+    /// Override the HTTP request timeout for LLM API calls. Values of 0
+    /// are ignored (the default timeout is kept) so a stray `Some(0)`
+    /// from config cannot disable the safety timeout.
+    pub fn timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.timeout_secs = Some(secs);
+        }
+        self
+    }
+
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set extra JSON parameters to merge into every API request body.
+    /// Keys in `extra` are inserted at the top level of the serialized
+    /// request, overriding any existing keys with the same name.
+    pub fn extra_body(mut self, extra: serde_json::Value) -> Self {
+        self.extra_body = Some(extra);
+        self
+    }
+
+    pub fn build(self) -> OpenRouterModelProvider {
+        OpenRouterModelProvider {
+            alias: self.alias,
+            credential: self.credential,
+            timeout_secs: self
+                .timeout_secs
+                .unwrap_or(omnesagent_api::model_provider::BASELINE_TIMEOUT_SECS),
+            max_tokens: self.max_tokens,
+            extra_body: self.extra_body,
+        }
+    }
+}
+
+impl OpenRouterModelProvider {
+    /// Entry point. Only `alias` is required; every other field is set
+    /// via a labelled chain method on the returned [`OpenRouterBuilder`].
+    pub fn builder(alias: &str) -> OpenRouterBuilder {
+        OpenRouterBuilder {
+            alias: alias.to_string(),
+            credential: None,
+            timeout_secs: None,
+            max_tokens: None,
+            extra_body: None,
+        }
+    }
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+        let items = tools?;
+        if items.is_empty() {
+            return None;
+        }
+        let valid: Vec<NativeToolSpec> = items
+            .iter()
+            .filter(|tool| is_valid_openai_tool_name(&tool.name))
+            .map(|tool| NativeToolSpec {
+                kind: "function".to_string(),
+                function: NativeToolFunctionSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: Arc::clone(&tool.parameters),
+                },
+            })
+            .collect();
+        if valid.is_empty() { None } else { Some(valid) }
+    }
+
+    fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        messages
+            .iter()
+            .map(|m| {
+                if m.role == "assistant"
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                    && let Some(tool_calls_value) = value.get("tool_calls")
+                    && let Ok(parsed_calls) =
+                        serde_json::from_value::<Vec<ProviderToolCall>>(tool_calls_value.clone())
+                {
+                    let tool_calls = parsed_calls
+                        .into_iter()
+                        .map(|tc| {
+                            let name = tc.name;
+                            NativeToolCall {
+                                id: Some(tc.id),
+                                kind: Some("function".to_string()),
+                                function: NativeFunctionCall {
+                                    arguments: crate::compatible::sanitize_tool_arguments(
+                                        &name,
+                                        &tc.arguments,
+                                    ),
+                                    name,
+                                },
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let content = crate::request_payload::non_empty_string_field(&value, "content")
+                        .map(MessageContent::Text);
+                    let reasoning_content = value
+                        .get("reasoning_content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
+                    return NativeMessage {
+                        role: "assistant".to_string(),
+                        content,
+                        tool_call_id: None,
+                        tool_calls: Some(tool_calls),
+                        reasoning_content,
+                    };
+                }
+
+                if m.role == "tool"
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
+                {
+                    let tool_call_id = value
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
+                    let content = value
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|value| MessageContent::Text(value.to_string()))
+                        .or_else(|| Some(MessageContent::Text(m.content.clone())));
+                    return NativeMessage {
+                        role: "tool".to_string(),
+                        content,
+                        tool_call_id,
+                        tool_calls: None,
+                        reasoning_content: None,
+                    };
+                }
+
+                NativeMessage {
+                    role: m.role.clone(),
+                    content: Some(Self::to_message_content(&m.role, &m.content)),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                }
+            })
+            .collect()
+    }
+
+    fn build_chat_with_system_request(
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> ChatRequest {
+        let mut messages = Vec::new();
+
+        if let Some(sys) = system_prompt {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: Self::to_message_content("system", sys),
+            });
+        }
+
+        messages.push(Message {
+            role: "user".to_string(),
+            content: Self::to_message_content("user", message),
+        });
+
+        ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            max_tokens,
+        }
+    }
+
+    fn to_message_content(role: &str, content: &str) -> MessageContent {
+        if role == "system" {
+            return MessageContent::Parts(vec![MessagePart::Text {
+                text: content.to_string(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                }),
+            }]);
+        }
+        if role != "user" {
+            return MessageContent::Text(content.to_string());
+        }
+
+        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+        if image_refs.is_empty() {
+            return MessageContent::Text(content.to_string());
+        }
+
+        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let trimmed_text = cleaned_text.trim();
+        if !trimmed_text.is_empty() {
+            parts.push(MessagePart::Text {
+                text: trimmed_text.to_string(),
+                cache_control: None,
+            });
+        }
+
+        for image_ref in image_refs {
+            parts.push(MessagePart::ImageUrl {
+                image_url: ImageUrlPart { url: image_ref },
+            });
+        }
+
+        MessageContent::Parts(parts)
+    }
+
+    fn parse_native_response(message: NativeResponseMessage) -> ProviderChatResponse {
+        let reasoning_content = message.reasoning_content.clone();
+        let tool_calls = message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| ProviderToolCall {
+                id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+                extra_content: None,
+            })
+            .collect::<Vec<_>>();
+
+        ProviderChatResponse {
+            text: message.content,
+            tool_calls,
+            usage: None,
+            reasoning_content,
+        }
+    }
+
+    fn compact_sanitized_body_snippet(body: &str) -> String {
+        super::sanitize_api_error(body)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    async fn read_response_body(
+        provider_name: &str,
+        response: reqwest::Response,
+    ) -> anyhow::Result<String> {
+        response.text().await.map_err(|error| {
+            let sanitized = super::format_error_chain(&error);
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": provider_name,
+                        "body": &sanitized,
+                    })),
+                "openrouter: transport error reading response body"
+            );
+            anyhow::Error::msg(format!(
+                "{provider_name} transport error while reading response body: {sanitized}"
+            ))
+        })
+    }
+
+    fn parse_response_body<T: DeserializeOwned>(
+        provider_name: &str,
+        body: &str,
+        kind: &str,
+    ) -> anyhow::Result<T> {
+        serde_json::from_str::<T>(body).map_err(|error| {
+            let snippet = Self::compact_sanitized_body_snippet(body);
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model_provider": provider_name,
+                        "kind": kind,
+                        "body": &snippet,
+                        "error": format!("{}", error),
+                    })),
+                "openrouter: unexpected response payload"
+            );
+            anyhow::Error::msg(format!(
+                "{provider_name} API returned an unexpected {kind} payload: {error}; body={snippet}"
+            ))
+        })
+    }
+
+    /// Serialize `request` to JSON, merge `self.extra_body` keys at the top
+    /// level (extra_body wins on conflicts), and return the merged Value.
+    fn merge_extra_body<T: Serialize>(&self, request: &T) -> anyhow::Result<serde_json::Value> {
+        let Some(extra) = &self.extra_body else {
+            return Ok(serde_json::to_value(request)?);
+        };
+        let overrides = extra.as_object().ok_or_else(|| {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"provider_extra": extra})),
+                "openrouter: provider_extra must be a JSON object"
+            );
+            anyhow::Error::msg(format!(
+                "provider_extra must be a JSON object, got: {extra}"
+            ))
+        })?;
+        let mut value = serde_json::to_value(request)?;
+        if let Some(base) = value.as_object_mut() {
+            for (k, v) in overrides {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(value)
+    }
+
+    fn http_client(&self) -> Client {
+        omnesagent_config::schema::build_runtime_proxy_client_with_timeouts(
+            "model_provider.openrouter",
+            self.timeout_secs,
+            OPENROUTER_CONNECT_TIMEOUT_SECS,
+        )
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OpenRouterModelProvider {
+    // ── ModelProvider-family defaults ──
+    fn default_base_url(&self) -> Option<&str> {
+        Some(BASE_URL)
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+            prompt_caching: false,
+            extended_thinking: false,
+        }
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
+        // This prevents the first real chat request from timing out on cold start.
+        if let Some(credential) = self.credential.as_ref() {
+            self.http_client()
+                .get(endpoint_url("auth/key"))
+                .header("Authorization", format!("Bearer {credential}"))
+                .send()
+                .await?
+                .error_for_status()?;
+        }
+        Ok(())
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        // OpenRouter's /models endpoint is public — no credential required.
+        // Returns ~300 models across every model_provider OpenRouter proxies.
+        let response = self
+            .http_client()
+            .get(endpoint_url("models"))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            id: String,
+        }
+
+        let body: Resp = response.json().await?;
+        let mut ids: Vec<String> = body.data.into_iter().map(|e| e.id).collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        crate::openrouter_catalog::list_all_models_with_pricing().await
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure.",
+            )
+        })?;
+
+        let request = Self::build_chat_with_system_request(
+            system_prompt,
+            message,
+            model,
+            temperature,
+            self.max_tokens,
+        );
+
+        let body = self.merge_extra_body(&request)?;
+        let response = self
+            .http_client()
+            .post(endpoint_url("chat/completions"))
+            .header("Authorization", format!("Bearer {credential}"))
+            .header("HTTP-Referer", "https://github.com/omnesagent-labs/omnesagent")
+            .header("X-Title", "OmnesAgent")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "chat-completions",
+        )?;
+
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure.",
+            )
+        })?;
+
+        let api_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: Self::to_message_content(&m.role, &m.content),
+            })
+            .collect();
+
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+            max_tokens: self.max_tokens,
+        };
+
+        let body = self.merge_extra_body(&request)?;
+        let response = self
+            .http_client()
+            .post(endpoint_url("chat/completions"))
+            .header("Authorization", format!("Bearer {credential}"))
+            .header("HTTP-Referer", "https://github.com/omnesagent-labs/omnesagent")
+            .header("X-Title", "OmnesAgent")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let chat_response = Self::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "chat-completions",
+        )?;
+
+        chat_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure.",
+            )
+        })?;
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: self.max_tokens,
+            stream: None,
+        };
+
+        let body = self.merge_extra_body(&native_request)?;
+        let response = self
+            .http_client()
+            .post(endpoint_url("chat/completions"))
+            .header("Authorization", format!("Bearer {credential}"))
+            .header("HTTP-Referer", "https://github.com/omnesagent-labs/omnesagent")
+            .header("X-Title", "OmnesAgent")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "native chat",
+        )?;
+        // OpenRouter surfaces cached-token accounting via
+        // `usage.prompt_tokens_details.cached_tokens` when the upstream
+        // provider supports prompt caching. For providers without caching
+        // the field is absent and we report `None`.
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })?;
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let credential = match self.credential.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return stream::once(async {
+                    Err(StreamError::ModelProvider(
+                        "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure."
+                            .to_string(),
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools,
+            max_tokens: self.max_tokens,
+            stream: Some(true),
+        };
+
+        let payload = match self.merge_extra_body(&native_request) {
+            Ok(v) => v,
+            Err(e) => {
+                let error = match e.downcast::<serde_json::Error>() {
+                    Ok(e) => StreamError::Json(e),
+                    Err(e) => StreamError::ModelProvider(e.to_string()),
+                };
+                return stream::once(async move { Err(error) }).boxed();
+            }
+        };
+
+        let client = self.http_client();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+        let handle = ::omnesagent_spawn::spawn!(async move {
+            let response = match client
+                .post(endpoint_url("chat/completions"))
+                .header("Authorization", format!("Bearer {credential}"))
+                .header("HTTP-Referer", "https://github.com/omnesagent-labs/omnesagent")
+                .header("X-Title", "OmnesAgent")
+                .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
+                .header("Accept", "text/event-stream")
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let _ = tx
+                    .send(Err(StreamError::ModelProvider(format!(
+                        "{status}: {error}"
+                    ))))
+                    .await;
+                return;
+            }
+
+            let mut event_stream = sse_bytes_to_events(response, count_tokens);
+            while let Some(event) = event_stream.next().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let guard = AbortOnDrop::new(handle.abort_handle());
+
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|event| (event, (rx, guard)))
+        })
+        .boxed()
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
+                "openrouter: API key not configured"
+            );
+            anyhow::Error::msg(
+                "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure.",
+            )
+        })?;
+
+        // Convert tool JSON values to NativeToolSpec
+        let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
+            None
+        } else {
+            let specs: Vec<NativeToolSpec> = tools
+                .iter()
+                .filter_map(|t| {
+                    let func = t.get("function")?;
+                    Some(NativeToolSpec {
+                        kind: "function".to_string(),
+                        function: NativeToolFunctionSpec {
+                            name: func.get("name")?.as_str()?.to_string(),
+                            description: func
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            parameters: Arc::new(
+                                func.get("parameters")
+                                    .cloned()
+                                    .unwrap_or(serde_json::json!({})),
+                            ),
+                        },
+                    })
+                })
+                .collect();
+            if specs.is_empty() { None } else { Some(specs) }
+        };
+
+        // Convert ChatMessage to NativeMessage, preserving structured assistant/tool entries
+        // when history contains native tool-call metadata.
+        let native_messages = Self::convert_messages(messages);
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: native_messages,
+            temperature,
+            tool_choice: native_tools
+                .as_ref()
+                .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            tools: native_tools,
+            max_tokens: self.max_tokens,
+            stream: None,
+        };
+
+        let body = self.merge_extra_body(&native_request)?;
+        let response = self
+            .http_client()
+            .post(endpoint_url("chat/completions"))
+            .header("Authorization", format!("Bearer {credential}"))
+            .header("HTTP-Referer", "https://github.com/omnesagent-labs/omnesagent")
+            .header("X-Title", "OmnesAgent")
+            .header("X-OpenRouter-Categories", "personal-agent,cli-agent")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenRouter", response).await);
+        }
+
+        let resp_body = Self::read_response_body("OpenRouter", response).await?;
+        let native_response = Self::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            &resp_body,
+            "native chat",
+        )?;
+        // OpenRouter surfaces cached-token accounting via
+        // `usage.prompt_tokens_details.cached_tokens` when the upstream
+        // provider supports prompt caching. For providers without caching
+        // the field is absent and we report `None`.
+        let usage = native_response.usage.map(|u| TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+        });
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                    "openrouter: empty choices in response"
+                );
+                anyhow::Error::msg("No response from OpenRouter")
+            })?;
+        let mut result = Self::parse_native_response(message);
+        result.usage = usage;
+        Ok(result)
+    }
+}
+
+/// Check if a tool name is valid for OpenAI-compatible APIs.
+/// Must match `^[a-zA-Z0-9_-]{1,64}$`.
+fn is_valid_openai_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+impl ::omnesagent_api::attribution::Attributable for OpenRouterModelProvider {
+    fn role(&self) -> ::omnesagent_api::attribution::Role {
+        ::omnesagent_api::attribution::Role::Provider(
+            ::omnesagent_api::attribution::ProviderKind::Model(
+                ::omnesagent_api::attribution::ModelProviderKind::OpenRouter,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{ChatMessage, ModelProvider};
+
+    #[test]
+    fn capabilities_report_vision_support() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
+        let caps = <OpenRouterModelProvider as ModelProvider>::capabilities(&model_provider);
+        assert!(caps.native_tool_calling);
+        assert!(caps.vision);
+    }
+
+    #[test]
+    fn supports_streaming_returns_true() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
+        assert!(model_provider.supports_streaming());
+    }
+
+    #[test]
+    fn supports_streaming_tool_events_returns_true() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
+        assert!(model_provider.supports_streaming_tool_events());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_key_returns_error_event() {
+        use crate::traits::{ChatMessage, ChatRequest};
+        use futures_util::StreamExt as _;
+
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let mut stream = model_provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            Some(0.0),
+            crate::traits::StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield at least one event");
+        assert!(first.is_err(), "expected error without API key");
+        let err = first.unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(
+            msg,
+            "ModelProvider error: OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure."
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_disabled_options_returns_final() {
+        use crate::traits::{ChatMessage, ChatRequest, StreamEvent};
+        use futures_util::StreamExt as _;
+
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let mut stream = model_provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            Some(0.0),
+            crate::traits::StreamOptions {
+                enabled: false,
+                count_tokens: false,
+            },
+        );
+
+        let first = stream
+            .next()
+            .await
+            .expect("stream should yield Final immediately");
+        assert!(matches!(first, Ok(StreamEvent::Final)));
+    }
+
+    #[test]
+    fn native_chat_request_serializes_stream_true() {
+        let req = NativeChatRequest {
+            model: "anthropic/claude-haiku-4-5".into(),
+            messages: vec![],
+            temperature: Some(0.0),
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: Some(true),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn native_chat_request_omits_stream_when_none() {
+        let req = NativeChatRequest {
+            model: "anthropic/claude-haiku-4-5".into(),
+            messages: vec![],
+            temperature: Some(0.0),
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("stream"));
+    }
+
+    #[test]
+    fn creates_with_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .build();
+        assert_eq!(
+            model_provider.credential.as_deref(),
+            Some("openrouter-test-credential")
+        );
+    }
+
+    #[test]
+    fn creates_without_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        assert!(model_provider.credential.is_none());
+    }
+
+    #[test]
+    fn warmup_and_model_discovery_urls_share_the_provider_base() {
+        assert_eq!(
+            endpoint_url("auth/key"),
+            "https://openrouter.ai/api/v1/auth/key",
+            "warmup must derive its URL from the provider-owned base"
+        );
+        assert_eq!(
+            endpoint_url("models"),
+            "https://openrouter.ai/api/v1/models",
+            "model discovery must derive its URL from the provider-owned base"
+        );
+    }
+
+    #[test]
+    fn uses_configured_timeout_when_provided() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .timeout_secs(1200)
+            .build();
+        assert_eq!(model_provider.timeout_secs, 1200);
+    }
+
+    #[test]
+    fn falls_back_to_default_timeout_for_zero() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("openrouter-test-credential"))
+            .timeout_secs(0)
+            .build();
+        assert_eq!(
+            model_provider.timeout_secs,
+            omnesagent_api::model_provider::BASELINE_TIMEOUT_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_without_key_is_noop() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let result = model_provider.warmup().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_fails_without_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let result = model_provider
+            .chat_with_system(Some("system"), "hello", "openai/gpt-4o", Some(0.2))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure."
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fails_without_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let result = model_provider
+            .chat(request, "openai/gpt-4o", Some(0.2))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure."
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_fails_without_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "be concise".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            },
+        ];
+
+        let result = model_provider
+            .chat_with_history(&messages, "anthropic/claude-sonnet-4", Some(0.7))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure."
+        );
+    }
+
+    #[test]
+    fn chat_request_serializes_with_system_and_user() {
+        let request = OpenRouterModelProvider::build_chat_with_system_request(
+            Some("You are helpful"),
+            "Summarize this",
+            "anthropic/claude-sonnet-4",
+            Some(0.5),
+            None,
+        );
+
+        let json = serde_json::to_value(&request).unwrap();
+        let messages = json["messages"]
+            .as_array()
+            .expect("messages should serialize as an array");
+        let system_parts = messages[0]["content"]
+            .as_array()
+            .expect("system content should use content parts");
+
+        assert_eq!(json["model"], "anthropic/claude-sonnet-4");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(system_parts[0]["type"], "text");
+        assert_eq!(system_parts[0]["text"], "You are helpful");
+        assert_eq!(system_parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "Summarize this");
+        assert_eq!(json["temperature"], 0.5);
+    }
+
+    #[test]
+    fn chat_request_serializes_history_messages() {
+        let messages = [
+            ChatMessage {
+                role: "assistant".into(),
+                content: "Previous answer".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Follow-up".into(),
+            },
+        ];
+
+        let request = ChatRequest {
+            model: "google/gemini-2.5-pro".into(),
+            messages: messages
+                .iter()
+                .map(|msg| Message {
+                    role: msg.role.clone(),
+                    content: MessageContent::Text(msg.content.clone()),
+                })
+                .collect(),
+            temperature: Some(0.0),
+            max_tokens: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"role\":\"assistant\""));
+        assert!(json.contains("\"role\":\"user\""));
+        assert!(json.contains("google/gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn response_deserializes_single_choice() {
+        let json = r#"{"choices":[{"message":{"content":"Hi from OpenRouter"}}]}"#;
+
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].message.content, "Hi from OpenRouter");
+    }
+
+    #[test]
+    fn response_deserializes_empty_choices() {
+        let json = r#"{"choices":[]}"#;
+
+        let response: ApiChatResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.choices.is_empty());
+    }
+
+    #[test]
+    fn parse_chat_response_body_reports_sanitized_snippet() {
+        let body = r#"{"choices":"invalid","api_key":"sk-test-secret-value"}"#;
+        let err = OpenRouterModelProvider::parse_response_body::<ApiChatResponse>(
+            "OpenRouter",
+            body,
+            "chat-completions",
+        )
+        .expect_err("payload should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("OpenRouter API returned an unexpected chat-completions payload"));
+        assert!(msg.contains("body="));
+        assert!(msg.contains("[REDACTED]"));
+        assert!(!msg.contains("sk-test-secret-value"));
+    }
+
+    #[test]
+    fn parse_native_response_body_reports_sanitized_snippet() {
+        let body = r#"{"choices":123,"api_key":"sk-another-secret"}"#;
+        let err = OpenRouterModelProvider::parse_response_body::<NativeChatResponse>(
+            "OpenRouter",
+            body,
+            "native chat",
+        )
+        .expect_err("payload should fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("OpenRouter API returned an unexpected native chat payload"));
+        assert!(msg.contains("body="));
+        assert!(msg.contains("[REDACTED]"));
+        assert!(!msg.contains("sk-another-secret"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_fails_without_key() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(None)
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "What is the date?".into(),
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+            }
+        })];
+
+        let result = model_provider
+            .chat_with_tools(&messages, &tools, "deepseek/deepseek-chat", Some(0.5))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "OpenRouter API key not set. Run `omnesagent quickstart` or `omnesagent config set` to configure."
+        );
+    }
+
+    #[test]
+    fn native_response_deserializes_with_tool_calls() {
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "content":null,
+                    "tool_calls":[
+                        {"id":"call_123","type":"function","function":{"name":"get_price","arguments":"{\"symbol\":\"BTC\"}"}}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let message = &response.choices[0].message;
+        assert!(message.content.is_none());
+        let tool_calls = message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_123"));
+        assert_eq!(tool_calls[0].function.name, "get_price");
+        assert_eq!(tool_calls[0].function.arguments, "{\"symbol\":\"BTC\"}");
+    }
+
+    #[test]
+    fn native_response_deserializes_with_text_and_tool_calls() {
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "content":"I'll get that for you.",
+                    "tool_calls":[
+                        {"id":"call_456","type":"function","function":{"name":"shell","arguments":"{\"command\":\"date\"}"}}
+                    ]
+                }
+            }]
+        }"#;
+
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let message = &response.choices[0].message;
+        assert_eq!(message.content.as_deref(), Some("I'll get that for you."));
+        let tool_calls = message.tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "shell");
+    }
+
+    #[test]
+    fn parse_native_response_converts_to_chat_response() {
+        let message = NativeResponseMessage {
+            content: Some("Here you go.".into()),
+            reasoning_content: None,
+            tool_calls: Some(vec![NativeToolCall {
+                id: Some("call_789".into()),
+                kind: Some("function".into()),
+                function: NativeFunctionCall {
+                    name: "file_read".into(),
+                    arguments: r#"{"path":"test.txt"}"#.into(),
+                },
+            }]),
+        };
+
+        let response = OpenRouterModelProvider::parse_native_response(message);
+
+        assert_eq!(response.text.as_deref(), Some("Here you go."));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_789");
+        assert_eq!(response.tool_calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn convert_messages_parses_assistant_tool_call_payload() {
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"Using tool","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(
+            converted[0]
+                .content
+                .as_ref()
+                .and_then(|content| match content {
+                    MessageContent::Text(value) => Some(value.as_str()),
+                    MessageContent::Parts(_) => None,
+                }),
+            Some("Using tool")
+        );
+
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_abc"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_parses_tool_result_payload() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: r#"{"tool_call_id":"call_xyz","content":"done"}"#.into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_xyz"));
+        assert_eq!(
+            converted[0]
+                .content
+                .as_ref()
+                .and_then(|content| match content {
+                    MessageContent::Text(value) => Some(value.as_str()),
+                    MessageContent::Parts(_) => None,
+                }),
+            Some("done")
+        );
+        assert!(converted[0].tool_calls.is_none());
+    }
+
+    #[test]
+    fn to_message_content_converts_image_markers_to_openai_parts() {
+        let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
+        let value =
+            serde_json::to_value(OpenRouterModelProvider::to_message_content("user", content))
+                .unwrap();
+        let parts = value
+            .as_array()
+            .expect("multimodal content should be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Describe this");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn native_response_parses_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 42, "completion_tokens": 15}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(42));
+        assert_eq!(usage.completion_tokens, Some(15));
+    }
+
+    #[test]
+    fn native_response_parses_without_usage() {
+        let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // prompt caching: request-side serialization
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn system_message_serializes_as_content_block_with_cache_control() {
+        let content = OpenRouterModelProvider::to_message_content("system", "You are helpful.");
+        let json = serde_json::to_value(&content).unwrap();
+        let parts = json.as_array().expect("system content should be an array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "You are helpful.");
+        assert_eq!(parts[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn user_message_without_images_serializes_as_plain_string() {
+        let content = OpenRouterModelProvider::to_message_content("user", "Hello");
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_string(), "user content should be a plain string");
+        assert_eq!(json.as_str().unwrap(), "Hello");
+    }
+
+    #[test]
+    fn assistant_message_serializes_as_plain_string() {
+        let content = OpenRouterModelProvider::to_message_content("assistant", "Hi there.");
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(
+            json.is_string(),
+            "assistant content should be a plain string"
+        );
+        assert_eq!(json.as_str().unwrap(), "Hi there.");
+    }
+
+    #[test]
+    fn tool_message_serializes_as_plain_string() {
+        let content = OpenRouterModelProvider::to_message_content(
+            "tool",
+            r#"{"tool_call_id":"call_1","content":"ok"}"#,
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.is_string(), "tool content should be a plain string");
+    }
+
+    #[test]
+    fn cache_control_absent_on_user_image_text_part() {
+        let content = OpenRouterModelProvider::to_message_content(
+            "user",
+            "Describe this\n\n[IMAGE:data:image/png;base64,abcd]",
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        let parts = json
+            .as_array()
+            .expect("multimodal content should be an array");
+        let text_part = &parts[0];
+        assert_eq!(text_part["type"], "text");
+        assert!(
+            text_part.get("cache_control").is_none(),
+            "cache_control should not appear on user image text parts (got {:?})",
+            text_part.get("cache_control")
+        );
+    }
+
+    #[test]
+    fn full_native_request_serializes_system_as_blocks_user_as_string() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "Be helpful".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+        ];
+        let native = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 2);
+
+        let sys_json = serde_json::to_value(&native[0].content).unwrap();
+        let sys_parts = sys_json.as_array().expect("system content should be array");
+        assert_eq!(sys_parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys_parts[0]["text"], "Be helpful");
+
+        let user_json = serde_json::to_value(&native[1].content).unwrap();
+        assert!(user_json.is_string(), "user content should be a string");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // prompt caching: response-side deserialization and token mapping
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn usage_info_deserializes_prompt_tokens_details() {
+        let json = r#"{
+            "prompt_tokens": 25000,
+            "completion_tokens": 500,
+            "prompt_tokens_details": {"cached_tokens": 20000}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, Some(25000));
+        assert_eq!(usage.completion_tokens, Some(500));
+        let details = usage
+            .prompt_tokens_details
+            .expect("prompt_tokens_details should deserialize");
+        assert_eq!(details.cached_tokens, Some(20000));
+    }
+
+    #[test]
+    fn usage_info_deserializes_without_prompt_tokens_details() {
+        let json = r#"{"prompt_tokens": 100, "completion_tokens": 50}"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        assert!(
+            usage.prompt_tokens_details.is_none(),
+            "absent field should deserialize to None (backward compat with providers without caching)"
+        );
+    }
+
+    #[test]
+    fn usage_info_deserializes_empty_prompt_tokens_details() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert!(details.cached_tokens.is_none());
+    }
+
+    #[test]
+    fn usage_info_deserializes_zero_cached_tokens_as_some_zero() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, Some(0));
+    }
+
+    #[test]
+    fn native_response_maps_cached_tokens_into_token_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 25000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {"cached_tokens": 15000}
+            }
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            })
+            .expect("usage should be Some");
+        assert_eq!(usage.input_tokens, Some(25000));
+        assert_eq!(usage.output_tokens, Some(500));
+        assert_eq!(usage.cached_input_tokens, Some(15000));
+    }
+
+    #[test]
+    fn native_response_maps_none_when_prompt_tokens_details_absent() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp
+            .usage
+            .map(|u| TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            })
+            .expect("usage should be Some");
+        assert!(
+            usage.cached_input_tokens.is_none(),
+            "absent details should map to None (providers without caching are unaffected)"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_native_response_captures_reasoning_content() {
+        let message = NativeResponseMessage {
+            content: Some("answer".into()),
+            reasoning_content: Some("thinking step".into()),
+            tool_calls: Some(vec![NativeToolCall {
+                id: Some("call_1".into()),
+                kind: Some("function".into()),
+                function: NativeFunctionCall {
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        };
+        let parsed = OpenRouterModelProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_none_reasoning_content_for_normal_model() {
+        let message = NativeResponseMessage {
+            content: Some("hello".into()),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+        let parsed = OpenRouterModelProvider::parse_native_response(message);
+        assert!(parsed.reasoning_content.is_none());
+    }
+
+    #[test]
+    fn native_response_deserializes_reasoning_content() {
+        let json = r#"{
+            "choices":[{
+                "message":{
+                    "content":"answer",
+                    "reasoning_content":"deep thought",
+                    "tool_calls":[
+                        {"id":"call_r1","type":"function","function":{"name":"shell","arguments":"{}"}}
+                    ]
+                }
+            }]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = &resp.choices[0].message;
+        assert_eq!(message.reasoning_content.as_deref(), Some("deep thought"));
+    }
+
+    #[test]
+    fn convert_messages_round_trips_reasoning_content() {
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{}"
+            }],
+            "reasoning_content": "Let me think..."
+        });
+
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: history_json.to_string(),
+        }];
+        let native = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        assert_eq!(
+            native[0].reasoning_content.as_deref(),
+            Some("Let me think...")
+        );
+    }
+
+    #[test]
+    fn convert_messages_no_reasoning_content_when_absent() {
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{}"
+            }]
+        });
+
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: history_json.to_string(),
+        }];
+        let native = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        assert!(native[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn convert_messages_sanitizes_invalid_tool_arguments_to_empty_object() {
+        // A malformed arguments string in the assistant history must be
+        // normalized to "{}" so the outbound chat-completions request doesn't
+        // 400 on strict upstreams. This test pins that the openrouter call site
+        // of `sanitize_tool_arguments` is wired in; the helper contract itself
+        // is covered in `compatible::tests::sanitize_tool_arguments_*`.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_bad"));
+        assert_eq!(tool_calls[0].function.name, "shell");
+        assert_eq!(tool_calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn convert_messages_passes_through_valid_tool_arguments() {
+        // Companion regression: valid JSON object must round-trip byte-for-byte
+        // so the openrouter call site cannot accidentally re-encode or strip
+        // good payloads.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn convert_messages_rejects_non_object_tool_arguments() {
+        // Strict providers (Cohere, OpenRouter auto-exacto) require a JSON
+        // object for tool-call arguments. Null, arrays, strings, numbers, and
+        // booleans are valid JSON but must not reach the upstream.
+        let messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
+                .into(),
+        }];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        let tool_calls = converted[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 3);
+        for tc in tool_calls {
+            assert_eq!(
+                tc.function.arguments, "{}",
+                "non-object arg for {} must normalize to empty object",
+                tc.function.name
+            );
+        }
+    }
+
+    #[test]
+    fn native_message_omits_reasoning_content_when_none() {
+        let msg = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".into())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn native_message_includes_reasoning_content_when_some() {
+        let msg = NativeMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("hi".into())),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: Some("thinking...".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("reasoning_content"));
+        assert!(json.contains("thinking..."));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // timeout_secs configuration tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn default_timeout_is_120() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
+        assert_eq!(model_provider.timeout_secs, 120);
+    }
+
+    #[test]
+    fn timeout_secs_overrides_default() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .timeout_secs(300)
+            .build();
+        assert_eq!(model_provider.timeout_secs, 300);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // tool name validation tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn valid_openai_tool_names() {
+        assert!(is_valid_openai_tool_name("shell"));
+        assert!(is_valid_openai_tool_name("file_read"));
+        assert!(is_valid_openai_tool_name("web-search"));
+        assert!(is_valid_openai_tool_name("Tool123"));
+        assert!(is_valid_openai_tool_name("a"));
+    }
+
+    #[test]
+    fn invalid_openai_tool_names() {
+        assert!(!is_valid_openai_tool_name(""));
+        assert!(!is_valid_openai_tool_name("mcp:server.tool"));
+        assert!(!is_valid_openai_tool_name("node.js"));
+        assert!(!is_valid_openai_tool_name("tool name"));
+        assert!(!is_valid_openai_tool_name(
+            "this_tool_name_is_way_too_long_and_exceeds_the_sixty_four_character_limit_xxxxx"
+        ));
+    }
+
+    #[test]
+    fn convert_tools_skips_invalid_names() {
+        use omnesagent_api::tool::ToolSpec;
+
+        let tools = vec![
+            ToolSpec::new(
+                "valid_tool",
+                "A valid tool",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "mcp:server.bad",
+                "Invalid name",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new(
+                "another-valid",
+                "Also valid",
+                serde_json::json!({"type": "object"}),
+            ),
+        ];
+
+        let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].function.name, "valid_tool");
+        assert_eq!(result[1].function.name, "another-valid");
+    }
+
+    #[test]
+    fn convert_tools_preserves_skill_namespaced_names_with_double_underscore() {
+        use omnesagent_api::tool::ToolSpec;
+
+        let tools = vec![
+            // New format — must pass through.
+            ToolSpec::new(
+                "openrouter-spend__check_openrouter_spend",
+                "Skill tool",
+                serde_json::json!({"type": "object"}),
+            ),
+            // Old format — must still be rejected so the regression stays caught.
+            ToolSpec::new(
+                "openrouter-spend.check_openrouter_spend",
+                "Skill tool with legacy dotted name",
+                serde_json::json!({"type": "object"}),
+            ),
+        ];
+
+        let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "only the __ form should survive convert_tools"
+        );
+        assert_eq!(
+            result[0].function.name,
+            "openrouter-spend__check_openrouter_spend"
+        );
+    }
+
+    #[test]
+    fn convert_tools_returns_none_when_all_invalid() {
+        use omnesagent_api::tool::ToolSpec;
+
+        let tools = vec![ToolSpec::new(
+            "mcp:bad.name",
+            "Invalid",
+            serde_json::json!({"type": "object"}),
+        )];
+
+        assert!(OpenRouterModelProvider::convert_tools(Some(&tools)).is_none());
+    }
+
+    #[test]
+    fn extra_body_sets_value() {
+        let extra = serde_json::json!({"model_provider": {"only": ["Anthropic"]}});
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(extra.clone())
+            .build();
+        assert_eq!(model_provider.extra_body, Some(extra));
+    }
+
+    #[test]
+    fn extra_body_none_produces_unchanged_request() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .build();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: Some(0.5),
+            max_tokens: None,
+        };
+
+        let base = serde_json::to_value(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
+        assert_eq!(base, merged);
+    }
+
+    #[test]
+    fn extra_body_empty_object_produces_unchanged_request() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({}))
+            .build();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: Some(0.5),
+            max_tokens: None,
+        };
+
+        let base = serde_json::to_value(&request).unwrap();
+        let merged = model_provider.merge_extra_body(&request).unwrap();
+        assert_eq!(base, merged);
+    }
+
+    #[test]
+    fn extra_body_adds_new_top_level_keys() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"model_provider": {"only": ["Anthropic"]}}))
+            .build();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: Some(0.5),
+            max_tokens: None,
+        };
+
+        let merged = model_provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(
+            obj.get("model_provider").unwrap(),
+            &serde_json::json!({"only": ["Anthropic"]})
+        );
+        assert_eq!(obj.get("model").unwrap(), "test-model");
+        assert_eq!(obj.get("temperature").unwrap(), 0.5);
+    }
+
+    #[test]
+    fn extra_body_overrides_existing_keys() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"temperature": 0.9}))
+            .build();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: Some(0.5),
+            max_tokens: None,
+        };
+
+        let merged = model_provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj.get("temperature").unwrap(), 0.9);
+    }
+
+    #[test]
+    fn extra_body_merges_at_top_level_not_nested() {
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!({"transforms": ["middle-out"]}))
+            .build();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            temperature: Some(0.5),
+            max_tokens: None,
+        };
+
+        let merged = model_provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        assert_eq!(
+            obj.get("transforms").unwrap(),
+            &serde_json::json!(["middle-out"])
+        );
+        assert!(obj.get("extra_body").is_none());
+    }
+
+    #[test]
+    fn streaming_extra_body_with_nested_provider_routing() {
+        let model_provider = OpenRouterModelProvider::builder("test").credential(Some("key")).extra_body(
+            serde_json::json!({"model_provider": {"only": ["Anthropic"], "allow_fallbacks": false}}),
+        ).build();
+        let request = NativeChatRequest {
+            model: "anthropic/claude-sonnet-4".into(),
+            messages: vec![],
+            temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            stream: Some(true),
+        };
+
+        let merged = model_provider.merge_extra_body(&request).unwrap();
+        let obj = merged.as_object().unwrap();
+        let prov = obj.get("model_provider").unwrap();
+        assert_eq!(prov["only"], serde_json::json!(["Anthropic"]));
+        assert_eq!(prov["allow_fallbacks"], false);
+        assert_eq!(obj.get("stream"), Some(&serde_json::json!(true)));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_rejects_non_object_extra_body_before_request() {
+        use crate::traits::{ChatRequest, StreamOptions};
+        use futures_util::StreamExt as _;
+
+        let model_provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("key"))
+            .extra_body(serde_json::json!(["invalid"]))
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+
+        let mut stream = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "anthropic/claude-haiku-4-5",
+            Some(0.0),
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let error = stream
+            .next()
+            .await
+            .expect("stream should yield the request-body error")
+            .expect_err("non-object provider_extra should fail before the request");
+        assert!(
+            error
+                .to_string()
+                .contains("provider_extra must be a JSON object"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_long_running_task() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = Arc::clone(&finished);
+
+        let handle = omnesagent_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            finished_clone.store(true, Ordering::SeqCst);
+        });
+        let raw_handle = handle.abort_handle();
+        let guard = AbortOnDrop::new(handle.abort_handle());
+
+        assert!(!raw_handle.is_finished());
+
+        drop(guard);
+
+        let cancelled = timeout(Duration::from_secs(2), async {
+            loop {
+                if raw_handle.is_finished() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            cancelled.is_ok(),
+            "task should be aborted within 2 s of AbortOnDrop being dropped"
+        );
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "cancelled task must not have run its completion side effect"
+        );
+    }
+}

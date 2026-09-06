@@ -1,0 +1,462 @@
+[workspace]
+members = [".", "crates/omnesagent-api", "crates/omnesagent-infra", "crates/omnesagent-config", "crates/omnesagent-log", "crates/omnesagent-log/tests/fixtures/attribution-macro-support", "crates/omnesagent-log/tests/fixtures/attribution-macro-consumer", "crates/omnesagent-tls", "crates/omnesagent-relay-proto", "apps/omnesrelay", "crates/omnesagent-spawn", "crates/omnesagent-commands", "crates/omnesagent-providers", "crates/omnesagent-memory", "crates/omnesagent-kag", "crates/omnesagent-channels", "crates/omnesagent-tools", "crates/omnesagent-sop-graph", "crates/omnesagent-runtime", "crates/omnesagent-eval", "apps/omnescode", "crates/omnesagent-plugins", "crates/omnesagent-plugins/tests/fixtures/channel-fixture", "crates/omnesagent-plugins/tests/fixtures/egress-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-timeout-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-secret-fixture", "crates/omnesagent-gateway", "crates/omnesagent-hardware", "crates/omnesagent-tool-call-parser", "crates/omnesagent-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.4"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omnesagent-labs/omnesagent"
+rust-version = "1.96.0"
+
+[workspace.dependencies]
+omnesagent-api = { path = "crates/omnesagent-api", version = "0.8.4" }
+omnesagent-infra = { path = "crates/omnesagent-infra", version = "0.8.4" }
+omnesagent-config = { path = "crates/omnesagent-config", version = "0.8.4", default-features = false }
+omnesagent-log = { path = "crates/omnesagent-log", version = "0.8.4" }
+omnesagent-tls = { path = "crates/omnesagent-tls", version = "0.8.4" }
+omnesagent-relay-proto = { path = "crates/omnesagent-relay-proto", version = "0.8.4" }
+omnesrelay = { path = "apps/omnesrelay", version = "0.8.4" }
+omnesagent-spawn = { path = "crates/omnesagent-spawn", version = "0.8.4" }
+omnesagent-commands = { path = "crates/omnesagent-commands", version = "0.8.4" }
+omnesagent-providers = { path = "crates/omnesagent-providers", version = "0.8.4" }
+omnesagent-memory = { path = "crates/omnesagent-memory", version = "0.8.4" }
+omnesagent-kag = { path = "crates/omnesagent-kag", version = "0.8.4" }
+omnesagent-channels = { path = "crates/omnesagent-channels", version = "0.8.4", default-features = false }
+omnesagent-tools = { path = "crates/omnesagent-tools", version = "0.8.4" }
+omnesagent-sop-graph = { path = "crates/omnesagent-sop-graph", version = "0.8.4", default-features = false }
+omnesagent-runtime = { path = "crates/omnesagent-runtime", version = "0.8.4", default-features = false }
+omnesagent-eval = { path = "crates/omnesagent-eval", version = "0.8.4" }
+omnesagent-plugins = { path = "crates/omnesagent-plugins", version = "0.8.4" }
+omnesagent-gateway = { path = "crates/omnesagent-gateway", version = "0.8.4" }
+omnesagent-hardware = { path = "crates/omnesagent-hardware", version = "0.8.4" }
+omnesagent-tool-call-parser = { path = "crates/omnesagent-tool-call-parser", version = "0.8.4" }
+omnesagent-macros = { path = "crates/omnesagent-macros", version = "0.8.4" }
+omnescode = { path = "apps/omnescode", version = "0.8.4" }
+directories = "6.0"
+sys-locale = "0.3"
+
+[package]
+name = "omnesagent"
+# Workspace crates are publish = false during microkernel transition.
+publish = false
+default-run = "omnesagent"
+autobenches = false
+version.workspace = true
+edition.workspace = true
+authors = ["theonlyhennygod"]
+license.workspace = true
+description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
+repository.workspace = true
+readme = "README.md"
+keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
+categories = ["command-line-utilities", "api-bindings"]
+rust-version.workspace = true
+include = [
+  "/src/**/*",
+  "/build.rs",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/LICENSE*",
+  "/README.md",
+  "/web/dist/**/*",
+  "/locales/**/*",
+]
+
+[[bin]]
+name = "omnesagent"
+path = "src/main.rs"
+
+[[bin]]
+name = "omnesagent-acp-bridge"
+path = "src/bin/omnesagent-acp-bridge.rs"
+required-features = ["acp-bridge"]
+
+[lib]
+name = "omnesagent"
+path = "src/lib.rs"
+
+[dependencies]
+# Internal workspace crates — versions and paths declared once in [workspace.dependencies]
+omnesagent-api.workspace = true
+omnesagent-spawn.workspace = true
+omnesagent-infra.workspace = true
+omnesagent-config = { workspace = true, features = ["clap"] }
+omnesagent-log.workspace = true
+omnesagent-providers.workspace = true
+omnesagent-memory.workspace = true
+omnesagent-channels = { workspace = true, optional = true }
+omnesagent-tools = { workspace = true, optional = true }
+omnesagent-runtime = { workspace = true, optional = true }
+omnesagent-tls = { workspace = true }
+omnesagent-eval = { workspace = true, optional = true }
+omnesagent-plugins = { workspace = true, optional = true }
+omnesagent-gateway = { workspace = true, optional = true }
+omnesagent-hardware = { workspace = true, optional = true }
+omnesagent-tool-call-parser.workspace = true
+omnesagent-macros.workspace = true
+# CLI - minimal and fast
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+clap-markdown = "0.1"
+
+# Async runtime - feature-optimized for size
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio-util = { version = "0.7", default-features = false }
+
+# HTTP client - minimal features
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
+
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+# Config
+directories = "6.0"
+toml = "1.0"
+
+# JSON Schema generation for config export
+schemars = { version = "1.2", optional = true }
+
+# Logging - minimal
+
+# URL encoding for web search
+urlencoding = "2.1"
+
+# Tarball extraction for binary updates
+flate2 = "1"
+tar = "0.4"
+
+# Temp files (update pipeline rollback)
+tempfile = "3.26"
+
+# Zip extraction (plugin registry, self-update archives)
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+
+# Error handling
+anyhow = "1.0"
+
+# HMAC for webhook signature verification
+sha2 = "0.10"
+hex = "0.4"
+
+# Async traits
+async-trait = "0.1"
+
+# Memory / persistence (migration.rs, behind agent-runtime)
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+# Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+console = "0.16"
+
+# Binary discovery (init system detection)
+which = { version = "8.0", optional = true }
+
+# WebSocket client channels (Discord/Lark/DingTalk/Nostr)
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+
+# HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"], optional = true }
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
+
+# rust-embed removed — web dashboard served from filesystem via gateway.web_dist_dir
+
+# Use the blocking HTTP exporter client to avoid Tokio-reactor panics in
+# non-Tokio contexts.
+
+# (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
+
+# Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
+
+# Linux-only: `desktop --install` opens candidate `.desktop` entries with
+# O_NONBLOCK|O_NOFOLLOW so a FIFO or symlink planted in an XDG data dir cannot
+# block or redirect the read.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Installer/surface metadata: which `[features]` are internal aggregates or
+# meta toggles rather than user-selectable rows. This bit is NOT derivable from
+# the feature graph (e.g. `embedded-web` and `whatsapp-web` are structurally
+# identical single cross-crate refs but one is meta and one is a real row), so
+# it lives here in the canonical registry. install.sh and `cargo cmd convert`
+# both read this; neither shadows it with its own list.
+[package.metadata.omnesagent]
+non_row_features = [
+    "default",
+    "default-channels",
+    "channels-full",
+    "ci-all",
+    "fantoccini",
+    "landlock",
+    "metrics",
+    "embedded-web",
+]
+# Features intentionally added to the lean Cargo defaults for standard
+# distribution artifacts. This list is the complete positive policy beyond
+# `default`; target-specific exclusions are resolved from the table below.
+dist_extra_features = [
+    "channel-matrix",
+    "channel-lark",
+    "channel-git",
+    "whatsapp-web",
+]
+
+# Features whose build needs system C libraries or tooling the minimal static
+# container image (StageX, no system package manager) does not provide. Excluded
+# from the container kitchen-sink (Selection::All) so the all-features image
+# builds; still available via source --features or a nix override. Not derivable
+# from the feature graph, so it lives in the canonical registry.
+container_excluded_features = [
+    "voice-wake",
+]
+
+# Compatibility exclusions for standard distribution artifacts. Release
+# workflows pass only their target triple; feature policy stays here.
+[package.metadata.omnesagent.dist_target_exclusions]
+aarch64-linux-android = ["whatsapp-web"]
+arm-unknown-linux-gnueabihf = ["observability-prometheus"]
+armv7-unknown-linux-gnueabihf = ["observability-prometheus"]
+
+[features]
+default = [
+    "agent-runtime",
+    "default-channels",
+    "acp-bridge",
+    "gateway",
+    "observability-prometheus",
+    "schema-export",
+]
+
+# The core agent runtime — agent loop, tools, persistence subsystems.
+# Without this, you get the kernel: config + providers + memory + CLI chat.
+# Channels are opt-in via the lean `default-channels` bundle, `channels-full`,
+# or individual `channel-*` features.
+agent-runtime = [
+    "dep:omnesagent-runtime", "dep:omnesagent-eval", "dep:omnesagent-channels", "dep:omnesagent-tools",
+    "dep:rusqlite",
+    "dep:which",
+    "dep:tokio-tungstenite",
+    "dep:rustls",
+]
+
+# Lean channel bundle included in `default`. These channels cover local/editor
+# ACP, gateway/webhook ingress, and common first-run external chat/email paths.
+default-channels = [
+    "channel-acp-server", "channel-webhook",
+    "channel-email", "channel-telegram", "channel-discord",
+    "channel-filesystem",
+]
+
+# Historical broad channel bundle. Preserves the older default channel surface.
+channels-full = [
+    "default-channels", "omnesagent-channels/channels-full", "channel-lark",
+    "channel-line",
+    "channel-slack", "channel-signal",
+    "channel-mattermost", "channel-irc", "channel-imessage",
+    "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
+    "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
+    "channel-linq", "channel-nextcloud",
+    "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
+    "channel-whatsapp-cloud", "channel-voice-call",
+]
+
+# Major subsystems — each forwards to exactly ONE crate
+gateway = [
+    "dep:omnesagent-gateway",
+    "dep:axum", "dep:tower",
+]
+schema-export = ["dep:schemars", "omnesagent-config/schema-export"]
+acp-bridge = ["dep:tokio-tungstenite"]
+
+# Channels — each forwards to omnesagent-channels.
+channel-email = ["omnesagent-channels/channel-email", "omnesagent-gateway?/channel-email"]
+channel-telegram = ["omnesagent-channels/channel-telegram"]
+channel-lark = ["omnesagent-channels/channel-lark"]
+channel-nostr = ["omnesagent-channels/channel-nostr"]
+channel-matrix = ["omnesagent-channels/channel-matrix"]
+channel-discord = ["omnesagent-channels/channel-discord"]
+channel-slack = ["omnesagent-channels/channel-slack"]
+channel-signal = ["omnesagent-channels/channel-signal"]
+channel-mattermost = ["omnesagent-channels/channel-mattermost"]
+channel-irc = ["omnesagent-channels/channel-irc"]
+channel-twitch = ["omnesagent-channels/channel-twitch"]
+channel-imessage = ["omnesagent-channels/channel-imessage"]
+channel-dingtalk = ["omnesagent-channels/channel-dingtalk"]
+channel-qq = ["omnesagent-channels/channel-qq"]
+channel-bluesky = ["omnesagent-channels/channel-bluesky"]
+channel-git = ["omnesagent-channels/channel-git"]
+provider-github = ["omnesagent-channels/provider-github"]
+provider-gitea = ["omnesagent-channels/provider-gitea"]
+channel-twitter = ["omnesagent-channels/channel-twitter"]
+channel-reddit = ["omnesagent-channels/channel-reddit"]
+channel-notion = ["omnesagent-channels/channel-notion"]
+channel-mqtt = ["omnesagent-channels/channel-mqtt"]
+channel-filesystem = ["omnesagent-channels/channel-filesystem"]
+channel-amqp = ["omnesagent-channels/channel-amqp"]
+channel-linq = ["omnesagent-channels/channel-linq", "omnesagent-gateway?/channel-linq"]
+channel-nextcloud = ["omnesagent-channels/channel-nextcloud", "omnesagent-gateway?/channel-nextcloud"]
+channel-mochat = ["omnesagent-channels/channel-mochat"]
+channel-wechat = ["omnesagent-channels/channel-wechat", "omnesagent-gateway?/channel-wechat"]
+channel-wecom = ["omnesagent-channels/channel-wecom"]
+channel-wecom-ws = ["omnesagent-channels/channel-wecom-ws"]
+channel-clawdtalk = ["omnesagent-channels/channel-clawdtalk"]
+channel-webhook = ["omnesagent-channels/channel-webhook"]
+channel-acp-server = ["omnesagent-channels/channel-acp-server", "omnesagent-gateway?/channel-acp-server"]
+channel-whatsapp-cloud = ["omnesagent-channels/channel-whatsapp-cloud", "omnesagent-gateway?/channel-whatsapp-cloud"]
+channel-voice-call = ["omnesagent-channels/channel-voice-call"]
+channel-line = ["omnesagent-channels/channel-line"]
+# Feishu uses the same channel implementation as Lark; `use_feishu = true`
+# selects Feishu endpoints at runtime.
+channel-feishu = ["channel-lark"]
+whatsapp-web = ["omnesagent-channels/whatsapp-web", "omnesagent-gateway?/whatsapp-web"]
+voice-wake = ["omnesagent-channels/voice-wake"]
+memory-postgres = ["omnesagent-memory/memory-postgres"]
+
+# Backends and platform flags — each forwards to ONE crate
+observability-prometheus = [
+    "omnesagent-runtime/observability-prometheus",
+    "omnesagent-gateway/observability-prometheus",
+]
+observability-otel = ["omnesagent-runtime/observability-otel"]
+hardware = ["dep:omnesagent-hardware", "omnesagent-hardware/hardware"]
+peripheral-rpi = ["dep:omnesagent-hardware", "omnesagent-hardware/peripheral-rpi"]
+# Forwards `omnesagent-hardware/dev-sim`: extends the serial allow-list with
+# `/tmp/zc-sim-*` for hardware-free simulation. Off by default; opt-in for the
+# simulator and demo.
+dev-sim = ["dep:omnesagent-hardware", "omnesagent-hardware/dev-sim"]
+sandbox-landlock = ["omnesagent-runtime/sandbox-landlock"]
+sandbox-bubblewrap = ["omnesagent-runtime/sandbox-bubblewrap"]
+browser-native = ["omnesagent-tools/browser-native"]
+plugins-wasm = ["dep:omnesagent-plugins", "omnesagent-runtime/plugins-wasm"]
+probe = ["dep:omnesagent-hardware", "omnesagent-hardware/probe"]
+webauthn = ["omnesagent-runtime/webauthn", "omnesagent-gateway?/webauthn"]
+embedded-web = ["omnesagent-gateway/embedded-web"]
+
+# Backward-compatible aliases
+fantoccini = ["browser-native"]
+landlock = ["sandbox-landlock"]
+metrics = ["observability-prometheus"]
+
+# WASM plugin execution choice:
+#
+# Omit all three of the following features and there will not be any WASM plugin
+# support at all — no plugin runtime, no WASM dependencies, and the plugin ABI
+# surface will be unavailable in the agent runtime.
+#
+# Each feature adds a WASM execution strategy; enable the smallest set your targets
+# need. `plugins-wasm-runtime-only` is implied by the other two. Every backend
+# feature also implies `plugins-wasm` itself, so enabling any execution strategy
+# always carries the plugin host and its CLI surface; a backend-only build
+# cannot silently produce a binary without the `plugin` subcommand.
+#
+# - `plugins-wasm-runtime-only`: Fastest startup for plugins and smallest binary size,
+#   but requires plugin authors to compile a specific version for each target
+#   architecture (`.cwasm` files instead of `.wasm`) unless one of the two JIT
+#   compilation feature flags is also used.
+# - `plugins-wasm-cranelift`: Add the Cranelift JIT compilation engine on top of
+#   the runtime which enables compiling WASM plugins on the host machine, but
+#   results in larger binary size due to the Cranelift dependency. NOTE: Not
+#   supported on all platforms (e.g., ARM32).
+# - `plugins-wasm-pulley`: Most flexible, supports JIT compilation on targets
+#   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
+#   performance.
+plugins-wasm-runtime-only = ["plugins-wasm", "omnesagent-plugins/plugins-wasmtime"]
+plugins-wasm-cranelift    = ["plugins-wasm", "omnesagent-plugins/plugins-wasm-cranelift", "omnesagent-runtime/plugins-wasm-cranelift"]
+plugins-wasm-pulley       = ["plugins-wasm", "omnesagent-plugins/plugins-wasm-pulley"]
+
+# CI meta-feature
+ci-all = [
+    "agent-runtime",
+    "channels-full",
+    "channel-nostr", "channel-matrix", "whatsapp-web", "channel-wechat",
+    "observability-prometheus", "observability-otel",
+    "hardware", "peripheral-rpi",
+    "sandbox-landlock", "sandbox-bubblewrap",
+    "browser-native", "probe",
+    "plugins-wasm", "plugins-wasm-cranelift",
+    "webauthn", "memory-postgres",
+]
+
+[profile.dev]
+incremental = true
+opt-level = 0
+
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = "fat"          # Maximum cross-crate optimization for smaller binaries
+codegen-units = 1    # Serialized codegen for low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM)
+                     # Higher values (e.g., 8) compile faster but require more RAM during compilation
+strip = true          # Remove debug symbols
+panic = "abort"      # Reduce binary size
+
+[profile.release-fast]
+inherits = "release"
+codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
+                     # Use: cargo build --profile release-fast
+
+[profile.ci]
+inherits = "release"
+lto = "thin"         # Much faster than fat LTO; still catches release-mode issues
+codegen-units = 16   # Full parallelism for CI runners
+
+[profile.dist]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dev-dependencies]
+# Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
+# so this package's integration-test helpers can mint the now-sealed engine tool
+# registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
+# binary build, so the assemble()-only seal holds in production.
+omnesagent-runtime = { workspace = true, features = ["test-util"] }
+tempfile = "3.26"
+criterion = { version = "0.8", features = ["async_tokio"] }
+wiremock = "0.6"
+scopeguard = "1.2"
+rcgen = "0.13"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "visit"] }
+# test-only: moved out of [dependencies] — no `src/` usage
+base64 = "0.22"
+hmac = "0.12"
+parking_lot = "0.12"
+regex = "1.10"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+
+[[test]]
+name = "component"
+path = "tests/test_component.rs"
+
+[[test]]
+name = "integration"
+path = "tests/test_integration.rs"
+
+[[test]]
+name = "system"
+path = "tests/test_system.rs"
+
+[[test]]
+name = "live"
+path = "tests/test_live.rs"
+
+# Architecture invariant gates. Fail-on-detect for patterns that
+# violate the workspace's ABSOLUTE RULE (AGENTS.md §1) — duplicate
+# state across the codebase. Run with `cargo test --test architecture`
+# during development; the workspace `cargo test` already includes it.
+[[test]]
+name = "architecture"
+path = "tests/test_architecture.rs"
+
+# Cross-crate activation proof: a configured channel plugin reaching a real
+# WASM component. Needs `plugins-wasm-cranelift` and the wasm32-wasip2 target.
+[[test]]
+name = "plugin_channel_runtime_e2e"
+path = "tests/plugin_channel_runtime_e2e.rs"

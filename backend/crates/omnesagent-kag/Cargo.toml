@@ -1,0 +1,40 @@
+[package]
+name = "omnesagent-kag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Knowledge Augmented Generation (KAG), deterministic AST code graph, and local neural embeddings for OmnesAgent."
+publish = false
+
+[dependencies]
+omnesagent-log.workspace = true
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+ignore = "0.4"
+notify = "6.1"
+notify-debouncer-mini = "0.4.1"
+parking_lot = "0.12"
+regex = "1.10"
+rusqlite = { version = "0.37", features = ["bundled", "hooks", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.50", features = ["full"] }
+tracing = "0.1"
+
+# Candle local neural embeddings
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+hf-hub = { version = "0.4", optional = true }
+
+[features]
+default = ["candle"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+
+[dev-dependencies]
+tempfile = "3.26"

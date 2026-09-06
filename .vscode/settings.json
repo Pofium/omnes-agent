@@ -1,0 +1,29 @@
+{
+  "git.autofetch": true,
+  "git.autofetchPeriod": 90,
+  "search.exclude": {
+    "**/target": true
+  },
+  "files.watcherExclude": {
+    "**/target/**": true
+  },
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": true,
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 1000,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": [
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "window.title": "${activeRepositoryBranchName}",
+  "coverage-gutters.coverageFileNames": [
+    "lcov.info"
+  ],
+  "git.postCommitCommand": "push",
+  "java.jdt.ls.vmargs": "-XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -Dsun.zip.disableMemoryMapping=true -Xmx4G -Xms100m -Xlog:disable"
+}

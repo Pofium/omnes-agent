@@ -1,0 +1,14292 @@
+//! JSON-RPC 2.0 method dispatch. Transport-agnostic.
+
+use super::context::{ConfigWriteGuard, RpcContext};
+use super::transport::RpcTransport;
+use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
+use super::types::*;
+
+const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(200);
+const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+use crate::agent::agent::TurnEvent;
+use crate::sop::SopGraphExt;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use omnesagent_config::schema::Config;
+
+use omnesagent_api::jsonrpc::error_codes::*;
+use omnesagent_api::jsonrpc::{
+    JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
+    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
+};
+use omnesagent_api::model_provider::{ChatMessage, ConversationMessage};
+use omnesagent_api::runtime_status::RuntimeConfigKind;
+use omnesagent_commands::{CommandSurface, commands_for_surface};
+
+/// Wire protocol version. Bump on breaking changes.
+pub const RPC_PROTOCOL_VERSION: u64 = 1;
+
+mod notification {
+    pub const SESSION_UPDATE: &str = "session/update";
+    pub const LOGS_EVENT: &str = "logs/event";
+}
+
+struct StatusRuntimeContext {
+    config_dir: String,
+    config_file: String,
+    config_kind: RuntimeConfigKind,
+    local_ipc_endpoint: String,
+}
+
+fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
+    let config_file = config.config_path.display().to_string();
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let local_ipc_endpoint = super::local::socket_path(config).display().to_string();
+
+    StatusRuntimeContext {
+        config_dir,
+        config_file,
+        config_kind,
+        local_ipc_endpoint,
+    }
+}
+
+// ── Method registry ──────────────────────────────────────────────
+//
+// Single source of truth. Every variant maps to exactly one wire
+// string. `from_wire` is a table scan — no hand-written string
+// matching anywhere in this file.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    // Core
+    Initialize,
+    Status,
+    Health,
+    DoctorRun,
+
+    // Sessions (agent chat lives here — session/prompt + session/update
+    // notifications is the RPC equivalent of the gateway's ws/chat)
+    SessionNew,
+    SessionClose,
+    SessionPrompt,
+    SessionConfigure,
+    SessionCancel,
+    SessionGitBranch,
+    SessionList,
+    SessionListAcp,
+    SessionMessages,
+    SessionState,
+    SessionDelete,
+    SessionApprove,
+    SessionKill,
+
+    // Memory
+    MemoryList,
+    MemorySearch,
+    MemoryGet,
+    MemoryStore,
+    MemoryDelete,
+
+    // Cron
+    CronList,
+    CronGet,
+    CronAdd,
+    CronPatch,
+    CronDelete,
+    CronRuns,
+    CronTrigger,
+    CronSettings,
+
+    // Config
+    ConfigGet,
+    ConfigSet,
+    ConfigValidate,
+    ConfigReload,
+    ConfigList,
+    ConfigDelete,
+    ConfigMapKeys,
+    ConfigResolveAliasSource,
+    ConfigMapKeyCreate,
+    ConfigMapKeyDelete,
+    ConfigMapKeyRename,
+    ConfigTemplates,
+
+    // Agents
+    AgentsList,
+    AgentsStatus,
+
+    // Cost
+    CostQuery,
+    CostOrg,
+
+    // Skills
+    SkillsBundles,
+    SkillsList,
+    SkillsRead,
+    SkillsWrite,
+    SkillsDelete,
+
+    // Personality
+    PersonalityList,
+    PersonalityGet,
+    PersonalityPut,
+    PersonalityTemplates,
+
+    // Config introspection (sections, catalog, status)
+    ConfigSections,
+    ConfigStatus,
+    ConfigCatalog,
+    ConfigCatalogModels,
+
+    // Logs / Events
+    LogsSubscribe,
+    LogsQuery,
+    LogsGet,
+
+    // TUI
+    TuiList,
+
+    // Files
+    FileAttach,
+    FsListDir,
+
+    // Locales
+    LocalesList,
+    LocalesFetch,
+
+    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
+    QuickstartState,
+    QuickstartFields,
+    QuickstartValidate,
+    QuickstartApply,
+    QuickstartDismiss,
+
+    // Certificates (mTLS client-cert lifecycle)
+    CertRenew,
+
+    SopsList,
+    SopsGet,
+    SopsGraph,
+    SopsRun,
+    SopsRuns,
+    SopsRunOverlay,
+    SopsValidate,
+    SopsSave,
+    SopsCreate,
+    SopsDelete,
+    SopsDecide,
+    SopsWireDraft,
+    SopsGraphDraft,
+    SopsTriggerSources,
+    ToolsParamOptions,
+}
+
+impl Method {
+    /// The single table. Wire name ↔ variant, defined once.
+    pub const ALL: &[(Method, &str)] = &[
+        (Method::Initialize, "initialize"),
+        (Method::Status, "status"),
+        (Method::Health, "health"),
+        (Method::DoctorRun, "doctor/run"),
+        // Sessions
+        (Method::SessionNew, "session/new"),
+        (Method::SessionClose, "session/close"),
+        (Method::SessionPrompt, "session/prompt"),
+        (Method::SessionConfigure, "session/configure"),
+        (Method::SessionCancel, "session/cancel"),
+        (Method::SessionGitBranch, "session/git_branch"),
+        (Method::SessionList, "session/list"),
+        (Method::SessionListAcp, "session/list-acp"),
+        (Method::SessionMessages, "session/messages"),
+        (Method::SessionState, "session/state"),
+        (Method::SessionDelete, "session/delete"),
+        (Method::SessionApprove, "session/approve"),
+        (Method::SessionKill, "session/kill"),
+        // Memory
+        (Method::MemoryList, "memory/list"),
+        (Method::MemorySearch, "memory/search"),
+        (Method::MemoryGet, "memory/get"),
+        (Method::MemoryStore, "memory/store"),
+        (Method::MemoryDelete, "memory/delete"),
+        // Cron
+        (Method::CronList, "cron/list"),
+        (Method::CronGet, "cron/get"),
+        (Method::CronAdd, "cron/add"),
+        (Method::CronPatch, "cron/patch"),
+        (Method::CronDelete, "cron/delete"),
+        (Method::CronRuns, "cron/runs"),
+        (Method::CronTrigger, "cron/trigger"),
+        (Method::CronSettings, "cron/settings"),
+        // Config
+        (Method::ConfigGet, "config/get"),
+        (Method::ConfigSet, "config/set"),
+        (Method::ConfigValidate, "config/validate"),
+        (Method::ConfigReload, "config/reload"),
+        (Method::ConfigList, "config/list"),
+        (Method::ConfigDelete, "config/delete"),
+        (Method::ConfigMapKeys, "config/map-keys"),
+        (
+            Method::ConfigResolveAliasSource,
+            "config/resolve-alias-source",
+        ),
+        (Method::ConfigMapKeyCreate, "config/map-key-create"),
+        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
+        (Method::ConfigMapKeyRename, "config/map-key-rename"),
+        (Method::ConfigTemplates, "config/templates"),
+        // Agents
+        (Method::AgentsList, "agents/list"),
+        (Method::AgentsStatus, "agents/status"),
+        // Cost
+        (Method::CostQuery, "cost/query"),
+        (Method::CostOrg, "cost/org"),
+        // Skills
+        (Method::SkillsBundles, "skills/bundles"),
+        (Method::SkillsList, "skills/list"),
+        (Method::SkillsRead, "skills/read"),
+        (Method::SkillsWrite, "skills/write"),
+        (Method::SkillsDelete, "skills/delete"),
+        // Personality
+        (Method::PersonalityList, "personality/list"),
+        (Method::PersonalityGet, "personality/get"),
+        (Method::PersonalityPut, "personality/put"),
+        (Method::PersonalityTemplates, "personality/templates"),
+        // Config introspection
+        (Method::ConfigSections, "config/sections"),
+        (Method::ConfigStatus, "config/status"),
+        (Method::ConfigCatalog, "config/catalog"),
+        (Method::ConfigCatalogModels, "config/catalog-models"),
+        // Logs
+        (Method::LogsSubscribe, "logs/subscribe"),
+        (Method::LogsQuery, "logs/query"),
+        (Method::LogsGet, "logs/get"),
+        // TUI
+        (Method::TuiList, "tui/list"),
+        // Files
+        (Method::FileAttach, "file/attach"),
+        (Method::FsListDir, "fs/list_dir"),
+        // Locales
+        (Method::LocalesList, "locales/list"),
+        (Method::LocalesFetch, "locales/fetch"),
+        // Quickstart
+        (Method::QuickstartState, "quickstart/state"),
+        (Method::QuickstartFields, "quickstart/fields"),
+        (Method::QuickstartValidate, "quickstart/validate"),
+        (Method::QuickstartApply, "quickstart/apply"),
+        (Method::QuickstartDismiss, "quickstart/dismiss"),
+        (Method::CertRenew, "cert/renew"),
+        (Method::SopsList, "sops/list"),
+        (Method::SopsGet, "sops/get"),
+        (Method::SopsGraph, "sops/graph"),
+        (Method::SopsRun, "sops/run"),
+        (Method::SopsRuns, "sops/runs"),
+        (Method::SopsRunOverlay, "sops/run-overlay"),
+        (Method::SopsValidate, "sops/validate"),
+        (Method::SopsSave, "sops/save"),
+        (Method::SopsCreate, "sops/create"),
+        (Method::SopsDelete, "sops/delete"),
+        (Method::SopsDecide, "sops/decide"),
+        (Method::SopsWireDraft, "sops/wire-draft"),
+        (Method::SopsGraphDraft, "sops/graph-draft"),
+        (Method::SopsTriggerSources, "sops/trigger-sources"),
+        (Method::ToolsParamOptions, "tools/param-options"),
+    ];
+
+    /// Resolve a wire method name to a variant. Table scan, no hand-written
+    /// string matching.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|(_, wire)| *wire == s)
+            .map(|(m, _)| *m)
+    }
+
+    /// Wire name for this variant.
+    pub fn wire_name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(m, _)| *m == self)
+            .map(|(_, wire)| *wire)
+            .expect("every variant is in ALL")
+    }
+}
+
+type RpcResult = Result<Value, JsonRpcError>;
+type BoxRpcFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RpcResult> + Send + 'a>>;
+
+fn rpc_err(code: i32, msg: impl Into<String>) -> JsonRpcError {
+    JsonRpcError {
+        code,
+        message: msg.into(),
+        data: None,
+    }
+}
+
+fn not_yet_implemented(method: Method) -> RpcResult {
+    Err(rpc_err(
+        INTERNAL_ERROR,
+        format!("{}: not yet implemented", method.wire_name()),
+    ))
+}
+
+fn doctor_summary(results: &[DiagResult]) -> DoctorSummary {
+    DoctorSummary {
+        ok: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Ok)
+            .count(),
+        warnings: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Warn)
+            .count(),
+        errors: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Error)
+            .count(),
+    }
+}
+
+fn personality_template_context(
+    config: &omnesagent_config::schema::Config,
+    req: &PersonalityTemplatesParams,
+) -> crate::agent::personality_templates::TemplateContext {
+    let agent_requested = req.agent.is_some();
+    let requested_agent = req
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let agent_alias = requested_agent.unwrap_or("default");
+    let configured_agent_exists = config.agent(agent_alias).is_some();
+
+    crate::agent::personality_templates::TemplateContext {
+        agent: requested_agent
+            .map(str::to_string)
+            .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
+            .unwrap_or_else(|| "OmnesAgent".to_string()),
+        include_memory: configured_agent_exists || agent_requested,
+        ..Default::default()
+    }
+}
+
+fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
+    let rest = prop.strip_prefix("providers.models.")?;
+    let (provider_type, rest) = rest.split_once('.')?;
+    let (provider_alias, field) = rest.split_once('.')?;
+    if provider_type.is_empty() || provider_alias.is_empty() || field.is_empty() {
+        None
+    } else {
+        Some(format!("{provider_type}.{provider_alias}"))
+    }
+}
+
+/// Extract the agent alias from an `agents.<alias>.model_provider` prop path.
+/// A live change to an agent's bound provider must rebuild that agent's live
+/// session boxes the same way a `providers.models.*` edit does, so any
+/// `config/set agents.<alias>.model_provider` caller (the config pane and other
+/// RPC/config-set clients) gets a live refresh.
+fn agent_alias_from_model_provider_prop(prop: &str) -> Option<String> {
+    let rest = prop.strip_prefix("agents.")?;
+    let (alias, field) = rest.split_once('.')?;
+    if alias.is_empty() || field != "model_provider" {
+        None
+    } else {
+        Some(alias.to_string())
+    }
+}
+
+/// Session-selection predicate for an agent-scoped `model_provider` refresh
+/// (`config/set agents.<alias>.model_provider`). Only sessions bound to the
+/// edited agent are eligible, and a session that carries its own
+/// `model_provider` override is excluded so unrelated agents and overridden
+/// sessions are never rebuilt.
+fn agent_scoped_refresh_selects(
+    edited_agent: &str,
+    session_agent: &str,
+    overrides: &SessionOverrides,
+) -> bool {
+    session_agent == edited_agent && overrides.model_provider.is_none()
+}
+
+/// Session-selection predicate for a provider-scoped refresh
+/// (`providers.models.*` edit). A session is eligible when its own
+/// `model_provider` override matches the edited provider, or when it has no
+/// override and thus inherits the agent's provider (final provider match is
+/// resolved separately against config).
+fn provider_scoped_refresh_selects(target_ref: &str, overrides: &SessionOverrides) -> bool {
+    overrides
+        .model_provider
+        .as_deref()
+        .map(|r| r == target_ref)
+        .unwrap_or(true)
+}
+
+/// Whether memory embeddings resolve from the given `<type>.<alias>` provider
+/// profile — either the base `[memory].embedding_provider` reference or any
+/// `[[embedding_routes]]` entry. Gates the memory-embedder refresh on a
+/// `config/set` provider-profile change
+fn memory_embeddings_use_provider(
+    config: &omnesagent_config::schema::Config,
+    model_provider_ref: &str,
+) -> bool {
+    config.memory.embedding_provider.trim() == model_provider_ref
+        || config
+            .embedding_routes
+            .iter()
+            .any(|route| route.model_provider.trim() == model_provider_ref)
+}
+
+fn rename_error_to_rpc(
+    path: &str,
+    from: &str,
+    err: omnesagent_config::alias_refs::RenameError,
+) -> JsonRpcError {
+    use omnesagent_config::alias_refs::RenameError;
+    let code = match err {
+        RenameError::PostCondition(_) => INTERNAL_ERROR,
+        _ => INVALID_PARAMS,
+    };
+    rpc_err(code, format!("{path}.{from}: {err}"))
+}
+
+async fn move_renamed_agent_workspace(
+    old_workspace: &std::path::Path,
+    new_workspace: &std::path::Path,
+) -> Option<String> {
+    if old_workspace == new_workspace || !old_workspace.exists() {
+        return None;
+    }
+    if let Some(parent) = new_workspace.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    match tokio::fs::rename(old_workspace, new_workspace).await {
+        Ok(()) => None,
+        Err(err) => Some(format!(
+            "workspace move {} -> {} failed: {err}",
+            old_workspace.display(),
+            new_workspace.display()
+        )),
+    }
+}
+
+fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> bool {
+    !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+}
+
+/// Per-connection dispatcher. Shared state lives in [`RpcContext`].
+pub struct RpcDispatcher {
+    ctx: Arc<RpcContext>,
+    rpc: Arc<RpcOutbound>,
+    authenticated: bool,
+    /// TUI session UID assigned during `initialize`. Used for registry
+    /// cleanup on disconnect.
+    tui_id: Option<String>,
+    /// Which registration of `tui_id` this connection owns. Created here: the
+    /// id alone cannot tell this connection's registration from a successor's
+    /// after a reconnect adopts the same id, and teardown must only remove its
+    /// own. `None` until `initialize` registers.
+    tui_epoch: Option<super::tui_identity::TuiEpoch>,
+    /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
+    peer_label: String,
+    client_elicitation_caps: omnesagent_api::elicitation::ElicitationCapabilities,
+    /// SHA-256 fingerprint of the client certificate presented on the mTLS
+    /// handshake (remote WSS plane only; `None` on the local socket). This is the
+    /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
+    /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
+    /// resolves from the registry.
+    peer_cert_fingerprint: Option<String>,
+}
+
+impl RpcDispatcher {
+    pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
+        Self {
+            ctx,
+            rpc: Arc::new(RpcOutbound::new(writer_tx)),
+            authenticated: false,
+            tui_id: None,
+            tui_epoch: None,
+            peer_label,
+            client_elicitation_caps: omnesagent_api::elicitation::ElicitationCapabilities::default(),
+            peer_cert_fingerprint: None,
+        }
+    }
+
+    /// Bind the client certificate fingerprint from the mTLS handshake (WSS).
+    /// Additive builder so the socket transport and tests need no change.
+    #[must_use]
+    pub fn with_peer_cert_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.peer_cert_fingerprint = fingerprint;
+        self
+    }
+
+    /// The presenting client certificate fingerprint, if this is an mTLS peer.
+    pub fn peer_cert_fingerprint(&self) -> Option<&str> {
+        self.peer_cert_fingerprint.as_deref()
+    }
+
+    /// TUI ID assigned during initialize, if any.
+    pub fn tui_id(&self) -> Option<&str> {
+        self.tui_id.as_deref()
+    }
+
+    /// This connection's registry registration: the TUI id and the epoch it was
+    /// registered under. Teardown must quote both, so that a connection whose
+    /// cleanup runs after a reconnect has already adopted the same id cannot
+    /// evict the live entry.
+    pub fn tui_registration(&self) -> Option<(&str, super::tui_identity::TuiEpoch)> {
+        Some((self.tui_id.as_deref()?, self.tui_epoch?))
+    }
+
+    #[cfg(test)]
+    pub fn set_tui_id_for_test(&mut self, tui_id: Option<String>) {
+        self.tui_id = tui_id;
+    }
+
+    #[cfg(test)]
+    pub fn rpc_for_test(&self) -> Arc<RpcOutbound> {
+        Arc::clone(&self.rpc)
+    }
+
+    /// Construct a pre-authenticated dispatcher sharing the same context and
+    /// RPC outbound as `self`. Used to run long-lived methods (e.g.
+    /// `session/prompt`) in a spawned task so the read loop remains live.
+    fn spawn_handle(&self) -> Self {
+        Self {
+            ctx: Arc::clone(&self.ctx),
+            rpc: Arc::clone(&self.rpc),
+            authenticated: true,
+            tui_id: self.tui_id.clone(),
+            // Same connection, so the same registration: this handle shares the
+            // parent's epoch rather than claiming one of its own. It never runs
+            // teardown; only the owning transport loop does.
+            tui_epoch: self.tui_epoch,
+            peer_label: self.peer_label.clone(),
+            client_elicitation_caps: self.client_elicitation_caps,
+            peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
+        }
+    }
+
+    async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
+        if let Some(event) = event
+            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
+        {
+            let _ = self.rpc.send_raw(notification).await;
+        }
+    }
+
+    /// Flush dirty config paths to disk.
+    ///
+    /// `_guard` is never read — it is a witness reminding the caller to
+    /// serialize on `ctx.config_write_lock` for the whole read-mutate-flush
+    /// critical section. It is NOT compile-time proof of holding *that*
+    /// mutex (a guard is not statically tied to a specific instance); the
+    /// `debug_assert!` below catches a caller holding a look-alike guard
+    /// from the wrong mutex. The invariant lives on
+    /// [`RpcContext::config_write_lock`]: every mutation of `ctx.config`
+    /// must hold it, and a bypassing writer that re-dirties a just-saved
+    /// path during a flush loses disk persistence of that write.
+    ///
+    /// Clone the config out of the lock (parking_lot guards are !Send, so
+    /// the clone can't be held across `snapshot.save_dirty().await`), save
+    /// the clone to disk, then remove only the paths that were actually
+    /// saved from the LIVE config's dirty set. This must NOT swap the live
+    /// config wholesale: a write landed on `ctx.config` while this method
+    /// awaits disk I/O would otherwise be overwritten by the stale snapshot
+    /// on write-back, silently erasing an in-memory change that was never
+    /// given a chance to be saved.
+    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "flush_config caller must hold ctx.config_write_lock"
+        );
+        let mut snapshot = self.ctx.config.read().clone();
+        let saved_paths = snapshot.dirty_paths.clone();
+        snapshot
+            .save_dirty()
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        self.ctx
+            .config
+            .write()
+            .dirty_paths
+            .retain(|path| !saved_paths.contains(path));
+        Ok(())
+    }
+
+    /// Save `snapshot` to disk, then install it as the live config.
+    ///
+    /// `_guard` is the same serialization witness as in
+    /// [`Self::flush_config`] (a reminder, not compile-time proof — see
+    /// there). Unlike `flush_config`, this deliberately swaps: callers pass
+    /// a clone that was itself mutated beyond just `dirty_paths` (e.g. an
+    /// alias rename), and installing that mutated snapshot wholesale is the
+    /// point. Holding `config_write_lock` is what makes the swap safe — no
+    /// other handler can land a concurrent `config` write while this is in
+    /// flight.
+    async fn save_and_swap_config(
+        &self,
+        mut snapshot: omnesagent_config::schema::Config,
+        _guard: &ConfigWriteGuard,
+    ) -> Result<(), JsonRpcError> {
+        debug_assert!(
+            self.ctx.config_write_lock.try_lock().is_err(),
+            "save_and_swap_config caller must hold ctx.config_write_lock"
+        );
+        snapshot
+            .save_dirty()
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        *self.ctx.config.write() = snapshot;
+        Ok(())
+    }
+
+    async fn agent_rename_residue_exists(
+        &self,
+        config: &omnesagent_config::schema::Config,
+        from: &str,
+    ) -> bool {
+        if config.agent_workspace_dir(from).exists() {
+            return true;
+        }
+        if crate::cron::list_jobs_by_agent(config, from)
+            .map(|jobs| !jobs.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Some(store) = self.ctx.acp_session_store.as_ref()
+            && store
+                .list_sessions_by_agent(from)
+                .map(|sessions| !sessions.is_empty())
+                .unwrap_or(false)
+        {
+            return true;
+        }
+        if let Some(mem) = self.ctx.memory.as_ref()
+            && mem.count_agent(from).await.unwrap_or(0) > 0
+        {
+            return true;
+        }
+        if let Some(backend) = self.ctx.session_backend.as_ref()
+            && backend.count_agent_attribution(from).unwrap_or(0) > 0
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Read frames from transport, dispatch, repeat.
+    pub async fn run(&mut self, transport: &mut (dyn RpcTransport + Send)) {
+        while let Some(line) = transport.next_frame().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            self.process_line(trimmed).await;
+        }
+    }
+
+    async fn process_line(&mut self, line: &str) {
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(e) => {
+                self.send_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
+                    .await;
+                return;
+            }
+        };
+
+        let frame = match JsonRpcFrame::from_value(value) {
+            Ok(frame) => frame,
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({ "line_len": line.len() })),
+                    "Rejected invalid JSON-RPC frame"
+                );
+                match e.kind() {
+                    JsonRpcFrameErrorKind::Request => {
+                        let id = e.request_id().cloned().unwrap_or(Value::Null);
+                        self.send_error(id, INVALID_REQUEST, &format!("Invalid request: {e}"))
+                            .await;
+                    }
+                    JsonRpcFrameErrorKind::Response => {}
+                    JsonRpcFrameErrorKind::Ambiguous => {
+                        self.send_error(
+                            Value::Null,
+                            INVALID_REQUEST,
+                            &format!("Invalid request: {e}"),
+                        )
+                        .await;
+                    }
+                }
+                return;
+            }
+        };
+
+        let req = match frame {
+            JsonRpcFrame::Request(req) => req,
+            JsonRpcFrame::Response { id, result } => {
+                if let Some(id_key) = response_id_key(&id) {
+                    if !self.rpc.dispatch_validated_response(&id_key, result) {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_category(::omnesagent_log::EventCategory::Agent)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                            "Dropped JSON-RPC response with an unknown ID"
+                        );
+                    }
+                } else {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_category(::omnesagent_log::EventCategory::Agent)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                        "Dropped JSON-RPC response with an uncorrelatable null ID"
+                    );
+                }
+                return;
+            }
+        };
+
+        let req_id = req.id.clone().unwrap_or(Value::Null);
+        let is_notification = req.id.is_none();
+
+        let method = match Method::from_wire(&req.method) {
+            Some(m) => m,
+            None => {
+                if !is_notification {
+                    self.send_error(
+                        req_id,
+                        METHOD_NOT_FOUND,
+                        &format!("Unknown method: {}", req.method),
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
+
+        if !self.authenticated && method != Method::Initialize {
+            if !is_notification {
+                self.send_error(req_id, AUTH_REQUIRED, "First call must be 'initialize'")
+                    .await;
+            }
+            return;
+        }
+
+        // Exhaustive match — compiler enforces every Method has a handler.
+        let result = match method {
+            // Core
+            Method::Initialize => self.handle_initialize(&req.params).await,
+            Method::Status => self.handle_status().await,
+            Method::Health => self.handle_health(),
+            Method::DoctorRun => self.handle_doctor_run().await,
+
+            // Sessions
+            Method::SessionNew => Box::pin(self.handle_session_new(&req.params)).await,
+            Method::SessionClose => self.handle_session_close(&req.params).await,
+            Method::SessionPrompt => {
+                // Always spawn — turn completion is signaled by a
+                // TurnComplete notification, not by this method's response.
+                // The response (empty {} or error) is kept only so legacy
+                // request-form callers don't park forever.
+                let handle = self.spawn_handle();
+                let id_clone = req_id.clone();
+                let params_clone = req.params.clone();
+                let is_notif = is_notification;
+                omnesagent_spawn::spawn!(async move {
+                    let result = handle.handle_session_prompt(&params_clone).await;
+                    if !is_notif {
+                        match result {
+                            Ok(_) => handle.send_result(id_clone, serde_json::json!({})).await,
+                            Err(e) => handle.send_error(id_clone, e.code, &e.message).await,
+                        }
+                    }
+                });
+                return;
+            }
+            Method::SessionConfigure => self.handle_session_configure(&req.params).await,
+            Method::SessionCancel => self.handle_session_cancel(&req.params).await,
+            Method::SessionGitBranch => self.handle_session_git_branch(&req.params).await,
+            Method::SessionList => self.handle_session_list(&req.params).await,
+            Method::SessionListAcp => self.handle_session_list_acp(&req.params).await,
+            Method::SessionMessages => self.handle_session_messages(&req.params).await,
+            Method::SessionState => self.handle_session_state(&req.params).await,
+            Method::SessionDelete => self.handle_session_delete(&req.params).await,
+            Method::SessionApprove => self.handle_session_approve(&req.params),
+            Method::SessionKill => self.handle_session_kill(&req.params).await,
+
+            // Memory
+            Method::MemoryList => self.handle_memory_list(&req.params).await,
+            Method::MemorySearch => self.handle_memory_search(&req.params).await,
+            Method::MemoryGet => self.handle_memory_get(&req.params).await,
+            Method::MemoryStore => self.handle_memory_store(&req.params).await,
+            Method::MemoryDelete => self.handle_memory_delete(&req.params).await,
+
+            // Cron
+            Method::CronList => self.handle_cron_list().await,
+            Method::CronGet => self.handle_cron_get(&req.params).await,
+            Method::CronAdd => self.handle_cron_add(&req.params).await,
+            Method::CronPatch => self.handle_cron_patch(&req.params).await,
+            Method::CronDelete => self.handle_cron_delete(&req.params).await,
+            Method::CronRuns => self.handle_cron_runs(&req.params).await,
+            Method::CronTrigger => self.handle_cron_trigger(&req.params).await,
+            Method::CronSettings => self.handle_cron_settings(&req.params).await,
+
+            // Config
+            Method::ConfigGet => self.handle_config_get(&req.params),
+            Method::ConfigSet => self.handle_config_set(&req.params).await,
+            Method::ConfigValidate => self.handle_config_validate(),
+            Method::ConfigReload => self.handle_config_reload(),
+            Method::ConfigList => self.handle_config_list(&req.params),
+            Method::ConfigDelete => self.handle_config_delete(&req.params).await,
+            Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
+            Method::ConfigResolveAliasSource => {
+                self.handle_config_resolve_alias_source(&req.params)
+            }
+            Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
+            Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
+            Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
+            Method::ConfigTemplates => self.handle_config_templates(),
+
+            // Agents
+            Method::AgentsList => self.handle_agents_list(),
+            Method::AgentsStatus => self.handle_agents_status().await,
+
+            // Cost
+            Method::CostQuery => self.handle_cost_query(&req.params),
+            Method::CostOrg => self.handle_cost_org(),
+
+            // Skills
+            Method::SkillsBundles => self.handle_skills_bundles(),
+            Method::SkillsList => self.handle_skills_list(&req.params),
+            Method::SkillsRead => self.handle_skills_read(&req.params),
+            Method::SkillsWrite => self.handle_skills_write(&req.params),
+            Method::SkillsDelete => self.handle_skills_delete(&req.params),
+
+            // Personality
+            Method::PersonalityList => self.handle_personality_list(&req.params),
+            Method::PersonalityGet => self.handle_personality_get(&req.params),
+            Method::PersonalityPut => self.handle_personality_put(&req.params),
+            Method::PersonalityTemplates => self.handle_personality_templates(&req.params),
+
+            // Config introspection
+            Method::ConfigSections => self.handle_config_sections(),
+            Method::ConfigStatus => self.handle_config_status(),
+            Method::ConfigCatalog => self.handle_config_catalog(),
+            Method::ConfigCatalogModels => self.handle_config_catalog_models(&req.params).await,
+
+            // Logs
+            Method::LogsSubscribe => self.handle_logs_subscribe().await,
+            Method::LogsQuery => self.handle_logs_query(&req.params).await,
+            Method::LogsGet => self.handle_logs_get(&req.params).await,
+
+            // TUI
+            Method::TuiList => self.handle_tui_list(),
+
+            // Files
+            Method::FileAttach => self.handle_file_attach(&req.params).await,
+            Method::FsListDir => super::fs::handle_fs_list_dir(&req.params).await,
+
+            // Locales
+            Method::LocalesList => super::locales::handle_locales_list(self.tui_id()),
+            Method::LocalesFetch => {
+                super::locales::handle_locales_fetch(&req.params, self.tui_id()).await
+            }
+
+            // Quickstart
+            Method::QuickstartState => self.handle_quickstart_state(),
+            Method::QuickstartFields => self.handle_quickstart_fields(&req.params),
+            Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
+            Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
+            Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
+            Method::CertRenew => self.handle_renew_cert(&req.params).await,
+
+            Method::SopsList => self.handle_sops_list(),
+            Method::SopsGet => self.handle_sops_get(&req.params),
+            Method::SopsGraph => self.handle_sops_graph(&req.params),
+            Method::SopsRun => self.handle_sops_run(&req.params).await,
+            Method::SopsRuns => self.handle_sops_runs(&req.params),
+            Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
+            Method::SopsValidate => self.handle_sops_validate(&req.params),
+            Method::SopsSave => self.handle_sops_save(&req.params),
+            Method::SopsCreate => self.handle_sops_create(&req.params),
+            Method::SopsDelete => self.handle_sops_delete(&req.params),
+            Method::SopsDecide => self.handle_sops_decide(&req.params).await,
+            Method::SopsWireDraft => self.handle_sops_wire_draft(&req.params),
+            Method::SopsGraphDraft => self.handle_sops_graph_draft(&req.params),
+            Method::SopsTriggerSources => self.handle_sops_trigger_sources(),
+            Method::ToolsParamOptions => self.handle_tools_param_options(&req.params),
+        };
+
+        if is_notification {
+            return;
+        }
+
+        match result {
+            Ok(v) => self.send_result(req_id, v).await,
+            Err(e) => self.send_error(req_id, e.code, &e.message).await,
+        }
+    }
+
+    // ── Core handlers ────────────────────────────────────────────
+
+    async fn handle_initialize(&mut self, params: &Value) -> RpcResult {
+        let req: InitializeParams = parse_params(params)?;
+
+        if req.protocol_version != RPC_PROTOCOL_VERSION {
+            return Err(rpc_err(
+                VERSION_MISMATCH,
+                format!(
+                    "Protocol version mismatch: server={RPC_PROTOCOL_VERSION}, client={}",
+                    req.protocol_version,
+                ),
+            ));
+        }
+
+        let elicitation = req
+            .client_capabilities
+            .as_ref()
+            .and_then(|c| c.get("elicitation"));
+        self.client_elicitation_caps =
+            omnesagent_api::elicitation::ElicitationCapabilities::from_value(elicitation);
+
+        // TUI identity: reconnect with previous credentials or generate new
+        let tui_id = if let (Some(claimed_id), Some(sig)) =
+            (req.tui_id.as_deref(), req.tui_sig.as_deref())
+        {
+            // Client presents ID + signature — verify
+            if !self.ctx.tui_registry.verify(claimed_id, sig) {
+                return Err(rpc_err(AUTH_REQUIRED, "Invalid TUI signature"));
+            }
+            // No explicit removal of the previous connection's entry: the
+            // registration below replaces it under a fresh epoch, which is what
+            // marks that predecessor superseded.
+            claimed_id.to_string()
+        } else if let Some(claimed_id) = req.tui_id.as_deref() {
+            // Client claims ID but no signature — accept only if signing disabled
+            if self.ctx.tui_registry.signing_is_enabled() {
+                return Err(rpc_err(AUTH_REQUIRED, "TUI signature required"));
+            }
+            claimed_id.to_string()
+        } else {
+            // Fresh connection — generate new ID
+            self.ctx.tui_registry.generate_unique_tui_id()
+        };
+
+        let tui_sig = self.ctx.tui_registry.sign(&tui_id);
+        let tui_epoch = self
+            .ctx
+            .tui_registry
+            .register(super::tui_identity::TuiEntry {
+                tui_id: tui_id.clone(),
+                connected_at: chrono::Utc::now(),
+                transport: self
+                    .peer_label
+                    .split_once(':')
+                    .map_or("unknown", |(proto, _)| proto)
+                    .to_string(),
+                peer_label: self.peer_label.clone(),
+                env: req.env,
+            });
+        self.tui_id = Some(tui_id.clone());
+        self.tui_epoch = Some(tui_epoch);
+
+        // Bind the session's tui_id to the presenting client cert fingerprint
+        // (mTLS peers only). The cert is the transport identity; the renew RPC
+        // gates on its ledger status. Authorization still resolves from the
+        // registry - the cert is not a parallel permission store.
+        if let Some(fp) = self.peer_cert_fingerprint.as_deref() {
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "tui_id": tui_id,
+                        "cert_fingerprint": fp,
+                    })),
+                "WSS session bound to client certificate"
+            );
+        }
+
+        self.authenticated = true;
+
+        let capabilities: Vec<String> = Method::ALL
+            .iter()
+            .map(|(_, name)| (*name).to_string())
+            .collect();
+        let commands = commands_for_surface(CommandSurface::Tui)
+            .map(|spec| CommandDescriptor {
+                id: spec.id.as_str().to_string(),
+                name: spec.name.to_string(),
+                aliases: spec
+                    .aliases
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect(),
+            })
+            .collect();
+
+        to_result(InitializeResult {
+            protocol_version: RPC_PROTOCOL_VERSION,
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            server_pid: std::process::id(),
+            tui_id: Some(tui_id),
+            tui_sig,
+            capabilities,
+            commands,
+        })
+    }
+
+    /// Renew the presenting client's certificate over its authenticated mTLS
+    /// session (no second bootstrap). Renewal is REFUSED when the presenting
+    /// cert is revoked in the ledger, so a stolen-but-unexpired cert cannot
+    /// self-renew forever (threat A5). The device identity comes from the
+    /// ledger (the cert's binding), never from the client/CSR.
+    async fn handle_renew_cert(&self, params: &Value) -> RpcResult {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+
+        let fingerprint = self.peer_cert_fingerprint.as_deref().ok_or_else(|| {
+            rpc_err(
+                INVALID_PARAMS,
+                "certificate renewal requires the mutually authenticated WSS plane",
+            )
+        })?;
+        let csr_pem = params
+            .get("csr_pem")
+            .and_then(Value::as_str)
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
+
+        let (data_dir, relay_cfg, static_client_pins_configured, crl_path) = {
+            let cfg = self.ctx.config.read();
+            (
+                cfg.data_dir.clone(),
+                cfg.relay.clone(),
+                cfg.wss
+                    .client_auth
+                    .as_ref()
+                    .map(|auth| !auth.pinned_certs.is_empty())
+                    .unwrap_or(false),
+                // The file the WSS verifier ACTUALLY reads, resolved from the
+                // same `[wss.client_auth].crl_path` the startup acceptor
+                // resolves. A ledger opened on the default path instead would
+                // revoke in SQLite and rewrite `<data_dir>/tls/revoked` while
+                // the verifier kept reading an unchanged operator-managed file
+                // - a revocation reported and never enforced.
+                //
+                // Resolved HERE, from the config this handler already reads,
+                // rather than snapshotted into `RpcContext` at startup: an
+                // operator who changes `crl_path` and reloads must not have
+                // renewals keep materializing to the old file. Deriving live
+                // policy at use time is the rule this repo works by.
+                crate::security::cert_ledger::effective_revoked_list_path(
+                    &cfg.data_dir,
+                    cfg.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                ),
+            )
+        };
+
+        if static_client_pins_configured {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "certificate renewal is disabled because [wss.client_auth].pinned_certs is configured; provision pinned client certificates out of band",
+            ));
+        }
+
+        // The daemon-wide audit logger, NOT a fresh one per renewal. Each
+        // logger holds the Merkle chain's sequence and prev_hash in its own
+        // mutex, so per-request loggers recover the same tip and append
+        // conflicting entries; concurrent renewals then leave an audit file
+        // that `verify_chain` rejects. Cloning the shared `Arc` puts every
+        // renewal behind the one lock that enrollment and the ledger use.
+        let audit = Arc::clone(self.ctx.cert_audit.as_ref().ok_or_else(|| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "certificate audit logger unavailable; refusing to renew without an audit trail",
+            )
+        })?);
+        let ledger = CertLedger::open_at(&data_dir, Some(audit), crl_path)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("cert ledger: {e}")))?;
+
+        // Gate on ledger status (A5): revoked cannot self-renew; an unknown cert
+        // must re-enroll rather than renew.
+        match ledger
+            .status_of(fingerprint)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger status: {e}")))?
+        {
+            Some(CertStatus::Active) => {}
+            Some(CertStatus::Revoked) => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "this certificate is revoked; re-enroll for a new one",
+                ));
+            }
+            None => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "this certificate is not in the issued-cert ledger; re-enroll",
+                ));
+            }
+        }
+
+        // Device identity is the presenting cert's ledger binding, not the CSR.
+        let device_id = ledger
+            .device_of(fingerprint)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger lookup: {e}")))?
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ledger row missing device id"))?;
+
+        // Sign the renewal CSR with the daemon CA (reads only the CSR public key).
+        let tls_dir = data_dir.join("tls");
+        let ca_cert_pem = std::fs::read_to_string(tls_dir.join("ca.crt"))
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("read CA cert: {e}")))?;
+        let ca_key_pem = omnesagent_tls::load_ca_key_pem(
+            &tls_dir.join("ca.key"),
+            &omnesagent_tls::CaKeyProtection::from_env(),
+        )
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("read CA key: {e}")))?;
+        let issued = omnesagent_tls::sign_csr(&ca_cert_pem, &ca_key_pem, &device_id, csr_pem)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("CSR rejected: {e}")))?;
+
+        // Record the renewal (new fingerprint, same device id) -> CertRenewed
+        // audit. The old cert stays active until it expires; revocation is a
+        // separate, explicit action.
+        //
+        // The presenting fingerprint rides along as a PRECONDITION of the
+        // publish. The status gate above ran several steps ago - a CA signature
+        // ago - on a connection the operator's `revoke-client-cert` does not
+        // share, so an operator revoking this device in the meantime would
+        // otherwise see their revocation succeed and this renewal hand the same
+        // device a fresh active certificate. Re-testing it inside the
+        // publishing transaction makes revocation the guaranteed winner.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        ledger
+            .record_issued_requiring(
+                &LedgerEntry {
+                    device_id: device_id.clone(),
+                    fingerprint: issued.fingerprint.clone(),
+                    not_before: issued.not_before,
+                    not_after: issued.not_after,
+                    status: CertStatus::Active,
+                    token_hash: String::new(),
+                    actor: "renew".to_string(),
+                    issued_at: now,
+                },
+                true,
+                Some(fingerprint),
+            )
+            .map_err(|e| {
+                let message = format!("{e:#}");
+                // A revocation that beat this renewal is the client's business,
+                // not an internal fault: it must re-enroll, and retrying the
+                // renewal will only fail again.
+                if message.contains(crate::security::cert_ledger::ISSUANCE_PRECONDITION_FAILED) {
+                    rpc_err(INVALID_PARAMS, message)
+                } else {
+                    rpc_err(INTERNAL_ERROR, format!("ledger record: {e}"))
+                }
+            })?;
+
+        // Hand back the current relay profile so an in-band node-id rotation
+        // reaches the client without a second bootstrap (rotation push consumer).
+        let relay_profile = crate::enroll::relay_profile(&data_dir, &relay_cfg);
+
+        let response = serde_json::json!({
+            "cert_pem": issued.cert_pem,
+            "ca_chain_pem": ca_cert_pem,
+            "device_id": device_id,
+            "not_after": issued.not_after,
+            "relay_profile": relay_profile,
+        });
+
+        // Delivery boundary for renewal - and an honest one about its limits.
+        // This layer returns a value to the JSON-RPC framing; it never sees the
+        // transport write, so "delivered" here means the response payload was
+        // built successfully, not that the client received it. That residual
+        // window is benign in a way the enrollment one is not: the client's
+        // PREVIOUS certificate is still active and unrevoked, so a renewal that
+        // is recorded but never arrives costs the client nothing - it keeps
+        // using the old cert and renews again - while the unmarked new row is
+        // swept and revoked. Marking after the ledger write (rather than
+        // inside it) is what keeps the sweep able to see the failure at all.
+        //
+        // A ledger that cannot record the delivery fails the renewal outright:
+        // nothing has been sent yet, so refusing is free, and it spares the
+        // client a certificate that would be revoked out from under it an hour
+        // later.
+        ledger
+            .mark_delivered(&issued.fingerprint)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger delivery record: {e}")))?;
+
+        Ok(response)
+    }
+
+    async fn handle_status(&self) -> RpcResult {
+        let ids = self.ctx.sessions.list_ids().await;
+        let config_path = self.ctx.config.read().config_path.clone();
+        let config_kind = omnesagent_config::schema::classify_runtime_config_kind(&config_path).await;
+        let runtime_context = {
+            let config = self.ctx.config.read();
+            status_runtime_context(&config, config_kind)
+        };
+        // Count persisted sessions (channel-originated) that aren't already
+        // in the in-memory RPC store.
+        let persisted_count = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .map(|b| b.list_sessions_with_metadata().len())
+            .unwrap_or(0);
+        let total = ids.len().max(persisted_count);
+        to_result(StatusResult {
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: RPC_PROTOCOL_VERSION,
+            active_sessions: total,
+            session_ids: ids,
+            config_dir: Some(runtime_context.config_dir),
+            config_file: Some(runtime_context.config_file),
+            config_kind: Some(runtime_context.config_kind),
+            local_ipc_endpoint: Some(runtime_context.local_ipc_endpoint),
+        })
+    }
+
+    fn handle_health(&self) -> RpcResult {
+        let mut val = crate::health::snapshot_json();
+        if let Some(obj) = val.as_object_mut() {
+            let stats = crate::process_stats::sample();
+            obj.insert(
+                "process".to_string(),
+                serde_json::to_value(&stats).unwrap_or_default(),
+            );
+        }
+        Ok(val)
+    }
+
+    async fn handle_doctor_run(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        self.run_doctor(Box::pin(crate::doctor::probe_models(&config)))
+            .await
+    }
+
+    /// Serialize a Doctor run into the `doctor/run` response. The probe future
+    /// is injectable so tests can force both sides of the timeout deadline
+    /// deterministically; the production path passes `Box::pin(probe_models)`.
+    async fn run_doctor(
+        &self,
+        probe: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<crate::doctor::DiagResult>> + Send + '_>,
+        >,
+    ) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let (results, timed_out_phase) =
+            crate::doctor::run_structured_with_probe(&config, PROBE_MODEL_TIMEOUT, probe).await;
+        let summary = doctor_summary(&results);
+        // Read enabled + path from the one canonical active-writer accessor.
+        // The runtime `ctx.config.observability.log_persistence` snapshot is
+        // updated immediately by `config/set` while `omnesagent-log` installs its
+        // writer state only at startup or daemon reload — gating on the config
+        // here would advertise a stale path (or omit a live one) during the
+        // config/reload window the Doctor diagnostics issue calls out.
+        let log_path = omnesagent_log::active_log_path().map(|p| p.to_string_lossy().to_string());
+        to_result(DoctorRunResult {
+            results,
+            summary,
+            log_path,
+            timed_out_phase,
+        })
+    }
+
+    // ── TUI handlers ─────────────────────────────────────────────
+
+    fn handle_tui_list(&self) -> RpcResult {
+        let entries = self.ctx.tui_registry.list();
+        to_result(TuiListResult {
+            tuis: entries
+                .into_iter()
+                .map(|e| TuiListEntry {
+                    tui_id: e.tui_id,
+                    connected_at: e.connected_at.to_rfc3339(),
+                    connected_at_unix: e.connected_at.timestamp(),
+                    peer_label: e.peer_label,
+                    transport: e.transport,
+                })
+                .collect(),
+        })
+    }
+
+    // ── Session handlers ─────────────────────────────────────────
+
+    #[cfg(test)]
+    pub async fn handle_session_new_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_session_new(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_session_messages_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_session_messages(params).await
+    }
+
+    /// Drive a full JSON-RPC request line through the dispatcher from a unit
+    /// test, including notification emission on the outbound channel. Mirrors
+    /// the transport `process_line` path.
+    #[cfg(test)]
+    async fn process_line_for_test(&mut self, line: &str) {
+        self.process_line(line).await;
+    }
+
+    async fn handle_session_new(&self, params: &Value) -> RpcResult {
+        let req: SessionNewParams = parse_params(params)?;
+        let resuming = req.session_id.is_some();
+        let session_id = req
+            .session_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // Session replacement and prompt execution share one admission
+        // permit. Resolve and install the new incarnation only after the
+        // previous same-ID turn has fully finalized its durable state.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        let config = self.ctx.config.read().clone();
+        let chat_mode = req
+            .chat_mode
+            .clone()
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        if req.interaction_surface.is_some()
+            && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "interaction_surface is only valid for ACP sessions",
+            ));
+        }
+        let mut resolved_interaction_surface = req.interaction_surface;
+
+        // Load resumed ACP metadata once, before constructing the live Agent.
+        // The durable row owns the original workspace and interaction surface.
+        let mut preloaded_acp: Option<omnesagent_infra::acp_session_store::AcpSessionData> = None;
+        if resuming
+            && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && let Some(ref store) = self.ctx.acp_session_store
+        {
+            let store_cloned = store.clone();
+            let sid = session_id.clone();
+            match tokio::task::spawn_blocking(move || store_cloned.load_session_for_restore(&sid))
+                .await
+            {
+                Ok(Ok(omnesagent_infra::acp_session_store::AcpSessionRestore::Restorable(
+                    mut data,
+                ))) => {
+                    if data.agent_alias != req.agent_alias {
+                        return Err(rpc_err(
+                            INVALID_PARAMS,
+                            "ACP session belongs to a different agent",
+                        ));
+                    }
+
+                    match data.interaction_surface.as_deref() {
+                        Some(value) => {
+                            if let Some(requested) = req.interaction_surface
+                                && requested.as_str() != value
+                            {
+                                return Err(rpc_err(
+                                    INVALID_PARAMS,
+                                    "ACP session belongs to a different interaction surface",
+                                ));
+                            }
+                            let stored =
+                                crate::agent::prompt::InteractionSurface::from_persisted(value)
+                                    .ok_or_else(|| {
+                                        rpc_err(
+                                            INVALID_PARAMS,
+                                            "ACP session has an unsupported interaction surface",
+                                        )
+                                    })?;
+                            resolved_interaction_surface = Some(stored);
+                        }
+                        None => {
+                            // Existing databases predate this field. The first
+                            // validated surface declaration claims the NULL slot
+                            // atomically; later mismatches are rejected above.
+                            if let Some(requested) = req.interaction_surface {
+                                let store_cloned = store.clone();
+                                let sid = session_id.clone();
+                                let claimed = requested.as_str().to_string();
+                                let durable = tokio::task::spawn_blocking(move || {
+                                    store_cloned.bind_interaction_surface_if_unset(&sid, &claimed)
+                                })
+                                .await
+                                .map_err(|join| {
+                                    rpc_err(
+                                        INTERNAL_ERROR,
+                                        format!("Failed to bind ACP interaction surface: {join}"),
+                                    )
+                                })?
+                                .map_err(|e| {
+                                    rpc_err(
+                                        INTERNAL_ERROR,
+                                        format!("Failed to bind ACP interaction surface: {e}"),
+                                    )
+                                })?;
+                                if durable != requested.as_str() {
+                                    return Err(rpc_err(
+                                        INVALID_PARAMS,
+                                        "ACP session belongs to a different interaction surface",
+                                    ));
+                                }
+                                data.interaction_surface = Some(durable);
+                                resolved_interaction_surface = Some(requested);
+                            }
+                        }
+                    }
+                    preloaded_acp = Some(data);
+                }
+                Ok(Ok(omnesagent_infra::acp_session_store::AcpSessionRestore::Missing)) => {}
+                Ok(Ok(omnesagent_infra::acp_session_store::AcpSessionRestore::Killed)) => {
+                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                }
+                Ok(Err(e)) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load ACP session: {e}"),
+                    ));
+                }
+                Err(join) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load ACP session: {join}"),
+                    ));
+                }
+            }
+        }
+
+        // The session cwd: caller-supplied wins, then a resumed ACP session's
+        // persisted cwd, then the agent's workspace dir.
+        let cwd = req
+            .cwd
+            .clone()
+            .or_else(|| preloaded_acp.as_ref().map(|d| d.workspace_dir.clone()))
+            .unwrap_or_else(|| {
+                config
+                    .agent_workspace_dir(&req.agent_alias)
+                    .to_string_lossy()
+                    .to_string()
+            });
+
+        let cwd_path = Some(std::path::Path::new(&cwd));
+        let tui_env = req
+            .tui_id
+            .as_deref()
+            .and_then(|id| self.ctx.tui_registry.get_env(id));
+        let chat_mode = req
+            .chat_mode
+            .clone()
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            || req.exclude_memory == Some(true);
+        // Chat sessions initialize MCP so the TUI sees the same MCP tools the
+        // gateway exposes for this agent; ACP (Code) sessions skip it to keep
+        // `session/new` prompt
+        let initialize_mcp = session_should_initialize_mcp(&chat_mode);
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
+            &req.agent_alias,
+            cwd_path,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
+        )
+        .await
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
+        agent.set_interaction_context(
+            resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
+        );
+
+        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
+            "rpc",
+            session_id.clone(),
+            Arc::clone(&self.rpc),
+            Arc::clone(&self.ctx.approval_pending),
+            self.client_elicitation_caps,
+        ));
+        // Align agent.channel_name with the registered back-channel key so
+        // ask_user/poll/escalate default to this conversation (not an arbitrary
+        // external channel from the seeded channel map).
+        agent.set_channel_name("rpc".to_string());
+        agent.channel_handles().register_channel("rpc", approval_ch);
+
+        self.ctx
+            .sessions
+            .insert(
+                session_id.clone(),
+                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                    .with_owner(self.tui_id.clone()),
+            )
+            .await
+            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+
+        if let Some(ref tui_id) = self.tui_id
+            && req.keep_siblings != Some(true)
+        {
+            let evicted = self
+                .ctx
+                .sessions
+                .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
+                .await;
+            if !evicted.is_empty() {
+                if let Some(ref hooks) = self.ctx.hooks {
+                    for (sid, _) in &evicted {
+                        hooks.fire_session_end(sid, "rpc").await;
+                    }
+                }
+                let span = ::omnesagent_log::info_span!(
+                    target: "omnesagent_log_internal_scope",
+                    "omnesagent_scope",
+                    session_key = %session_id,
+                    agent_alias = %req.agent_alias,
+                    channel = "rpc",
+                );
+                let _guard = span.enter();
+                ::omnesagent_log::record!(
+                    DEBUG,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "tui_id": tui_id,
+                            "evicted": evicted.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                        })),
+                    "Evicted abandoned same-mode session(s) on session/new"
+                );
+                // Every evicted session was idle (no in-flight turn), so its
+                // removal above dropped the last Agent strong ref and freed the
+                // history. Trimming now actually returns those pages.
+                crate::util::release_freed_heap();
+                ::omnesagent_log::record!(
+                    DEBUG,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "evicted_count": evicted.len(),
+                        })),
+                    "Trimmed glibc arenas after same-mode session eviction"
+                );
+            }
+        }
+
+        enum AcpSessionNewLoad {
+            Restored(omnesagent_infra::acp_session_store::AcpSessionData),
+            Created,
+            Killed,
+        }
+
+        let mut message_count = 0;
+        match chat_mode {
+            crate::rpc::types::ChatMode::Acp => {
+                // Reuse the data already loaded for cwd recovery on resume so the
+                // store isn't hit twice; otherwise fall through to the restore-
+                // aware load-or-create path below.
+                let loaded = if let Some(data) = preloaded_acp.take() {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
+                } else {
+                    let Some(ref store) = self.ctx.acp_session_store else {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
+                        self.ctx.sessions.remove(&session_id).await;
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            "ACP session store is not available",
+                        ));
+                    };
+
+                    let store_cloned = store.clone();
+                    let sid = session_id.clone();
+                    let alias = req.agent_alias.clone();
+                    let cwd_owned = cwd.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
+                        match store_cloned.load_session_for_restore(&sid)? {
+                            omnesagent_infra::acp_session_store::AcpSessionRestore::Restorable(
+                                data,
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            omnesagent_infra::acp_session_store::AcpSessionRestore::Missing => {
+                                store_cloned.create_session_with_interaction_surface(
+                                    &sid,
+                                    &alias,
+                                    &cwd_owned,
+                                    resolved_interaction_surface.map(|surface| surface.as_str()),
+                                )?;
+                                Ok(AcpSessionNewLoad::Created)
+                            }
+                            omnesagent_infra::acp_session_store::AcpSessionRestore::Killed => {
+                                Ok(AcpSessionNewLoad::Killed)
+                            }
+                        }
+                    })
+                    .await
+                };
+                match loaded {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                        if data.agent_alias != req.agent_alias {
+                            if let Some(ref hooks) = self.ctx.hooks {
+                                hooks.fire_session_end(&session_id, "rpc").await;
+                            }
+                            self.ctx.sessions.remove(&session_id).await;
+                            return Err(rpc_err(
+                                INVALID_PARAMS,
+                                "ACP session belongs to a different agent",
+                            ));
+                        }
+                        message_count = data.messages.len();
+                        let seed_event = self
+                            .ctx
+                            .sessions
+                            .seed_conversation_history_with_event(&session_id, data.messages)
+                            .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
+                        if let Some(ref store) = self.ctx.acp_session_store {
+                            let store = store.clone();
+                            let sid = session_id.clone();
+                            let plan = tokio::task::spawn_blocking(move || {
+                                store.get_plan(&sid).unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !plan.is_empty() {
+                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
+                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
+                                    let _ = self.rpc.send_raw(n).await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
+                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
+                        self.ctx.sessions.remove(&session_id).await;
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
+                        self.ctx.sessions.remove(&session_id).await;
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
+                            "Failed to load or create ACP session"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to load or create ACP session: {e}"),
+                        ));
+                    }
+                    Err(join) => {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
+                        self.ctx.sessions.remove(&session_id).await;
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
+                            "ACP session load task failed"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("ACP session load task failed: {join}"),
+                        ));
+                    }
+                }
+            }
+            crate::rpc::types::ChatMode::Chat => {
+                if let Some(ref backend) = self.ctx.session_backend {
+                    let session_key = format!("rpc_{session_id}");
+                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                    let stored = backend.load(&session_key);
+                    if !stored.is_empty() {
+                        let seed_event = self
+                            .ctx
+                            .sessions
+                            .seed_history_with_event(&session_id, &stored)
+                            .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
+                        message_count = stored.len();
+                    }
+                }
+            }
+        }
+
+        if let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_start(&session_id, "rpc").await;
+        }
+
+        to_result(SessionNewResult {
+            session_id,
+            agent_alias: req.agent_alias,
+            message_count,
+            workspace_dir: cwd,
+        })
+    }
+
+    async fn handle_session_close(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        // Cancellation must be signalled before waiting: the admitted prompt
+        // owns this permit until its terminal state and transcript writes are
+        // complete. Removal then happens under the same incarnation fence.
+        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+            agent
+                .lock()
+                .await
+                .channel_handles()
+                .unregister_channel("rpc");
+            let strong = std::sync::Arc::strong_count(&agent);
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(&req.session_id)
+                .await
+                .unwrap_or_default();
+            let span = ::omnesagent_log::info_span!(
+                target: "omnesagent_log_internal_scope",
+                "omnesagent_scope",
+                session_key = %req.session_id,
+                agent_alias = %agent_alias,
+                channel = "rpc",
+            );
+            let _guard = span.enter();
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_category(::omnesagent_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "agent_arc_strong_count_before_remove": strong,
+                    })),
+                "session close: dropping local Agent handle before remove"
+            );
+            // Drop our clone explicitly so the session map holds the last
+            // strong ref; `remove` then frees the Agent at removal time
+            // rather than at end-of-scope, letting the allocator reclaim
+            // promptly.
+            drop(agent);
+        }
+        if !self.ctx.sessions.remove(&req.session_id).await {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+        if let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_end(&req.session_id, "rpc").await;
+        }
+        crate::util::release_freed_heap();
+        {
+            let span = ::omnesagent_log::info_span!(
+                target: "omnesagent_log_internal_scope",
+                "omnesagent_scope",
+                session_key = %req.session_id,
+                channel = "rpc",
+            );
+            let _guard = span.enter();
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_category(::omnesagent_log::EventCategory::Agent)
+                    .with_outcome(::omnesagent_log::EventOutcome::Success),
+                "Trimmed glibc arenas after session close"
+            );
+        }
+        to_result(SessionCloseResult {
+            session_id: req.session_id,
+            closed: true,
+        })
+    }
+
+    async fn handle_session_kill(&self, params: &Value) -> RpcResult {
+        let req: SessionKillParams = parse_params(params)?;
+        let sid = &req.session_id;
+
+        // Preserve kill semantics by signalling the admitted prompt first,
+        // then wait for its finalization before reading mode or tombstoning
+        // and removing this exact session incarnation.
+        self.ctx.sessions.signal_session_kill(sid);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        let chat_mode = self
+            .ctx
+            .sessions
+            .chat_mode(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .unwrap_or_default();
+        let span = ::omnesagent_log::info_span!(
+            target: "omnesagent_log_internal_scope",
+            "omnesagent_scope",
+            session_key = %sid,
+            agent_alias = %agent_alias,
+            channel = "rpc",
+        );
+        let _guard = span.enter();
+
+        if matches!(chat_mode, ChatMode::Acp) {
+            let store = self
+                .ctx
+                .acp_session_store
+                .clone()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+            let sid_owned = sid.to_string();
+            let marked =
+                tokio::task::spawn_blocking(move || store.mark_session_killed(&sid_owned)).await;
+            match marked {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_category(::omnesagent_log::EventCategory::Agent)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                        "session/kill: live ACP session had no durable row to tombstone"
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to mark ACP session killed: {e}"),
+                    ));
+                }
+            }
+        }
+
+        let killed = self.ctx.sessions.kill_session(sid).await;
+        if killed {
+            if let Some(ref hooks) = self.ctx.hooks {
+                hooks.fire_session_end(sid, "rpc").await;
+            }
+            crate::util::release_freed_heap();
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_category(::omnesagent_log::EventCategory::Agent)
+                    .with_outcome(::omnesagent_log::EventOutcome::Success),
+                "session/kill: session terminated by admin"
+            );
+        } else {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_category(::omnesagent_log::EventCategory::Agent)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                "session/kill: session vanished between existence check and kill (concurrent close?)"
+            );
+        }
+
+        to_result(SessionKillResult {
+            session_id: req.session_id,
+            killed,
+        })
+    }
+
+    /// Rebuild a reaped ACP session from a restorable durable row so a fresh
+    /// prompt recovers to a working session instead of hanging. Returns the
+    /// live agent on success; returns `None` for missing, killed, or unreadable
+    /// durable state.
+    async fn rehydrate_reaped_session(
+        &self,
+        sid: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
+        let store = self.ctx.acp_session_store.clone()?;
+        let sid_owned = sid.to_string();
+        let loaded =
+            tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
+        let data = match loaded {
+            Ok(Ok(omnesagent_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
+            Ok(Ok(omnesagent_infra::acp_session_store::AcpSessionRestore::Killed)) => {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Success),
+                    "session/prompt: refusing to rehydrate admin-killed ACP session"
+                );
+                return None;
+            }
+            Ok(Err(e)) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "session/prompt: failed to query ACP killed marker before rehydrate"
+                );
+                return None;
+            }
+            Ok(Ok(omnesagent_infra::acp_session_store::AcpSessionRestore::Missing)) => return None,
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "session/prompt: ACP killed-marker query task failed before rehydrate"
+                );
+                return None;
+            }
+        };
+
+        let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
+        let tui_env = self
+            .tui_id
+            .as_deref()
+            .and_then(|id| self.ctx.tui_registry.get_env(id));
+        let exclude_memory = true;
+        // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
+        // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+            Arc::clone(&self.ctx.config),
+            &data.agent_alias,
+            cwd_path,
+            false,
+            exclude_memory,
+            tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
+        )
+        .await
+        .ok()?;
+        let interaction_context = match data.interaction_surface.as_deref() {
+            Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
+                Some(surface) => Some(surface.resolve()),
+                None => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Read,)
+                            .with_category(::omnesagent_log::EventCategory::Agent)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": sid,
+                                "interaction_surface": value,
+                            })),
+                        "session/prompt: refusing to rehydrate an unsupported interaction surface"
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        };
+        agent.set_interaction_context(interaction_context);
+
+        let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
+            "rpc",
+            sid.to_string(),
+            Arc::clone(&self.rpc),
+            Arc::clone(&self.ctx.approval_pending),
+            self.client_elicitation_caps,
+        ));
+        // See session/new: channel_name must match the registered back-channel
+        // key so interactive tools default to this conversation.
+        agent.set_channel_name("rpc".to_string());
+        agent.channel_handles().register_channel("rpc", approval_ch);
+
+        let message_count = data.messages.len();
+        self.ctx
+            .sessions
+            .insert(
+                sid.to_string(),
+                super::session::RpcSession::new(
+                    agent,
+                    &data.agent_alias,
+                    &data.workspace_dir,
+                    crate::rpc::types::ChatMode::Acp,
+                )
+                .with_owner(self.tui_id.clone()),
+            )
+            .await
+            .ok()?;
+        let seed_event = self
+            .ctx
+            .sessions
+            .seed_conversation_history_with_event(sid, data.messages)
+            .await;
+        self.forward_seed_event(sid, seed_event).await;
+        self.ctx.sessions.touch(sid).await;
+
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_category(::omnesagent_log::EventCategory::Agent)
+                .with_outcome(::omnesagent_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "session_id": sid,
+                    "agent_alias": data.agent_alias,
+                    "messages_restored": message_count,
+                })),
+            "rehydrated reaped session from durable store; turn continues on a working session"
+        );
+
+        self.ctx.sessions.get_agent(sid).await
+    }
+
+    async fn handle_session_prompt(&self, params: &Value) -> RpcResult {
+        let req: SessionPromptParams = parse_params(params)?;
+        let sid = &req.session_id;
+
+        if req.prompt.trim().is_empty() && req.attachments.is_empty() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "session/prompt requires a non-empty `prompt` or at least one attachment",
+            ));
+        }
+
+        // Admission fences the complete session incarnation: agent, mode,
+        // attachments, durable writes, and terminal state are all resolved
+        // while same-ID replacement is excluded.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        // Registration is the first operation after admission and the RAII
+        // handle removes this exact generation on every exit path. Removal
+        // handlers signal before waiting on the same queue, so they cannot
+        // lose cancellation while setup awaits agent lookup, attachments, or
+        // persistence.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_registration = self
+            .ctx
+            .sessions
+            .register_cancel_token_guard(sid, cancel.clone());
+        self.ctx
+            .sessions
+            .wait_test_prompt_registration_pause()
+            .await;
+
+        let agent = match self.ctx.sessions.get_agent(sid).await {
+            Some(a) => a,
+            None => match self.rehydrate_reaped_session(sid).await {
+                Some(a) => a,
+                None => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail,)
+                            .with_category(::omnesagent_log::EventCategory::Agent)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "session_id": sid })),
+                        "session/prompt on a session absent from memory and the durable store; emitting TurnComplete so the client exits the working state"
+                    );
+                    self.emit_turn_complete(
+                        sid,
+                        crate::rpc::types::TurnCompletionOutcome::Failed,
+                        "turn cancelled by daemon: session_not_found".to_string(),
+                    )
+                    .await;
+                    return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                }
+            },
+        };
+
+        // Process inline attachments: upload each, append markers to prompt.
+        let mut prompt = req.prompt.clone();
+        if !req.attachments.is_empty() {
+            use super::attachments::process_file_entry;
+
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(sid)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            let upload_root = self
+                .ctx
+                .config
+                .read()
+                .agent_workspace_dir(&agent_alias)
+                .to_string_lossy()
+                .to_string();
+            let is_wss = self.peer_label.starts_with("wss:");
+            if !prompt.is_empty() {
+                prompt.push('\n');
+            }
+            for (idx, entry) in req.attachments.iter().enumerate() {
+                let result =
+                    process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions)
+                        .await?;
+                if idx > 0 {
+                    prompt.push('\n');
+                }
+                prompt.push_str(&result.marker);
+            }
+        }
+
+        let chat_mode = self
+            .ctx
+            .sessions
+            .chat_mode(sid)
+            .await
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+
+        // Mirror the gateway WS path so `session/state` and stuck-session
+        // detection see RPC-driven turns too. The durable row lives under the
+        // same `rpc_{sid}` key the Chat-mode message persistence below and
+        // `session/state` both use. The HTTP running-sessions listing stays
+        // blind to these rows: it derives its caller-facing id by stripping a
+        // `gw_` prefix, and the sibling lookup and abort paths resolve only
+        // gateway keys, so surfacing a row here would hand callers an id those
+        // endpoints cannot act on.
+        //
+        // Scoped to Chat sessions only. Session IDs are caller-supplied and
+        // the two persistence modes share that namespace, so an ACP prompt
+        // reusing the ID of a closed Chat session would otherwise mutate that
+        // session's retained `rpc_{sid}` row — making a stale Chat record
+        // report `running`/`idle`/`error` from an ACP turn, and surfacing it
+        // in stuck-session queries. ACP state belongs to `AcpSessionStore`.
+        let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
+        let session_key = format!("rpc_{sid}");
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
+        }
+
+        self.ctx.sessions.touch(sid).await;
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Invoke)
+                .with_category(::omnesagent_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({ "session_id": sid })),
+            "turn dispatch: registered cancel token, starting turn"
+        );
+
+        // Capture live attribution fields and max_context_tokens for the turn span.
+        // Zerocode's context meter field is named `max_context_tokens` and must
+        // reflect the runtime-profile budget (`[runtime_profiles.<name>]
+        // max_context_tokens`), not the provider model-window helper (which
+        // falls back to 32_000 when `context_window` is unset).
+        let (agent_alias, model_provider, model, max_ctx) = {
+            let alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(sid)
+                .await
+                .unwrap_or_default();
+            let (mp, m) = if let Some(agent) = self.ctx.sessions.get_agent(sid).await {
+                let (_, model_provider, model) = agent.lock().await.attribution_fields();
+                (model_provider, model)
+            } else {
+                (String::new(), String::new())
+            };
+            let max_ctx = {
+                let cfg = self.ctx.config.read();
+                Some(context_usage_max_tokens(&cfg, &alias))
+            };
+            (alias, mp, m, max_ctx)
+        };
+
+        let rpc = self.rpc.clone();
+        let sid_owned = sid.to_string();
+        // Clone of the session store so the turn-event closure can persist
+        // the latest TodoWrite plan (store-then-emit) before the plan
+        // notification goes out. See `persist_plan_if_any`.
+        let sessions_for_plan = self.ctx.sessions.clone();
+        let acp_token_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            self.ctx.acp_session_store.clone()
+        } else {
+            None
+        };
+        let attribution_agent_alias = agent_alias.clone();
+        let attribution_model_provider = model_provider.clone();
+        let attribution_model = model.clone();
+        // Cost-tracking context for this turn. Built from the daemon-scoped
+        // tracker + the live pricing map and stamped with the agent alias so
+        // `execute_turn` can persist token usage and attribute spend. `None`
+        // when cost tracking is disabled (no tracker wired).
+        let cost_context = self.ctx.cost_tracker.as_ref().map(|tracker| {
+            let cfg_guard = self.ctx.config.read();
+            let pricing = crate::agent::cost::build_model_provider_pricing(&cfg_guard);
+            crate::agent::cost::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                std::sync::Arc::new(pricing),
+            )
+            .with_agent_alias(&attribution_agent_alias)
+        });
+        let outcome = execute_turn(
+            agent,
+            prompt.clone(),
+            cancel,
+            TurnAttribution {
+                session_key: Some(sid.to_string()),
+                agent_alias,
+                model_provider,
+                model,
+                channel: "rpc",
+            },
+            cost_context,
+            move |event| {
+                let rpc = rpc.clone();
+                let sid = sid_owned.clone();
+                let acp_token_store = acp_token_store.clone();
+                let sessions_for_plan = sessions_for_plan.clone();
+                async move {
+                    if let (
+                        Some(store),
+                        TurnEvent::Usage {
+                            input_tokens: Some(it),
+                            ..
+                        },
+                    ) = (acp_token_store.as_ref(), &event)
+                    {
+                        let store = store.clone();
+                        let sid = sid.clone();
+                        let it = *it;
+                        let _ =
+                            tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
+                                .await;
+                    }
+                    persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
+                        .await;
+                    if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
+                        let _ = rpc.send_raw(n).await;
+                    }
+                }
+            },
+        )
+        .await;
+
+        // Drain the cancel cause BEFORE removing the token (removal clears the
+        // cause map). Every cancel firing site records its cause before firing;
+        // a cancel with no recorded cause is a bug, not user attribution.
+        let cancel_cause = cancel_registration.finish();
+
+        // ── Durable turn-verdict audit row ───────────────────────────────
+        // Every turn termination writes one attributed row to the ACP session
+        // store's event log so a cancel verdict is diagnosable after the trace
+        // log rotates. Fire-and-forget on a blocking task.
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+            && let Some(store) = self.ctx.acp_session_store.clone()
+        {
+            let (action, event_outcome, payload) = match &outcome {
+                Ok(crate::rpc::turn::TurnOutcome::Completed { .. }) => (
+                    ::omnesagent_log::Action::Complete,
+                    ::omnesagent_log::EventOutcome::Success,
+                    None,
+                ),
+                Ok(crate::rpc::turn::TurnOutcome::Cancelled { .. }) => (
+                    ::omnesagent_log::Action::Cancel,
+                    ::omnesagent_log::EventOutcome::Unknown,
+                    Some(
+                        ::serde_json::json!({
+                            "cancel_cause": cancel_cause.map(|c| c.as_str()),
+                        })
+                        .to_string(),
+                    ),
+                ),
+                Err(e) => (
+                    ::omnesagent_log::Action::Fail,
+                    ::omnesagent_log::EventOutcome::Failure,
+                    Some(::serde_json::json!({ "error": e.to_string() }).to_string()),
+                ),
+            };
+            let sid_owned = sid.to_string();
+            let span_session = sid.to_string();
+            let span_alias = attribution_agent_alias.clone();
+            let span_provider = attribution_model_provider.clone();
+            let span_model = attribution_model.clone();
+            omnesagent_spawn::spawn!(async move {
+                use ::omnesagent_log::Instrument as _;
+                let span = ::omnesagent_log::info_span!(
+                    target: "omnesagent_log_internal_scope",
+                    "omnesagent_scope",
+                    session_key = %span_session,
+                    agent_alias = %span_alias,
+                    model_provider = %span_provider,
+                    model = %span_model,
+                    channel = "rpc",
+                );
+                async move {
+                    let persisted = tokio::task::spawn_blocking(move || {
+                        store.append_event(&sid_owned, action, event_outcome, payload.as_deref())
+                    })
+                    .await;
+                    let error = match persisted {
+                        Ok(Ok(())) => return,
+                        Ok(Err(e)) => e.to_string(),
+                        Err(join) => join.to_string(),
+                    };
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Write)
+                            .with_category(::omnesagent_log::EventCategory::Agent)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "error": error })),
+                        "Failed to persist ACP turn-verdict audit event"
+                    );
+                }
+                .instrument(span)
+                .await;
+            });
+        }
+
+        match chat_mode {
+            crate::rpc::types::ChatMode::Acp => {
+                if let Some(ref store) = self.ctx.acp_session_store
+                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
+                {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
+                        "Failed to persist ACP turn"
+                    );
+                }
+            }
+            crate::rpc::types::ChatMode::Chat => {
+                if let Some(ref backend) = self.ctx.session_backend {
+                    let key = format!("rpc_{sid}");
+                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
+                    match &outcome {
+                        Ok(TurnOutcome::Completed { text, .. }) => {
+                            let _ = backend.append(&key, &ChatMessage::assistant(text));
+                        }
+                        Ok(TurnOutcome::Cancelled { partial_text, .. })
+                            if !partial_text.is_empty() =>
+                        {
+                            let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        match outcome {
+            Ok(TurnOutcome::Completed { text, .. }) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
+                self.emit_turn_complete(
+                    &req.session_id,
+                    crate::rpc::types::TurnCompletionOutcome::Completed,
+                    text.clone(),
+                )
+                .await;
+                to_result(SessionPromptResult {
+                    session_id: req.session_id,
+                    stop_reason: "end_turn".to_string(),
+                    content: text,
+                })
+            }
+            Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
+                let cancel_message = match cancel_cause {
+                    Some(cause) => {
+                        format!(
+                            "turn cancelled via {} in RPC_SESSION {}",
+                            cause.as_str(),
+                            req.session_id
+                        )
+                    }
+                    None => {
+                        format!(
+                            "turn cancelled (cause unattributed) in RPC_SESSION {}",
+                            req.session_id
+                        )
+                    }
+                };
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Cancel)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": req.session_id,
+                            "agent_alias": attribution_agent_alias,
+                            "model_provider": attribution_model_provider,
+                            "model": attribution_model,
+                            "chat_mode": format!("{chat_mode:?}"),
+                            "cancel_cause": cancel_cause.map(|c| c.as_str()),
+                        })),
+                    "turn cancelled; emitting attributed TurnComplete so the client exits the working state"
+                );
+                self.emit_turn_complete(
+                    &req.session_id,
+                    crate::rpc::types::TurnCompletionOutcome::Cancelled,
+                    cancel_message,
+                )
+                .await;
+                to_result(SessionPromptResult {
+                    session_id: req.session_id,
+                    stop_reason: "cancelled".to_string(),
+                    content: partial_text,
+                })
+            }
+            Err(e) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "error", Some(&turn_id));
+                }
+                let user_message = e.user_message().map(str::to_owned);
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": req.session_id,
+                            "agent_alias": attribution_agent_alias,
+                            "model_provider": attribution_model_provider,
+                            "model": attribution_model,
+                            "chat_mode": format!("{chat_mode:?}"),
+                            "error": e.to_string(),
+                        })),
+                    "turn failed; emitting TurnComplete so the client exits the working state"
+                );
+                self.emit_turn_complete(
+                    &req.session_id,
+                    crate::rpc::types::TurnCompletionOutcome::Failed,
+                    user_message
+                        .clone()
+                        .unwrap_or_else(|| format!("turn failed: {e}")),
+                )
+                .await;
+                Err(rpc_err(
+                    INTERNAL_ERROR,
+                    user_message.unwrap_or_else(|| e.to_string()),
+                ))
+            }
+        }
+    }
+
+    /// Emit the terminal `session/update` notification for a turn.
+    /// The TUI uses this — not the JSON-RPC response — to flip
+    /// `turn_in_flight` back to false.
+    async fn emit_turn_complete(
+        &self,
+        session_id: &str,
+        outcome: crate::rpc::types::TurnCompletionOutcome,
+        content: String,
+    ) {
+        let update = SessionUpdateEvent::TurnComplete {
+            session_id: session_id.to_string(),
+            outcome,
+            content,
+        };
+        if let Ok(params) = serde_json::to_value(update) {
+            let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+            if let Ok(s) = serde_json::to_string(&n) {
+                let _ = self.rpc.send_raw(s).await;
+            }
+        }
+    }
+
+    async fn handle_session_configure(&self, params: &Value) -> RpcResult {
+        let req: SessionConfigureParams = parse_params(params)?;
+        validate_session_configure_overrides(&req.overrides)?;
+
+        // Capture the session generation /before/ acquiring the per-session
+        // update lock. If the session is replaced while we wait for the lock,
+        // the re-verification below will detect the mismatch and reject the
+        // stale configure.
+        let session_generation = self
+            .ctx
+            .sessions
+            .get_generation(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Acquire the per-session ordering boundary.
+        let _model_provider_update = self
+            .ctx
+            .sessions
+            .lock_model_provider_update(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Re-verify the session has not been replaced while we waited for
+        // the lock. If replaced, this configure is stale — reject it.
+        if self.ctx.sessions.get_generation(&req.session_id).await != Some(session_generation) {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+
+        let merged = self
+            .ctx
+            .sessions
+            .preview_overrides(&req.session_id, &req.overrides)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Model/model_provider overrides need a live provider-box rebuild,
+        // which requires Config — held here, not in the session store. Resolve
+        // the provider from the prospective merged override or configured
+        // agent, build the box, and only then commit the override.
+        let built_model_provider = if merged.model_provider.is_some() || merged.model.is_some() {
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(&req.session_id)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            let built = {
+                let config = self.ctx.config.read();
+                let agent_cfg = config
+                    .resolved_agent_config(&agent_alias)
+                    .or_else(|| config.agent(&agent_alias).cloned())
+                    .ok_or_else(|| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!("Agent `{agent_alias}` is not configured"),
+                        )
+                    })?;
+                let model_provider_ref = merged
+                    .model_provider
+                    .as_deref()
+                    .unwrap_or_else(|| agent_cfg.model_provider.as_str());
+                let (model_provider, model_provider_name, model_name) =
+                    crate::agent::agent::build_session_model_provider(
+                        &config,
+                        model_provider_ref,
+                        merged.model.as_deref(),
+                    )
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                    &agent_cfg,
+                    model_provider.as_ref(),
+                    &model_name,
+                );
+                (
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
+                )
+            };
+            Some(built)
+        } else {
+            None
+        };
+
+        let merged = self
+            .ctx
+            .sessions
+            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        if let Some((model_provider, model_provider_name, model_name, tool_dispatcher)) =
+            built_model_provider
+        {
+            self.ctx
+                .sessions
+                .apply_model_provider(
+                    &req.session_id,
+                    session_generation,
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
+                    None,
+                )
+                .await
+                .then_some(())
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        }
+
+        to_result(SessionConfigureResult {
+            session_id: req.session_id,
+            overrides: merged,
+        })
+    }
+
+    async fn handle_session_cancel(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let owner = self
+            .ctx
+            .sessions
+            .session_owner_tui_id(&req.session_id)
+            .await;
+        let allowed = match (
+            owner.as_ref().and_then(|o| o.as_deref()),
+            self.tui_id.as_deref(),
+        ) {
+            (Some(o), Some(c)) => o == c,
+            _ => false,
+        };
+        if !allowed {
+            let (agent_alias, model_provider, model) =
+                match self.ctx.sessions.get_agent(&req.session_id).await {
+                    Some(agent) => agent.lock().await.attribution_fields(),
+                    None => (String::new(), String::new(), String::new()),
+                };
+            let span = ::omnesagent_log::info_span!(
+                target: "omnesagent_log_internal_scope",
+                "omnesagent_scope",
+                session_key = %req.session_id,
+                agent_alias = %agent_alias,
+                model_provider = %model_provider,
+                model = %model,
+                channel = "rpc",
+            );
+            let _guard = span.enter();
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_category(::omnesagent_log::EventCategory::Channel)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "caller_tui_id": self.tui_id.as_deref().unwrap_or("<none>"),
+                        "owner_tui_id": owner
+                            .as_ref()
+                            .and_then(|o| o.as_deref())
+                            .unwrap_or("<none>"),
+                        "peer_label": &self.peer_label,
+                    })),
+                "session/cancel refused: caller does not own the session"
+            );
+            return Err(rpc_err(
+                SESSION_NOT_OWNED,
+                "Caller does not own this session",
+            ));
+        }
+        if self.ctx.sessions.cancel_session(&req.session_id) {
+            to_result(SessionCancelResult {
+                session_id: req.session_id,
+                cancelled: true,
+            })
+        } else {
+            Err(rpc_err(
+                SESSION_NOT_FOUND,
+                "No active turn for this session",
+            ))
+        }
+    }
+
+    async fn handle_session_git_branch(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let cwd = self
+            .ctx
+            .sessions
+            .get_workspace_dir(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "session not found"))?;
+        let info = crate::rpc::git::head_info(std::path::Path::new(&cwd)).unwrap_or_default();
+        to_result(SessionGitBranchResult {
+            session_id: req.session_id,
+            branch: info.branch,
+            hash: info.hash,
+        })
+    }
+
+    async fn handle_session_list(&self, params: &Value) -> RpcResult {
+        let backend = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        let req: SessionListParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+
+        // Use FTS when a query is provided, plain list otherwise.
+        let all = if let Some(ref keyword) = req.query {
+            if keyword.trim().is_empty() {
+                backend.list_sessions_with_metadata()
+            } else {
+                use omnesagent_infra::session_backend::SessionQuery;
+                backend.search(&SessionQuery {
+                    keyword: Some(keyword.clone()),
+                    limit: req.limit,
+                })
+            }
+        } else {
+            backend.list_sessions_with_metadata()
+        };
+
+        let sessions: Vec<SessionEntry> = all
+            .into_iter()
+            .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
+            .map(|meta| {
+                let agent_alias = meta.agent_alias.clone().or_else(|| {
+                    meta.channel_id
+                        .as_deref()
+                        .and_then(|c| config.agent_for_channel(c))
+                        .map(str::to_string)
+                });
+                let session_id = meta
+                    .key
+                    .strip_prefix("rpc_")
+                    .or_else(|| meta.key.strip_prefix("gw_"))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| meta.key.clone());
+                SessionEntry {
+                    session_id,
+                    session_key: meta.key,
+                    created_at: meta.created_at.to_rfc3339(),
+                    last_activity: meta.last_activity.to_rfc3339(),
+                    message_count: meta.message_count,
+                    agent_alias,
+                    channel_id: meta.channel_id,
+                    name: meta.name,
+                }
+            })
+            .collect();
+        to_result(SessionListResult { sessions })
+    }
+
+    /// List ACP sessions from the dedicated ACP session store. The Code (ACP)
+    /// pane in the TUI calls this instead of `session/list` so its picker only
+    /// shows sessions that came from `acp-sessions.db` — chat-pane sessions
+    /// live in the unified `session_backend` and must not appear here.
+    async fn handle_session_list_acp(&self, _params: &Value) -> RpcResult {
+        let store = self
+            .ctx
+            .acp_session_store
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?;
+
+        let summaries = store
+            .list_sessions()
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("acp session list failed: {e}")))?;
+
+        let sessions: Vec<SessionEntry> = summaries
+            .into_iter()
+            .map(|s| SessionEntry {
+                session_id: s.session_uuid.clone(),
+                // ACP sessions are keyed by their UUID directly — no `rpc_`/`gw_`
+                // prefix exists in this store, so session_id == session_key.
+                session_key: s.session_uuid,
+                created_at: s.created_at.to_rfc3339(),
+                last_activity: s.last_activity.to_rfc3339(),
+                message_count: s.message_count,
+                agent_alias: Some(s.agent_alias),
+                channel_id: None,
+                // ACP sessions don't carry a user-set display name today; the
+                // picker falls back to `session_id` when this is None.
+                name: None,
+            })
+            .collect();
+
+        to_result(SessionListResult { sessions })
+    }
+
+    async fn handle_session_messages(&self, params: &Value) -> RpcResult {
+        let req: SessionMessagesParams = parse_params(params)?;
+        let mut messages = Vec::new();
+        let mut acp_session_found = false;
+
+        if let Some(store) = self.ctx.acp_session_store.as_ref() {
+            match store.load_session(&req.session_id) {
+                Ok(Some(data)) => {
+                    acp_session_found = true;
+                    messages = conversation_message_entries(&data.messages);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load ACP session messages: {e}"),
+                    ));
+                }
+            }
+        }
+
+        if !acp_session_found {
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+
+            // Try the raw id first (channel sessions store as-is), then
+            // prefixed variants for RPC/gateway-originated sessions.
+            let candidates = [
+                req.session_id.clone(),
+                format!("rpc_{}", req.session_id),
+                format!("gw_{}", req.session_id),
+            ];
+            for key in &candidates {
+                let loaded = backend.load(key);
+                if !loaded.is_empty() {
+                    messages = loaded
+                        .into_iter()
+                        .map(|message| MessageEntry {
+                            role: message.role,
+                            content: message.content,
+                            kind: MessageEntryKind::Message,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                        })
+                        .collect();
+                    break;
+                }
+            }
+        }
+
+        let total = messages.len();
+        let limit = req.limit.unwrap_or(total);
+        let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
+        let start = end.saturating_sub(limit);
+        let messages = messages[start..end].to_vec();
+
+        to_result(SessionMessagesResult {
+            session_id: req.session_id,
+            messages,
+            total,
+            start,
+        })
+    }
+
+    async fn handle_session_state(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let backend = self
+            .ctx
+            .session_backend
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        let candidates = [
+            req.session_id.clone(),
+            format!("rpc_{}", req.session_id),
+            format!("gw_{}", req.session_id),
+        ];
+        for key in &candidates {
+            match backend.get_session_state(key) {
+                Ok(Some(ss)) => {
+                    return to_result(SessionStateResult {
+                        session_id: req.session_id,
+                        state: ss.state,
+                        turn_id: ss.turn_id,
+                        turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
+                    });
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to get session state: {e}"),
+                    ));
+                }
+            }
+        }
+        Err(rpc_err(SESSION_NOT_FOUND, "Session not found"))
+    }
+
+    async fn handle_session_delete(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+        if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
+            agent
+                .lock()
+                .await
+                .channel_handles()
+                .unregister_channel("rpc");
+        }
+        let existed = self.ctx.sessions.remove(&req.session_id).await;
+        if existed && let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_end(&req.session_id, "rpc").await;
+        }
+        // Remove from persistent backend — try raw id, then prefixed variants.
+        if let Some(ref backend) = self.ctx.session_backend {
+            for key in &[
+                req.session_id.clone(),
+                format!("rpc_{}", req.session_id),
+                format!("gw_{}", req.session_id),
+            ] {
+                let _ = backend.delete_session(key);
+            }
+        }
+        to_result(SessionDeleteResult {
+            session_id: req.session_id,
+            deleted: true,
+        })
+    }
+
+    fn handle_session_approve(&self, params: &Value) -> RpcResult {
+        let p: SessionApproveParams = parse_params(params)?;
+
+        let response = match p.decision.as_str() {
+            "allow_once" => omnesagent_api::channel::ChannelApprovalResponse::Approve,
+            "allow_always" => omnesagent_api::channel::ChannelApprovalResponse::AlwaysApprove,
+            "reject" | "reject_once" => omnesagent_api::channel::ChannelApprovalResponse::Deny,
+            "reject_with_edit" => {
+                let replacement = p.replacement.unwrap_or_default();
+                omnesagent_api::channel::ChannelApprovalResponse::DenyWithEdit { replacement }
+            }
+            other => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("unknown decision: {other}"),
+                ));
+            }
+        };
+
+        self.ctx.approval_pending.resolve(&p.request_id, response);
+
+        to_result(SessionApproveResult {
+            session_id: p.session_id,
+            request_id: p.request_id,
+            acknowledged: true,
+        })
+    }
+
+    // ── Memory handlers ──────────────────────────────────────────
+
+    async fn handle_memory_list(&self, params: &Value) -> RpcResult {
+        let mem = self
+            .ctx
+            .memory
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let req: MemoryListParams = parse_params(params)?;
+        let category = req
+            .category
+            .as_deref()
+            .map(|s| MemoryCategory::Custom(s.to_string()));
+        let entries = mem
+            .list(category.as_ref(), req.session_id.as_deref())
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory list failed: {e}")))?;
+        let count = entries.len();
+        let entries = truncate_memory_previews(entries);
+        to_result(MemoryListResult { entries, count })
+    }
+
+    async fn handle_memory_search(&self, params: &Value) -> RpcResult {
+        let mem = self
+            .ctx
+            .memory
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let req: MemorySearchParams = parse_params(params)?;
+        let entries = mem
+            .recall(
+                &req.query,
+                req.limit,
+                req.session_id.as_deref(),
+                req.since.as_deref(),
+                req.until.as_deref(),
+            )
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory search failed: {e}")))?;
+        let count = entries.len();
+        let entries = truncate_memory_previews(entries);
+        to_result(MemorySearchResult { entries, count })
+    }
+
+    /// `memory/get { key } → MemoryEntry`. Returns the full memory
+    /// entry for one key so the Memory pane can keep only preview
+    /// rows in memory and fetch the full `content` only when the
+    /// detail pane opens. Dropped on detail close.
+    async fn handle_memory_get(&self, params: &Value) -> RpcResult {
+        let mem = self
+            .ctx
+            .memory
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let req: MemoryGetParams = parse_params(params)?;
+        let entry = mem
+            .get(&req.key)
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory get failed: {e}")))?;
+        match entry {
+            Some(e) => to_result(MemoryGetResult { entry: Some(e) }),
+            None => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("Memory key `{}` not found", req.key),
+            )),
+        }
+    }
+
+    async fn handle_memory_store(&self, params: &Value) -> RpcResult {
+        let mem = self
+            .ctx
+            .memory
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let req: MemoryStoreParams = parse_params(params)?;
+        let category = req
+            .category
+            .as_deref()
+            .map(|s| MemoryCategory::Custom(s.to_string()))
+            .unwrap_or(MemoryCategory::Custom("user".into()));
+        mem.store(&req.key, &req.content, category, req.session_id.as_deref())
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory store failed: {e}")))?;
+        to_result(MemoryStoreResult {
+            key: req.key,
+            stored: true,
+        })
+    }
+
+    async fn handle_memory_delete(&self, params: &Value) -> RpcResult {
+        let mem = self
+            .ctx
+            .memory
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Memory subsystem is not available"))?;
+        let req: MemoryDeleteParams = parse_params(params)?;
+        mem.forget(&req.key)
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Memory delete failed: {e}")))?;
+        to_result(MemoryDeleteResult {
+            key: req.key,
+            deleted: true,
+        })
+    }
+
+    // ── Cron handlers ────────────────────────────────────────────
+
+    async fn handle_cron_list(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let jobs = crate::cron::list_jobs(&config)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron list failed: {e}")))?;
+        to_result(CronListResult { jobs })
+    }
+
+    async fn handle_cron_get(&self, params: &Value) -> RpcResult {
+        let req: CronIdParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let job = crate::cron::get_job(&config, &req.id)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        to_result(job)
+    }
+
+    async fn handle_cron_add(&self, params: &Value) -> RpcResult {
+        let req: CronAddParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let schedule = Schedule::Cron {
+            expr: req.schedule,
+            tz: req.tz,
+        };
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            &req.agent,
+            req.name,
+            schedule,
+            req.command.as_deref().unwrap_or(""),
+            req.delivery,
+            true, // RPC calls are pre-approved
+        )
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron add failed: {e}")))?;
+        to_result(job)
+    }
+
+    async fn handle_cron_patch(&self, params: &Value) -> RpcResult {
+        let req: CronPatchParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let patch = CronJobPatch {
+            schedule: req.schedule.map(|s| Schedule::Cron {
+                expr: s,
+                tz: if req.clear_tz == Some(true) {
+                    None
+                } else {
+                    req.tz
+                },
+            }),
+            command: req.command,
+            prompt: req.prompt,
+            name: req.name,
+            ..Default::default()
+        };
+        let job = crate::cron::update_job(&config, &req.id, patch)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron patch failed: {e}")))?;
+        to_result(job)
+    }
+
+    async fn handle_cron_delete(&self, params: &Value) -> RpcResult {
+        let req: CronIdParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        crate::cron::remove_job(&config, &req.id)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron delete failed: {e}")))?;
+        to_result(CronDeleteResult {
+            id: req.id,
+            deleted: true,
+        })
+    }
+
+    async fn handle_cron_runs(&self, params: &Value) -> RpcResult {
+        let req: CronRunsParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let limit = req.limit.unwrap_or(20) as usize;
+        let runs = crate::cron::list_runs(&config, &req.id, limit)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
+        to_result(CronRunsResult { runs })
+    }
+
+    async fn handle_cron_trigger(&self, params: &Value) -> RpcResult {
+        let req: CronIdParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let job = crate::cron::get_job(&config, &req.id)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
+        let event_tx = self.ctx.event_tx.clone();
+        let result = crate::cron::scheduler::run_manual_job(
+            &config,
+            &job,
+            crate::cron::scheduler::CronDeliveryContext::RpcManual,
+            &event_tx,
+        )
+        .await;
+        to_result(CronTriggerResult {
+            id: result.job_id,
+            success: result.success,
+            status: result.status,
+            output: result.output,
+            duration_ms: result.duration_ms,
+            started_at: result.started_at.to_rfc3339(),
+            finished_at: result.finished_at.to_rfc3339(),
+        })
+    }
+
+    async fn handle_cron_settings(&self, params: &Value) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        // If a "patch" field is present, this is a write; otherwise read.
+        if params.get("patch").is_some() {
+            not_yet_implemented(Method::CronSettings)
+        } else {
+            Ok(serde_json::to_value(&config.scheduler).unwrap_or(Value::Null))
+        }
+    }
+
+    // ── Config handlers ──────────────────────────────────────────
+
+    fn handle_config_get(&self, params: &Value) -> RpcResult {
+        use omnesagent_config::traits::MaskSecrets;
+        let req: ConfigGetParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        if let Some(prop) = req.prop {
+            let val = config
+                .get_prop(&prop)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("Unknown prop: {e}")))?;
+            to_result(ConfigGetPropResult { prop, value: val })
+        } else {
+            // Return full config, masked.
+            let mut masked = config;
+            masked.mask_secrets();
+            Ok(serde_json::to_value(&masked).unwrap_or(Value::Null))
+        }
+    }
+
+    async fn handle_config_set(&self, params: &Value) -> RpcResult {
+        let req: ConfigSetParams = parse_params(params)?;
+        let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        // Clone the live config and perform every mutation — alias creation,
+        // field lookup, value coercion, masked-secret validation, and the
+        // persistent write — on the working copy. Any early error simply
+        // returns and drops the clone, so a partially-applied attempt (e.g. a
+        // freshly auto-created alias followed by a coercion failure) is
+        // discarded as one unit and can never leave a phantom entry on the
+        // live config. Only a fully successful mutation is committed, by
+        // swapping the snapshot in under `config_write_guard`. This keeps
+        // alias-creation ownership inside `omnesagent-config` and commit
+        // orchestration inside the runtime, rather than mirroring config
+        // transaction semantics through a tracked tuple.
+        // `Config` is a large aggregate; box the working clone so it lives on
+        // the heap rather than inflating this async fn's stack frame across the
+        // awaits below.
+        let mut config = Box::new(self.ctx.config.read().clone());
+        if config.ensure_map_key_for_path(&req.prop) {
+            // Refused to vivify the reserved `default` agent: return a
+            // reserved error rather than a downstream "Unknown property".
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "alias `default` is reserved and cannot be created",
+            ));
+        }
+        let info = config
+            .prop_fields()
+            .into_iter()
+            .find(|f| f.name == req.prop);
+        // Polymorphic value: strings pass through, everything else coerced.
+        let value_str = match &req.value {
+            Value::String(s) => s.clone(),
+            other => match omnesagent_config::typed_value::coerce_for_set_prop(
+                other,
+                info.as_ref().map(|i| i.kind),
+            ) {
+                Ok(coerced) => coerced,
+                Err(e) => return Err(rpc_err(INVALID_PARAMS, e.message)),
+            },
+        };
+        // Reject the masked sentinel for secrets — surfaces echo the
+        // masked display value back when no real edit happened, and
+        // letting that through silently clobbers the live secret with
+        // the literal masked string.
+        let is_secret_prop = info
+            .as_ref()
+            .is_some_and(|i| i.is_secret || i.derived_from_secret)
+            || omnesagent_config::schema::Config::prop_is_secret(&req.prop);
+        if is_secret_prop
+            && (value_str == omnesagent_config::traits::MASKED_SECRET
+                || value_str == "****"
+                || value_str.is_empty())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "Refusing to overwrite secret `{}` with a masked or empty value",
+                    req.prop
+                ),
+            ));
+        }
+        if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
+            return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
+        }
+        self.save_and_swap_config(*config, &config_write_guard)
+            .await?;
+        if let Some(model_provider_ref) = refresh_model_provider_ref {
+            self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
+            self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
+        }
+        if let Some(agent_alias) = agent_alias_from_model_provider_prop(&req.prop) {
+            self.schedule_live_sessions_refresh_for_agent(agent_alias);
+        }
+        to_result(ConfigSetResult {
+            prop: req.prop,
+            set: true,
+        })
+    }
+
+    fn refresh_memory_embedder_for_model_provider(&self, model_provider_ref: &str) {
+        let resolved = {
+            let config = self.ctx.config.read();
+            if !memory_embeddings_use_provider(&config, model_provider_ref) {
+                return;
+            }
+            // Match daemon-boot resolution (`create_memory_with_storage_and_routes`
+            // is called with `api_key = None`): keys come from the per-route /
+            // `[memory]` override or the referenced profile, never an inherited seed.
+            omnesagent_memory::resolve_embedding_settings(
+                &config.memory,
+                &config.embedding_routes,
+                None,
+                Some(&config.providers.models),
+            )
+        };
+        // 1. Install-wide RPC memory handle.
+        if let Some(memory) = self.ctx.memory.as_ref() {
+            memory.refresh_embedder(
+                &resolved.model_provider,
+                resolved.api_key.as_deref(),
+                &resolved.model,
+                resolved.dimensions,
+            );
+        }
+        self.schedule_live_agent_memory_refresh(resolved);
+    }
+
+    fn schedule_live_agent_memory_refresh(&self, resolved: omnesagent_memory::EmbeddingSettings) {
+        let ctx = Arc::clone(&self.ctx);
+        omnesagent_spawn::spawn!(async move {
+            Self::refresh_live_agent_memory(ctx, resolved).await;
+        });
+    }
+
+    async fn refresh_live_agent_memory(
+        ctx: Arc<RpcContext>,
+        resolved: omnesagent_memory::EmbeddingSettings,
+    ) {
+        for session_id in ctx.sessions.list_ids().await {
+            if let Some(agent) = ctx.sessions.get_agent(&session_id).await {
+                agent.lock().await.refresh_memory_embedder(
+                    &resolved.model_provider,
+                    resolved.api_key.as_deref(),
+                    &resolved.model,
+                    resolved.dimensions,
+                );
+            }
+        }
+    }
+
+    fn schedule_live_sessions_refresh_for_model_provider(&self, model_provider_ref: String) {
+        let ctx = Arc::clone(&self.ctx);
+        omnesagent_spawn::spawn!(async move {
+            Self::refresh_live_sessions_for_model_provider(ctx, &model_provider_ref).await;
+        });
+    }
+
+    /// Rebuild the live agent box for every session bound to `agent_alias`,
+    /// resolving the agent's currently-configured `model_provider` from config.
+    /// Fired when `agents.<alias>.model_provider` changes via `config/set` so a
+    /// provider switch takes effect on the running session without a restart —
+    /// the same refresh a `providers.models.*` edit triggers. Only sessions
+    /// bound to the edited agent are rebuilt; sessions belonging to other
+    /// agents, and sessions that carry their own `model_provider` override, are
+    /// left untouched even when they resolve to the same provider.
+    fn schedule_live_sessions_refresh_for_agent(&self, agent_alias: String) {
+        let ctx = Arc::clone(&self.ctx);
+        omnesagent_spawn::spawn!(async move {
+            Self::refresh_live_sessions_for_agent(ctx, &agent_alias).await;
+        });
+    }
+
+    async fn refresh_live_sessions_for_agent(ctx: Arc<RpcContext>, agent_alias: &str) {
+        Self::refresh_live_sessions_matching(ctx, |config, session_agent, overrides| {
+            if !agent_scoped_refresh_selects(agent_alias, session_agent, overrides) {
+                return None;
+            }
+            config
+                .agent(agent_alias)
+                .map(|agent| agent.model_provider.to_string())
+        })
+        .await;
+    }
+
+    async fn refresh_live_sessions_for_model_provider(
+        ctx: Arc<RpcContext>,
+        model_provider_ref: &str,
+    ) {
+        let target_ref = model_provider_ref.to_string();
+        Self::refresh_live_sessions_matching(ctx, move |config, session_agent, overrides| {
+            if !provider_scoped_refresh_selects(&target_ref, overrides) {
+                return None;
+            }
+            let effective_ref = overrides.model_provider.as_deref().or_else(|| {
+                config
+                    .agent(session_agent)
+                    .map(|agent| agent.model_provider.as_str())
+            });
+            (effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone())
+        })
+        .await;
+    }
+
+    async fn refresh_live_sessions_matching<F>(ctx: Arc<RpcContext>, resolve_provider_ref: F)
+    where
+        F: Fn(&Config, &str, &SessionOverrides) -> Option<String>,
+    {
+        let session_ids = ctx.sessions.list_ids().await;
+        for session_id in session_ids {
+            // Capture the generation before acquiring the lock so we can
+            // detect same-ID replacement while waiting.
+            let Some(session_generation) = ctx.sessions.get_generation(&session_id).await else {
+                continue;
+            };
+
+            // Acquire the per-session ordering boundary. This serialises
+            // with session/configure so the state we read afterwards
+            // reflects any configure that committed before this point.
+            let Some(_model_provider_update) =
+                ctx.sessions.lock_model_provider_update(&session_id).await
+            else {
+                continue;
+            };
+
+            // Re-verify the session has not been replaced while we waited
+            // for the lock.
+            let Some(current_gen) = ctx.sessions.get_generation(&session_id).await else {
+                continue;
+            };
+            if current_gen != session_generation {
+                continue;
+            };
+
+            // Re-read alias and overrides inside the ordering boundary.
+            // A session/configure may have committed new overrides on the
+            // same generation while we were waiting for the lock; reading
+            // here ensures the refresh acts on the latest state.
+            let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+                continue;
+            };
+            let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                continue;
+            };
+
+            let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
+                let config = ctx.config.read();
+                let Some(model_provider_ref) =
+                    resolve_provider_ref(&config, &agent_alias, &overrides)
+                else {
+                    continue;
+                };
+                let provider_temperature = model_provider_ref.split_once('.').and_then(
+                    |(provider_type, provider_alias)| {
+                        config
+                            .providers
+                            .models
+                            .find(provider_type, provider_alias)
+                            .and_then(|entry| entry.temperature)
+                    },
+                );
+                let Some(agent_cfg) = config
+                    .resolved_agent_config(&agent_alias)
+                    .or_else(|| config.agent(&agent_alias).cloned())
+                else {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": session_id,
+                                "agent_alias": agent_alias,
+                                "model_provider": model_provider_ref,
+                            })),
+                        "config/set saved provider profile but live session refresh could not resolve agent config"
+                    );
+                    continue;
+                };
+                match crate::agent::agent::build_session_model_provider(
+                    &config,
+                    &model_provider_ref,
+                    overrides.model.as_deref(),
+                ) {
+                    Ok((model_provider, model_provider_name, model_name)) => {
+                        let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                            &agent_cfg,
+                            model_provider.as_ref(),
+                            &model_name,
+                        );
+                        (
+                            model_provider,
+                            model_provider_name,
+                            model_name,
+                            tool_dispatcher,
+                            overrides.temperature.or(provider_temperature),
+                        )
+                    }
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": session_id,
+                                "agent_alias": agent_alias,
+                                "model_provider": model_provider_ref,
+                                "error": e.to_string(),
+                            })),
+                            "config/set saved provider profile but live session refresh failed"
+                        );
+                        continue;
+                    }
+                }
+            };
+            ctx.sessions
+                .apply_model_provider(
+                    &session_id,
+                    session_generation,
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
+                    Some(temperature),
+                )
+                .await;
+        }
+    }
+
+    fn handle_config_validate(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        match config.validate() {
+            Ok(()) => to_result(ConfigValidateResult {
+                valid: true,
+                error: None,
+            }),
+            Err(e) => to_result(ConfigValidateResult {
+                valid: false,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    fn handle_config_reload(&self) -> RpcResult {
+        if !self.schedule_daemon_reload("config") {
+            return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
+        }
+        to_result(ConfigReloadResult { reloading: true })
+    }
+
+    fn schedule_daemon_reload(&self, surface: &'static str) -> bool {
+        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+            return false;
+        };
+        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        omnesagent_spawn::spawn!(async move {
+            tokio::time::sleep(RPC_RELOAD_REPLY_FLUSH_DELAY).await;
+            if let Some(gateway_shutdown_tx) = gateway_shutdown_tx {
+                let _ = gateway_shutdown_tx.send(true);
+                tokio::time::sleep(RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY).await;
+            }
+            let _ = reload_tx.send(true);
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Complete)
+                    .with_outcome(::omnesagent_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({ "surface": surface })),
+                "daemon reload dispatched"
+            );
+        });
+        true
+    }
+
+    fn handle_config_list(&self, params: &Value) -> RpcResult {
+        use omnesagent_config::field_visibility;
+        use omnesagent_config::traits::ConfigFieldEntry;
+        let req: ConfigListParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let prefix = req.prefix.as_deref();
+        let excluded = field_visibility::excluded_paths(&config, prefix.unwrap_or(""));
+        let entries: Vec<ConfigFieldEntry> = config
+            .prop_fields()
+            .into_iter()
+            .filter(|info| match prefix {
+                Some(p) => field_visibility::path_matches_prefix(&info.name, p),
+                None => true,
+            })
+            .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
+            .map(|info| {
+                let env = config.prop_is_env_overridden(&info.name);
+                ConfigFieldEntry::from_prop_field(info, env)
+            })
+            .collect();
+        to_result(ConfigListResult { entries })
+    }
+
+    async fn handle_config_delete(&self, params: &Value) -> RpcResult {
+        let req: ConfigDeleteParams = parse_params(params)?;
+        let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        {
+            let mut config = self.ctx.config.write();
+            config
+                .set_prop_persistent(&req.prop, "")
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        }
+        self.flush_config(&config_write_guard).await?;
+        if let Some(model_provider_ref) = refresh_model_provider_ref {
+            self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
+            self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
+        }
+        to_result(ConfigDeleteResult {
+            prop: req.prop,
+            deleted: true,
+        })
+    }
+
+    fn handle_config_resolve_alias_source(&self, params: &Value) -> RpcResult {
+        let req: ConfigResolveAliasSourceParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let values = config.resolve_alias_source(req.source);
+        to_result(ConfigResolveAliasSourceResult {
+            source: req.source,
+            values,
+        })
+    }
+
+    fn handle_config_map_keys(&self, params: &Value) -> RpcResult {
+        let req: ConfigMapKeysParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let keys = config.get_map_keys(&req.path).ok_or_else(|| {
+            rpc_err(
+                INVALID_PARAMS,
+                format!("No map-keyed section at `{}`", req.path),
+            )
+        })?;
+        to_result(ConfigMapKeysResult {
+            path: req.path,
+            keys,
+        })
+    }
+
+    async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
+        let req: ConfigMapKeyCreateParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let created = {
+            let mut config = self.ctx.config.write();
+            // Shared guarded boundary: enforces the reserved-agent rule (the
+            // `default` runtime fallback) on this surface too, so the RPC create
+            // path cannot author an `agents.default` the rename guard then traps.
+            let created = omnesagent_config::alias_refs::create_map_key_checked(
+                &mut config,
+                &req.path,
+                &req.key,
+            )
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+            if created {
+                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+            }
+            created
+        };
+        if created {
+            self.flush_config(&config_write_guard).await?;
+        }
+        to_result(ConfigMapKeyCreateResult {
+            path: req.path,
+            key: req.key,
+            created,
+        })
+    }
+
+    async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
+        let req: ConfigMapKeyDeleteParams = parse_params(params)?;
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let deleted = {
+            let mut config = self.ctx.config.write();
+            let deleted = config
+                .delete_map_key(&req.path, &req.key)
+                .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+            if deleted {
+                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+            }
+            deleted
+        };
+        if deleted {
+            self.flush_config(&config_write_guard).await?;
+        }
+        to_result(ConfigMapKeyDeleteResult {
+            path: req.path,
+            key: req.key,
+            deleted,
+        })
+    }
+
+    fn handle_config_map_key_rename<'a>(&'a self, params: &'a Value) -> BoxRpcFuture<'a> {
+        let req: ConfigMapKeyRenameParams = match parse_params(params) {
+            Ok(req) => req,
+            Err(err) => return Box::pin(std::future::ready(Err(err))),
+        };
+
+        Box::pin(async move {
+            // Acquired once here, not inside `handle_config_alias_rename`:
+            // the alias-kind branch below delegates into it, and the tokio
+            // Mutex is not reentrant. The guard moves by value into the
+            // alias-rename path so it can be released at that handler's
+            // commit point, before its slow post-commit side effects.
+            let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+            if let Some(kind) = omnesagent_config::alias_refs::alias_kind_for_map_path(&req.path) {
+                return self
+                    .handle_config_alias_rename(req, kind, config_write_guard)
+                    .await;
+            }
+
+            let renamed = {
+                let mut config = self.ctx.config.write();
+                let renamed = config
+                    .rename_map_key(&req.path, &req.from, &req.to)
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
+                if renamed {
+                    config.mark_dirty(&format!("{}.{}", req.path, req.from));
+                    config.mark_dirty(&format!("{}.{}", req.path, req.to));
+                }
+                renamed
+            };
+            if renamed {
+                self.flush_config(&config_write_guard).await?;
+            }
+            to_result(ConfigMapKeyRenameResult {
+                path: req.path,
+                from: req.from,
+                to: req.to,
+                renamed,
+                warnings: Vec::new(),
+            })
+        })
+    }
+
+    fn handle_config_alias_rename<'a>(
+        &'a self,
+        req: ConfigMapKeyRenameParams,
+        kind: omnesagent_config::alias_refs::AliasKind,
+        config_write_guard: ConfigWriteGuard,
+    ) -> BoxRpcFuture<'a> {
+        Box::pin(async move {
+            let is_agent = matches!(kind, omnesagent_config::alias_refs::AliasKind::Agent);
+            if is_agent {
+                // Live RPC sessions hold the selected agent alias in memory; refuse
+                // rather than letting them recreate old-alias state after the rename.
+                let active = self
+                    .ctx
+                    .sessions
+                    .count_by_agent()
+                    .await
+                    .get(&req.from)
+                    .copied()
+                    .unwrap_or(0);
+                if active > 0 {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        format!(
+                            "{}.{}: cannot rename agent with {active} active RPC session(s); close those sessions first",
+                            req.path, req.from
+                        ),
+                    ));
+                }
+            }
+
+            let mut working = self.ctx.config.read().clone();
+            let old_workspace = is_agent.then(|| working.agent_workspace_dir(&req.from));
+            // If a prior call saved config as `to` but crashed before side effects,
+            // re-running `from -> to` should converge lagging owned state instead
+            // of failing because `from` is no longer a config key.
+            let resume_committed_to = is_agent
+                && working.agent(&req.from).is_none()
+                && working.agent(&req.to).is_some()
+                && self.agent_rename_residue_exists(&working, &req.from).await;
+
+            if !resume_committed_to {
+                let report = omnesagent_config::alias_refs::rename_with_cascade(
+                    &mut working,
+                    &kind,
+                    &req.from,
+                    &req.to,
+                )
+                .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
+                for path in &report.dirty_paths {
+                    working.mark_dirty(path);
+                }
+                self.save_and_swap_config(working.clone(), &config_write_guard)
+                    .await?;
+            }
+            // Config is committed (saved + swapped, or already committed by a
+            // prior crashed run). Release before the post-commit side effects
+            // below: workspace moves and the memory/cron/ACP/session-backend
+            // cascade can be slow or wedge, and holding the lock across them
+            // would stall every config-mutating RPC daemon-wide.
+            drop(config_write_guard);
+            let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
+
+            let mut warnings = Vec::new();
+            if let (Some(old_workspace), Some(new_workspace)) = (old_workspace, new_workspace) {
+                warnings.extend(move_renamed_agent_workspace(&old_workspace, &new_workspace).await);
+                warnings.extend(
+                    self.rename_agent_owned_state(&working, &req.from, &req.to)
+                        .await,
+                );
+            }
+
+            to_result(ConfigMapKeyRenameResult {
+                path: req.path,
+                from: req.from,
+                to: req.to,
+                renamed: true,
+                warnings,
+            })
+        })
+    }
+
+    async fn rename_agent_owned_state(
+        &self,
+        config: &omnesagent_config::schema::Config,
+        from: &str,
+        to: &str,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut memory_rows = 0usize;
+        let mut cron_jobs = 0usize;
+        let mut acp_sessions = 0usize;
+        let mut sessions_repointed = 0usize;
+
+        if let Some(mem) = &self.ctx.memory {
+            match mem.rename_agent(from, to).await {
+                Ok(n) => memory_rows = n,
+                Err(e) => warnings.push(format!("memory rename: {e}")),
+            }
+        }
+
+        match crate::cron::rename_jobs_by_agent(config, from, to) {
+            Ok(n) => cron_jobs = n,
+            Err(e) => warnings.push(format!("cron rename: {e}")),
+        }
+
+        match &self.ctx.acp_session_store {
+            Some(store) => match store.rename_sessions_by_agent(from, to) {
+                Ok(n) => acp_sessions = n,
+                Err(e) => warnings.push(format!("acp rename: {e}")),
+            },
+            None => warnings.push("acp store unavailable".to_string()),
+        }
+
+        if let Some(backend) = &self.ctx.session_backend {
+            match backend.rename_agent_attribution(from, to) {
+                Ok(n) => sessions_repointed = n,
+                Err(e) => warnings.push(format!("session attribution rename: {e}")),
+            }
+        }
+
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "memory": memory_rows,
+                    "cron": cron_jobs,
+                    "acp": acp_sessions,
+                    "sessions": sessions_repointed,
+                    "warnings": warnings.clone(),
+                })
+            ),
+            "agent renamed with RPC owned-state cascade"
+        );
+
+        warnings
+    }
+
+    fn handle_config_templates(&self) -> RpcResult {
+        use omnesagent_config::schema::Config;
+        let templates: Vec<ConfigTemplateEntry> = Config::map_key_sections()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        to_result(ConfigTemplatesResult { templates })
+    }
+
+    // ── Agents handlers ──────────────────────────────────────────
+
+    fn handle_agents_list(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let agents: Vec<AgentEntry> = config
+            .agents
+            .iter()
+            .map(|(alias, agent_cfg)| AgentEntry {
+                alias: alias.clone(),
+                enabled: agent_cfg.enabled,
+                channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
+            })
+            .collect();
+        to_result(AgentsListResult { agents })
+    }
+
+    async fn handle_agents_status(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+
+        // Count sessions from the persisted backend (covers channel-originated
+        // sessions) + in-memory RPC sessions, deduped by taking the max.
+        let rpc_counts = self.ctx.sessions.count_by_agent().await;
+        let mut backend_counts = std::collections::HashMap::<String, usize>::new();
+        if let Some(ref backend) = self.ctx.session_backend {
+            for meta in backend.list_sessions_with_metadata() {
+                let alias = meta.agent_alias.or_else(|| {
+                    meta.channel_id
+                        .as_deref()
+                        .and_then(|c| config.agent_for_channel(c))
+                        .map(str::to_string)
+                });
+                if let Some(a) = alias {
+                    *backend_counts.entry(a).or_default() += 1;
+                }
+            }
+        }
+
+        let agents: Vec<AgentStatusEntry> = config
+            .agents
+            .iter()
+            .map(|(alias, agent_cfg)| {
+                let rpc = *rpc_counts.get(alias).unwrap_or(&0);
+                let persisted = *backend_counts.get(alias).unwrap_or(&0);
+                AgentStatusEntry {
+                    alias: alias.clone(),
+                    enabled: agent_cfg.enabled,
+                    live_sessions: rpc,
+                    persisted_sessions: persisted,
+                    channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
+                }
+            })
+            .collect();
+        to_result(AgentsStatusResult { agents })
+    }
+
+    // ── Cost handler ─────────────────────────────────────────────
+
+    fn handle_cost_query(&self, params: &Value) -> RpcResult {
+        let tracker = self
+            .ctx
+            .cost_tracker
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Cost tracking is not available"))?;
+        let req: CostQueryParams = parse_params(params)?;
+        // Optional `[from, to)` window (RFC3339). Lets callers (the dashboard's
+        // Reports view, or an external CLI report) pull day/month/quarter/YTD
+        // scalars rather than only the daemon's today/this-month aggregates.
+        let parse_bound = |raw: &str| -> Result<chrono::DateTime<chrono::Utc>, _> {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid date {raw:?}: {e}")))
+        };
+        let from = req.from.as_deref().map(parse_bound).transpose()?;
+        let to = req.to.as_deref().map(parse_bound).transpose()?;
+        // Precedence (inherited from the existing per-agent path): an explicit
+        // `agent` selects that agent's summary and the [from, to) window does
+        // NOT apply; the window scopes only the fleet-wide summary.
+        let summary = if let Some(agent) = req.agent {
+            tracker
+                .get_summary_for_agent(&agent)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
+        } else if from.is_some() || to.is_some() {
+            tracker
+                .get_summary_in_bounds(from, to)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
+        } else {
+            tracker
+                .get_summary()
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cost query failed: {e}")))?
+        };
+        to_result(summary)
+    }
+
+    fn handle_cost_org(&self) -> RpcResult {
+        let path = self.ctx.config.read().data_dir.join("org_cost.json");
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let value: Value = serde_json::from_str(&raw).map_err(|e| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("org_cost.json is not valid JSON: {e}"),
+                    )
+                })?;
+                Ok(value)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+            Err(e) => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("failed to read org_cost.json: {e}"),
+            )),
+        }
+    }
+
+    // ── Skills handlers ──────────────────────────────────────────
+
+    fn handle_skills_bundles(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let bundles: Vec<SkillBundleEntry> = svc
+            .list_bundles()
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills bundles failed: {e}")))?
+            .into_iter()
+            .map(|b| SkillBundleEntry {
+                alias: b.alias,
+                directory: b.directory.to_string_lossy().to_string(),
+                include: b.include,
+                exclude: b.exclude,
+            })
+            .collect();
+        to_result(SkillsBundlesResult { bundles })
+    }
+
+    fn handle_skills_list(&self, params: &Value) -> RpcResult {
+        let req: SkillsListParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let skills: Vec<SkillListEntry> = svc
+            .list_skills(req.bundle.as_deref())
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skills list failed: {e}")))?
+            .into_iter()
+            .map(|s| SkillListEntry {
+                bundle: s.r#ref.bundle().to_string(),
+                name: s.r#ref.name().to_string(),
+                directory: s.directory.to_string_lossy().to_string(),
+                frontmatter: s.frontmatter,
+            })
+            .collect();
+        to_result(SkillsListResult { skills })
+    }
+
+    fn handle_skills_read(&self, params: &Value) -> RpcResult {
+        let req: SkillsReadParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let skill_ref = svc
+            .resolve_ref(&req.name, Some(&req.bundle))
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let doc = svc
+            .read_skill(&skill_ref)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill read failed: {e}")))?;
+        to_result(SkillsReadResult {
+            bundle: req.bundle,
+            name: req.name,
+            frontmatter: doc.frontmatter,
+            body: doc.body,
+        })
+    }
+
+    fn handle_skills_write(&self, params: &Value) -> RpcResult {
+        let req: SkillsWriteParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let skill_ref = svc
+            .resolve_ref(&req.name, Some(&req.bundle))
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        let doc = crate::skills::document::SkillDocument {
+            frontmatter: req.frontmatter,
+            body: req.body,
+        };
+        svc.write_skill(&skill_ref, &doc)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill write failed: {e}")))?;
+        to_result(SkillsWriteResult {
+            bundle: req.bundle,
+            name: req.name,
+            written: true,
+        })
+    }
+
+    fn handle_skills_delete(&self, params: &Value) -> RpcResult {
+        let req: SkillsDeleteParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let root = config.install_root_dir();
+        let svc = crate::skills::service::SkillsService::new(&config, &root);
+        let skill_ref = svc
+            .resolve_ref(&req.name, Some(&req.bundle))
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid skill ref: {e}")))?;
+        svc.remove_skill(&skill_ref, crate::skills::service::RemoveMode::Archive)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Skill delete failed: {e}")))?;
+        to_result(SkillsDeleteResult {
+            bundle: req.bundle,
+            name: req.name,
+            deleted: true,
+        })
+    }
+
+    // ── Personality handlers ─────────────────────────────────────
+
+    fn handle_personality_list(&self, params: &Value) -> RpcResult {
+        let req: PersonalityListParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let workspace = req.agent.as_deref().map(|a| config.agent_workspace_dir(a));
+        let files: Vec<PersonalityFileEntry> =
+            crate::agent::personality::EDITABLE_PERSONALITY_FILES
+                .iter()
+                .map(|&filename| {
+                    let (exists, size, mtime_ms) = workspace
+                        .as_ref()
+                        .and_then(|dir| {
+                            let path = dir.join(filename);
+                            let meta = std::fs::metadata(&path).ok()?;
+                            let mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as i64);
+                            Some((true, meta.len(), mtime))
+                        })
+                        .unwrap_or((false, 0, None));
+                    PersonalityFileEntry {
+                        filename: filename.to_string(),
+                        exists,
+                        size,
+                        mtime_ms,
+                    }
+                })
+                .collect();
+        to_result(PersonalityListResult {
+            files,
+            max_chars: crate::agent::personality::MAX_FILE_CHARS,
+        })
+    }
+
+    fn handle_personality_get(&self, params: &Value) -> RpcResult {
+        let req: PersonalityGetParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+
+        // Sandbox: only allow files from the allowlist.
+        if !crate::agent::personality::EDITABLE_PERSONALITY_FILES.contains(&req.filename.as_str()) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Not an editable file: {}", req.filename),
+            ));
+        }
+        let workspace = config.agent_workspace_dir(&req.agent);
+        let path = workspace.join(&req.filename);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let mtime_ms = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64);
+                let truncated = content.chars().count() > crate::agent::personality::MAX_FILE_CHARS;
+                to_result(PersonalityGetResult {
+                    filename: req.filename,
+                    content: Some(content),
+                    exists: true,
+                    truncated,
+                    mtime_ms,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => to_result(PersonalityGetResult {
+                filename: req.filename,
+                content: None,
+                exists: false,
+                truncated: false,
+                mtime_ms: None,
+            }),
+            Err(e) => Err(rpc_err(INTERNAL_ERROR, format!("Read failed: {e}"))),
+        }
+    }
+
+    fn handle_personality_put(&self, params: &Value) -> RpcResult {
+        let req: PersonalityPutParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+
+        if !crate::agent::personality::EDITABLE_PERSONALITY_FILES.contains(&req.filename.as_str()) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Not an editable file: {}", req.filename),
+            ));
+        }
+        if req.content.chars().count() > crate::agent::personality::MAX_FILE_CHARS {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "Content exceeds {} char limit",
+                    crate::agent::personality::MAX_FILE_CHARS
+                ),
+            ));
+        }
+        let workspace = config.agent_workspace_dir(&req.agent);
+        let path = workspace.join(&req.filename);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, &req.content)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Write failed: {e}")))?;
+        let bytes_written = req.content.len() as u64;
+        let mtime_ms = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        to_result(PersonalityPutResult {
+            bytes_written,
+            mtime_ms,
+        })
+    }
+
+    fn handle_personality_templates(&self, params: &Value) -> RpcResult {
+        let req: PersonalityTemplatesParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let ctx = personality_template_context(&config, &req);
+        let templates = crate::agent::personality_templates::render_preset_default(&ctx);
+        let files: Vec<TemplateFileEntry> = templates
+            .into_iter()
+            .map(|(name, content)| TemplateFileEntry {
+                filename: name.to_string(),
+                content,
+            })
+            .collect();
+        to_result(PersonalityTemplatesResult {
+            preset: "default".to_string(),
+            files,
+        })
+    }
+
+    // ── Config introspection handlers ───────────────────────────
+
+    fn handle_config_sections(&self) -> RpcResult {
+        use omnesagent_config::schema::Config;
+        use omnesagent_config::sections::{
+            QUICKSTART_SECTIONS, Section, SectionShape, section_help, section_index_for_key,
+        };
+
+        let config = self.ctx.config.read().clone();
+
+        // Schema-driven: walk Config::prop_fields() to discover ALL
+        // top-level section roots, not just QUICKSTART_SECTIONS.
+        let mut roots: std::collections::BTreeSet<String> = config
+            .prop_fields()
+            .iter()
+            .filter_map(|f| f.name.split('.').next().map(str::to_string))
+            .collect();
+
+        // Hidden system fields the user never edits.
+        const HIDDEN: &[&str] = &[
+            "schema_version",
+            "onboard_state",
+            "onboard-state",
+            "config_path",
+            "workspace_dir",
+            "env_overridden_paths",
+            "pre_override_snapshots",
+        ];
+        for h in HIDDEN {
+            roots.remove(*h);
+        }
+
+        // Map-keyed sections surface even when empty.
+        let all_map_paths: Vec<&'static str> =
+            Config::map_key_sections().iter().map(|s| s.path).collect();
+        for &prefix in &all_map_paths
+            .iter()
+            .filter_map(|p| p.split('.').next())
+            .collect::<std::collections::HashSet<_>>()
+        {
+            roots.insert(prefix.to_string());
+        }
+
+        // Inject synthetic onboarding sections (e.g. personality).
+        for s in QUICKSTART_SECTIONS {
+            roots.insert(s.as_str().to_string());
+        }
+
+        let direct_scalar_parents: std::collections::HashSet<String> = config
+            .prop_fields()
+            .iter()
+            .filter_map(|f| {
+                let mut segs = f.name.split('.');
+                let root = segs.next()?;
+                // exactly one more segment past root = direct child scalar
+                segs.next()?;
+                if segs.next().is_some() {
+                    return None;
+                }
+                Some(root.to_string())
+            })
+            .collect();
+        let parents_with_children: std::collections::HashSet<String> = roots
+            .iter()
+            .filter_map(|k| k.split_once('.').map(|(p, _)| p.to_string()))
+            .collect();
+        roots.retain(|k| {
+            k.contains('.')
+                || !parents_with_children.contains(k)
+                || direct_scalar_parents.contains(k)
+        });
+
+        // Hide cost.rates subtree.
+        roots.retain(|k| !k.starts_with("cost.rates"));
+
+        // Sort: onboarding sections in canonical order first, rest alpha.
+        let mut ordered: Vec<String> = roots.into_iter().collect();
+        ordered.sort_by(
+            |a, b| match (section_index_for_key(a), section_index_for_key(b)) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            },
+        );
+
+        // Picker eligibility: map-keyed section or onboarding section
+        // with a picker shape.
+        let section_has_picker_for_key = |key: &str| -> bool {
+            let key_dot = format!("{key}.");
+            all_map_paths.iter().any(|p| {
+                *p == key
+                    || p.strip_prefix(&key_dot)
+                        .is_some_and(|rest| !rest.contains('.'))
+            })
+        };
+
+        let sections: Vec<ConfigSectionEntry> = ordered
+            .into_iter()
+            .map(|key| {
+                let wizard = Section::from_key(&key);
+                let has_picker = match wizard {
+                    Some(w) => matches!(
+                        w.shape(),
+                        SectionShape::TypedFamilyMap | SectionShape::OneTierAliasMap
+                    ),
+                    None => section_has_picker_for_key(&key),
+                };
+                let completed = wizard
+                    .map(|w| omnesagent_config::sections::section_has_signal(&config, w))
+                    .unwrap_or(false);
+                let label = omnesagent_config::sections::humanize_section_key(&key);
+                ConfigSectionEntry {
+                    help: section_help(&key).to_string(),
+                    has_picker,
+                    completed,
+                    ready: false,
+                    group: omnesagent_config::sections::section_group_for_key(&key)
+                        .label()
+                        .to_string(),
+                    is_quickstart: wizard.is_some(),
+                    shape: wizard.map(Section::shape),
+                    cost_category: omnesagent_config::schema::cost_category_for_provider_section(
+                        &key,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
+                    label,
+                    key,
+                }
+            })
+            .collect();
+        to_result(ConfigSectionsResult { sections })
+    }
+
+    fn handle_config_status(&self) -> RpcResult {
+        use omnesagent_config::sections::QUICKSTART_SECTIONS;
+        let config = self.ctx.config.read().clone();
+        let missing: Vec<String> = QUICKSTART_SECTIONS
+            .iter()
+            .filter(|&&s| !omnesagent_config::sections::section_has_signal(&config, s))
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let needs_quickstart = !missing.is_empty();
+        let reason = if needs_quickstart {
+            format!("{} section(s) incomplete", missing.len())
+        } else {
+            "all sections complete".to_string()
+        };
+        to_result(ConfigStatusResult {
+            needs_quickstart,
+            reason,
+            has_partial_state: false,
+            missing,
+        })
+    }
+
+    fn handle_config_catalog(&self) -> RpcResult {
+        let providers: Vec<CatalogModelProvider> = omnesagent_providers::list_model_providers()
+            .into_iter()
+            .map(|p| CatalogModelProvider {
+                name: p.name.to_string(),
+                display_name: p.display_name.to_string(),
+                local: p.local,
+            })
+            .collect();
+        to_result(CatalogResponse {
+            model_providers: providers,
+        })
+    }
+
+    async fn handle_config_catalog_models(&self, params: &Value) -> RpcResult {
+        let req: CatalogModelsParams = parse_params(params)?;
+        let local = crate::quickstart::model_provider_is_local(&req.model_provider);
+        // Snapshot config so the catalog can resolve the alias credential and
+        // reach the native /models endpoint (surfacing new native-only models
+        // that models.dev may not carry yet) rather than silently falling back.
+        let config = self.ctx.config.read().clone();
+        let (models, pricing, live) =
+            crate::quickstart::model_catalog_with_config(Some(&config), &req.model_provider).await;
+        to_result(CatalogModelsResult {
+            model_provider: req.model_provider,
+            models,
+            pricing,
+            local,
+            live,
+        })
+    }
+
+    // ── Logs handler ─────────────────────────────────────────────
+
+    async fn handle_logs_subscribe(&self) -> RpcResult {
+        let event_tx = self
+            .ctx
+            .event_tx
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Event streaming is not available"))?;
+        let mut rx = event_tx.subscribe();
+        let rpc = self.rpc.clone();
+        omnesagent_spawn::spawn!(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = rpc.closed() => break,
+                    event = rx.recv() => match event {
+                        Ok(mut event) => {
+                            // Pairing secrets (QR payloads, one-shot pair codes)
+                            // ride the shared broadcast bus stamped with the
+                            // ephemeral marker. `logs/subscribe` is NOT the
+                            // bearer-authenticated SSE surface those credentials
+                            // are scoped to — a fresh remote RPC client can
+                            // `initialize` and subscribe over WSS without the
+                            // gateway bearer check — so fail closed: withhold
+                            // marked frames entirely and strip the internal
+                            // marker from everything else (public shape
+                            // unchanged). See `omnesagent_gateway::sse`.
+                            if omnesagent_log::frame_carries_ephemeral_credentials(&event) {
+                                continue;
+                            }
+                            omnesagent_log::strip_ephemeral_broadcast_marker(&mut event);
+                            let notification =
+                                JsonRpcNotification::new(notification::LOGS_EVENT, event);
+                            if let Ok(json) = serde_json::to_string(&notification)
+                                && !rpc.send_raw(json).await
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                }
+            }
+        });
+        to_result(LogsSubscribeResult { subscribed: true })
+    }
+
+    #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
+    async fn handle_logs_query(&self, params: &Value) -> RpcResult {
+        let p: LogsQueryParams = parse_params(params)?;
+
+        let path = omnesagent_log::current_log_path()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
+
+        let filter = omnesagent_log::LogFilter {
+            since_ts: p.since_ts,
+            until_ts: p.until_ts,
+            until_id: p.until_id,
+            until_line_offset: p.until_line_offset,
+            action: p.action,
+            category: p.category,
+            outcome: p.outcome,
+            severity_min: p.severity_min,
+            trace_id: p.trace_id,
+            q: p.q,
+            hide_internal: p.hide_internal,
+            field_eq: std::collections::BTreeMap::new(),
+        };
+
+        let limit = p.limit.unwrap_or(200);
+
+        let page = omnesagent_log::load_page(&path, &filter, limit)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+
+        let events: Vec<serde_json::Value> = page
+            .events
+            .into_iter()
+            .filter_map(|evt| serde_json::to_value(evt).ok())
+            .collect();
+
+        to_result(LogsQueryResult {
+            events,
+            log_path: omnesagent_log::active_log_path()
+                .map(|path| path.to_string_lossy().into_owned()),
+            next_cursor: page.next_cursor,
+            next_cursor_line_offset: page.next_cursor_line_offset,
+            at_end: page.at_end,
+        })
+    }
+
+    /// `logs/get { id } → LogEvent`. Loads one full event by id from
+    /// the persistent JSONL log so the Logs pane can keep only preview
+    /// fields in memory and lazy-fetch the full payload only when the
+    /// user opens the detail pane.
+    async fn handle_logs_get(&self, params: &Value) -> RpcResult {
+        let p: LogsGetParams = parse_params(params)?;
+        let path = omnesagent_log::current_log_path()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
+        let event = omnesagent_log::find_event_by_id(&path, &p.id)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Log read failed: {e:#}")))?;
+        match event {
+            Some(evt) => {
+                let event = serde_json::to_value(evt).map_err(|e| {
+                    rpc_err(INTERNAL_ERROR, format!("Failed to serialize event: {e}"))
+                })?;
+                to_result(LogsGetResult { event })
+            }
+            None => Err(rpc_err(
+                INTERNAL_ERROR,
+                format!("Log id `{}` not found", p.id),
+            )),
+        }
+    }
+
+    // ── File attachment handler ────────────────────────────────
+
+    async fn handle_file_attach(&self, params: &Value) -> RpcResult {
+        use super::attachments::{MAX_REQUEST_BYTES, process_file_entry};
+
+        let req: FileAttachParams = parse_params(params)?;
+        let sid = &req.session_id;
+
+        // Uploads land in the per-agent workspace, not the session cwd.
+        // See `handle_send_message` for the rationale.
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let upload_root = self
+            .ctx
+            .config
+            .read()
+            .agent_workspace_dir(&agent_alias)
+            .to_string_lossy()
+            .to_string();
+
+        let is_wss = self.peer_label.starts_with("wss:");
+
+        let mut total_bytes: u64 = 0;
+        let mut results = Vec::with_capacity(req.files.len());
+
+        for entry in &req.files {
+            let result =
+                process_file_entry(entry, sid, &upload_root, is_wss, &self.ctx.sessions).await?;
+            total_bytes += result.size_bytes;
+            if total_bytes > MAX_REQUEST_BYTES {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "Total attachment size exceeds {} MB limit",
+                        MAX_REQUEST_BYTES / (1024 * 1024)
+                    ),
+                ));
+            }
+            results.push(result);
+        }
+
+        to_result(FileAttachResult { files: results })
+    }
+
+    // ── Wire helpers ─────────────────────────────────────────────
+
+    async fn send_result(&self, id: Value, result: Value) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: Some(result),
+            error: None,
+            id,
+        };
+        if let Ok(json) = serde_json::to_string(&resp) {
+            let _ = self.rpc.send_raw(json).await;
+        }
+    }
+
+    async fn send_error(&self, id: Value, code: i32, message: &str) {
+        let resp = JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.to_string(),
+                data: None,
+            }),
+            id,
+        };
+        if let Ok(json) = serde_json::to_string(&resp) {
+            let _ = self.rpc.send_raw(json).await;
+        }
+    }
+
+    fn handle_quickstart_state(&self) -> RpcResult {
+        let cfg = self.ctx.config.read().clone();
+        to_result(crate::quickstart::snapshot_state(&cfg))
+    }
+
+    fn handle_quickstart_fields(&self, params: &Value) -> RpcResult {
+        let req: QuickstartFieldsParams = parse_params(params)?;
+        let descriptors = crate::quickstart::field_shape(req.section, &req.type_key);
+        to_result(QuickstartFieldsResult {
+            fields: descriptors,
+        })
+    }
+
+    fn handle_quickstart_validate(&self, params: &Value) -> RpcResult {
+        let req: QuickstartValidateParams = parse_params(params)?;
+        let cfg = self.ctx.config.read().clone();
+        let body = match crate::quickstart::validate_only_with_surface(
+            &req.submission,
+            &cfg,
+            crate::quickstart::Surface::Tui,
+        ) {
+            Ok(()) => QuickstartValidateResult::Ok,
+            Err(errors) => QuickstartValidateResult::Errors { errors },
+        };
+        to_result(body)
+    }
+
+    fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
+        let config = self.ctx.config.read();
+        let install_root = config.install_root_dir();
+        let dir = crate::sop::resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
+        let mode = crate::sop::parse_execution_mode(&config.sop.default_execution_mode);
+        (dir, mode)
+    }
+
+    fn parse_sop(value: &Value) -> Result<crate::sop::Sop, JsonRpcError> {
+        serde_json::from_value(value.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+    }
+
+    fn handle_sops_list(&self) -> RpcResult {
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sops = crate::sop::load_sops_from_directory(&dir, mode);
+        to_result(sops)
+    }
+
+    fn handle_sops_get(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(sop)
+    }
+
+    fn handle_sops_graph(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        to_result(crate::sop::SopGraph::from_sop_with_specs(
+            &sop,
+            &self.sop_tool_specs(),
+        ))
+    }
+
+    async fn handle_sops_run(&self, params: &Value) -> RpcResult {
+        let req: SopRunRequest = parse_params(params)?;
+
+        if let Some(payload) = req.payload.as_deref()
+            && !payload.trim().is_empty()
+            && serde_json::from_str::<Value>(payload).is_err()
+        {
+            return Err(rpc_err(INVALID_PARAMS, "payload is not valid JSON"));
+        }
+
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let audit = self
+            .ctx
+            .sop_audit
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+
+        let payload = req
+            .payload
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+
+        let event = crate::sop::SopEvent {
+            source: crate::sop::SopTriggerSource::Manual,
+            topic: None,
+            payload,
+            timestamp: crate::sop::engine::now_iso8601(),
+        };
+
+        let results =
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        crate::sop::dispatch::process_headless_results(&results);
+
+        for result in &results {
+            match result {
+                crate::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                    return to_result(SopRunResponse {
+                        run_id: run_id.clone(),
+                    });
+                }
+                crate::sop::dispatch::DispatchResult::Skipped { reason, .. }
+                | crate::sop::dispatch::DispatchResult::BlockedUnsafe { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::Deferred { reason, .. } => {
+                    return Err(rpc_err(INVALID_PARAMS, reason.clone()));
+                }
+                crate::sop::dispatch::DispatchResult::Coalesced {
+                    existing_run_id, ..
+                } => {
+                    return to_result(SopRunResponse {
+                        run_id: existing_run_id.clone(),
+                    });
+                }
+                crate::sop::dispatch::DispatchResult::NoMatch => {}
+            }
+        }
+
+        Err(rpc_err(
+            INVALID_PARAMS,
+            format!("SOP '{}' has no matching manual trigger", req.name),
+        ))
+    }
+
+    fn handle_sops_runs(&self, params: &Value) -> RpcResult {
+        let req: SopRunsRequest = parse_params(params)?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let runs = crate::sop::run_summaries_for(engine, req.sop.as_deref())
+            .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+        to_result(serde_json::json!({ "runs": runs }))
+    }
+
+    fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
+        let req: SopRunOverlayRequest = parse_params(params)?;
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let overlay = crate::sop::run_overlay_for(&sop, engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(overlay)
+    }
+
+    async fn handle_sops_decide(&self, params: &Value) -> RpcResult {
+        let req: SopDecideRequest = parse_params(params)?;
+        let decision: crate::sop::approval::ApprovalDecision =
+            serde_json::from_value(req.decision.clone()).map_err(|e| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("decision is not a valid approval decision: {e}"),
+                )
+            })?;
+
+        let (dir, mode) = self.sops_dir_and_mode();
+        let sop = crate::sop::load_sop_by_name(&dir, &req.name, mode)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?
+            .clone();
+
+        let agent_alias = sop.agent.clone().unwrap_or_default();
+        let span = ::omnesagent_log::info_span!(
+            target: "omnesagent_log_internal_scope",
+            "omnesagent_scope",
+            session_key = %req.run_id,
+            agent_alias = %agent_alias,
+            channel = "rpc",
+        );
+        let _guard = span.enter();
+
+        let mut resolved_outcome = None;
+        {
+            let mut guard = engine
+                .lock()
+                .map_err(|_| rpc_err(INTERNAL_ERROR, "SOP engine lock poisoned"))?;
+            let run_sop_name = guard
+                .get_run(&req.run_id)
+                .map(|run| run.sop_name.clone())
+                .ok_or_else(|| {
+                    rpc_err(INVALID_PARAMS, format!("run '{}' not found", req.run_id))
+                })?;
+            if run_sop_name != req.name {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "run '{}' belongs to SOP '{}', not '{}'",
+                        req.run_id, run_sop_name, req.name
+                    ),
+                ));
+            }
+            use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
+            let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
+            match guard
+                .resolve_via_broker_deferred(&req.run_id, decision, principal)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
+            {
+                outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
+                    resolved_outcome = Some(outcome);
+                }
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::Denied
+                    | ResolveOutcome::AlreadyResolved
+                    | ResolveOutcome::Revised,
+                )
+                | BrokerOutcome::PendingQuorum { .. } => {}
+                BrokerOutcome::Resolved(
+                    ResolveOutcome::NotWaiting | ResolveOutcome::DeferredAtCapacity,
+                )
+                | BrokerOutcome::NotWaiting => {
+                    return Err(rpc_err(
+                        INVALID_PARAMS,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-decision-invalid-state",
+                            &[("run_id", req.run_id.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::Resolved(ResolveOutcome::RejectedSelfApproval)
+                | BrokerOutcome::NotAuthorized { .. } => {
+                    return Err(rpc_err(
+                        AUTH_REQUIRED,
+                        crate::i18n::get_required_cli_string("sop-rpc-decision-unauthorized"),
+                    ));
+                }
+                BrokerOutcome::PolicyMissing { name } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-missing",
+                            &[("name", name.as_str())],
+                        ),
+                    ));
+                }
+                BrokerOutcome::PolicyUnavailable { reason } => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "sop-rpc-policy-unavailable",
+                            &[("reason", reason.as_str())],
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(outcome) = resolved_outcome {
+            let config = self.ctx.config.read();
+            crate::sop::drive_resumed_broker_action(
+                &config,
+                Arc::clone(&engine),
+                self.ctx.sop_audit.clone(),
+                &outcome,
+            );
+        }
+
+        let overlay = crate::sop::run_overlay_for(&sop, &engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        to_result(overlay)
+    }
+
+    fn handle_sops_validate(&self, params: &Value) -> RpcResult {
+        let sop = if params.get("sop").is_some() {
+            let req: SopSaveRequest = parse_params(params)?;
+            Self::parse_sop(&req.sop)?
+        } else {
+            let req: SopSelectRequest = parse_params(params)?;
+            let (dir, mode) = self.sops_dir_and_mode();
+            crate::sop::load_sop_by_name(&dir, &req.name, mode)
+                .map_err(|e| rpc_err(INVALID_PARAMS, format!("SOP '{}': {e}", req.name)))?
+        };
+        let v = crate::sop::validate_sop_strict(&sop);
+        to_result(serde_json::json!({
+            "blocking": v.blocking,
+            "warnings": v.warnings,
+            "ok": v.is_ok(),
+        }))
+    }
+
+    fn handle_sops_save(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        if let Some(original) = req.original_name.as_deref()
+            && !original.is_empty()
+            && original != sop.name
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "rename not supported: SOP '{original}' cannot be saved as '{}'",
+                    sop.name
+                ),
+            ));
+        }
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::save_sop(&dir, &sop).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({ "saved": sop.name }))
+    }
+
+    fn handle_sops_create(&self, params: &Value) -> RpcResult {
+        let req: SopSaveRequest = parse_params(params)?;
+        let sop = Self::parse_sop(&req.sop)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::create_sop_typed(&dir, &sop).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::AlreadyExists(_) => SOP_ALREADY_EXISTS,
+                _ => INVALID_PARAMS,
+            };
+            rpc_err(code, e.to_string())
+        })?;
+        to_result(serde_json::json!({ "created": sop.name }))
+    }
+
+    fn handle_sops_delete(&self, params: &Value) -> RpcResult {
+        let req: SopSelectRequest = parse_params(params)?;
+        let (dir, _mode) = self.sops_dir_and_mode();
+        crate::sop::delete_sop_typed(&dir, &req.name).map_err(|e| {
+            let code = match e {
+                crate::sop::SopAuthorError::NotFound(_) => SOP_NOT_FOUND,
+                _ => INTERNAL_ERROR,
+            };
+            rpc_err(code, e.to_string())
+        })?;
+        to_result(serde_json::json!({ "deleted": req.name }))
+    }
+
+    fn handle_sops_wire_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let edit_val = params
+            .get("edit")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'edit'"))?;
+        let mut sop = Self::parse_sop(sop_val)?;
+        let edit: crate::sop::WireEdit = serde_json::from_value(edit_val.clone())
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("invalid wire edit: {e}")))?;
+        crate::sop::apply_wire(&mut sop, &edit)
+            .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        to_result(serde_json::json!({
+            "sop": sop,
+            "graph": crate::sop::SopGraph::from_sop_with_specs(&sop, &self.sop_tool_specs()),
+        }))
+    }
+
+    fn handle_sops_graph_draft(&self, params: &Value) -> RpcResult {
+        let sop_val = params
+            .get("sop")
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing 'sop'"))?;
+        let sop = Self::parse_sop(sop_val)?;
+        to_result(crate::sop::SopGraph::from_sop_with_specs(
+            &sop,
+            &self.sop_tool_specs(),
+        ))
+    }
+
+    fn sop_tool_specs(&self) -> crate::sop::ToolSpecs {
+        let config = self.ctx.config.read();
+        let agent = config.agents.keys().min().cloned().unwrap_or_default();
+        crate::sop::tool_specs_from_config(&config, &agent)
+    }
+
+    fn handle_sops_trigger_sources(&self) -> RpcResult {
+        let registry = {
+            let config = self.ctx.config.read();
+            crate::sop::registry_from_config(&config)
+        };
+        to_result(registry)
+    }
+
+    /// Resolve selectable values for a domain-typed tool parameter.
+    /// Params: `{ domain, agent?, args? }`. `domain` is an
+    /// `OptionDomain` wire name (e.g. `peer_targets`); `agent` scopes
+    /// agent-relative domains; `args` carries sibling arguments already
+    /// chosen so cascading domains can narrow.
+    fn handle_tools_param_options(&self, params: &Value) -> RpcResult {
+        #[derive(serde::Deserialize)]
+        struct ParamOptionsParams {
+            domain: omnesagent_api::tool::OptionDomain,
+            #[serde(default)]
+            agent: Option<String>,
+            #[serde(default)]
+            args: Value,
+        }
+        let req: ParamOptionsParams = parse_params(params)?;
+        let config = self.ctx.config.read();
+        let agent_alias = req
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .or_else(|| config.agents.keys().min().cloned())
+            .unwrap_or_default();
+
+        let entries = if req.domain == omnesagent_api::tool::OptionDomain::ToolNames {
+            let security = std::sync::Arc::new(
+                omnesagent_config::policy::SecurityPolicy::for_agent(&config, &agent_alias)
+                    .unwrap_or_default(),
+            );
+            let tools = crate::tools::default_tools(security);
+            let refs: Vec<&dyn omnesagent_api::tool::Tool> =
+                tools.iter().map(std::convert::AsRef::as_ref).collect();
+            crate::tools::param_options::resolve_options(
+                req.domain,
+                &config,
+                &agent_alias,
+                &req.args,
+                &refs,
+            )
+        } else {
+            crate::tools::param_options::resolve_options(
+                req.domain,
+                &config,
+                &agent_alias,
+                &req.args,
+                &[],
+            )
+        };
+        to_result(serde_json::json!({ "options": entries }))
+    }
+
+    async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
+        let req: QuickstartApplyParams = parse_params(params)?;
+        // Serializes with every other config-mutating handler for the whole
+        // clone-apply-save-swap below, so the install on success can't race
+        // a concurrent config write (see `ctx.config_write_lock`).
+        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        // Clone out of the lock to satisfy `&mut Config`. On success
+        // install the mutated snapshot, mirroring the gateway's
+        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
+        // the clone, so `save_and_swap_config` performs no second disk
+        // write (empty dirty set short-circuits) — just the guarded swap.
+        let mut working = self.ctx.config.read().clone();
+        let result = crate::quickstart::apply_with_surface(
+            req.submission,
+            &mut working,
+            crate::quickstart::Surface::Tui,
+        )
+        .await;
+        let body = match result {
+            Ok(agent) => {
+                self.save_and_swap_config(working, &config_write_guard)
+                    .await?;
+                let reload_signalled = self.signal_daemon_reload();
+                QuickstartApplyResult::Applied {
+                    agent,
+                    daemon_restarted: reload_signalled,
+                }
+            }
+            Err(errors) => QuickstartApplyResult::Errors { errors },
+        };
+        to_result(body)
+    }
+
+    fn handle_quickstart_dismiss(&self, params: &Value) -> RpcResult {
+        let req: QuickstartDismissParams = parse_params(params)?;
+        crate::quickstart::record_dismissed(&req.run_id, req.surface, req.last_step);
+        to_result(QuickstartDismissResult { recorded: true })
+    }
+
+    /// Signal the in-place daemon reload using the same `reload_tx`
+    /// watch channel `/admin/reload` and the gateway's quickstart route
+    /// use. Returns `true` when the supervisor was notified, `false`
+    /// when no supervisor is attached (e.g. test harness).
+    fn signal_daemon_reload(&self) -> bool {
+        if self.ctx.reload_tx.is_none() {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "reason": "no_supervisor",
+                        "surface": crate::quickstart::Surface::Tui.as_str(),
+                    })),
+                "quickstart: daemon reload not available (standalone daemon)"
+            );
+            return false;
+        };
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Start).with_attrs(
+                ::serde_json::json!({
+                    "surface": crate::quickstart::Surface::Tui.as_str(),
+                })
+            ),
+            "quickstart: daemon reload signalled"
+        );
+        self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
+    }
+}
+
+fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<MessageEntry> {
+    let mut entries = Vec::new();
+    let mut tool_entries_by_id =
+        std::collections::HashMap::<String, std::collections::VecDeque<usize>>::new();
+
+    for message in messages {
+        match message {
+            ConversationMessage::Chat(chat) => entries.push(MessageEntry {
+                role: chat.role.clone(),
+                content: chat.content.clone(),
+                kind: MessageEntryKind::Message,
+                tool_call_id: None,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+            }),
+            ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } => {
+                if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: text.clone(),
+                        kind: MessageEntryKind::Message,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                    });
+                }
+
+                for call in tool_calls {
+                    let index = entries.len();
+                    tool_entries_by_id
+                        .entry(call.id.clone())
+                        .or_default()
+                        .push_back(index);
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: format!("Tool call: {}\n{}", call.name, call.arguments),
+                        kind: MessageEntryKind::ToolCall,
+                        tool_call_id: Some(call.id.clone()),
+                        tool_name: Some(call.name.clone()),
+                        tool_input: Some(
+                            serde_json::from_str(&call.arguments)
+                                .unwrap_or_else(|_| Value::String(call.arguments.clone())),
+                        ),
+                        tool_output: None,
+                    });
+                }
+            }
+            ConversationMessage::ToolResults(results) => {
+                for result in results {
+                    let output = result.content.clone();
+                    let entry_index = tool_entries_by_id
+                        .get_mut(&result.tool_call_id)
+                        .and_then(std::collections::VecDeque::pop_front);
+                    if tool_entries_by_id
+                        .get(&result.tool_call_id)
+                        .is_some_and(std::collections::VecDeque::is_empty)
+                    {
+                        tool_entries_by_id.remove(&result.tool_call_id);
+                    }
+                    if let Some(entry) = entry_index.and_then(|index| entries.get_mut(index)) {
+                        entry.tool_output = Some(output.clone());
+                        entry.content.push_str("\nResult:\n");
+                        entry.content.push_str(&output);
+                    } else {
+                        entries.push(MessageEntry {
+                            role: "tool".to_string(),
+                            content: format!(
+                                "Tool result: {}\n{}",
+                                if result.tool_name.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &result.tool_name
+                                },
+                                output
+                            ),
+                            kind: MessageEntryKind::ToolResult,
+                            tool_call_id: Some(result.tool_call_id.clone()),
+                            tool_name: (!result.tool_name.is_empty())
+                                .then(|| result.tool_name.clone()),
+                            tool_input: None,
+                            tool_output: Some(output),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    entries
+}
+
+fn response_id_key(id: &Value) -> Option<String> {
+    match id {
+        Value::String(id) => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        Value::Null => None,
+        _ => unreachable!("validated JSON-RPC ID"),
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
+    serde_json::from_value(params.clone()).map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))
+}
+
+fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<(), JsonRpcError> {
+    if overrides
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err(rpc_err(INVALID_PARAMS, "model must not be blank"));
+    }
+    if overrides
+        .model_provider
+        .as_deref()
+        .is_some_and(|provider| provider.trim().is_empty())
+    {
+        return Err(rpc_err(INVALID_PARAMS, "model_provider must not be blank"));
+    }
+    Ok(())
+}
+
+fn to_result<T: Serialize>(val: T) -> RpcResult {
+    serde_json::to_value(val).map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))
+}
+
+const MEMORY_PREVIEW_CONTENT_BYTES: usize = 200;
+
+/// Truncate each entry's `content` to the preview budget. Operates
+/// in place to avoid a second allocation per entry.
+fn truncate_memory_previews(
+    mut entries: Vec<omnesagent_api::memory_traits::MemoryEntry>,
+) -> Vec<omnesagent_api::memory_traits::MemoryEntry> {
+    for entry in &mut entries {
+        if entry.content.len() > MEMORY_PREVIEW_CONTENT_BYTES {
+            // Truncate on a char boundary so we never split a UTF-8 sequence.
+            let mut end = MEMORY_PREVIEW_CONTENT_BYTES;
+            while end > 0 && !entry.content.is_char_boundary(end) {
+                end -= 1;
+            }
+            entry.content.truncate(end);
+            entry.content.push('…');
+        }
+    }
+    entries
+}
+
+/// Resolve the max-token ceiling shown on Zerocode's context usage meter.
+///
+/// The wire field is named `max_context_tokens` and must track the operator's
+/// runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`),
+/// which is also the preemptive history-trim budget. Using the provider
+/// model-window helper here is wrong: that path ignores the runtime profile
+/// and falls back to 32_000 when `providers.models.*.context_window` is unset,
+/// so the meter freezes at the default even when the profile is set higher.
+fn context_usage_max_tokens(cfg: &omnesagent_config::schema::Config, agent_alias: &str) -> u64 {
+    cfg.effective_max_context_tokens(agent_alias) as u64
+}
+
+/// Persist the exact turn delta captured before structured history trimming.
+/// Empty and failed turns intentionally remain no-ops.
+async fn persist_acp_turn(
+    store: &Arc<omnesagent_infra::acp_session_store::AcpSessionStore>,
+    session_id: &str,
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) -> Option<String> {
+    let messages = match outcome {
+        Ok(TurnOutcome::Completed { messages, .. })
+        | Ok(TurnOutcome::Cancelled { messages, .. })
+            if !messages.is_empty() =>
+        {
+            messages.clone()
+        }
+        _ => return None,
+    };
+    let store = Arc::clone(store);
+    let session_id = session_id.to_string();
+    match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(join) => Some(join.to_string()),
+    }
+}
+
+/// Persist a `TurnEvent::Plan` before it is emitted, so a racing
+/// reconnect — or a later `session/resume` — reads a consistent plan.
+/// Writes both the in-memory live cache (`sessions`) and, when an ACP
+/// durable store is present, the on-disk `plan_json` column (via
+/// `spawn_blocking`, since SQLite is synchronous). No-op for every
+/// other event. Durable-write failures are logged-and-swallowed: the
+/// in-memory cache is still authoritative for the live session.
+async fn persist_plan_if_any(
+    sessions: &crate::rpc::session::SessionStore,
+    acp_store: Option<&std::sync::Arc<omnesagent_infra::acp_session_store::AcpSessionStore>>,
+    session_id: &str,
+    event: &TurnEvent,
+) {
+    let TurnEvent::Plan { entries } = event else {
+        return;
+    };
+    sessions.set_plan(session_id, entries.clone()).await;
+    if let Some(store) = acp_store {
+        let store = store.clone();
+        let sid = session_id.to_string();
+        let entries = entries.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = store.set_plan(&sid, &entries) {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Write)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_id": sid,
+                            "error": e.to_string(),
+                        })),
+                    "Failed to persist TodoWrite plan to ACP session store"
+                );
+            }
+        })
+        .await;
+    }
+}
+
+fn plan_replay_notification(
+    session_id: &str,
+    entries: &[omnesagent_api::plan::PlanEntry],
+) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let event = TurnEvent::Plan {
+        entries: entries.to_vec(),
+    };
+    notification_for_turn_event(session_id, &event, None)
+}
+
+fn notification_for_turn_event(
+    session_id: &str,
+    event: &TurnEvent,
+    max_context_tokens: Option<u64>,
+) -> Option<String> {
+    let update = match event {
+        TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
+            session_id: session_id.to_string(),
+            text: delta.clone(),
+        },
+        TurnEvent::Thinking { delta } => SessionUpdateEvent::AgentThoughtChunk {
+            session_id: session_id.to_string(),
+            text: delta.clone(),
+        },
+        TurnEvent::ToolCall { id, name, args } => SessionUpdateEvent::ToolCall {
+            session_id: session_id.to_string(),
+            tool_call_id: id.clone(),
+            name: name.clone(),
+            raw_input: args.clone(),
+        },
+        // The RPC/SessionUpdateEvent surface forwards the text output only; file
+        // attachment happens on the direct ACP path, so `artifact` is not needed here.
+        TurnEvent::ToolResult {
+            id,
+            name,
+            output,
+            artifact: _,
+        } => SessionUpdateEvent::ToolResult {
+            session_id: session_id.to_string(),
+            tool_call_id: id.clone(),
+            name: name.clone(),
+            raw_output: output.clone(),
+        },
+        TurnEvent::ApprovalRequest {
+            request_id,
+            tool_name,
+            arguments_summary,
+            timeout_secs,
+        } => SessionUpdateEvent::ApprovalRequest {
+            session_id: session_id.to_string(),
+            request_id: request_id.clone(),
+            tool_name: tool_name.clone(),
+            arguments_summary: arguments_summary.clone(),
+            timeout_secs: *timeout_secs,
+        },
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => SessionUpdateEvent::HistoryTrimmed {
+            session_id: session_id.to_string(),
+            dropped_messages: *dropped_messages,
+            kept_turns: *kept_turns,
+            reason: reason.clone(),
+        },
+        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
+            session_id: session_id.to_string(),
+            input_tokens: *input_tokens,
+            max_context_tokens,
+        },
+        TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
+            session_id: session_id.to_string(),
+            entries: entries.clone(),
+        },
+    };
+
+    let params = serde_json::to_value(update).ok()?;
+    let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
+    serde_json::to_string(&n).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    fn parse(s: &str) -> Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn memory_embeddings_use_provider_matches_base_ref_and_routes() {
+        use omnesagent_config::schema::{Config, EmbeddingRouteConfig};
+
+        let mut config = Config::default();
+        config.memory.embedding_provider = "openai.default".into();
+        config.embedding_routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "openrouter.alt".into(),
+            model: "embed".into(),
+            dimensions: Some(1024),
+            api_key: None,
+        }];
+
+        // Base `[memory].embedding_provider` reference.
+        assert!(memory_embeddings_use_provider(&config, "openai.default"));
+        // Any `[[embedding_routes]]` reference.
+        assert!(memory_embeddings_use_provider(&config, "openrouter.alt"));
+        // An unrelated provider must not trigger a memory-embedder refresh.
+        assert!(!memory_embeddings_use_provider(
+            &config,
+            "anthropic.default"
+        ));
+    }
+
+    #[test]
+    fn agent_alias_from_model_provider_prop_matches_only_the_bound_provider_field() {
+        // The config pane and other `config/set agents.<alias>.model_provider`
+        // callers write this path; it must map back to the alias so the live
+        // session refresh fires. The zerocode picker takes the `session/configure`
+        // path instead and is not a caller here.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("agents.fred.model_provider"),
+            Some("fred".to_string())
+        );
+        // Any other agent field must not trigger a provider rebuild.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("agents.fred.risk_profile"),
+            None
+        );
+        // A provider-profile edit is handled by the other refresh path, not this one.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("providers.models.anthropic.default.model"),
+            None
+        );
+        // Empty alias is rejected.
+        assert_eq!(
+            agent_alias_from_model_provider_prop("agents..model_provider"),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_scoped_refresh_selects_only_edited_agent_without_override() {
+        use crate::rpc::session::SessionOverrides;
+        let no_override = SessionOverrides::default();
+        let with_override = SessionOverrides {
+            model_provider: Some("anthropic.other".to_string()),
+            ..Default::default()
+        };
+
+        // A session bound to the edited agent with no override is rebuilt.
+        assert!(agent_scoped_refresh_selects("fred", "fred", &no_override));
+        // A session belonging to a different agent is never rebuilt, even
+        // when it resolves to the same provider.
+        assert!(!agent_scoped_refresh_selects("fred", "wilma", &no_override));
+        // The edited agent's own session is left untouched when it carries a
+        // `model_provider` override.
+        assert!(!agent_scoped_refresh_selects(
+            "fred",
+            "fred",
+            &with_override
+        ));
+        // A different agent with an override is likewise excluded.
+        assert!(!agent_scoped_refresh_selects(
+            "fred",
+            "wilma",
+            &with_override
+        ));
+    }
+
+    #[test]
+    fn provider_scoped_refresh_selects_inheritors_and_matching_overrides() {
+        use crate::rpc::session::SessionOverrides;
+        let no_override = SessionOverrides::default();
+        let matching_override = SessionOverrides {
+            model_provider: Some("anthropic.default".to_string()),
+            ..Default::default()
+        };
+        let other_override = SessionOverrides {
+            model_provider: Some("openai.default".to_string()),
+            ..Default::default()
+        };
+
+        // No override: inherits the agent provider, so it is a candidate
+        // (final config match is resolved by the caller).
+        assert!(provider_scoped_refresh_selects(
+            "anthropic.default",
+            &no_override
+        ));
+        // Override that names the edited provider is a candidate.
+        assert!(provider_scoped_refresh_selects(
+            "anthropic.default",
+            &matching_override
+        ));
+        // Override that names a different provider is excluded.
+        assert!(!provider_scoped_refresh_selects(
+            "anthropic.default",
+            &other_override
+        ));
+    }
+
+    #[test]
+    fn session_initializes_mcp_for_chat_but_not_acp() {
+        use crate::rpc::types::ChatMode;
+        // Chat sessions must initialize MCP so the Zerocode TUI sees the same
+        // MCP tools (and the deferred-loading `tool_search`) the gateway
+        // already exposes for the agent
+        assert!(
+            session_should_initialize_mcp(&ChatMode::Chat),
+            "Chat sessions must eagerly initialize MCP"
+        );
+        // ACP (Code) sessions intentionally skip eager MCP init to keep
+        // `session/new` prompt.
+        assert!(
+            !session_should_initialize_mcp(&ChatMode::Acp),
+            "ACP sessions must skip eager MCP init"
+        );
+    }
+
+    /// Spin up a wiremock server that speaks the minimum MCP HTTP handshake
+    /// (`initialize` → `notifications/initialized` → `tools/list`) and advertises
+    /// a single tool. The dotted `tool_name` exercises spec-valid names that
+    /// must survive `<server>__<tool>` prefixing
+    async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "remote", "version": "0.1.0"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{
+                    "name": tool_name,
+                    "description": "List domains",
+                    "inputSchema": {"type": "object"}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `make_acp_test_config` plus an MCP server granted to `test-agent` via an
+    /// `mcp_bundles` grant, pointed at `mock_uri`. `deferred` selects
+    /// deferred-loading (`tool_search`) vs eager registration.
+    fn make_mcp_granting_config(
+        tmp: &tempfile::TempDir,
+        mock_uri: String,
+        deferred: bool,
+    ) -> omnesagent_config::schema::Config {
+        use omnesagent_config::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+
+        let mut config = make_acp_test_config(tmp);
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = deferred;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(mock_uri),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "b1".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into()],
+                exclude: vec![],
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .mcp_bundles = vec!["b1".into()];
+        config
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_tool_search_in_deferred_mcp_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            names.contains(&"tool_search"),
+            "Chat session with deferred MCP must expose `tool_search`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_excluded_tool_search_is_dropped_in_deferred_mcp_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let mut config = make_mcp_granting_config(&tmp, server.uri(), true);
+        // Deny the deferred-MCP discovery tool by name.
+        config
+            .risk_profiles
+            .get_mut("test-profile")
+            .expect("test-profile must exist")
+            .excluded_tools = vec!["tool_search".into()];
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-excl-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-excl-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search"),
+            "excluded_tools = [\"tool_search\"] must drop the deferred tool_search \
+             wrapper (excluded_tools always subtracts); tools: {names:?}"
+        );
+        // The registry and prompt surfaces must move together: the system prompt
+        // must not instruct the model to call a tool the policy just removed.
+        let prompt = agent
+            .system_prompt_for_test()
+            .expect("system prompt must render");
+        assert!(
+            !prompt.contains("tool_search"),
+            "excluded tool_search must not be advertised in the system prompt; prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("## Deferred Tools"),
+            "excluded tool_search must suppress the deferred-tools section entirely; prompt: {prompt}"
+        );
+        assert!(
+            !prompt.contains("remote__domains.list"),
+            "excluded tool_search must not leak the deferred stub it would have activated; prompt: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_advertises_deferred_mcp_section_in_system_prompt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-prompt-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-prompt-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let prompt = agent
+            .system_prompt_for_test()
+            .expect("system prompt must render");
+        assert!(
+            prompt.contains("## Deferred Tools"),
+            "system prompt must include the deferred-tools section; prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("tool_search"),
+            "system prompt must instruct the model to call `tool_search`; prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("remote__domains.list"),
+            "system prompt must advertise the dotted `<server>__<tool>` stub; prompt: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_tool_search_returns_granted_mcp_tool_in_deferred_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-search-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-search-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+
+        let tool_result = agent
+            .execute_tool_for_test("tool_search", json!({ "query": "domains" }))
+            .await
+            .expect("deferred Chat session must expose `tool_search`")
+            .expect("tool_search must execute without error");
+
+        assert!(
+            tool_result.success,
+            "tool_search should succeed; error: {:?}",
+            tool_result.error
+        );
+        assert!(
+            tool_result.output.contains("remote__domains.list"),
+            "tool_search must resolve the granted `<server>__<tool>` stub, not just \
+             be present; output: {}",
+            tool_result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_prefixed_mcp_tool_in_eager_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), false);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-eager-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-eager-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        // Eager mode registers the MCP tool directly; the dotted suffix keeps
+        // its `<server>__<tool>` prefix.
+        assert!(
+            names.contains(&"remote__domains.list"),
+            "Chat session with eager MCP must expose `remote__domains.list`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_deferred() {
+        use omnesagent_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let mut config = make_mcp_granting_config(&tmp, server.uri(), true);
+
+        // Add a SECOND agent with no `mcp_bundles`. Reuse `test-agent`'s
+        // model_provider/risk_profile so the agent is fully constructible
+        // without touching providers/risk_profiles.
+        let template = config
+            .agents
+            .get("test-agent")
+            .cloned()
+            .expect("test-agent must exist in make_mcp_granting_config");
+        config.agents.insert(
+            "unscoped-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: template.model_provider.clone(),
+                risk_profile: template.risk_profile.clone(),
+                mcp_bundles: Vec::new(), // explicit: no grant
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "unscoped-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-unscoped-deferred-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new for an unscoped agent should still succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-unscoped-deferred-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search"),
+            "Unscoped agent must NOT expose `tool_search` in deferred mode \
+             (mcp_bundles is empty -> no MCP connection -> no deferred \
+             registry -> no tool_search). Tools were: {names:?}"
+        );
+        // And, defensively, no prefixed MCP tool either.
+        assert!(
+            !names.iter().any(|n| n.contains("__")),
+            "Unscoped agent must expose zero `<server>__<tool>` MCP tools; \
+             tools were: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_omits_mcp_tools_when_agent_has_no_bundles_eager() {
+        use omnesagent_config::schema::AliasedAgentConfig;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let mut config = make_mcp_granting_config(&tmp, server.uri(), false);
+
+        let template = config
+            .agents
+            .get("test-agent")
+            .cloned()
+            .expect("test-agent must exist in make_mcp_granting_config");
+        config.agents.insert(
+            "unscoped-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: template.model_provider.clone(),
+                risk_profile: template.risk_profile.clone(),
+                mcp_bundles: Vec::new(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "unscoped-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-unscoped-eager-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new for an unscoped agent should still succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-unscoped-eager-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"remote__domains.list"),
+            "Unscoped agent must NOT expose `remote__domains.list` in \
+             eager mode (mcp_bundles is empty -> no MCP connection -> \
+             no eager registration). Tools were: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("remote__")),
+            "No `remote__*` tool may leak to an unscoped agent; tools \
+             were: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_skips_mcp_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        // Deferred mode would register `tool_search` for a Chat session; an ACP
+        // session must skip MCP init entirely regardless. ACP `session/new`
+        // requires the persistence dispatcher (it touches the ACP store).
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-mcp-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-mcp-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search") && !names.contains(&"remote__domains.list"),
+            "ACP session must skip MCP init (no `tool_search`, no MCP tools); tools: {names:?}"
+        );
+    }
+
+    /// Blocking regression: a fresh remote RPC client that reaches
+    /// `logs/subscribe` (an unauthenticated surface — a new WSS client can
+    /// `initialize` and subscribe without the gateway bearer) must never
+    /// receive a pairing credential off the shared broadcast bus, while
+    /// ordinary log frames still forward with the internal marker stripped.
+    #[tokio::test]
+    async fn logs_subscribe_fails_closed_on_pairing_credentials() {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let config = omnesagent_config::schema::Config::default();
+        let (event_tx, _rx0) = tokio::sync::broadcast::channel(16);
+        let ctx = RpcContext::minimal_with_event_tx(config, sessions, event_tx.clone());
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let d = RpcDispatcher::new(ctx, writer_tx, "remote:wss=1,uid=anon".into());
+
+        assert!(
+            d.handle_logs_subscribe().await.is_ok(),
+            "a fresh client should be able to subscribe"
+        );
+
+        // Marker-stamped credential frame (as `record_event` stamps a QR login
+        // event) followed by an ordinary lifecycle frame.
+        let credential = serde_json::json!({
+            "source": "observability",
+            "attributes": { "login": { "state": "qr", "qr_payload": "SECRET-QR-PAYLOAD" } },
+            omnesagent_log::EPHEMERAL_BROADCAST_MARKER: true,
+        });
+        let plain = serde_json::json!({
+            "source": "observability",
+            "type": "tool_call",
+            "tool": "SENTINEL-LIVE",
+        });
+        event_tx.send(credential).expect("send credential frame");
+        event_tx.send(plain).expect("send plain frame");
+
+        // Collect forwarded notifications until the sentinel arrives or the
+        // budget elapses.
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, writer_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let hit = msg.contains("SENTINEL-LIVE");
+                    seen.push_str(&msg);
+                    if hit {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            seen.contains("SENTINEL-LIVE"),
+            "an ordinary lifecycle frame must still forward over logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains("SECRET-QR-PAYLOAD"),
+            "a remote RPC client must never obtain a pairing credential via logs/subscribe: {seen:?}"
+        );
+        assert!(
+            !seen.contains(omnesagent_log::EPHEMERAL_BROADCAST_MARKER),
+            "the internal fail-closed marker must be stripped from forwarded frames: {seen:?}"
+        );
+    }
+
+    fn make_cost_query_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let tracker = Arc::new(
+            omnesagent_config::cost::tracker::CostTracker::new(
+                omnesagent_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                data_dir,
+            )
+            .unwrap(),
+        );
+        let config = omnesagent_config::schema::Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        };
+        let ctx = RpcContext::minimal_with_cost_tracker(config, sessions, tracker);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-costquery:pid=1".into())
+    }
+
+    #[test]
+    fn cost_query_invalid_rfc3339_bound_is_invalid_params() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_query_test_dispatcher(tmp.path());
+        let err = d
+            .handle_cost_query(&serde_json::json!({ "from": "not-a-real-date" }))
+            .expect_err("an invalid RFC3339 bound must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("invalid date"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn cost_query_valid_bounds_reach_in_bounds_summary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_query_test_dispatcher(tmp.path());
+        let res = d.handle_cost_query(&serde_json::json!({
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-07-01T00:00:00Z"
+        }));
+        assert!(
+            res.is_ok(),
+            "a valid bounded cost/query must reach get_summary_in_bounds: {res:?}"
+        );
+    }
+
+    fn make_cost_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let config = omnesagent_config::schema::Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        };
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-cost:pid=1".into())
+    }
+
+    // cost/org: null only for a genuinely-absent snapshot; any other read failure
+    // (unreadable file, a directory at the path, bad JSON) surfaces as an error so a
+    // broken deployment is not mistaken for a vanilla one. (Audacity88/JordanTheJet,)
+    #[test]
+    fn cost_org_absent_returns_null() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        assert_eq!(d.handle_cost_org().unwrap(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn cost_org_present_returns_snapshot_verbatim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("org_cost.json"),
+            r#"{"org":"acme","billed_usd":12.5}"#,
+        )
+        .unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let v = d.handle_cost_org().unwrap();
+        assert_eq!(v["org"], serde_json::json!("acme"));
+        assert_eq!(v["billed_usd"], serde_json::json!(12.5));
+    }
+
+    #[test]
+    fn cost_org_invalid_json_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("org_cost.json"), "not valid json{").unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        assert!(d.handle_cost_org().is_err());
+    }
+
+    // The `sops/trigger-sources` RPC response must carry the full
+    // ordered `SopTriggerSource` walk so authoring surfaces (web + zerocode)
+    // render the picker from the backend list instead of reconstructing it.
+    // Any new trigger source variant appears here automatically; a surface that
+    // reconstructs its own list would drift while this guard would not, so the
+    // contract is pinned at the transport boundary every surface reads from.
+    #[test]
+    fn sops_trigger_sources_rpc_carries_full_trigger_source_walk() {
+        use crate::sop::types::SopTriggerSource;
+        use strum::IntoEnumIterator;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let value = d
+            .handle_sops_trigger_sources()
+            .expect("sops/trigger-sources must succeed on a default config");
+        let sources: Vec<String> = value
+            .get("sources")
+            .and_then(|s| serde_json::from_value(s.clone()).ok())
+            .expect("response must carry a `sources` array");
+        let expected: Vec<String> = SopTriggerSource::iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            sources, expected,
+            "RPC `sources` must equal the complete SopTriggerSource walk so \
+             surfaces cannot drift by reconstructing their own list"
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_run_rejects_malformed_payload_before_engine() {
+        // Payload validation runs before the engine lookup, so a malformed JSON
+        // string is rejected with INVALID_PARAMS even on a dispatcher with no
+        // SOP engine wired. This pins the "surface a clear error on malformed
+        // JSON rather than failing the run opaquely" contract.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_run(&serde_json::json!({ "name": "any", "payload": "{not json" }))
+            .await
+            .expect_err("malformed payload must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn sops_run_requires_engine() {
+        // A well-formed request against a dispatcher with no SOP engine reports
+        // the subsystem as unavailable rather than panicking or silently
+        // succeeding.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_run(&serde_json::json!({ "name": "any", "payload": "{\"k\":1}" }))
+            .await
+            .expect_err("missing engine must error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn sops_runs_requires_engine() {
+        // Listing runs against a dispatcher with no SOP engine reports the
+        // subsystem as unavailable rather than returning a bogus empty list.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_runs(&serde_json::json!({}))
+            .expect_err("missing engine must error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    #[test]
+    fn sops_runs_accepts_optional_sop_filter() {
+        // The request parses with or without the `sop` field; both fail only on
+        // the engine guard, not on param parsing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        let err = d
+            .handle_sops_runs(&serde_json::json!({ "sop": "some-sop" }))
+            .expect_err("missing engine must error");
+        assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    // The `sop list` create-hint tells users to author under `<shared>/sops`;
+    // this locks the CLI scan root (sops_dir_and_mode) to that same path when
+    // sops_dir is unset, so the hint can never drift from where we actually
+    // read.
+    #[test]
+    fn sops_list_scan_root_matches_shared_sops_create_hint() {
+        use omnesagent_config::schema::Config;
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        assert!(
+            config.sop.sops_dir.is_none(),
+            "default config must leave sops_dir unset so the hint path applies",
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let d = RpcDispatcher::new(ctx, tx, "test-peer-sopscan:pid=1".into());
+
+        let (dir, _mode) = d.sops_dir_and_mode();
+        assert_eq!(dir, tmp.path().join("shared").join("sops"));
+    }
+
+    fn make_checkpoint_rpc_dispatcher(
+        quorum: u32,
+        members: &[&str],
+        tui_id: &str,
+    ) -> (
+        RpcDispatcher,
+        Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        String,
+        tempfile::TempDir,
+    ) {
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::collections::HashMap;
+        use omnesagent_config::schema::{
+            ApprovalGroupConfig, ApprovalPolicyConfig, Config, SopApprovalConfig,
+        };
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let sops_dir = temp.path().join("sops");
+        let sop = Sop {
+            name: "rpc-checkpoint".into(),
+            description: "checkpoint RPC authorization test".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "authorize".into(),
+                    kind: SopStepKind::Checkpoint,
+                    policy: Some("prod".into()),
+                    ..SopStep::default()
+                },
+                SopStep {
+                    number: 2,
+                    title: "continue".into(),
+                    kind: SopStepKind::Execute,
+                    ..SopStep::default()
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).unwrap();
+        let mut groups = HashMap::new();
+        groups.insert(
+            "release".to_string(),
+            ApprovalGroupConfig {
+                members: members.iter().map(|member| (*member).to_string()).collect(),
+            },
+        );
+        let mut policies = HashMap::new();
+        policies.insert(
+            "prod".to_string(),
+            ApprovalPolicyConfig {
+                required_group: Some("release".into()),
+                quorum,
+                request_route: None,
+                escalation_route: None,
+            },
+        );
+        let mut config = Config::default();
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        config.sop.approval = SopApprovalConfig { groups, policies };
+
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone())
+            .with_approval_broker(Arc::new(crate::sop::approval::ApprovalBroker::disabled()));
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "rpc-checkpoint",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: crate::sop::engine::now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = match action {
+            SopRunAction::CheckpointWait { run_id, .. } => run_id,
+            other => panic!("expected checkpoint wait, got {other:?}"),
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(SessionActorQueue::new(4, 10, 60)),
+        ));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
+        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
+        (dispatcher, engine, run_id, temp)
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rpc_enforces_checkpoint_membership_and_quorum() {
+        use crate::sop::types::SopRunStatus;
+
+        let (unauthorized, engine, run_id, _temp) =
+            make_checkpoint_rpc_dispatcher(1, &["cli:OmnesAgentOperator"], "OmnesAgentAgent");
+        let error = unauthorized
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("unauthorized RPC principal must be rejected");
+        assert_eq!(error.code, AUTH_REQUIRED);
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+
+        let (pending, engine, run_id, _temp) = make_checkpoint_rpc_dispatcher(
+            2,
+            &["cli:OmnesAgentOperator", "cli:OmnesAgentMaintainer"],
+            "OmnesAgentOperator",
+        );
+        pending
+            .handle_sops_decide(&json!({
+                "name": "rpc-checkpoint",
+                "run_id": run_id.clone(),
+                "decision": "approve",
+            }))
+            .await
+            .expect("an authorized first vote returns the still-parked overlay");
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap()
+                .get_run(&run_id)
+                .map(|run| run.status),
+            Some(SopRunStatus::PausedCheckpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_decide_drives_resumed_execute_step() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use omnesagent_config::schema::{Config, SopConfig};
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().expect("temporary SOP directory");
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+        let sop = Sop {
+            name: "rpc-resumed-execute".to_string(),
+            description: "RPC resume driver regression".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Supervised,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Execute after approval".to_string(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temporary SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-resumed-execute",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-gated SOP");
+            let SopRunAction::WaitApproval { run_id, .. } = action else {
+                panic!("supervised Execute step must park for approval: {action:?}");
+            };
+            run_id
+        };
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(config, sessions, Arc::clone(&engine));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-resumed-execute",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect("RPC approval must accept the parked run");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = engine
+                    .lock()
+                    .expect("engine lock")
+                    .get_run(&run_id)
+                    .map(|run| run.status);
+                if status == Some(SopRunStatus::Failed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC approval must schedule the resumed ExecuteStep");
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_approval_mode_rejection() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use omnesagent_config::schema::{ApprovalMode, Config, SopConfig};
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            approval_mode: ApprovalMode::AgentTool,
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        let sop = Sop {
+            name: "rpc-agent-tool-only".to_string(),
+            description: "rpc approval-mode checkpoint".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Policy gate".to_string(),
+                kind: SopStepKind::Checkpoint,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            agent: None,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+        };
+        crate::sop::save_sop(&sops_dir, &sop).expect("save temp SOP");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        let engine = Arc::new(Mutex::new(engine));
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-agent-tool-only",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start approval-mode SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("approval-mode SOP must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-agent-tool-only",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("RPC principal must be rejected by approval_mode=agent_tool");
+        assert_eq!(err.code, AUTH_REQUIRED);
+        assert!(
+            err.message.contains(&crate::i18n::get_required_cli_string(
+                "sop-rpc-decision-unauthorized",
+            )),
+            "approval_mode rejection must surface, got: {}",
+            err.message
+        );
+        let guard = engine.lock().expect("engine lock");
+        assert_eq!(
+            guard.get_run(&run_id).expect("run still active").status,
+            SopRunStatus::PausedCheckpoint
+        );
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "rejected RPC decision must not append a gate_resolved row"
+        );
+    }
+
+    #[tokio::test]
+    async fn sops_decide_rejects_run_id_from_different_sop_before_broker_resolution() {
+        use crate::sop::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopRunStatus, SopStep,
+            SopStepKind, SopTrigger, SopTriggerSource,
+        };
+        use std::sync::{Arc, Mutex};
+        use omnesagent_config::schema::{Config, SopConfig};
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        fn dispatcher_with_sop_engine(
+            config: Config,
+            engine: Arc<Mutex<crate::sop::SopEngine>>,
+        ) -> RpcDispatcher {
+            let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let ctx = RpcContext::minimal_with_sop_engine(config, sessions, engine);
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+            dispatcher.set_tui_id_for_test(Some("alice".to_string()));
+            dispatcher
+        }
+
+        fn checkpoint_sop(name: &str) -> Sop {
+            Sop {
+                name: name.to_string(),
+                description: format!("{name} checkpoint"),
+                version: "1.0.0".to_string(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Deterministic,
+                triggers: vec![SopTrigger::Manual],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Gate".to_string(),
+                    kind: SopStepKind::Checkpoint,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: true,
+                agent: None,
+                admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_config = SopConfig {
+            sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+            default_execution_mode: "deterministic".to_string(),
+            ..SopConfig::default()
+        };
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: sop_config.clone(),
+            ..Config::default()
+        };
+
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-a")).expect("save rpc-a");
+        crate::sop::save_sop(&sops_dir, &checkpoint_sop("rpc-b")).expect("save rpc-b");
+
+        let mut engine = crate::sop::SopEngine::new(sop_config);
+        engine.reload(tmp.path());
+        assert_eq!(engine.sops().len(), 2, "both temp SOPs should load");
+        let engine = Arc::new(Mutex::new(engine));
+
+        let run_id = {
+            let mut guard = engine.lock().expect("engine lock");
+            let action = guard
+                .start_run(
+                    "rpc-b",
+                    SopEvent {
+                        source: SopTriggerSource::Manual,
+                        topic: None,
+                        payload: None,
+                        timestamp: crate::sop::engine::now_iso8601(),
+                    },
+                )
+                .expect("start rpc-b SOP");
+            let SopRunAction::CheckpointWait { run_id, .. } = action else {
+                panic!("rpc-b must park at checkpoint, got {action:?}");
+            };
+            run_id
+        };
+
+        let dispatcher = dispatcher_with_sop_engine(config, Arc::clone(&engine));
+        let err = dispatcher
+            .handle_sops_decide(&serde_json::json!({
+                "name": "rpc-a",
+                "run_id": run_id,
+                "decision": "approve",
+            }))
+            .await
+            .expect_err("mismatched name/run_id must be rejected before broker resolution");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("belongs to SOP 'rpc-b', not 'rpc-a'"),
+            "mismatch rejection must name both SOPs, got: {}",
+            err.message
+        );
+
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("rpc-b run still active");
+        assert_eq!(run.sop_name, "rpc-b");
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert!(
+            !guard
+                .run_events(&run_id)
+                .unwrap_or_default()
+                .iter()
+                .any(|event| event.kind == "gate_resolved"),
+            "mismatched RPC decision must not append a gate_resolved row"
+        );
+    }
+
+    #[test]
+    fn cost_org_unreadable_non_notfound_errors() {
+        // A directory at the snapshot path produces a non-NotFound read error; it must
+        // surface as an RPC error, not masquerade as "no snapshot configured".
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("org_cost.json")).unwrap();
+        let d = make_cost_test_dispatcher(tmp.path());
+        assert!(
+            d.handle_cost_org().is_err(),
+            "an unreadable snapshot must not be reported as absent"
+        );
+    }
+
+    fn make_approval_test_dispatcher() -> RpcDispatcher {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(omnesagent_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
+    }
+
+    /// A5: the renew RPC gates on ledger status. An active cert renews; a revoked
+    /// (but unexpired) cert cannot self-renew; a connection with no client cert
+    /// (e.g. the local socket) cannot renew at all.
+    #[tokio::test]
+    async fn cert_renew_gates_on_ledger_status() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let mk = |id: &str| {
+            let (csr, _) = omnesagent_tls::testing::gen_client_csr(id);
+            omnesagent_tls::sign_csr(&ca_cert, &ca_key, id, &csr).unwrap()
+        };
+        let active = mk("dev-active");
+        let revoked = mk("dev-revoked");
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            for (issued, id) in [(&active, "dev-active"), (&revoked, "dev-revoked")] {
+                ledger
+                    .record_issued(
+                        &LedgerEntry {
+                            device_id: id.to_string(),
+                            fingerprint: issued.fingerprint.clone(),
+                            not_before: issued.not_before,
+                            not_after: issued.not_after,
+                            status: CertStatus::Active,
+                            token_hash: String::new(),
+                            actor: "enroll:test".to_string(),
+                            issued_at: 0,
+                        },
+                        false,
+                    )
+                    .unwrap();
+                // These stand for certificates their clients actually hold. An
+                // unmarked row is an UNDELIVERED one, and the ledger's sweep
+                // revokes those at open - so without this the renewal below
+                // would be refused for the wrong reason entirely.
+                ledger.mark_delivered(&issued.fingerprint).unwrap();
+            }
+            ledger.mark_revoked(&revoked.fingerprint, "test").unwrap();
+        }
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        // Active cert renews.
+        let active_disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        assert!(
+            active_disp.handle_renew_cert(&params).await.is_ok(),
+            "an active cert should renew"
+        );
+
+        // Revoked-but-unexpired cert is refused (A5).
+        let revoked_disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+            .with_peer_cert_fingerprint(Some(revoked.fingerprint.clone()));
+        assert!(
+            revoked_disp.handle_renew_cert(&params).await.is_err(),
+            "a revoked cert must not self-renew"
+        );
+
+        // No client cert (local socket) cannot renew.
+        let nocert_disp = RpcDispatcher::new(ctx, tx, "unix:test".into());
+        assert!(
+            nocert_disp.handle_renew_cert(&params).await.is_err(),
+            "renewal requires the mutually authenticated WSS plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_refuses_static_pinned_wss_policy() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = omnesagent_tls::testing::gen_client_csr("dev-static-pin");
+        let active =
+            omnesagent_tls::sign_csr(&ca_cert, &ca_key, "dev-static-pin", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-static-pin".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            // A certificate its client holds; an unmarked row would be swept as
+            // undelivered and the assertion below would read Revoked.
+            ledger.mark_delivered(&active.fingerprint).unwrap();
+        }
+
+        let mut config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+        config.wss.client_auth = Some(omnesagent_config::schema::WssClientAuthConfig {
+            pinned_certs: vec![active.fingerprint.clone()],
+            ..Default::default()
+        });
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        let err = disp
+            .handle_renew_cert(&params)
+            .await
+            .expect_err("static WSS pins must disable in-band renewal");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("[wss.client_auth].pinned_certs"),
+            "got: {}",
+            err.message
+        );
+
+        let ledger = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            ledger.status_of(&active.fingerprint).unwrap(),
+            Some(CertStatus::Active)
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_refuses_once_the_operator_has_revoked_the_device() {
+        // End-to-end at the RPC boundary: an operator revocation that wins the
+        // race must leave the device with no usable certificate, and the client
+        // must be told to re-enroll rather than retry. INVALID_PARAMS, not
+        // INTERNAL_ERROR - this is the client's situation, not a server fault.
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (csr, _) = omnesagent_tls::testing::gen_client_csr("dev-revoked-mid");
+        let presenting =
+            omnesagent_tls::sign_csr(&ca_cert, &ca_key, "dev-revoked-mid", &csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-revoked-mid".to_string(),
+                        fingerprint: presenting.fingerprint.clone(),
+                        not_before: presenting.not_before,
+                        not_after: presenting.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&presenting.fingerprint).unwrap();
+            // The operator revokes the whole device, exactly as
+            // `security revoke-client-cert --device` does, on its own handle.
+            assert_eq!(
+                ledger.revoke_device("dev-revoked-mid", "operator").unwrap(),
+                1
+            );
+        }
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(presenting.fingerprint.clone()));
+
+        let err = disp
+            .handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect_err("a revoked device must not renew");
+        assert_eq!(err.code, INVALID_PARAMS, "got: {err:?}");
+
+        // No new active certificate exists for the revoked device.
+        let ledger = CertLedger::open(dir.path(), None).unwrap();
+        assert!(
+            ledger.list_active().unwrap().is_empty(),
+            "a revoked device must hold no active certificate, got: {:?}",
+            ledger.list_active().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_revokes_into_the_configured_crl_not_the_default() {
+        // The renewal RPC opens its own ledger per call. Opening it on the
+        // ledger DEFAULT path while `[wss.client_auth].crl_path` is configured
+        // meant every revocation it performs - including the undelivered sweep
+        // that runs at every open - rewrote `<data_dir>/tls/revoked`, a file
+        // the verifier never reads, and left the operator's real CRL untouched.
+        // Revoked in SQLite, still accepted at the handshake.
+        use crate::security::cert_ledger::{
+            CertLedger, CertStatus, LedgerEntry, effective_revoked_list_path, revoked_list_path,
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let custom_crl = dir.path().join("operator-managed.crl");
+        let mut config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+        config.wss.client_auth = Some(omnesagent_config::schema::WssClientAuthConfig {
+            crl_path: custom_crl.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (csr, _) = omnesagent_tls::testing::gen_client_csr("dev-crl");
+        let presenting = omnesagent_tls::sign_csr(&ca_cert, &ca_key, "dev-crl", &csr).unwrap();
+
+        // Seed through a ledger opened on the SAME configured path, so the
+        // fixture cannot be what puts the revocation in the right file.
+        let effective = effective_revoked_list_path(
+            dir.path(),
+            config.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+        );
+        assert_eq!(effective, custom_crl);
+        {
+            let ledger = CertLedger::open_at(dir.path(), None, effective.clone()).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-crl".to_string(),
+                        fingerprint: presenting.fingerprint.clone(),
+                        not_before: presenting.not_before,
+                        not_after: presenting.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&presenting.fingerprint).unwrap();
+            // A stranded undelivered certificate, already past the TTL. The
+            // renewal's ledger open must sweep it.
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-ghost".to_string(),
+                        fingerprint: "ab".repeat(32),
+                        not_before: 0,
+                        not_after: i64::MAX,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(presenting.fingerprint.clone()));
+
+        disp.handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect("renewal must succeed");
+
+        // The sweep's revocation landed in the file the verifier reads...
+        let set = omnesagent_tls::load_revoked_fingerprints(&custom_crl)
+            .expect("the configured CRL must exist");
+        assert!(
+            set.contains(&"ab".repeat(32)),
+            "the renewal path must revoke into the CONFIGURED CRL, got: {set:?}"
+        );
+        // ...and not only into the default path the verifier ignores.
+        let default_body =
+            std::fs::read_to_string(revoked_list_path(dir.path())).unwrap_or_default();
+        assert!(
+            !default_body.contains(&"ab".repeat(32)),
+            "revocation must not be written to the unused default path: {default_body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_marks_delivery_and_reconciles_one_that_never_landed() {
+        // Renewal's half of the delivery contract, both directions.
+        //
+        // A renewal records a SECOND active row (new fingerprint, same device)
+        // while the old certificate stays valid - that is what makes renewal
+        // safe. So an undelivered renewal has to be reconciled without
+        // disturbing the certificate the client is still using, or the sweep
+        // would lock out the very client it is protecting.
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = omnesagent_tls::testing::gen_client_csr("dev-renew");
+        let prior = omnesagent_tls::sign_csr(&ca_cert, &ca_key, "dev-renew", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-renew".to_string(),
+                        fingerprint: prior.fingerprint.clone(),
+                        not_before: prior.not_before,
+                        not_after: prior.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            // The client holds this one - it is what it presents to renew.
+            ledger.mark_delivered(&prior.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(prior.fingerprint.clone()));
+
+        let renewed = disp
+            .handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect("an active, delivered cert must renew");
+        let renewed_fp = omnesagent_tls::single_cert_pem_sha256_fingerprint(
+            renewed["cert_pem"].as_str().expect("cert_pem is a string"),
+        )
+        .unwrap();
+        assert_ne!(
+            renewed_fp, prior.fingerprint,
+            "a renewal produces a new fingerprint, so it is a second row"
+        );
+
+        // Direction 1: the handler marked the renewal delivered, so it survives
+        // the sweep. Without the call site this assertion is what fails.
+        let marks = |fp: &str| -> Option<i64> {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.query_row(
+                "SELECT delivered_at FROM issued_certs WHERE fingerprint = ?1",
+                rusqlite::params![fp],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            marks(&renewed_fp).is_some(),
+            "the renewal handler must record delivery of the certificate it returns"
+        );
+
+        // Direction 2: the crash window the handler cannot close itself - the
+        // process dies between the ledger write and the delivery mark. Clearing
+        // the mark reproduces exactly the durable state that leaves behind,
+        // the same way `stage_pending_row` reproduces a mid-issuance crash.
+        {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.execute(
+                "UPDATE issued_certs SET delivered_at = NULL, issued_at = issued_at - 7200
+                     WHERE fingerprint = ?1",
+                rusqlite::params![renewed_fp],
+            )
+            .unwrap();
+        }
+
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            reopened.status_of(&renewed_fp).unwrap(),
+            Some(CertStatus::Revoked),
+            "an undelivered renewal must be reconciled to revoked"
+        );
+        assert_eq!(
+            reopened.status_of(&prior.fingerprint).unwrap(),
+            Some(CertStatus::Active),
+            "the certificate the client still holds must be untouched by the sweep"
+        );
+        assert_eq!(
+            reopened.revoked_fingerprints().unwrap(),
+            vec![renewed_fp],
+            "only the undelivered renewal is revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_propagates_certificate_audit_write_failure() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+        config.security.audit.log_path = "missing/audit.log".to_string();
+
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = omnesagent_tls::testing::gen_client_csr("dev-active");
+        let active = omnesagent_tls::sign_csr(&ca_cert, &ca_key, "dev-active", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-active".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            // Delivered, so the failing audit logger below is exercised by the
+            // RENEWAL write - not by the undelivered sweep trying to revoke
+            // this row at open, which fails the open for a different reason.
+            ledger.mark_delivered(&active.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint));
+        let err = disp
+            .handle_renew_cert(&params)
+            .await
+            .expect_err("audit write failure must fail renewal");
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message.contains("certificate audit event"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// Renewal must append through the daemon's SHARED audit logger, not one
+    /// it builds itself. Proven by injecting a write failure into
+    /// `ctx.cert_audit` and requiring the renewal to see it: a handler that
+    /// constructed its own `AuditLogger` would be writing to a different
+    /// instance, the injected fault would not reach it, and the renewal would
+    /// succeed. Deterministic — no concurrency needed to tell the two wirings
+    /// apart.
+    #[tokio::test]
+    async fn cert_renew_writes_through_the_shared_audit_logger() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = omnesagent_tls::testing::gen_client_csr("dev-shared");
+        let active = omnesagent_tls::sign_csr(&ca_cert, &ca_key, "dev-shared", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-shared".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&active.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let shared = ctx
+            .cert_audit
+            .clone()
+            .expect("the daemon context must carry a certificate audit logger");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        // Fault the SHARED instance. Only a renewal that writes through it
+        // can observe this.
+        shared.fail_writes_after_for_test(0);
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+        let disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        let err = disp.handle_renew_cert(&params).await.expect_err(
+            "renewal must write through the shared audit logger, so a fault injected \
+             into it must fail the renewal",
+        );
+        assert_eq!(err.code, INTERNAL_ERROR);
+
+        // Clearing the fault on the same instance lets renewal proceed, which
+        // confirms the failure came from the injection and not from setup.
+        shared.clear_write_failure_for_test();
+        let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint));
+        disp.handle_renew_cert(&params)
+            .await
+            .expect("renewal must succeed once the injected fault is cleared");
+
+        let log_path = dir.path().join("audit.log");
+        crate::security::audit::verify_chain(&log_path)
+            .expect("a failed then retried renewal must leave a verifiable audit chain");
+    }
+
+    /// Renewal is a normal operational path with audit logging on by default,
+    /// so several clients renewing at once is ordinary traffic - not an edge
+    /// case. Every one of them appends to the Merkle-chained audit file, and
+    /// the chain has exactly one writer per file: the shared
+    /// `RpcContext::cert_audit`.
+    ///
+    /// When each renewal built its own `AuditLogger`, each instance recovered
+    /// the same chain tip and then advanced its own private copy of the
+    /// sequence and `prev_hash`. Concurrent renewals appended entries that
+    /// duplicated sequence numbers and linked to hashes their neighbours had
+    /// overwritten, and `verify_chain` rejected the whole file even though
+    /// every request had used its own correctly locked logger.
+    ///
+    /// NOTE: some renewals in this test are expected to fail, for a reason
+    /// that has nothing to do with the audit chain. `CertLedger::open` runs
+    /// `materialize_revocations`, which stages the revocation list through a
+    /// FIXED temp filename (`cert_ledger.rs`, `materialize_on`: `let tmp =
+    /// path.with_extension("tmp")`) and renames it into place. Concurrent
+    /// opens — and renewal opens the ledger per request — collide on that one
+    /// temp path, and the loser's rename fails with ENOENT. This test
+    /// therefore accepts that specific failure and rejects every other error,
+    /// so it still fails loudly if renewal breaks for any new reason. The
+    /// ledger race is tracked separately; fixing it should let this test
+    /// require all renewals to succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_renewals_keep_the_audit_chain_verifiable() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        const RENEWALS: usize = 8;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..omnesagent_config::schema::Config::default()
+        };
+
+        let mats = omnesagent_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+
+        // One active certificate per concurrent client.
+        let mut fingerprints = Vec::with_capacity(RENEWALS);
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            for i in 0..RENEWALS {
+                let device = format!("dev-concurrent-{i}");
+                let (csr, _) = omnesagent_tls::testing::gen_client_csr(&device);
+                let issued = omnesagent_tls::sign_csr(&ca_cert, &ca_key, &device, &csr).unwrap();
+                ledger
+                    .record_issued(
+                        &LedgerEntry {
+                            device_id: device,
+                            fingerprint: issued.fingerprint.clone(),
+                            not_before: issued.not_before,
+                            not_after: issued.not_after,
+                            status: CertStatus::Active,
+                            token_hash: String::new(),
+                            actor: "enroll:test".to_string(),
+                            issued_at: 0,
+                        },
+                        false,
+                    )
+                    .unwrap();
+                // A real client cert reached its owner, so the row is
+                // delivered; without this the undelivered sweep at ledger open
+                // revokes it and renewal is refused for the wrong reason.
+                ledger.mark_delivered(&issued.fingerprint).unwrap();
+                fingerprints.push(issued.fingerprint);
+            }
+        }
+
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        // ONE context, so one shared audit logger - exactly the daemon's shape.
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        // Every renewal is in flight before any of them finishes.
+        let gate = Arc::new(tokio::sync::Barrier::new(RENEWALS));
+        let mut tasks = Vec::with_capacity(RENEWALS);
+        for fingerprint in fingerprints {
+            let disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+                .with_peer_cert_fingerprint(Some(fingerprint));
+            let gate = Arc::clone(&gate);
+            let (renew_csr, _) = omnesagent_tls::testing::gen_client_csr("ignored-by-daemon");
+            tasks.push(::omnesagent_spawn::spawn!(async move {
+                let params = serde_json::json!({ "csr_pem": renew_csr });
+                gate.wait().await;
+                disp.handle_renew_cert(&params).await
+            }));
+        }
+        // EVERY concurrent renewal must succeed. This assertion used to tolerate
+        // failures whose message contained "initialize cert ledger DB", because
+        // each ledger open materializes the revocation list through a FIXED
+        // temp path and concurrent opens raced the rename - three of eight
+        // failed. That race is fixed in `CertLedger::materialize_on` (unique
+        // per-call temp name), so tolerating it here would only hide its
+        // return.
+        let mut succeeded = 0usize;
+        for task in tasks {
+            match task.await.expect("renewal task panicked") {
+                Ok(_) => succeeded += 1,
+                Err(e) => panic!("a concurrent renewal must not fail: {e:?}"),
+            }
+        }
+        assert_eq!(
+            succeeded, RENEWALS,
+            "all {RENEWALS} concurrent renewals must complete"
+        );
+
+        // The trail must still verify end to end.
+        let log_path = dir.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path).expect("audit log must exist");
+        let entries: Vec<crate::security::audit::AuditEvent> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("every audit line must be complete JSON"))
+            .collect();
+
+        let verified = crate::security::audit::verify_chain(&log_path)
+            .expect("concurrent renewals must leave a verifiable audit chain");
+        assert_eq!(
+            verified as usize,
+            entries.len(),
+            "verify_chain must cover every appended entry"
+        );
+        assert_eq!(
+            entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            (0..entries.len() as u64).collect::<Vec<_>>(),
+            "sequences must be strictly consecutive: no duplicates, no gaps"
+        );
+
+        let renewed = entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    crate::security::audit::AuditEventType::CertRenewed
+                )
+            })
+            .count();
+        assert_eq!(
+            renewed, succeeded,
+            "every renewal that completed must be recorded exactly once"
+        );
+    }
+
+    #[test]
+    fn method_from_wire_roundtrip() {
+        for (method, wire) in Method::ALL {
+            assert_eq!(
+                Method::from_wire(wire),
+                Some(*method),
+                "from_wire({wire}) should resolve"
+            );
+            assert_eq!(method.wire_name(), *wire, "wire_name roundtrip for {wire}");
+        }
+    }
+
+    #[test]
+    fn method_from_wire_unknown() {
+        assert_eq!(Method::from_wire("nonexistent/method"), None);
+    }
+
+    #[test]
+    fn doctor_run_method_is_registered() {
+        assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
+        assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[tokio::test]
+    async fn config_reload_shuts_down_gateway_before_daemon_reload() {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            omnesagent_config::schema::Config::default(),
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-reload:pid=1".into());
+
+        let result = dispatcher.handle_config_reload();
+        assert!(
+            result.is_ok(),
+            "config/reload should accept reload-capable contexts"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("gateway shutdown must be signalled before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+        use omnesagent_config::presets::{
+            AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+        };
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..omnesagent_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            config,
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([(
+                    "api_key".to_string(),
+                    "sk-test".to_string(),
+                )]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+
+        let result = dispatcher
+            .handle_quickstart_apply(&json!({ "submission": submission }))
+            .await
+            .expect("quickstart/apply should accept reload-capable contexts");
+        assert_eq!(
+            result["kind"], "applied",
+            "quickstart/apply result: {result:#?}"
+        );
+        assert_eq!(result["daemon_restarted"], true);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("quickstart/apply must signal gateway shutdown before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "quickstart/apply daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("quickstart/apply daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
+    }
+
+    #[test]
+    fn doctor_summary_counts_each_severity_bucket() {
+        let results = vec![
+            DiagResult {
+                severity: crate::doctor::Severity::Ok,
+                category: "config".to_string(),
+                message: "ok".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "config".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "runtime".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Error,
+                category: "workspace".to_string(),
+                message: "error".to_string(),
+            },
+        ];
+
+        let summary = doctor_summary(&results);
+
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.warnings, 2);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
+    fn method_all_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for (_, wire) in Method::ALL {
+            assert!(seen.insert(*wire), "duplicate wire name: {wire}");
+        }
+    }
+
+    #[test]
+    fn session_approve_resolves_pending_request() {
+        let dispatcher = make_approval_test_dispatcher();
+        let (tx, mut rx) =
+            tokio::sync::oneshot::channel::<omnesagent_api::channel::ChannelApprovalResponse>();
+        dispatcher
+            .ctx
+            .approval_pending
+            .insert("req-allow".to_string(), tx);
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "req-allow",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "req-allow");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            omnesagent_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
+    }
+
+    #[test]
+    fn session_approve_unknown_request_is_acknowledged_noop() {
+        let dispatcher = make_approval_test_dispatcher();
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "timed-out-req",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "timed-out-req");
+        assert_eq!(result["acknowledged"], true);
+        assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
+    }
+
+    #[test]
+    fn personality_templates_use_requested_agent_name_before_config_exists() {
+        let req = PersonalityTemplatesParams {
+            agent: Some(" bob ".to_string()),
+        };
+        let ctx = personality_template_context(&omnesagent_config::schema::Config::default(), &req);
+
+        assert_eq!(ctx.agent, "bob");
+        assert!(ctx.include_memory);
+    }
+
+    #[test]
+    fn personality_templates_without_agent_stay_generic_and_memoryless() {
+        let req = PersonalityTemplatesParams { agent: None };
+        let ctx = personality_template_context(&omnesagent_config::schema::Config::default(), &req);
+
+        assert_eq!(ctx.agent, "OmnesAgent");
+        assert!(!ctx.include_memory);
+    }
+
+    #[test]
+    fn chunk_notification() {
+        let event = TurnEvent::Chunk {
+            delta: "hello".into(),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
+        assert_eq!(v["method"], notification::SESSION_UPDATE);
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["type"], "agent_message_chunk");
+        assert_eq!(v["params"]["text"], "hello");
+    }
+
+    #[test]
+    fn thinking_notification() {
+        let event = TurnEvent::Thinking {
+            delta: "hmm".into(),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "agent_thought_chunk");
+        assert_eq!(v["params"]["text"], "hmm");
+    }
+
+    #[test]
+    fn tool_call_notification() {
+        let event = TurnEvent::ToolCall {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            args: json!({"cmd": "ls"}),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "tool_call");
+        assert_eq!(v["params"]["tool_call_id"], "tc_1");
+        assert_eq!(v["params"]["name"], "bash");
+        assert_eq!(v["params"]["raw_input"]["cmd"], "ls");
+    }
+
+    #[test]
+    fn tool_result_notification() {
+        let event = TurnEvent::ToolResult {
+            id: "tc_1".into(),
+            name: "bash".into(),
+            output: "file.txt".into(),
+            artifact: None,
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "tool_result");
+        assert_eq!(v["params"]["tool_call_id"], "tc_1");
+        assert_eq!(v["params"]["raw_output"], "file.txt");
+    }
+
+    #[test]
+    fn plan_turn_event_maps_to_plan_notification() {
+        use omnesagent_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+
+        let event = TurnEvent::Plan {
+            entries: vec![PlanEntry {
+                content: "Analyze codebase".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::High,
+                active_form: Some("Analyzing codebase".to_string()),
+            }],
+        };
+        let json = notification_for_turn_event("sess-1", &event, None)
+            .expect("plan yields a notification");
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan");
+        assert_eq!(v["params"]["session_id"], "sess-1");
+        assert_eq!(v["params"]["entries"][0]["content"], "Analyze codebase");
+        assert_eq!(v["params"]["entries"][0]["status"], "in_progress");
+        assert_eq!(v["params"]["entries"][0]["priority"], "high");
+        assert_eq!(
+            v["params"]["entries"][0]["activeForm"],
+            "Analyzing codebase"
+        );
+    }
+
+    #[test]
+    fn empty_plan_turn_event_maps_to_empty_entries() {
+        let event = TurnEvent::Plan { entries: vec![] };
+        let json =
+            notification_for_turn_event("sess-2", &event, None).expect("empty plan still notifies");
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "plan");
+        assert!(v["params"]["entries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_plan_notification_built_for_nonempty_plan() {
+        use omnesagent_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let entries = vec![PlanEntry {
+            content: "Resume me".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Medium,
+            active_form: None,
+        }];
+        let json = plan_replay_notification("sess-9", &entries).expect("nonempty plan replays");
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "plan");
+        assert_eq!(v["params"]["session_id"], "sess-9");
+        assert_eq!(v["params"]["entries"][0]["content"], "Resume me");
+    }
+
+    #[test]
+    fn resume_plan_notification_absent_for_empty_plan() {
+        assert!(plan_replay_notification("sess-9", &[]).is_none());
+    }
+
+    async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("minimal Agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+        sessions
+    }
+
+    #[tokio::test]
+    async fn plan_event_is_stored_before_emitting() {
+        use omnesagent_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "persist-plan-sess";
+        let store = store_with_one_session(sid).await;
+
+        let entries = vec![PlanEntry {
+            content: "A".to_string(),
+            status: PlanStatus::InProgress,
+            priority: PlanPriority::High,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        persist_plan_if_any(&store, None, sid, &event).await;
+        assert_eq!(store.get_plan(sid).await.unwrap(), entries);
+    }
+
+    #[tokio::test]
+    async fn non_plan_event_does_not_touch_stored_plan() {
+        let sid = "no-touch-sess";
+        let store = store_with_one_session(sid).await;
+        persist_plan_if_any(&store, None, sid, &TurnEvent::Chunk { delta: "hi".into() }).await;
+        assert!(store.get_plan(sid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_event_persists_to_durable_acp_store() {
+        use omnesagent_api::plan::{PlanEntry, PlanPriority, PlanStatus};
+        let sid = "durable-plan-sess";
+        let sessions = store_with_one_session(sid).await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acp =
+            Arc::new(omnesagent_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        acp.create_session(sid, "alpha", tmp.path().to_str().unwrap())
+            .unwrap();
+
+        let entries = vec![PlanEntry {
+            content: "Durable".to_string(),
+            status: PlanStatus::Pending,
+            priority: PlanPriority::Low,
+            active_form: None,
+        }];
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        persist_plan_if_any(&sessions, Some(&acp), sid, &event).await;
+
+        // In-memory cache updated…
+        assert_eq!(sessions.get_plan(sid).await.unwrap(), entries);
+        // …and durable store updated (survives daemon restart / eviction).
+        assert_eq!(acp.get_plan(sid).unwrap(), entries);
+    }
+
+    #[test]
+    fn approval_request_notification() {
+        let event = TurnEvent::ApprovalRequest {
+            request_id: "ar_1".into(),
+            tool_name: "bash".into(),
+            arguments_summary: "rm -rf /".into(),
+            timeout_secs: 30,
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "approval_request");
+        assert_eq!(v["params"]["request_id"], "ar_1");
+        assert_eq!(v["params"]["tool_name"], "bash");
+        assert_eq!(v["params"]["timeout_secs"], 30);
+    }
+
+    #[test]
+    fn history_trimmed_notification() {
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "history_trimmed");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["kept_turns"], 1);
+        assert_eq!(v["params"]["reason"], "context token budget exceeded");
+    }
+
+    #[test]
+    fn usage_event_emits_context_usage_notification() {
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: Some(0.01),
+        };
+        let json = notification_for_turn_event("s1", &event, Some(32_000)).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(v["params"]["session_id"], "s1");
+        // Context size is the prompt the model just consumed = input_tokens.
+        // Output tokens are the model's reply, not part of the prompt size.
+        // cached_input_tokens is a *subset* of input_tokens per the
+        // TokenUsage contract and must NOT be added (double-counts).
+        assert_eq!(v["params"]["input_tokens"], 100);
+        assert_eq!(v["params"]["max_context_tokens"], 32_000);
+    }
+
+    /// Regression: Zerocode's context meter must read the runtime-profile
+    /// `max_context_tokens` budget, not the provider model-window helper.
+    /// The model-window path falls back to 32_000 when `context_window` is
+    /// unset, which made the meter ignore a profile set to e.g. 128_000.
+    #[test]
+    fn context_usage_max_tokens_uses_runtime_profile_budget() {
+        use std::collections::HashMap;
+        use omnesagent_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                // No provider context_window configured — the broken path
+                // would fall back to 32_000 here.
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            context_usage_max_tokens(&cfg, "coder"),
+            128_000,
+            "context meter must use runtime_profiles.<name>.max_context_tokens"
+        );
+        assert_eq!(
+            cfg.effective_model_context_window("coder"),
+            32_000,
+            "sanity: model-window helper still defaults to 32k without provider context_window"
+        );
+    }
+
+    /// Boundary regression: prove the corrected ceiling survives the *wire*
+    /// path, not just the config helper. This threads
+    /// `context_usage_max_tokens(&cfg, alias)` through the exact
+    /// `notification_for_turn_event` serialization the RPC dispatch emits, and
+    /// asserts the on-the-wire `context_usage.max_context_tokens` reads the
+    /// runtime-profile budget (128_000) rather than the model-window fallback
+    /// (32_000). This closes the "helper is right but does the emitted payload
+    /// carry it?" gap without needing a live daemon smoke.
+    #[test]
+    fn context_usage_notification_wire_reports_runtime_profile_budget() {
+        use std::collections::HashMap;
+        use omnesagent_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                // No provider context_window: the broken path would emit 32_000.
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            ..Config::default()
+        };
+
+        // Resolve the ceiling exactly as RPC dispatch does, then emit it
+        // through the real wire serializer.
+        let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: Some(0.01),
+        };
+        let json = notification_for_turn_event("s1", &event, Some(max_ctx)).unwrap();
+        let v = parse(&json);
+
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["max_context_tokens"], 128_000,
+            "emitted context_usage must carry the runtime-profile budget, not the 32k model-window fallback"
+        );
+    }
+
+    #[test]
+    fn usage_event_without_input_tokens_emits_null() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: None,
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        // No input_tokens reported → field omitted (skip_serializing_if).
+        assert!(
+            v["params"].get("input_tokens").is_none(),
+            "absent input_tokens should not be synthesized from output_tokens"
+        );
+    }
+
+    #[test]
+    fn usage_event_does_not_double_count_cached_subset() {
+        let event = TurnEvent::Usage {
+            input_tokens: Some(25_000),
+            cached_input_tokens: Some(15_000),
+            output_tokens: Some(200),
+            cost_usd: None,
+        };
+        let json = notification_for_turn_event("s1", &event, Some(200_000)).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["input_tokens"], 25_000,
+            "input_tokens is reported as-is — cached subset must not be added"
+        );
+    }
+
+    #[test]
+    fn usage_event_only_cached_tokens_emits_null() {
+        // Edge case: provider reports only cached without input total.
+        // Without a known total this is ambiguous, so we don't synthesize one.
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: Some(80_000),
+            output_tokens: Some(100),
+            cost_usd: None,
+        };
+        let json = notification_for_turn_event("s1", &event, Some(100_000)).unwrap();
+        let v = parse(&json);
+        assert!(
+            v["params"].get("input_tokens").is_none(),
+            "cached-only is ambiguous; do not fabricate a total"
+        );
+    }
+
+    #[test]
+    fn parse_params_valid() {
+        let v = json!({"session_id": "s1"});
+        let p: SessionIdParams = parse_params(&v).unwrap();
+        assert_eq!(p.session_id, "s1");
+    }
+
+    #[test]
+    fn parse_params_missing_required() {
+        let v = json!({});
+        let err = parse_params::<SessionIdParams>(&v).unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn to_result_roundtrip() {
+        let r = InitializeResult {
+            protocol_version: 1,
+            server_version: "0.1.0".into(),
+            server_pid: 42,
+            tui_id: None,
+            tui_sig: None,
+            capabilities: vec![],
+            commands: vec![],
+        };
+        let val = to_result(r).unwrap();
+        assert_eq!(val["protocol_version"], 1);
+        assert_eq!(val["server_version"], "0.1.0");
+        assert_eq!(val["server_pid"], 42);
+        assert_eq!(
+            val["commands"],
+            json!([]),
+            "new daemons must serialize an authoritative empty catalogue"
+        );
+    }
+
+    #[test]
+    fn status_runtime_context_reports_config_root_and_local_endpoint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..omnesagent_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let context = status_runtime_context(&config, RuntimeConfigKind::Temporary);
+
+        assert_eq!(context.config_dir, tmp.path().display().to_string());
+        assert_eq!(
+            context.config_file,
+            tmp.path().join("config.toml").display().to_string()
+        );
+        assert_eq!(context.config_kind, RuntimeConfigKind::Temporary);
+        assert_eq!(
+            context.local_ipc_endpoint,
+            crate::rpc::local::socket_path(&config)
+                .display()
+                .to_string()
+        );
+
+        config.config_path = std::path::PathBuf::from("/opt/omnesagent/config.toml");
+        assert_eq!(
+            status_runtime_context(&config, RuntimeConfigKind::Custom).config_kind,
+            RuntimeConfigKind::Custom
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_status_includes_runtime_context_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..omnesagent_config::schema::Config::default()
+        };
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        let value = dispatcher.handle_status().await.expect("status result");
+        let status: StatusResult = serde_json::from_value(value).expect("status shape");
+
+        assert_eq!(
+            status.config_dir.as_deref(),
+            Some(tmp.path().to_str().unwrap())
+        );
+        assert_eq!(
+            status.config_file.as_deref(),
+            Some(tmp.path().join("config.toml").to_str().unwrap())
+        );
+        assert_eq!(status.config_kind, Some(RuntimeConfigKind::Temporary));
+        assert_eq!(
+            status.local_ipc_endpoint.as_deref(),
+            Some(crate::rpc::local::socket_path(&config).to_str().unwrap())
+        );
+    }
+
+    /// Cover the `initialize` parsing path that caches the TUI's
+    /// `clientCapabilities.elicitation` block so the per-session
+    /// `RpcApprovalChannel` can route `request_choice` over
+    /// `elicitation/create`. Source-of-truth check: the dispatcher
+    /// is the canonical owner; the test reads the field directly.
+    /// Wiring check for the registry's epoch guard: `initialize` must record the
+    /// epoch it registered under, so a displaced connection's teardown removes
+    /// its own registration and not the reconnect that adopted the same TUI id.
+    /// The registry enforces the rule; this proves the dispatcher supplies it.
+    #[tokio::test]
+    async fn a_reconnect_survives_the_displaced_connections_teardown() {
+        let (mut first, _sessions) =
+            make_acp_test_dispatcher(omnesagent_config::schema::Config::default());
+        let ctx = Arc::clone(&first.ctx);
+
+        first
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION,
+            }))
+            .await
+            .expect("first initialize");
+        let (id, epoch_first) = first.tui_registration().expect("first registered");
+        let id = id.to_string();
+
+        // The client reconnects on a NEW connection, claiming the same id.
+        // Test registries are unsigned, so the claim is accepted as it would be
+        // with a valid signature.
+        let (writer_tx, _writer_rx) = mpsc::channel(8);
+        let mut second =
+            RpcDispatcher::new(Arc::clone(&ctx), writer_tx, "wss:reconnect".to_string());
+        second
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION,
+                "tui_id": id,
+            }))
+            .await
+            .expect("reconnect initialize");
+        let (_, epoch_second) = second.tui_registration().expect("reconnect registered");
+        assert_ne!(
+            epoch_first, epoch_second,
+            "a reconnect must register under its own epoch"
+        );
+
+        // The displaced connection's transport loop finally tears down.
+        ctx.tui_registry.unregister(&id, epoch_first);
+        assert_eq!(
+            ctx.tui_registry.list().len(),
+            1,
+            "the reconnect must survive the displaced connection's cleanup"
+        );
+        assert!(
+            ctx.tui_registry.get_env(&id).is_some(),
+            "the live TUI must still resolve its captured environment"
+        );
+
+        // The live connection's own teardown still works.
+        ctx.tui_registry.unregister(&id, epoch_second);
+        assert!(ctx.tui_registry.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_caches_elicitation_form_capability() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(omnesagent_config::schema::Config::default());
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "clientCapabilities": { "elicitation": { "form": {} } }
+        });
+        let result = dispatcher.handle_initialize(&params).await;
+        assert!(result.is_ok(), "initialize should succeed; got {result:?}");
+        assert!(dispatcher.client_elicitation_caps.form);
+        assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    #[tokio::test]
+    async fn initialize_advertises_canonical_tui_command_descriptors() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(omnesagent_config::schema::Config::default());
+        let result = dispatcher
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["commands"],
+            serde_json::json!([
+                {"id": "help", "name": "help"},
+                {"id": "new", "name": "new", "aliases": ["new-session"]},
+                {"id": "model", "name": "model"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_without_elicitation_leaves_caps_unset() {
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(omnesagent_config::schema::Config::default());
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+        });
+        let _ = dispatcher.handle_initialize(&params).await.unwrap();
+        assert!(!dispatcher.client_elicitation_caps.form);
+        assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_empty_elicitation_object_is_form_only() {
+        // RFD backward-compat: `"elicitation": {}` advertises form-only.
+        let (mut dispatcher, _sessions) =
+            make_acp_test_dispatcher(omnesagent_config::schema::Config::default());
+        let params = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "clientCapabilities": { "elicitation": {} }
+        });
+        let _ = dispatcher.handle_initialize(&params).await.unwrap();
+        assert!(dispatcher.client_elicitation_caps.form);
+        assert!(!dispatcher.client_elicitation_caps.url);
+    }
+
+    use omnesagent_tools::MEMORY_TOOL_NAMES as MEMORY_TOOLS;
+
+    fn make_acp_test_config(tmp: &tempfile::TempDir) -> omnesagent_config::schema::Config {
+        use std::collections::HashMap;
+        use omnesagent_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut providers = omnesagent_config::providers::Providers::default();
+        {
+            let base = providers
+                .models
+                .ensure("openai", "test-provider")
+                .expect("`openai` slot must exist");
+            base.api_key = Some("test-key".into());
+            base.model = Some("test-model".into());
+            base.uri = Some("http://127.0.0.1:1".into());
+        }
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let mut risk_profiles = HashMap::new();
+        risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
+
+        omnesagent_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            providers,
+            agents,
+            risk_profiles,
+            ..omnesagent_config::schema::Config::default()
+        }
+    }
+
+    fn make_acp_test_dispatcher(
+        config: omnesagent_config::schema::Config,
+    ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
+        make_acp_test_dispatcher_with_events(config, None)
+    }
+
+    fn make_acp_test_dispatcher_with_events(
+        config: omnesagent_config::schema::Config,
+        event_tx: Option<tokio::sync::broadcast::Sender<Value>>,
+    ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        ctx.event_tx = event_tx;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
+        (dispatcher, sessions)
+    }
+
+    fn make_acp_test_dispatcher_with_receiver(
+        config: omnesagent_config::schema::Config,
+    ) -> (
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+        tokio::sync::mpsc::Receiver<String>,
+    ) {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-stack:pid=1".into());
+        dispatcher.authenticated = true;
+        (dispatcher, sessions, rx)
+    }
+
+    /// Create a Chat-mode session through the real `session/new` handler,
+    /// optionally sending the `keep_siblings` opt-out.
+    async fn new_chat_session_for_eviction_test(
+        dispatcher: &RpcDispatcher,
+        session_id: &str,
+        keep_siblings: Option<bool>,
+    ) {
+        let mut params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": session_id,
+        });
+        if let Some(keep) = keep_siblings {
+            params["keep_siblings"] = json!(keep);
+        }
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new for {session_id} should succeed; got: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_default_evicts_idle_same_mode_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-evict-default".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "sibling-new", None).await;
+
+        assert!(
+            sessions.get_agent("sibling-old").await.is_none(),
+            "an unflagged session/new must evict the idle same-mode sibling"
+        );
+        assert!(
+            sessions.get_agent("sibling-new").await.is_some(),
+            "the new session must survive the sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_keep_siblings_spares_idle_same_mode_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "kept-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "kept-new", Some(true)).await;
+
+        assert!(
+            sessions.get_agent("kept-old").await.is_some(),
+            "keep_siblings: true must skip the idle-sibling sweep"
+        );
+        assert!(sessions.get_agent("kept-new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_new_keep_siblings_false_matches_default_eviction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep-false".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "false-old", None).await;
+        new_chat_session_for_eviction_test(&dispatcher, "false-new", Some(false)).await;
+
+        assert!(
+            sessions.get_agent("false-old").await.is_none(),
+            "an explicit keep_siblings: false must behave like an absent flag"
+        );
+        assert!(sessions.get_agent("false-new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn keep_siblings_shields_only_the_flagged_call() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
+        dispatcher.set_tui_id_for_test(Some("tui-keep-scope".into()));
+
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-a", Some(true)).await;
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-b", Some(true)).await;
+        assert!(sessions.get_agent("scoped-a").await.is_some());
+        assert!(sessions.get_agent("scoped-b").await.is_some());
+
+        // A later unflagged session/new under the same TUI still garbage
+        // collects previously kept idle siblings: the flag protects a single
+        // call's sweep, not the sessions it leaves behind.
+        new_chat_session_for_eviction_test(&dispatcher, "scoped-c", None).await;
+        assert!(sessions.get_agent("scoped-a").await.is_none());
+        assert!(sessions.get_agent("scoped-b").await.is_none());
+        assert!(sessions.get_agent("scoped-c").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn doctor_run_omits_log_path_when_persistence_is_disabled() {
+        // Serialize against the other tests that mutate the process-global
+        // writer state (the two transition tests below) and install an
+        // explicit disabled writer so the assertion cannot observe a writer
+        // another parallel test installed.
+        let _writer_guard = omnesagent_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        omnesagent_log::init_from_config(
+            &omnesagent_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+        let mut config = make_acp_test_config(&tmp);
+        // Doctor must not advertise any path regardless of the config snapshot.
+        config.observability.log_persistence = omnesagent_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must be null when no writer is active; got: {:?}",
+            obj.get("log_path")
+        );
+    }
+
+    /// Config/reload window, scenario A: the daemon started with an
+    /// ACTIVE writer (rolling), then `config/set` flipped
+    /// `observability.log_persistence` to `none` WITHOUT a daemon reload.
+    /// The writer still persists, so Doctor must still advertise the path —
+    /// gating on the `ctx.config` snapshot would hide a live log.
+    #[tokio::test]
+    async fn doctor_reports_active_writer_path_after_config_set_to_none_without_reload() {
+        let _writer_guard = omnesagent_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        omnesagent_log::init_from_config(
+            &omnesagent_log::LogConfig {
+                log_persistence: "rolling".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = omnesagent_config::schema::LogPersistence::None;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        let log_path = obj.get("log_path").and_then(|v| v.as_str());
+        assert!(
+            matches!(log_path, Some(p) if p.ends_with("runtime-trace.jsonl")),
+            "an active writer must be advertised even when the config snapshot says none; got: {:?}",
+            obj.get("log_path")
+        );
+
+        // Restore a disabled writer so later tests start from a clean state.
+        omnesagent_log::init_from_config(
+            &omnesagent_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+    }
+
+    /// Config/reload window, scenario B: the daemon started with
+    /// persistence DISABLED, then `config/set` flipped it to `rolling`
+    /// WITHOUT a daemon reload. No writer is installed, so Doctor must NOT
+    /// advertise the disabled writer's stale resolved path.
+    #[tokio::test]
+    async fn doctor_omits_log_path_after_config_set_to_rolling_without_reload_when_writer_disabled()
+    {
+        let _writer_guard = omnesagent_log::__private_test_writer_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        omnesagent_log::init_from_config(
+            &omnesagent_log::LogConfig {
+                log_persistence: "none".into(),
+                log_persistence_path: "state/runtime-trace.jsonl".into(),
+                ..Default::default()
+            },
+            tmp.path(),
+        );
+
+        let mut config = make_acp_test_config(&tmp);
+        config.observability.log_persistence = omnesagent_config::schema::LogPersistence::Rolling;
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let result = dispatcher
+            .handle_doctor_run()
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+        assert!(
+            obj.get("log_path").map(|v| v.is_null()).unwrap_or(true),
+            "log_path must stay null when no writer is installed, even if the config says rolling; got: {:?}",
+            obj.get("log_path")
+        );
+    }
+
+    /// RPC-boundary coverage for the probe-timeout branch: a controlled
+    /// never-completing probe must yield a `doctor/run` response whose
+    /// serialized JSON carries `timed_out_phase`, preserves the earlier
+    /// diagnostics, and appends the localized timeout warning exactly once.
+    #[tokio::test]
+    async fn doctor_run_timeout_serializes_partial_result() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        // Force the timeout branch deterministically — no reliance on a real
+        // network endpoint hanging or not.
+        let result = dispatcher
+            .run_doctor(Box::pin(std::future::pending::<
+                Vec<crate::doctor::DiagResult>,
+            >()))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        assert_eq!(
+            obj.get("timed_out_phase").and_then(|v| v.as_str()),
+            Some("probe_models"),
+            "serialized response must carry timed_out_phase='probe_models'"
+        );
+
+        // Earlier diagnostics survive in the serialized results.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("config")),
+            "serialized results must retain config diagnostics after timeout"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("category").and_then(|c| c.as_str()) == Some("workspace")),
+            "serialized results must retain workspace diagnostics after timeout"
+        );
+
+        // The timeout warning is appended exactly once in the serialized output.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        let warns = results
+            .iter()
+            .filter(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str()))
+            .count();
+        assert_eq!(
+            warns, 1,
+            "serialized results must append the timeout warning exactly once"
+        );
+    }
+
+    /// RPC-boundary coverage for the under-deadline branch: a probe that
+    /// completes immediately with a real result must have that result retained
+    /// in the serialized `doctor/run` response, with `timed_out_phase` absent.
+    #[tokio::test]
+    async fn doctor_run_under_deadline_retains_probe_results() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config);
+
+        let probe_result = crate::doctor::DiagResult {
+            severity: crate::doctor::Severity::Ok,
+            category: "probe.mock".into(),
+            message: "mock probe ok".into(),
+        };
+        let result = dispatcher
+            .run_doctor(Box::pin(async move { vec![probe_result] }))
+            .await
+            .expect("doctor/run must succeed");
+        let obj = result.as_object().expect("result must be an object");
+
+        // timed_out_phase is None → skipped on the wire.
+        assert!(
+            obj.get("timed_out_phase")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "under-deadline response must not carry timed_out_phase"
+        );
+
+        // The completed probe result survives in the serialized output.
+        let results = obj
+            .get("results")
+            .and_then(|v| v.as_array())
+            .expect("results must be an array");
+        assert!(
+            results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some("mock probe ok")),
+            "serialized results must retain the completed probe result"
+        );
+
+        // No timeout warning leaks into the under-deadline response.
+        let warning = crate::i18n::get_required_cli_string("cli-doctor-probe-timeout-message");
+        assert!(
+            !results
+                .iter()
+                .any(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str())),
+            "under-deadline response must not contain the timeout warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_rpc_persists_run_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "test-agent",
+            Some("rpc-trigger".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-trigger-ok",
+            None,
+            true,
+        )
+        .expect("test cron job should be created");
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        let value = dispatcher
+            .handle_cron_trigger(&json!({ "id": job.id }))
+            .await
+            .expect("cron/trigger should succeed");
+
+        assert_eq!(value["id"], job.id);
+        assert_eq!(value["success"], true);
+        assert_eq!(value["status"], "ok");
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rpc-trigger-ok")
+        );
+
+        let updated = crate::cron::get_job(&config, &job.id).expect("job should still exist");
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .is_some_and(|output| output.contains("rpc-trigger-ok"))
+        );
+
+        let runs =
+            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or("")
+                .contains("rpc-trigger-ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_rpc_reports_degraded_status_and_broadcasts() {
+        crate::cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "test-agent",
+            Some("rpc-trigger-degraded".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-trigger-degraded",
+            Some(crate::cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("fail-delivery".into()),
+                to: Some("123456".into()),
+                thread_id: None,
+                best_effort: true,
+            }),
+            true,
+        )
+        .expect("test cron job should be created");
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let (dispatcher, _sessions) =
+            make_acp_test_dispatcher_with_events(config.clone(), Some(event_tx));
+
+        let value = dispatcher
+            .handle_cron_trigger(&json!({ "id": job.id }))
+            .await
+            .expect("cron/trigger should succeed");
+
+        assert_eq!(value["id"], job.id);
+        assert_eq!(value["success"], true);
+        assert_eq!(value["status"], "degraded");
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delivery failed:")
+        );
+        assert!(value["duration_ms"].as_i64().is_some());
+        assert!(value["started_at"].as_str().unwrap_or("").contains('T'));
+        assert!(value["finished_at"].as_str().unwrap_or("").contains('T'));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("cron trigger should broadcast")
+            .expect("broadcast channel should stay open");
+        assert_eq!(event["type"], "cron_result");
+        assert_eq!(event["job_id"], job.id);
+        assert_eq!(event["success"], true);
+        assert_eq!(event["manual"], true);
+        assert!(
+            event["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delivery failed:")
+        );
+
+        let runs =
+            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_exposes_no_memory_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "exclude_memory": true,
+            "session_id": "acp-test-session-001"
+        });
+
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-test-session-001")
+            .await
+            .expect("session must be registered in the store after session/new");
+
+        let agent = agent_arc.lock().await;
+        let tool_names = agent.tool_names();
+
+        for &mem_tool in MEMORY_TOOLS {
+            assert!(
+                !tool_names.contains(&mem_tool),
+                "ACP session must NOT expose `{mem_tool}` — found in tool list: {tool_names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_chat_mode_strips_memory_tools_without_exclude_flag() {
+        // The server must derive memory exclusion from `chat_mode: acp`, not
+        // trust the wire `exclude_memory` flag. A Code session that omits the
+        // flag entirely must still come up with no memory tools.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-no-flag-session-001"
+        });
+
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-no-flag-session-001")
+            .await
+            .expect("session must be registered in the store after session/new");
+
+        let agent = agent_arc.lock().await;
+        let tool_names = agent.tool_names();
+
+        for &mem_tool in MEMORY_TOOLS {
+            assert!(
+                !tool_names.contains(&mem_tool),
+                "ACP chat_mode must strip `{mem_tool}` even without exclude_memory — \
+                 tool list: {tool_names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_acp_session_new_exposes_memory_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "exclude_memory": false,
+            "session_id": "chat-test-session-001"
+        });
+
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-test-session-001")
+            .await
+            .expect("session must be registered in the store after session/new");
+
+        let agent = agent_arc.lock().await;
+        let tool_names = agent.tool_names();
+
+        let has_any_memory_tool = MEMORY_TOOLS.iter().any(|&t| tool_names.contains(&t));
+        assert!(
+            has_any_memory_tool,
+            "non-ACP session MUST expose at least one memory tool — tool list: {tool_names:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // chat_mode persistence routing: ACP vs Chat must not cross stores
+    // -----------------------------------------------------------------------
+
+    use omnesagent_infra::session_backend::SessionBackend;
+
+    fn make_persistence_test_dispatcher(
+        config: omnesagent_config::schema::Config,
+        data_dir: &std::path::Path,
+    ) -> (
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+        Arc<omnesagent_infra::session_sqlite::SqliteSessionBackend>,
+        Arc<omnesagent_infra::acp_session_store::AcpSessionStore>,
+    ) {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(omnesagent_infra::session_sqlite::SqliteSessionBackend::new(data_dir).unwrap());
+        let acp_store =
+            Arc::new(omnesagent_infra::acp_session_store::AcpSessionStore::new(data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    #[tokio::test]
+    async fn zerocode_code_surface_injects_context_without_changing_authority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": "generic-acp",
+            }))
+            .await
+            .expect("generic ACP session should succeed");
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "zerocode-acp",
+            }))
+            .await
+            .expect("ZeroCode ACP session should succeed");
+
+        let generic = sessions.get_agent("generic-acp").await.unwrap();
+        let surfaced = sessions.get_agent("zerocode-acp").await.unwrap();
+        let mut generic_tools = generic
+            .lock()
+            .await
+            .tool_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let surfaced_guard = surfaced.lock().await;
+        let mut surfaced_tools = surfaced_guard
+            .tool_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        generic_tools.sort();
+        surfaced_tools.sort();
+        assert_eq!(
+            surfaced_tools, generic_tools,
+            "interaction context must not grant or remove tools"
+        );
+
+        let prompt = surfaced_guard.system_prompt_for_test().unwrap();
+        assert!(prompt.contains("## Interaction Context"));
+        assert!(prompt.contains("Surface: ZeroCode Code (ACP)"));
+        assert!(prompt.contains("this description grants no capabilities"));
+        drop(surfaced_guard);
+
+        assert_eq!(
+            acp_store
+                .load_session("zerocode-acp")
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("zerocode_code")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_surface_claims_outside_the_closed_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        for params in [
+            json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+                "interaction_surface": "zerocode_code",
+                "session_id": "wrong-mode",
+            }),
+            json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "caller_defined_surface",
+                "session_id": "unknown-surface",
+            }),
+        ] {
+            let sid = params["session_id"].as_str().unwrap().to_string();
+            let err = dispatcher
+                .handle_session_new_for_test(&params)
+                .await
+                .expect_err("untrusted surface claims must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+            assert!(sessions.get_agent(&sid).await.is_none());
+        }
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "interaction_context": {
+                    "prompt": "CLIENT_AUTHORED_PROMPT_MUST_NOT_APPEAR",
+                    "tools": "grant_everything"
+                },
+                "session_id": "ignored-client-prose",
+            }))
+            .await
+            .expect("unknown client prose must be ignored, not consumed as context");
+        let agent = sessions.get_agent("ignored-client-prose").await.unwrap();
+        let prompt = agent.lock().await.system_prompt_for_test().unwrap();
+        assert!(!prompt.contains("CLIENT_AUTHORED_PROMPT_MUST_NOT_APPEAR"));
+        assert!(!prompt.contains("grant_everything"));
+    }
+
+    #[tokio::test]
+    async fn resumed_acp_session_preserves_surface_and_rejects_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "surface-resume",
+            }))
+            .await
+            .expect("initial session/new should succeed");
+        assert!(sessions.remove("surface-resume").await);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": "surface-resume",
+            }))
+            .await
+            .expect("an older client may omit the surface without relabelling it");
+        let restored = sessions.get_agent("surface-resume").await.unwrap();
+        assert!(
+            restored
+                .lock()
+                .await
+                .system_prompt_for_test()
+                .unwrap()
+                .contains("Surface: ZeroCode Code (ACP)")
+        );
+        assert!(sessions.remove("surface-resume").await);
+
+        acp_store
+            .create_session_with_interaction_surface(
+                "surface-mismatch",
+                "test-agent",
+                "/tmp/test-agent",
+                Some("another_surface"),
+            )
+            .unwrap();
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "surface-mismatch",
+            }))
+            .await
+            .expect_err("surface mismatch must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("different interaction surface"));
+        assert!(sessions.get_agent("surface-mismatch").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resumed_legacy_acp_session_binds_first_validated_surface_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        acp_store
+            .create_session("legacy-surface", "test-agent", "/tmp/test-agent")
+            .unwrap();
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "legacy-surface",
+            }))
+            .await
+            .expect("a validated surface should bind an unlabelled legacy session");
+        assert_eq!(
+            acp_store
+                .load_session("legacy-surface")
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("zerocode_code")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_trim_event_is_forwarded_exactly_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 4,
+            kept_turns: 1,
+            reason: "message cap".into(),
+        };
+
+        dispatcher
+            .forward_seed_event("restored-session", Some(event))
+            .await;
+
+        let raw = rx
+            .try_recv()
+            .expect("restored history trim must notify the active client");
+        let notification: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(notification["method"], notification::SESSION_UPDATE);
+        assert_eq!(notification["params"]["session_id"], "restored-session");
+        assert_eq!(notification["params"]["dropped_messages"], 4);
+        assert!(
+            rx.try_recv().is_err(),
+            "one seed trim must emit exactly one notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_appends_complete_pretrim_delta_at_cap() {
+        use omnesagent_api::model_provider::ConversationMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(omnesagent_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "trim-at-cap";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let existing = (0..50)
+            .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
+            .collect::<Vec<_>>();
+        store.append_turn(sid, &existing).unwrap();
+
+        let new_messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("new-user")),
+            ConversationMessage::Chat(ChatMessage::assistant("new-assistant")),
+        ];
+        let outcome = Ok(TurnOutcome::Completed {
+            text: "new-assistant".into(),
+            messages: new_messages.clone(),
+        });
+
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(restored.messages.len(), 52);
+        assert_eq!(
+            serde_json::to_value(&restored.messages[50..]).unwrap(),
+            serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_skips_empty_and_failed_turns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(omnesagent_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "no-turn-delta";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        let empty = Ok(TurnOutcome::Cancelled {
+            partial_text: String::new(),
+            messages: Vec::new(),
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+
+        let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert!(
+            store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    fn make_agent_rename_test_config(tmp: &tempfile::TempDir) -> omnesagent_config::schema::Config {
+        use omnesagent_config::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
+        use omnesagent_config::schema::{AliasedAgentConfig, DelegateTargetConfig};
+
+        let mut config = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.heartbeat.enabled = true;
+        config.heartbeat.agent = "alpha".to_string();
+        config.acp.default_agent = Some("alpha".to_string());
+
+        let mut alpha = AliasedAgentConfig {
+            delegates: vec![DelegateTargetConfig::bounded("alpha")],
+            ..Default::default()
+        };
+        alpha
+            .workspace
+            .access
+            .insert(AgentAlias::new("alpha"), AccessMode::Read);
+        config.agents.insert("alpha".to_string(), alpha);
+
+        let mut reviewer = AliasedAgentConfig {
+            delegates: vec![DelegateTargetConfig::bounded("alpha")],
+            ..Default::default()
+        };
+        reviewer
+            .workspace
+            .read_memory_from
+            .push(AgentAlias::new("alpha"));
+        config.agents.insert("reviewer".to_string(), reviewer);
+
+        let mut group = PeerGroupConfig::default();
+        group.agents.push(AgentAlias::new("alpha"));
+        config.peer_groups.insert("crew".to_string(), group);
+
+        config
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_uses_agent_cascade() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let result = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await
+            .expect("agent rename must succeed");
+
+        assert_eq!(result["renamed"], true);
+        assert_eq!(result["path"], "agents");
+        assert_eq!(result["from"], "alpha");
+        assert_eq!(result["to"], "beta");
+        assert!(
+            result.get("warnings").is_none(),
+            "test stores should make owned-state cascade warning-free: {result:?}"
+        );
+
+        let config = dispatcher.ctx.config.read().clone();
+        assert!(!config.agents.contains_key("alpha"));
+        assert!(config.agents.contains_key("beta"));
+        assert_eq!(config.heartbeat.agent, "beta");
+        assert_eq!(config.acp.default_agent.as_deref(), Some("beta"));
+        assert_eq!(
+            config.agents["beta"].delegates,
+            vec![omnesagent_config::schema::DelegateTargetConfig::bounded(
+                "beta"
+            )]
+        );
+        assert!(
+            config.agents["beta"]
+                .workspace
+                .access
+                .contains_key(&omnesagent_config::multi_agent::AgentAlias::new("beta"))
+        );
+        assert_eq!(
+            config.agents["reviewer"].delegates,
+            vec![omnesagent_config::schema::DelegateTargetConfig::bounded(
+                "beta"
+            )]
+        );
+        assert_eq!(
+            config.agents["reviewer"].workspace.read_memory_from,
+            vec![omnesagent_config::multi_agent::AgentAlias::new("beta")]
+        );
+        assert_eq!(
+            config.peer_groups["crew"].agents,
+            vec![omnesagent_config::multi_agent::AgentAlias::new("beta")]
+        );
+
+        let written = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(written.contains("[agents.beta]"), "{written}");
+        assert!(!written.contains("[agents.alpha]"), "{written}");
+        assert!(written.contains("agent = \"beta\""), "{written}");
+        assert!(written.contains("default_agent = \"beta\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_resumes_committed_agent_rename_side_effects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_rename_test_config(&tmp);
+        let old_workspace = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&old_workspace).unwrap();
+        std::fs::write(old_workspace.join("marker.txt"), "lagged workspace").unwrap();
+
+        omnesagent_config::alias_refs::rename_with_cascade(
+            &mut config,
+            &omnesagent_config::alias_refs::AliasKind::Agent,
+            "alpha",
+            "beta",
+        )
+        .expect("seed config already committed to beta");
+        let new_workspace = config.agent_workspace_dir("beta");
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let result = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await
+            .expect("re-issued rename must converge lagging side effects");
+
+        assert_eq!(result["renamed"], true);
+        assert_eq!(result["from"], "alpha");
+        assert_eq!(result["to"], "beta");
+        assert!(
+            !old_workspace.exists(),
+            "old workspace should be moved on resume"
+        );
+        assert!(
+            new_workspace.join("marker.txt").exists(),
+            "workspace residue should converge onto the renamed alias"
+        );
+    }
+
+    #[test]
+    fn config_alias_rename_future_is_small_enough_for_rpc_task_stack() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "path": "agents",
+            "from": "alpha",
+            "to": "beta"
+        });
+        let future = dispatcher.handle_config_map_key_rename(&params);
+        let future_size = std::mem::size_of_val(&future);
+        drop(future);
+
+        assert!(
+            future_size < 16 * 1024,
+            "agent alias rename future is {future_size} bytes; keep large config snapshots \
+             out of the RPC task stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_refuses_active_agent_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "live-agent-session"
+            }))
+            .await
+            .expect("session/new should succeed");
+        assert_eq!(sessions.count_by_agent().await.get("test-agent"), Some(&1));
+
+        let err = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "test-agent",
+                "to": "renamed-agent"
+            }))
+            .await
+            .expect_err("agent rename must refuse active sessions");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("active RPC session"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_writes_to_acp_store_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-routing-001";
+        let params = json!({
+            "agent_alias": "test-agent",
+            "exclude_memory": true,
+            "chat_mode": "acp",
+            "session_id": sid,
+        });
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("session/new should succeed");
+
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "ACP session must be persisted to acp_session_store"
+        );
+
+        assert!(
+            chat_backend.load(&format!("rpc_{sid}")).is_empty(),
+            "ACP session must NOT touch chat session_backend"
+        );
+    }
+
+    #[test]
+    fn conversation_message_entries_projects_typed_tool_exchange() {
+        use omnesagent_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+
+        let entries = conversation_message_entries(&[
+            ConversationMessage::Chat(ChatMessage::user("question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("I will inspect both files".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "call-2".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"a.txt"}"#.into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "call-2".into(),
+                    content: "contents".into(),
+                    tool_name: "read".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    content: "/tmp".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "orphan".into(),
+                    content: "late result".into(),
+                    tool_name: "shell".into(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].kind, MessageEntryKind::Message);
+        assert_eq!(entries[1].content, "I will inspect both files");
+        assert_eq!(entries[2].kind, MessageEntryKind::ToolCall);
+        assert_eq!(entries[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(entries[2].tool_output.as_deref(), Some("/tmp"));
+        assert_eq!(entries[3].kind, MessageEntryKind::ToolCall);
+        assert_eq!(entries[3].tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(entries[3].tool_output.as_deref(), Some("contents"));
+        assert_eq!(entries[4].kind, MessageEntryKind::ToolResult);
+        assert_eq!(entries[4].tool_call_id.as_deref(), Some("orphan"));
+        assert_eq!(entries[4].tool_output.as_deref(), Some("late result"));
+    }
+
+    #[test]
+    fn conversation_message_entries_pairs_duplicate_tool_ids_in_order() {
+        use omnesagent_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let entries = conversation_message_entries(&[
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "first".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "second".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "first result".into(),
+                    tool_name: "first".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "second result".into(),
+                    tool_name: "second".into(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tool_name.as_deref(), Some("first"));
+        assert_eq!(entries[0].tool_output.as_deref(), Some("first result"));
+        assert_eq!(entries[1].tool_name.as_deref(), Some("second"));
+        assert_eq!(entries[1].tool_output.as_deref(), Some("second result"));
+    }
+
+    #[test]
+    fn persisted_transcript_projection_survives_active_history_trim() {
+        use omnesagent_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+
+        let durable = vec![
+            ConversationMessage::Chat(ChatMessage::user("old question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("checking".into()),
+                tool_calls: vec![ToolCall {
+                    id: "old-call".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"pwd"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "old-call".into(),
+                content: "/tmp".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+            ConversationMessage::Chat(ChatMessage::user("new question")),
+            ConversationMessage::Chat(ChatMessage::assistant("new answer")),
+        ];
+
+        let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
+            durable.clone(),
+            2,
+            false,
+        );
+        assert!(active.trimmed);
+        assert!(!active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "old question"
+        )));
+
+        let transcript = conversation_message_entries(&durable);
+        assert!(
+            transcript
+                .iter()
+                .any(|entry| entry.content == "old question")
+        );
+        assert!(transcript.iter().any(|entry| {
+            entry.tool_call_id.as_deref() == Some("old-call")
+                && entry.tool_output.as_deref() == Some("/tmp")
+        }));
+    }
+
+    #[tokio::test]
+    async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
+        use serde_json::from_value;
+        use omnesagent_api::model_provider::{ChatMessage, ConversationMessage};
+        use omnesagent_providers::{ToolCall, ToolResultMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-resume-7799";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .expect("ACP session row");
+        acp_store
+            .append_turn(
+                sid,
+                &[
+                    ConversationMessage::Chat(ChatMessage {
+                        role: "user".into(),
+                        content: "hello from prior turn".into(),
+                    }),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("let me check the logs".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"tail log"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-1".into(),
+                        content: "log contents".into(),
+                        tool_name: String::new(),
+                    }]),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tc-2".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"grep err"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-2".into(),
+                        content: "no errors".into(),
+                        tool_name: String::new(),
+                    }]),
+                    ConversationMessage::Chat(ChatMessage {
+                        role: "assistant".into(),
+                        content: "ack from prior turn".into(),
+                    }),
+                ],
+            )
+            .expect("append turn");
+
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .expect("seed colliding unified backend row");
+
+        assert_eq!(chat_backend.load(sid).len(), 1);
+        for key in [format!("rpc_{sid}"), format!("gw_{sid}")] {
+            assert!(chat_backend.load(&key).is_empty());
+        }
+
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect("session/messages should succeed");
+        let parsed: SessionMessagesResult =
+            from_value(result).expect("SessionMessagesResult shape");
+
+        assert_eq!(parsed.session_id, sid);
+        assert_eq!(
+            parsed.total, 5,
+            "ACP-backed sessions must report their full replayable message count"
+        );
+        assert_eq!(
+            parsed.messages.len(),
+            5,
+            "ACP-backed sessions must replay their persisted messages, not a blank transcript"
+        );
+        assert_eq!(parsed.messages[0].role, "user");
+        assert_eq!(parsed.messages[0].content, "hello from prior turn");
+        assert_eq!(parsed.messages[1].role, "assistant");
+        assert_eq!(
+            parsed.messages[1].content, "let me check the logs",
+            "assistant narration on an AssistantToolCalls row must be preserved \
+             when flattening for session/messages — the agent stores it ONLY \
+             on that row, so dropping it would lose visible turns from the \
+             replayed transcript"
+        );
+        assert_eq!(parsed.messages[2].kind, MessageEntryKind::ToolCall);
+        assert_eq!(parsed.messages[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(
+            parsed.messages[2].tool_output.as_deref(),
+            Some("log contents")
+        );
+        assert_eq!(parsed.messages[3].kind, MessageEntryKind::ToolCall);
+        assert_eq!(parsed.messages[3].tool_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(parsed.messages[3].tool_output.as_deref(), Some("no errors"));
+        assert_eq!(parsed.messages[4].role, "assistant");
+        assert_eq!(parsed.messages[4].content, "ack from prior turn");
+        assert!(
+            parsed
+                .messages
+                .iter()
+                .all(|entry| !entry.content.contains("stale backend collision")),
+            "a colliding generic backend row must not override canonical ACP history"
+        );
+
+        let page = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": sid,
+                "limit": 2,
+                "before_index": 3
+            }))
+            .await
+            .expect("paginated session/messages should succeed");
+        let page: SessionMessagesResult = from_value(page).expect("paginated result shape");
+        assert_eq!(page.total, 5);
+        assert_eq!(page.start, 1);
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[0].content, "let me check the logs");
+        assert_eq!(page.messages[1].tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[tokio::test]
+    async fn session_messages_keeps_plain_backend_projection() {
+        use serde_json::from_value;
+        use omnesagent_api::model_provider::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        chat_backend
+            .append("rpc-plain", &ChatMessage::user("hello"))
+            .unwrap();
+        chat_backend
+            .append("rpc-plain", &ChatMessage::assistant("world"))
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": "rpc-plain" }))
+            .await
+            .expect("plain session/messages should succeed");
+        let parsed: SessionMessagesResult = from_value(result).unwrap();
+        assert_eq!(parsed.total, 2);
+        assert!(parsed.messages.iter().all(|entry| {
+            entry.kind == MessageEntryKind::Message
+                && entry.tool_call_id.is_none()
+                && entry.tool_output.is_none()
+        }));
+    }
+
+    #[tokio::test]
+    async fn session_messages_does_not_mask_malformed_acp_history_with_backend_fallback() {
+        use rusqlite::{Connection, params};
+        use omnesagent_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-malformed-history";
+
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some("checking".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "bad-call".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    }],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .unwrap();
+
+        let conn = Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
+        conn.execute(
+            "UPDATE acp_tool_calls SET event_kind = 'malformed' WHERE tool_call_id = ?1",
+            params!["bad-call"],
+        )
+        .unwrap();
+
+        let error = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect_err("malformed ACP history must fail closed");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(
+            error
+                .message
+                .contains("Failed to load ACP session messages")
+        );
+    }
+
+    #[tokio::test]
+    async fn reaped_acp_session_rehydrates_to_working_instead_of_failing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-reaped-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "freshly created session must be live in memory"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "durable row must exist for the rehydrate source"
+        );
+
+        // Simulate the reaper tearing the in-memory session down while the
+        // durable row survives.
+        assert!(
+            sessions.remove(sid).await,
+            "reap must remove the in-memory session"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "post-reap the session must be absent from memory"
+        );
+
+        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        assert!(
+            recovered.is_some(),
+            "a reaped session with a live durable row must rehydrate to a \
+             working agent, not fail; failing here is the irrecoverable hang"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "after rehydrate the session must be live in memory again so the \
+             next prompt lands on a working session"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_resume_recovers_persisted_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-cwd-resume-001";
+        let original_cwd = tmp.path().join("project-dir").to_string_lossy().to_string();
+
+        // First create the session with an explicit cwd.
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+                "cwd": original_cwd,
+            }))
+            .await
+            .expect("initial session/new should succeed");
+        assert_eq!(created["workspace_dir"], original_cwd);
+        assert_eq!(
+            acp_store.load_session(sid).unwrap().unwrap().workspace_dir,
+            original_cwd
+        );
+
+        // Resume with NO cwd: the daemon must report the persisted cwd, not the
+        // agent workspace dir.
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("resume session/new should succeed");
+        assert_eq!(
+            resumed["workspace_dir"], original_cwd,
+            "resume must keep the retained session's cwd, not default it"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaped_acp_session_rehydrates_without_memory_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-reaped-mem-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        // Reap the in-memory session, leaving the durable row to rehydrate from.
+        assert!(sessions.remove(sid).await, "reap must remove the session");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("a reaped ACP session must rehydrate to a working agent");
+
+        let agent = recovered.lock().await;
+        let tool_names = agent.tool_names();
+        for &mem_tool in MEMORY_TOOLS {
+            assert!(
+                !tool_names.contains(&mem_tool),
+                "rehydrated ACP session must NOT expose `{mem_tool}` — found in tool list: {tool_names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn killed_acp_session_does_not_rehydrate_from_durable_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-killed-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        assert!(
+            sessions.get_agent(sid).await.is_some(),
+            "freshly created session must be live in memory"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "durable row must exist before kill"
+        );
+
+        dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("session/kill should succeed");
+
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "session/kill must remove the live in-memory agent"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "session/kill must preserve durable history"
+        );
+
+        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        assert!(
+            recovered.is_none(),
+            "admin-killed ACP sessions must stay killed instead of rehydrating \
+             from durable history on the next prompt"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "failed rehydrate must leave the session absent from memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn killed_acp_session_new_resume_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-killed-resume-001";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the original ACP session");
+        dispatcher
+            .handle_session_kill(&json!({ "session_id": sid }))
+            .await
+            .expect("session/kill should succeed");
+
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await;
+
+        assert!(
+            resumed.is_err(),
+            "session/new must not revive a killed ACP session"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "rejected resume must leave the killed session absent from memory"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "rejected resume must preserve durable history"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_resume_rejects_agent_alias_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-alias-mismatch-001";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent")
+            .expect("test should seed durable ACP session");
+
+        let resumed = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent-2",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await;
+
+        let err = resumed.expect_err("session/new must reject ACP alias mismatches");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "rejected mismatched resume must not create a live session"
+        );
+        assert!(
+            acp_store.load_session(sid).unwrap().is_some(),
+            "rejected mismatched resume must preserve durable history"
+        );
+    }
+
+    /// chat_mode omitted (or =chat) creates rows via session_backend,
+    /// acp-sessions.db stays empty for that session_id.
+    #[tokio::test]
+    async fn chat_session_new_writes_to_chat_backend_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "chat-routing-001";
+        let params = json!({
+            "agent_alias": "test-agent",
+            "session_id": sid,
+        });
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("session/new should succeed");
+
+        assert!(
+            acp_store.load_session(sid).unwrap().is_none(),
+            "Chat session must NOT touch acp_session_store"
+        );
+
+        let key = format!("rpc_{sid}");
+        let metadata = chat_backend.list_sessions_with_metadata();
+        let entry = metadata
+            .iter()
+            .find(|m| m.key == key)
+            .expect("Chat session must be registered in session_backend metadata");
+        assert_eq!(
+            entry.agent_alias.as_deref(),
+            Some("test-agent"),
+            "Chat session must stamp its agent_alias in session_backend (got: {:?})",
+            entry.agent_alias
+        );
+    }
+
+    // ── config/set secret-routing ────────────────────────────────
+
+    fn make_config_set_test_dispatcher(config: omnesagent_config::schema::Config) -> RpcDispatcher {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        dispatcher
+    }
+
+    fn make_shared_sessions_dispatcher(
+        config: omnesagent_config::schema::Config,
+        sessions: Arc<crate::rpc::session::SessionStore>,
+    ) -> RpcDispatcher {
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        dispatcher
+    }
+
+    fn make_secret_test_config(tmp: &tempfile::TempDir) -> omnesagent_config::schema::Config {
+        let mut cfg = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        cfg
+    }
+
+    // `make_config_set_test_dispatcher` takes the `Config` by value and adds no
+    // isolation of its own, and a successful `config/set` falls through to
+    // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
+    // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[tokio::test]
+    async fn config_set_does_not_materialize_resource_keyed_rate_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-5.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_err(), "unknown rate path must not be auto-created");
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_on_dotted_resource_id_does_not_plant_phantom_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.create_map_key("cost.rates.providers.models.openai", "gpt-4.1")
+            .expect("create the dotted resource id");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "value": 1.5
+            }))
+            .await;
+        assert!(res.is_ok(), "editing a real dotted rate must work: {res:?}");
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .get_map_keys("cost.rates.providers.models.openai")
+                .expect("known section"),
+            vec!["gpt-4.1".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_ambiguous_dotted_resource_path_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            omnesagent_config::schema::ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        cfg.cost.rates.providers.models.openai.insert(
+            "gpt-4.1.input_per_mtok".to_string(),
+            omnesagent_config::schema::ModelCostRates {
+                input_per_mtok: Some(2.0),
+                ..Default::default()
+            },
+        );
+        cfg.save().await.expect("seed colliding resource keys");
+        let prior_disk = std::fs::read_to_string(&config_path).unwrap();
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "value": 9.9
+            }))
+            .await;
+        let err = res.expect_err("ambiguous resource path must fail closed");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\\\"gpt-4.1.input_per_mtok\\\"]"),
+            "RPC error must name the whole-entry interpretation: {message}"
+        );
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\\\"gpt-4.1\\\"].input_per_mtok"),
+            "RPC error must name the field interpretation: {message}"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert_eq!(
+            live.cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(1.0),
+            "the field interpretation must remain unchanged"
+        );
+        assert_eq!(
+            live.cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1.input_per_mtok")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(2.0),
+            "the exact-key interpretation must remain unchanged"
+        );
+        drop(live);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            prior_disk,
+            "a rejected config/set must not rewrite the on-disk config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_still_materializes_operator_chosen_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "channels.telegram.newbot.bot_token",
+                "value": "tok"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "operator-chosen alias must still vivify: {res:?}"
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .channels
+                .telegram
+                .contains_key("newbot")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_writes_real_secret_through_set_prop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let params = json!({
+            "prop": "providers.models.anthropic.default.api_key",
+            "value": "sk-real-test-key"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(res.is_ok(), "config/set must accept a real secret: {res:?}");
+        let cfg = dispatcher.ctx.config.read().clone();
+        let stored = cfg
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.api_key.clone());
+        assert_eq!(
+            stored.as_deref(),
+            Some("sk-real-test-key"),
+            "real secret must land in memory as plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_persists_dotted_dynamic_secret_keys_for_existing_and_fresh_aliases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.secrets.encrypt = false;
+        cfg.create_map_key("providers.models.openai", "existing")
+            .expect("create the existing provider alias");
+        cfg.providers
+            .models
+            .openai
+            .get_mut("existing")
+            .expect("existing provider alias must be present")
+            .base
+            .model = Some("gpt-4o".to_string());
+        cfg.save().await.expect("seed the on-disk config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        let existing = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.existing.extra_headers.X-Trace.level",
+                "value": "existing-value"
+            }))
+            .await;
+        assert!(
+            existing.is_ok(),
+            "config/set must accept a dotted key on an existing alias: {existing:?}"
+        );
+
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: omnesagent_config::schema::Config = toml::from_str(&disk).unwrap_or_else(|e| {
+            panic!("config must reload after existing-alias write: {e}\n{disk}")
+        });
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("existing")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("existing-value"),
+            "RPC success must mean the literal dotted key survived save/reload"
+        );
+
+        let fresh = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.fresh.extra_headers.X-Trace.level",
+                "value": "fresh-value"
+            }))
+            .await;
+        assert!(
+            fresh.is_ok(),
+            "config/set must materialize an alias for a first dotted dynamic-map write: {fresh:?}"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("fresh-value"),
+            "new alias and dotted key must be published to live config"
+        );
+
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: omnesagent_config::schema::Config = toml::from_str(&disk)
+            .unwrap_or_else(|e| panic!("config must reload after fresh-alias write: {e}\n{disk}"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("fresh-value"),
+            "fresh alias dotted key must survive the RPC save/reload boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_post_rename_sync_failure_still_commits_disk_live_and_backup() {
+        // Production-boundary regression for the post-rename durability fault:
+        // the injected failure is driven through `config/set` itself (not the
+        // write helper), proving the RPC reports committed success, disk and
+        // live config agree on the new value, and the prior file is retained
+        // as `.bak`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = make_secret_test_config(&tmp);
+        cfg.save().await.expect("seed the on-disk config");
+        let prior_disk = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("seeded config must exist on disk");
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let config_path = tmp.path().join("config.toml");
+        omnesagent_config::schema::arm_post_replace_sync_failure_for_test(&config_path);
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.anthropic.default.api_key",
+                "value": "sk-post-rename-sync-key"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "a post-rename sync fault must still report a committed config/set: {res:?}"
+        );
+        assert!(
+            !omnesagent_config::schema::post_replace_sync_failure_armed(&config_path),
+            "the injected fault must actually fire inside the config/set save path"
+        );
+
+        let live = dispatcher
+            .ctx
+            .config
+            .read()
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.api_key.clone());
+        assert_eq!(
+            live.as_deref(),
+            Some("sk-post-rename-sync-key"),
+            "live config must hold the committed value"
+        );
+
+        let disk = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("config.toml must survive the injected fault");
+        assert!(
+            disk.contains("api_key"),
+            "disk must contain the replacement config: {disk}"
+        );
+        assert_ne!(
+            disk, prior_disk,
+            "disk must hold the new file, not the pre-fault one"
+        );
+
+        let backup = tokio::fs::read_to_string(tmp.path().join("config.toml.bak"))
+            .await
+            .expect("durability uncertainty must retain the pre-replace backup");
+        assert_eq!(
+            backup, prior_disk,
+            ".bak must contain the prior on-disk config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_refreshes_memory_embedder_on_provider_change() {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        // Memory embeddings resolve from openai.default.
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 1536;
+
+        // Long-lived handle constructed with the Noop embedder (dims 0), exactly
+        // the stale state the bug leaves behind.
+        let mem = Arc::new(omnesagent_memory::SqliteMemory::new("default", tmp.path()).unwrap());
+        assert_eq!(mem.embedder_dimensions(), 0, "starts on the Noop embedder");
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_memory(
+            cfg,
+            Arc::clone(&sessions),
+            Arc::clone(&mem) as Arc<dyn omnesagent_api::memory_traits::Memory>,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+
+        let params = json!({
+            "prop": "providers.models.openai.default.api_key",
+            "value": "sk-rotated-key"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "config/set on the memory embedding provider must hot-swap the live \
+             handle's embedder to the resolved provider (#8359)"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_routes_memory_embeds_to_new_endpoint_and_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use omnesagent_api::memory_traits::{Memory, MemoryCategory};
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let mock_a = MockServer::start().await;
+        let mock_b = MockServer::start().await;
+        let embed_body = serde_json::json!({ "data": [{ "embedding": [0.1, 0.2, 0.3] }] });
+        for server in [&mock_a, &mock_b] {
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(embed_body.clone()))
+                .mount(server)
+                .await;
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg.set_prop_persistent("providers.models.openai.default.uri", &mock_a.uri())
+            .expect("set initial uri");
+        cfg.set_prop_persistent("providers.models.openai.default.api_key", "key-a")
+            .expect("set initial key");
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 3;
+
+        // Long-lived handle built via the real factory → embedder points at A.
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory_with_storage_and_routes(
+                &cfg.memory,
+                &cfg.embedding_routes,
+                cfg.resolve_active_storage(),
+                &cfg.data_dir,
+                None,
+                Some(&cfg.providers.models),
+            )
+            .expect("build memory"),
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_memory(cfg, Arc::clone(&sessions), Arc::clone(&mem));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+
+        // Rotate the provider profile's endpoint + key through config/set.
+        for (prop, value) in [
+            ("providers.models.openai.default.uri", mock_b.uri()),
+            (
+                "providers.models.openai.default.api_key",
+                "key-b".to_string(),
+            ),
+        ] {
+            let res = dispatcher
+                .handle_config_set(&json!({ "prop": prop, "value": value }))
+                .await;
+            assert!(res.is_ok(), "config/set {prop} must succeed: {res:?}");
+        }
+
+        // Next embed must go to the NEW endpoint with the NEW key.
+        mem.store("k1", "hello wiremock", MemoryCategory::Core, None)
+            .await
+            .expect("store");
+
+        let b_reqs = mock_b
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let hit = b_reqs
+            .iter()
+            .find(|r| r.url.path() == "/v1/embeddings")
+            .expect("new endpoint (mock B) must receive the embed after config/set");
+        let auth = hit
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer key-b", "embed must carry the rotated api key");
+
+        let a_reqs = mock_a.received_requests().await.unwrap_or_default();
+        assert!(
+            a_reqs.iter().all(|r| r.url.path() != "/v1/embeddings"),
+            "stale endpoint (mock A) must not receive embeds after the refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_refreshes_live_agent_session_memory() {
+        use omnesagent_api::memory_traits::Memory;
+        use omnesagent_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg.memory.embedding_provider = "openai.default".into();
+        cfg.memory.embedding_model = "text-embedding-3-small".into();
+        cfg.memory.embedding_dimensions = 1536;
+
+        // The agent's memory: AgentScopedMemory wrapping a concrete SQLite
+        // backend (Noop, dims 0) — the stale state config/set must repair.
+        let sqlite = Arc::new(omnesagent_memory::SqliteMemory::new("agent", tmp.path()).unwrap());
+        assert_eq!(sqlite.embedder_dimensions(), 0);
+        let scoped: Arc<dyn Memory> = Arc::new(omnesagent_memory::AgentScopedMemory::new(
+            Arc::clone(&sqlite) as Arc<dyn Memory>,
+            "agent-uuid",
+            Vec::<String>::new(),
+        ));
+
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(scoped)
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("agent builds");
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        sessions
+            .insert(
+                "s1".into(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "agent",
+                    ".",
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let ctx = RpcContext::minimal(cfg, Arc::clone(&sessions));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+
+        // Full RPC path: this schedules the live-agent memory refresh.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.default.api_key",
+                "value": "sk-rotated"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // The agent refresh is spawned; wait (bounded) for it to land.
+        let mut dims = 0;
+        for _ in 0..200 {
+            dims = sqlite.embedder_dimensions();
+            if dims == 1536 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            dims, 1536,
+            "config/set must refresh the live session's per-agent memory embedder \
+             through the AgentScopedMemory wrapper (#8359)"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_masked_secret_value() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.providers
+            .models
+            .anthropic
+            .get_mut("default")
+            .unwrap()
+            .base
+            .api_key = Some("sk-live-secret".into());
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        for masked in [omnesagent_config::traits::MASKED_SECRET, "****", ""] {
+            let params = json!({
+                "prop": "providers.models.anthropic.default.api_key",
+                "value": masked
+            });
+            let res = dispatcher.handle_config_set(&params).await;
+            assert!(
+                res.is_err(),
+                "config/set must refuse masked/empty secret (`{masked}`), got: {res:?}"
+            );
+        }
+
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        let stored = cfg_after
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.api_key.clone());
+        assert_eq!(
+            stored.as_deref(),
+            Some("sk-live-secret"),
+            "live secret must NOT be clobbered by a masked write"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_unknown_field_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(omnesagent_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.anthropic.new_bot.not_a_real_field",
+            "value": "anything"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set on an unknown tail field must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "the alias auto-created to resolve the write must be rolled back, \
+             not left as a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_bad_value_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(omnesagent_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot.temperature",
+            "value": "abc"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an unparsable value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "a set_prop value failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_coercion_failure_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(omnesagent_config::schema::Config::default());
+        // Non-string JSON value so the failure happens in coerce_for_set_prop,
+        // not in the later set_prop parse.
+        let params = json!({
+            "prop": "providers.models.openai.new_bot3.temperature",
+            "value": {"not": "a-float"}
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an uncoercible value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot3")),
+            "a value coercion failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_masked_secret_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(omnesagent_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot2.api_key",
+            "value": "****"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with a masked secret value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot2")),
+            "the masked-secret rejection after alias auto-creation must roll \
+             the alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_handles_dynamic_http_request_secret_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        });
+
+        let params = json!({
+            "prop": "http_request.secrets.api_token",
+            "value": "Bearer runtime-secret"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(
+            res.is_ok(),
+            "config/set must accept a real dynamic http_request secret: {res:?}"
+        );
+        let cfg = dispatcher.ctx.config.read().clone();
+        assert_eq!(
+            cfg.http_request
+                .secrets
+                .get("api_token")
+                .map(String::as_str),
+            Some("Bearer runtime-secret")
+        );
+
+        for masked in [omnesagent_config::traits::MASKED_SECRET, "****", ""] {
+            let params = json!({
+                "prop": "http_request.secrets.next_token",
+                "value": masked
+            });
+            let res = dispatcher.handle_config_set(&params).await;
+            assert!(
+                res.is_err(),
+                "config/set must reject masked/empty dynamic secret (`{masked}`), got: {res:?}"
+            );
+        }
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            !cfg_after.http_request.secrets.contains_key("next_token"),
+            "masked dynamic writes must not materialize a secret key"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_non_secret_field_still_uses_set_prop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let params = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "claude-sonnet-4-5"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(res.is_ok(), "non-secret set must succeed: {res:?}");
+        let cfg = dispatcher.ctx.config.read().clone();
+        let stored = cfg
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.model.clone());
+        assert_eq!(stored.as_deref(), Some("claude-sonnet-4-5"));
+    }
+
+    #[tokio::test]
+    async fn config_set_persists_mcp_server_field_to_disk() {
+        use omnesagent_config::schema::{McpServerConfig, McpTransport};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file with an existing `[[mcp.servers]]`
+        // entry so `save_dirty` exercises its incremental path
+        // (the new-file fallback to full `save` would mask the
+        // dirty-path bug because it serializes the whole struct).
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            omnesagent_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut cfg = omnesagent_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        // The exact wire shape the dashboard / TUI send for a
+        // per-field edit on an `[[mcp.servers]]` entry.
+        let params = json!({
+            "prop": "mcp.servers.fs.command",
+            "value": "/usr/local/bin/mcp-fs"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(
+            res.is_ok(),
+            "config/set on a per-field mcp.servers path must succeed: {res:?}"
+        );
+
+        // In-memory landed (this is what the UI sees — and what was
+        // working before; the bug was strictly on the save side).
+        let in_memory = dispatcher
+            .ctx
+            .config
+            .read()
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "fs")
+            .map(|s| s.command.clone());
+        assert_eq!(
+            in_memory.as_deref(),
+            Some("/usr/local/bin/mcp-fs"),
+            "in-memory mutation must land — this part already worked"
+        );
+
+        // The regression: the same value must reach disk.
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("/usr/local/bin/mcp-fs"),
+            "config/set on `mcp.servers.fs.command` must persist to disk; \
+             on-disk file still reads:\n{written}"
+        );
+        assert!(
+            !written.contains("/usr/bin/mcp-fs"),
+            "stale command must be overwritten on disk; got:\n{written}"
+        );
+        // The natural-key field itself must stay on disk so the entry
+        // remains addressable on the next load.
+        assert!(
+            written.contains("name = \"fs\""),
+            "natural-key `name` must survive the incremental save; got:\n{written}"
+        );
+
+        let reparsed: omnesagent_config::schema::Config = toml::from_str(&written).unwrap();
+        let entry = reparsed
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "fs")
+            .expect("reparse must surface the entry by natural key");
+        assert_eq!(entry.command, "/usr/local/bin/mcp-fs");
+    }
+
+    fn make_model_refresh_test_config(tmp: &tempfile::TempDir) -> omnesagent_config::schema::Config {
+        use std::collections::HashMap;
+        use omnesagent_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai provider slot exists");
+        provider.api_key = Some("test-key".into());
+        provider.uri = Some("http://127.0.0.1:1".into());
+        provider.model = Some("old-model".into());
+        provider.temperature = Some(0.2);
+
+        config.agents = HashMap::from([(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        )]);
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config
+            .runtime_profiles
+            .insert("default".into(), Default::default());
+        config
+    }
+
+    async fn create_model_refresh_test_session(
+        dispatcher: &RpcDispatcher,
+        tmp: &tempfile::TempDir,
+    ) -> String {
+        let session_res = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": tmp.path().join("workspace"),
+            }))
+            .await
+            .expect("session/new should create the agent");
+        session_res
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .expect("session/new result includes session_id")
+            .to_string()
+    }
+
+    async fn model_name_for_session(dispatcher: &RpcDispatcher, session_id: &str) -> String {
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .expect("session agent exists");
+        agent.lock().await.attribution_fields().2
+    }
+
+    async fn temperature_for_session(dispatcher: &RpcDispatcher, session_id: &str) -> Option<f64> {
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .expect("session agent exists");
+        agent.lock().await.temperature_for_test()
+    }
+
+    async fn wait_for_model_name(dispatcher: &RpcDispatcher, session_id: &str, expected: &str) {
+        for _ in 0..50 {
+            if model_name_for_session(dispatcher, session_id).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            model_name_for_session(dispatcher, session_id).await,
+            expected
+        );
+    }
+
+    async fn wait_for_temperature(
+        dispatcher: &RpcDispatcher,
+        session_id: &str,
+        expected: Option<f64>,
+    ) {
+        for _ in 0..50 {
+            if temperature_for_session(dispatcher, session_id).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            temperature_for_session(dispatcher, session_id).await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_agent_model_provider_refreshes_bound_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+        other.temperature = Some(0.2);
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "session must start on the currently-bound provider's model"
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.test-agent.model_provider",
+                "value": "openai.other-provider"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set agents.<alias>.model_provider must succeed: {res:?}"
+        );
+
+        wait_for_model_name(&dispatcher, &session_id, "other-model").await;
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_blocks_session_configure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(
+            make_model_refresh_test_config(&tmp),
+        ));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let configure_dispatcher = Arc::clone(&dispatcher);
+        let configure_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = omnesagent_spawn::spawn!(async move {
+            configure_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": { "temperature": 0.6 }
+                }))
+                .await
+        });
+        let mut configure = Box::pin(configure);
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must reach the provider update boundary");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut configure)
+                .await
+                .is_err(),
+            "session/configure must wait while a provider update owns the ordering boundary"
+        );
+
+        drop(update_guard);
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must succeed after the update boundary is released");
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_does_not_block_unrelated_session_configure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let blocked_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let other_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let blocked_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&blocked_session)
+            .await
+            .expect("session update lock exists");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": other_session,
+                "overrides": { "temperature": 0.6 }
+            })),
+        )
+        .await
+        .expect("an unrelated session must not wait for this session's provider update")
+        .expect("session/configure must succeed for the unrelated session");
+
+        drop(blocked_guard);
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_preserves_newer_session_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+        let refresh_ctx = Arc::clone(&dispatcher.ctx);
+        let refresh_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let refresh_wait = refresh_waiting.notified();
+        let refresh = omnesagent_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
+            .await
+            .expect("agent refresh must reach the provider update boundary");
+
+        let configure_dispatcher = Arc::new(dispatcher);
+        let configure_task_dispatcher = Arc::clone(&configure_dispatcher);
+        let configure_session_id = session_id.clone();
+        let configure_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = omnesagent_spawn::spawn!(async move {
+            configure_task_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": configure_session_id,
+                    "overrides": { "model_provider": "openai.test-provider" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must queue behind the agent refresh");
+        drop(update_guard);
+
+        refresh.await.expect("agent refresh task must complete");
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must apply the newer override");
+        assert_eq!(
+            model_name_for_session(&configure_dispatcher, &session_id).await,
+            "old-model",
+            "a queued agent refresh must not overwrite a newer session provider override"
+        );
+        assert_eq!(
+            configure_dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.model_provider),
+            Some("openai.test-provider".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn model_provider_update_converges_on_latest_agent_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        for (alias, model) in [
+            ("other-provider", "other-model"),
+            ("latest-provider", "latest-model"),
+        ] {
+            let provider = cfg
+                .providers
+                .models
+                .ensure("openai", alias)
+                .expect("openai provider slot exists");
+            provider.api_key = Some("test-key".into());
+            provider.uri = Some("http://127.0.0.1:1".into());
+            provider.model = Some(model.into());
+        }
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+        let release_older_refresh = Arc::new(tokio::sync::Notify::new());
+        let older_release = Arc::clone(&release_older_refresh);
+        let older_ctx = Arc::clone(&dispatcher.ctx);
+        let older_refresh = omnesagent_spawn::spawn!(async move {
+            older_release.notified().await;
+            RpcDispatcher::refresh_live_sessions_for_agent(older_ctx, "test-agent").await;
+        });
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.latest-provider".into();
+        let latest_ctx = Arc::clone(&dispatcher.ctx);
+        let latest_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let latest_wait = latest_waiting.notified();
+        let latest_refresh = omnesagent_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(latest_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), latest_wait)
+            .await
+            .expect("latest agent refresh must reach the provider update boundary");
+
+        let older_waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+        let older_wait = older_waiting.notified();
+        release_older_refresh.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), older_wait)
+            .await
+            .expect("older agent refresh must queue after the latest refresh");
+        drop(update_guard);
+
+        latest_refresh
+            .await
+            .expect("latest agent refresh task must complete");
+        older_refresh
+            .await
+            .expect("older agent refresh task must complete");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "latest-model",
+            "queued refreshes must resolve the latest persisted agent provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_session_uses_reloaded_structured_history_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            omnesagent_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .max_history_messages = Some(2);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old assistant"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new assistant"),
+        ]);
+
+        assert!(
+            matches!(event, Some(TurnEvent::HistoryTrimmed { .. })),
+            "an existing session must observe the reloaded runtime-profile cap"
+        );
+        assert!(!agent.history().iter().any(|message| matches!(
+            message,
+            omnesagent_providers::ConversationMessage::Chat(chat) if chat.content == "old user"
+        )));
+        assert!(agent.history().iter().any(|message| matches!(
+            message,
+            omnesagent_providers::ConversationMessage::Chat(chat)
+                if chat.content == "new assistant"
+        )));
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_model_refreshes_matching_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        wait_for_model_name(&dispatcher, &session_id, "new-model").await;
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_refresh_failure_does_not_fail_saved_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": ""
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set must report the saved write even if live refresh cannot rebuild: {res:?}"
+        );
+        let cfg = dispatcher.ctx.config.read().clone();
+        let stored = cfg
+            .providers
+            .models
+            .openai
+            .get("test-provider")
+            .and_then(|e| e.base.model.clone());
+        assert_eq!(
+            stored, None,
+            "config/set must still persist the requested provider-profile clear"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "failed live refresh must leave the existing session provider intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_invalid_provider_does_not_commit_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "model_provider": "openai.missing"
+                }
+            }))
+            .await;
+        assert!(
+            res.is_err(),
+            "invalid provider switch must fail before mutating session overrides"
+        );
+
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session still exists");
+        assert_eq!(
+            overrides.model_provider, None,
+            "failed provider switch must not leave a stale override behind"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "failed provider switch must leave the live agent unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_blank_model_fields_do_not_commit_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        for model in ["", "   "] {
+            let res = dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": {
+                        "model": model
+                    }
+                }))
+                .await;
+            let err = res.expect_err("blank model must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+
+            let overrides = dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .expect("session still exists");
+            assert_eq!(
+                overrides.model, None,
+                "failed model switch must not leave a stale override behind"
+            );
+            assert_eq!(
+                model_name_for_session(&dispatcher, &session_id).await,
+                "old-model",
+                "failed model switch must leave the live agent unchanged"
+            );
+        }
+
+        for model_provider in ["", "   "] {
+            let res = dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": session_id,
+                    "overrides": {
+                        "model_provider": model_provider
+                    }
+                }))
+                .await;
+            let err = res.expect_err("blank model_provider must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+
+            let overrides = dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .expect("session still exists");
+            assert_eq!(
+                overrides.model_provider, None,
+                "failed provider switch must not leave a stale override behind"
+            );
+            assert_eq!(
+                model_name_for_session(&dispatcher, &session_id).await,
+                "old-model",
+                "failed provider switch must leave the live agent unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_temperature_refreshes_matching_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2)
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.temperature",
+                "value": 0.4
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        wait_for_temperature(&dispatcher, &session_id, Some(0.4)).await;
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_refresh_preserves_session_temperature_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let merged = dispatcher
+            .ctx
+            .sessions
+            .set_overrides(
+                &session_id,
+                crate::rpc::session::SessionOverrides {
+                    temperature: Some(0.6),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session override applies");
+        assert_eq!(merged.temperature, Some(0.6));
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        wait_for_model_name(&dispatcher, &session_id, "new-model").await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.6),
+            "session temperature override must win over provider profile temperature"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_delete_provider_temperature_refreshes_matching_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2)
+        );
+
+        let res = dispatcher
+            .handle_config_delete(&json!({
+                "prop": "providers.models.openai.test-provider.temperature",
+            }))
+            .await;
+        assert!(res.is_ok(), "config/delete must succeed: {res:?}");
+
+        wait_for_temperature(&dispatcher, &session_id, None).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // session/cancel ownership enforcement — the spurious-cancel bug
+    // -----------------------------------------------------------------------
+
+    /// Build two dispatchers sharing one `RpcContext`/`SessionStore`. Mirrors
+    /// production where each TUI connection gets its own dispatcher with its
+    /// own `tui_id`, all routing to the same shared session map.
+    fn make_two_dispatchers_sharing_context(
+        config: omnesagent_config::schema::Config,
+    ) -> (
+        RpcDispatcher,
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+    ) {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(64);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(64);
+        let dispatcher_a = RpcDispatcher::new(Arc::clone(&ctx), tx_a, "test-peer-a:pid=1".into());
+        let dispatcher_b = RpcDispatcher::new(ctx, tx_b, "test-peer-b:pid=2".into());
+        (dispatcher_a, dispatcher_b, sessions)
+    }
+
+    async fn create_session_with_owner(
+        dispatcher: &mut RpcDispatcher,
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        session_id: &str,
+        owner_tui_id: &str,
+    ) -> tokio_util::sync::CancellationToken {
+        dispatcher.set_tui_id_for_test(Some(owner_tui_id.to_string()));
+        let params = json!({
+            "agent_alias": "test-agent",
+            "session_id": session_id,
+        });
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("session/new must succeed");
+
+        let stamped_owner = sessions
+            .session_owner_tui_id(session_id)
+            .await
+            .expect("session must exist after session/new");
+        assert_eq!(
+            stamped_owner.as_deref(),
+            Some(owner_tui_id),
+            "harness invariant: session/new must stamp owner_tui_id from the \
+             caller's tui_id; if this fails, the ownership tests below are \
+             measuring nothing"
+        );
+
+        let token = tokio_util::sync::CancellationToken::new();
+        sessions.register_cancel_token(session_id, token.clone());
+        token
+    }
+
+    fn make_dispatcher_with_capture(
+        config: omnesagent_config::schema::Config,
+    ) -> (
+        RpcDispatcher,
+        tokio::sync::mpsc::Receiver<String>,
+        Arc<crate::rpc::session::SessionStore>,
+    ) {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        (dispatcher, rx, sessions)
+    }
+
+    #[tokio::test]
+    async fn session_prompt_on_missing_session_emits_turn_complete_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, mut rx, _sessions) = make_dispatcher_with_capture(config);
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": "gone-id",
+                "prompt": "anything",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "missing session must still produce an RPC error for legacy \
+             request-form callers; the new behaviour is the additional \
+             notification, not replacing the error"
+        );
+
+        // The notification must already be queued on the writer channel by
+        // the time `handle_session_prompt` returns. `try_recv` rules out
+        // any test flakiness from racing with a spawned task.
+        let raw = rx.try_recv().expect(
+            "handle_session_prompt must emit a session/update TurnComplete \
+             notification before returning on missing-session — without it \
+             the TUI's `working` state never clears and the next prompt is \
+             the production freeze",
+        );
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("notification must be JSON");
+        assert_eq!(v["method"], notification::SESSION_UPDATE);
+        assert_eq!(v["params"]["session_id"], "gone-id");
+        assert_eq!(
+            v["params"]["outcome"], "failed",
+            "missing-session is not Completed and not Cancelled — it is a \
+             distinct Failed verdict. Folding it into Cancelled would lie \
+             about whether the user pressed Esc."
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_from_distinct_non_owner_dispatcher_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher_a, mut dispatcher_b, sessions) =
+            make_two_dispatchers_sharing_context(config);
+
+        let token =
+            create_session_with_owner(&mut dispatcher_a, &sessions, "sess-owned-by-tui-A", "tui-A")
+                .await;
+
+        dispatcher_b.set_tui_id_for_test(Some("tui-B".to_string()));
+        let result = dispatcher_b
+            .handle_session_cancel(&json!({
+                "session_id": "sess-owned-by-tui-A",
+            }))
+            .await;
+
+        let err = result.expect_err(
+            "a cancel from a dispatcher whose tui_id does not match the \
+             session's owner_tui_id must be refused",
+        );
+        assert_ne!(
+            err.code, SESSION_NOT_FOUND,
+            "the rejection must NOT be reported as SESSION_NOT_FOUND — the \
+             session DOES exist; reporting NOT_FOUND would hide the \
+             ownership violation behind a benign-looking error"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "the owner's cancel token must remain un-fired — the rightful \
+             owner's turn must survive a mis-targeted cancel from another TUI"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_from_anonymous_dispatcher_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher_a, mut dispatcher_b, sessions) =
+            make_two_dispatchers_sharing_context(config);
+
+        let token =
+            create_session_with_owner(&mut dispatcher_a, &sessions, "sess-owned-by-tui-A", "tui-A")
+                .await;
+
+        // dispatcher_b never set its tui_id — fresh connection, no
+        // initialize handshake yet.
+        dispatcher_b.set_tui_id_for_test(None);
+        let result = dispatcher_b
+            .handle_session_cancel(&json!({
+                "session_id": "sess-owned-by-tui-A",
+            }))
+            .await;
+
+        let err = result.expect_err("anonymous cancel must be refused");
+        assert_ne!(err.code, SESSION_NOT_FOUND);
+        assert!(
+            !token.is_cancelled(),
+            "anonymous cancel must not fire the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cancel_from_owner_dispatcher_still_works() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher_a, _dispatcher_b, sessions) =
+            make_two_dispatchers_sharing_context(config);
+
+        let token =
+            create_session_with_owner(&mut dispatcher_a, &sessions, "sess-owned-by-tui-A", "tui-A")
+                .await;
+
+        // Same dispatcher, same tui_id that created the session.
+        let result = dispatcher_a
+            .handle_session_cancel(&json!({
+                "session_id": "sess-owned-by-tui-A",
+            }))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "owner cancel must succeed; got: {:?}",
+            result.err()
+        );
+        assert!(
+            token.is_cancelled(),
+            "owner cancel must fire the session's cancel token"
+        );
+    }
+
+    // ── Missing-session regression: close / delete must not fabricate
+    //    session_end for sessions that never existed ──────────────────
+
+    struct EndCountingHook {
+        end_count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl EndCountingHook {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicU32>) {
+            let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            (
+                Self {
+                    end_count: count.clone(),
+                },
+                count,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for EndCountingHook {
+        fn name(&self) -> &str {
+            "end-counter"
+        }
+        fn priority(&self) -> i32 {
+            0
+        }
+        async fn on_session_end(&self, _session_id: &str, _channel: &str) {
+            self.end_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_close_missing_session_does_not_fire_session_end() {
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut runner = crate::hooks::HookRunner::new();
+        let (_hook, end_count) = EndCountingHook::new();
+        runner.register(Box::new(_hook));
+        let ctx = Arc::new(crate::rpc::context::RpcContext {
+            config: Arc::new(parking_lot::RwLock::new(
+                omnesagent_config::schema::Config::default(),
+            )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions: Arc::clone(&sessions),
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
+            tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: Some(Arc::new(runner)),
+            cert_audit: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_close(&serde_json::json!({"session_id": "ghost-close"}))
+            .await;
+        assert!(result.is_err(), "close on nonexistent session must error");
+
+        assert_eq!(
+            end_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "session_end must not fire when close targets a missing session"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_delete_missing_session_does_not_fire_session_end() {
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let mut runner = crate::hooks::HookRunner::new();
+        let (_hook, end_count) = EndCountingHook::new();
+        runner.register(Box::new(_hook));
+        let ctx = Arc::new(crate::rpc::context::RpcContext {
+            config: Arc::new(parking_lot::RwLock::new(
+                omnesagent_config::schema::Config::default(),
+            )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions: Arc::clone(&sessions),
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
+            tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: Some(Arc::new(runner)),
+            cert_audit: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_delete(&serde_json::json!({"session_id": "ghost-delete"}))
+            .await;
+        assert!(
+            result.is_ok(),
+            "delete on nonexistent session should succeed"
+        );
+
+        assert_eq!(
+            end_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "session_end must not fire when delete targets a missing session"
+        );
+    }
+
+    // ── Positive lifecycle regression: close on a real session must fire
+    //    session_end so that configured hooks observe RPC lifecycles ──
+
+    struct DummyModelProvider;
+
+    #[async_trait]
+    impl omnesagent_api::model_provider::ModelProvider for DummyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    impl omnesagent_api::attribution::Attributable for DummyModelProvider {
+        fn role(&self) -> omnesagent_api::attribution::Role {
+            omnesagent_api::attribution::Role::Provider(
+                omnesagent_api::attribution::ProviderKind::Model(
+                    omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "dummy"
+        }
+    }
+
+    #[tokio::test]
+    async fn session_close_real_session_fires_session_end_hook() {
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let sid = "real-session-close-hook".to_string();
+
+        // Build a minimal agent and insert it into the store so the
+        // dispatcher sees a live session.
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("minimal Agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions.insert(sid.clone(), rpc_session).await.unwrap();
+
+        // Wire a counting hook.
+        let mut runner = crate::hooks::HookRunner::new();
+        let (_hook, end_count) = EndCountingHook::new();
+        runner.register(Box::new(_hook));
+
+        let ctx = Arc::new(crate::rpc::context::RpcContext {
+            config: Arc::new(parking_lot::RwLock::new(
+                omnesagent_config::schema::Config::default(),
+            )),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions: Arc::clone(&sessions),
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
+            tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
+            hooks: Some(Arc::new(runner)),
+            cert_audit: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());
+
+        // Close the real session.
+        let result = dispatcher
+            .handle_session_close(&serde_json::json!({"session_id": sid}))
+            .await;
+        assert!(result.is_ok(), "close on real session must succeed");
+
+        assert_eq!(
+            end_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "session_end must fire when a real session is closed"
+        );
+    }
+
+    fn make_bidi_test_dispatcher() -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        use omnesagent_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(omnesagent_config::schema::Config::default(), sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
+        dispatcher.authenticated = true;
+        (dispatcher, rx)
+    }
+
+    #[test]
+    fn process_line_session_new_creates_session_on_two_megabyte_stack() {
+        std::thread::Builder::new()
+            .name("rpc-session-new-stack-regression".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let tmp = tempfile::TempDir::new().expect("temporary test directory");
+                    let config = make_acp_test_config(&tmp);
+                    let (mut dispatcher, sessions, mut rx) =
+                        make_acp_test_dispatcher_with_receiver(config);
+                    let session_id = "rpc-stack-regression";
+                    let line = format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"agent_alias":"test-agent","chat_mode":"chat","session_id":"{session_id}"}}}}"#
+                    );
+
+                    dispatcher.process_line(&line).await;
+
+                    let response = rx.recv().await.expect("session/new response");
+                    let response: Value =
+                        serde_json::from_str(&response).expect("response should be valid JSON");
+                    assert_eq!(response["id"], json!(1));
+                    assert_eq!(response["result"]["session_id"], json!(session_id));
+                    assert_eq!(response["result"]["agent_alias"], json!("test-agent"));
+                    assert!(
+                        sessions.get_agent(session_id).await.is_some(),
+                        "session/new response must correspond to a registered session"
+                    );
+                });
+            })
+            .expect("stack regression thread should spawn")
+            .join()
+            .expect("session/new should not exhaust a two-megabyte stack");
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_success_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            omnesagent_spawn::spawn!(async move { rpc.request("ask_user", json!({"q": "?"})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", omnesagent_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame =
+            format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":{{"answer":"blue"}}}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, json!({"answer": "blue"}));
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_error_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter = omnesagent_spawn::spawn!(async move { rpc.request("poll", json!({})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", omnesagent_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":"{expected_id}","error":{{"code":-32601,"message":"nope"}}}}"#
+        );
+        dispatcher.process_line_for_test(&frame).await;
+
+        let err = waiter
+            .await
+            .expect("waiter task join")
+            .expect_err("rpc error");
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "nope");
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_explicit_null_result_response() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            omnesagent_spawn::spawn!(
+                async move { rpc.request("ask_user", json!({"q": "skip"})).await }
+            );
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", omnesagent_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":null}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, Value::Null);
+    }
+
+    async fn assert_process_line_error(line: &str, code: i32, id: Value) {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        Box::pin(dispatcher.process_line_for_test(line)).await;
+
+        let response = rx.try_recv().expect("JSON-RPC error response");
+        let response: Value = serde_json::from_str(&response).expect("valid response JSON");
+        assert_eq!(response["error"]["code"], json!(code), "line: {line}");
+        assert_eq!(response["id"], id, "line: {line}");
+    }
+
+    async fn assert_process_line_drops_invalid_response(line: &str) {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        Box::pin(dispatcher.process_line_for_test(line)).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "an invalid response must not produce another response: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_line_distinguishes_syntax_and_envelope_errors() {
+        assert_process_line_error("{", PARSE_ERROR, Value::Null).await;
+
+        let invalid_requests = [
+            (r#"{"jsonrpc":"1.0","method":"status","id":1}"#, json!(1)),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":true,"id":7}"#,
+                json!(7),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":null,"id":8}"#,
+                json!(8),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":null}"#,
+                Value::Null,
+            ),
+        ];
+
+        for (line, id) in invalid_requests {
+            assert_process_line_error(line, INVALID_REQUEST, id).await;
+        }
+
+        let ambiguous = [
+            "null",
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","id":3}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":6}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":null}"#,
+            r#"{"jsonrpc":"2.0","method":"status","id":9,"result":true}"#,
+        ];
+        for line in ambiguous {
+            assert_process_line_error(line, INVALID_REQUEST, Value::Null).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn process_line_drops_malformed_response_frames_without_reply() {
+        let invalid_responses = [
+            r#"{"id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"1.0","id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"2.0","result":true}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":"bad","message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":{"nested":5},"result":true}"#,
+            r#"{"jsonrpc":"2.0","id":10,"result":true,"params":{}}"#,
+        ];
+
+        for line in invalid_responses {
+            assert_process_line_drops_invalid_response(line).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_frames_cannot_complete_opposite_direction_same_id_request() {
+        let (mut dispatcher, mut daemon_writer_rx) = make_bidi_test_dispatcher();
+        let daemon_rpc = dispatcher.rpc_for_test();
+        let daemon_wait_rpc = Arc::clone(&daemon_rpc);
+        let daemon_waiter = omnesagent_spawn::spawn!(async move {
+            daemon_wait_rpc.request("ask_user", json!({"q": "?"})).await
+        });
+
+        let daemon_request: Value = serde_json::from_str(
+            &daemon_writer_rx
+                .recv()
+                .await
+                .expect("daemon outbound request"),
+        )
+        .expect("valid daemon request");
+
+        let (client_writer_tx, mut client_writer_rx) = tokio::sync::mpsc::channel(4);
+        let client_rpc = Arc::new(RpcOutbound::new(client_writer_tx));
+        let client_wait_rpc = Arc::clone(&client_rpc);
+        let client_waiter =
+            omnesagent_spawn::spawn!(
+                async move { client_wait_rpc.request("status", Value::Null).await }
+            );
+        let client_request: Value = serde_json::from_str(
+            &client_writer_rx
+                .recv()
+                .await
+                .expect("client outbound request"),
+        )
+        .expect("valid client request");
+
+        let shared_id = format!("{}0", omnesagent_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        assert_eq!(daemon_request["id"], json!(&shared_id));
+        assert_eq!(client_request["id"], json!(&shared_id));
+
+        let malformed = format!(
+            r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":null,"error":{{"code":-32600,"message":"bad"}}}}"#
+        );
+        Box::pin(dispatcher.process_line_for_test(&malformed)).await;
+
+        assert!(
+            matches!(
+                daemon_writer_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "malformed response must not generate a same-ID reply"
+        );
+        assert_eq!(daemon_rpc.pending_count(), 1);
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        let malformed_methods = [
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}"}}"#),
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}","result":true}}"#),
+        ];
+        for malformed_method in malformed_methods {
+            Box::pin(dispatcher.process_line_for_test(&malformed_method)).await;
+
+            let error_response: Value = serde_json::from_str(
+                &daemon_writer_rx
+                    .try_recv()
+                    .expect("invalid-request response"),
+            )
+            .expect("valid JSON-RPC response");
+            assert_eq!(error_response["id"], Value::Null);
+            assert_eq!(error_response["error"]["code"], json!(INVALID_REQUEST));
+            assert_eq!(daemon_rpc.pending_count(), 1);
+            assert_eq!(client_rpc.pending_count(), 1);
+        }
+
+        let valid_daemon_response =
+            format!(r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":{{"answer":"blue"}}}}"#);
+        Box::pin(dispatcher.process_line_for_test(&valid_daemon_response)).await;
+        let daemon_result = tokio::time::timeout(std::time::Duration::from_secs(1), daemon_waiter)
+            .await
+            .expect("daemon request remained resolvable")
+            .expect("daemon waiter task")
+            .expect("daemon result");
+        assert_eq!(daemon_result, json!({"answer": "blue"}));
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        assert!(client_rpc.dispatch_validated_response(&shared_id, Ok(json!({"status": "ready"}))));
+        let client_result = tokio::time::timeout(std::time::Duration::from_secs(1), client_waiter)
+            .await
+            .expect("client request remained resolvable")
+            .expect("client waiter task")
+            .expect("client result");
+        assert_eq!(client_result, json!({"status": "ready"}));
+    }
+
+    #[tokio::test]
+    async fn process_line_drops_unknown_valid_response_without_reply() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        dispatcher
+            .process_line_for_test(r#"{"jsonrpc":"2.0","id":"unknown","result":true}"#)
+            .await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a valid response with an unknown ID must not start a response loop"
+        );
+    }
+
+    #[test]
+    fn response_id_key_accepts_string_and_numeric_ids() {
+        assert_eq!(
+            response_id_key(&json!("zc-out-1")).as_deref(),
+            Some("zc-out-1")
+        );
+        assert_eq!(response_id_key(&json!(42)).as_deref(), Some("42"));
+        assert_eq!(response_id_key(&Value::Null), None);
+    }
+
+    // ── config_write_lock races ─────────────────────────────────
+
+    fn make_two_provider_test_config(tmp: &tempfile::TempDir) -> omnesagent_config::schema::Config {
+        let mut cfg = omnesagent_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        cfg.create_map_key("providers.models.openai", "default")
+            .expect("create openai.default");
+        cfg
+    }
+
+    fn provider_model(config: &omnesagent_config::schema::Config, provider: &str) -> Option<String> {
+        match provider {
+            "anthropic" => config
+                .providers
+                .models
+                .anthropic
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            "openai" => config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|e| e.base.model.clone()),
+            other => panic!("unexpected provider {other}"),
+        }
+    }
+
+    /// Regression test: `flush_config` used to clone the live config,
+    /// await `save_dirty()` on the clone, then swap the clone back over the
+    /// live config wholesale. A write landed on `ctx.config` while that save
+    /// was in flight was silently erased by the swap even though it was
+    /// never given a chance to reach disk.
+    ///
+    /// This drives `flush_config` to its first real yield point (inside
+    /// `save_dirty`'s disk I/O) with a single manual poll, proving the
+    /// snapshot has already been cloned out from under the live lock, lands
+    /// a second write directly on the live config, then lets the flush
+    /// finish. Against the old swap-based body this fails: P2 disappears
+    /// from live config when the stale snapshot lands on top of it. It was
+    /// confirmed to fail this way by temporarily reverting `flush_config` to
+    /// the swap-based body and re-running this test.
+    #[tokio::test]
+    async fn flush_config_preserves_write_landed_during_save() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_two_provider_test_config(&tmp);
+        cfg.set_prop_persistent("providers.models.anthropic.default.model", "p1-value")
+            .expect("mark P1 dirty");
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let guard = Arc::clone(&dispatcher.ctx.config_write_lock)
+            .lock_owned()
+            .await;
+        let mut flush_fut = Box::pin(dispatcher.flush_config(&guard));
+
+        // Single manual poll: past the synchronous clone-and-capture prefix
+        // of `flush_config`, into `save_dirty`'s disk I/O, which must
+        // suspend rather than resolve synchronously.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let first_poll = std::future::Future::poll(flush_fut.as_mut(), &mut cx);
+        assert!(
+            first_poll.is_pending(),
+            "flush must suspend on save_dirty's disk I/O for this test to interleave"
+        );
+
+        // P2: lands directly on the live config while the flush above is
+        // mid-save over its own (now stale) snapshot.
+        {
+            let mut live = dispatcher.ctx.config.write();
+            live.set_prop_persistent("providers.models.openai.default.model", "p2-value")
+                .expect("mark P2 dirty");
+        }
+
+        flush_fut.await.expect("flush of P1 must still succeed");
+        drop(guard);
+
+        let live = dispatcher.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("p2-value"),
+            "P2, written while the flush was mid-save, must survive in live config"
+        );
+        assert!(
+            live.dirty_paths
+                .contains("providers.models.openai.default.model"),
+            "P2 must still be dirty -- this flush never saved it"
+        );
+        assert!(
+            !live
+                .dirty_paths
+                .contains("providers.models.anthropic.default.model"),
+            "P1 was actually saved, so it must no longer be dirty"
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: omnesagent_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("p1-value"),
+            "P1 must have reached disk; on-disk file:\n{on_disk}"
+        );
+    }
+
+    /// Shared blocking scaffold: hold `config_write_lock`, spawn the RPC
+    /// call, assert it stays parked across a bounded sleep-free yield loop,
+    /// release, and return the task's result for caller-specific asserts.
+    async fn assert_rpc_blocks_on_config_write_lock<F>(
+        ctx: Arc<RpcContext>,
+        rpc_call: F,
+        blocked_msg: &'static str,
+    ) -> RpcResult
+    where
+        F: std::future::Future<Output = RpcResult> + Send + 'static,
+    {
+        let guard = Arc::clone(&ctx.config_write_lock).lock_owned().await;
+        let task = omnesagent_spawn::spawn!(rpc_call);
+
+        // Bounded, sleep-free: the handler must not race ahead of the
+        // externally held guard no matter how many times it's polled.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            assert!(!task.is_finished(), "{blocked_msg}");
+        }
+
+        drop(guard);
+        task.await.expect("blocked RPC task must not panic")
+    }
+
+    #[tokio::test]
+    async fn config_set_blocks_while_config_write_lock_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let params = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "blocked-value"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move { dispatcher.handle_config_set(&params).await },
+            "config/set must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "config/set must succeed once the guard is released: {result:?}"
+        );
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("blocked-value"),
+            "config/set must persist once unblocked; on-disk file:\n{on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_sets_both_persist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_two_provider_test_config(&tmp);
+        let (dispatcher_a, dispatcher_b, _sessions) = make_two_dispatchers_sharing_context(cfg);
+
+        let params_a = json!({
+            "prop": "providers.models.anthropic.default.model",
+            "value": "concurrent-a"
+        });
+        let params_b = json!({
+            "prop": "providers.models.openai.default.model",
+            "value": "concurrent-b"
+        });
+
+        let (result_a, result_b) = tokio::join!(
+            dispatcher_a.handle_config_set(&params_a),
+            dispatcher_b.handle_config_set(&params_b),
+        );
+        assert!(
+            result_a.is_ok(),
+            "first config/set must succeed: {result_a:?}"
+        );
+        assert!(
+            result_b.is_ok(),
+            "second config/set must succeed: {result_b:?}"
+        );
+
+        let live = dispatcher_a.ctx.config.read();
+        assert_eq!(
+            provider_model(&live, "anthropic").as_deref(),
+            Some("concurrent-a")
+        );
+        assert_eq!(
+            provider_model(&live, "openai").as_deref(),
+            Some("concurrent-b")
+        );
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        let reparsed: omnesagent_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        assert_eq!(
+            provider_model(&reparsed, "anthropic").as_deref(),
+            Some("concurrent-a"),
+            "provider a's set must have reached disk:\n{on_disk}"
+        );
+        assert_eq!(
+            provider_model(&reparsed, "openai").as_deref(),
+            Some("concurrent-b"),
+            "provider b's set must have reached disk:\n{on_disk}"
+        );
+    }
+
+    /// Same blocking pattern as `config_set_blocks_while_config_write_lock_held`,
+    /// but for the `save_and_swap_config` path used by alias rename: proves
+    /// alias rename and config/set share the same `config_write_lock` and so
+    /// can never interleave their read-mutate-flush critical sections.
+    #[tokio::test]
+    async fn alias_rename_serializes_with_config_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        let config_path = config.config_path.clone();
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&dispatcher.ctx);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut rename_dispatcher =
+            RpcDispatcher::new(Arc::clone(&ctx), tx, "test-peer-rename".into());
+        rename_dispatcher.authenticated = true;
+        let params = json!({
+            "path": "agents",
+            "from": "alpha",
+            "to": "beta"
+        });
+        let result = assert_rpc_blocks_on_config_write_lock(
+            ctx,
+            async move {
+                rename_dispatcher
+                    .handle_config_map_key_rename(&params)
+                    .await
+            },
+            "alias rename must block on config_write_lock while it is held",
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "alias rename must succeed once the guard is released: {result:?}"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert!(!live.agents.contains_key("alpha"));
+        assert!(live.agents.contains_key("beta"));
+        drop(live);
+
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("[agents.beta]"),
+            "renamed alias must persist:\n{on_disk}"
+        );
+        assert!(
+            !on_disk.contains("[agents.alpha]"),
+            "old alias must not survive on disk:\n{on_disk}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // session/prompt must mirror the durable running/idle/error state the
+    // gateway WS path already writes, so session/state and stuck-session
+    // detection see RPC-driven turns.
+    // -----------------------------------------------------------------------
+
+    /// A provider whose `chat` call reports back on `started` the moment it
+    /// is invoked, then blocks until the test releases it on `release`. Lets
+    /// a test observe state that is only true while a turn is in flight,
+    /// without racing a sleep against the agent loop.
+    struct GatedProvider {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl omnesagent_api::model_provider::ModelProvider for GatedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: omnesagent_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<omnesagent_providers::ChatResponse> {
+            let _ = self.started.send(());
+            let rx = self
+                .release
+                .lock()
+                .await
+                .take()
+                .expect("chat must be invoked at most once in this harness");
+            let _ = rx.await;
+            Ok(omnesagent_providers::ChatResponse {
+                text: Some("turn finished".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl omnesagent_api::attribution::Attributable for GatedProvider {
+        fn role(&self) -> omnesagent_api::attribution::Role {
+            omnesagent_api::attribution::Role::Provider(
+                omnesagent_api::attribution::ProviderKind::Model(
+                    omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "gated-provider"
+        }
+    }
+
+    /// A provider whose `chat` call always fails, driving `execute_turn` down
+    /// the `Err` path so the session-state write on failure can be observed.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl omnesagent_api::model_provider::ModelProvider for FailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: omnesagent_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<omnesagent_providers::ChatResponse> {
+            Err(anyhow::Error::msg("provider unavailable"))
+        }
+    }
+
+    impl omnesagent_api::attribution::Attributable for FailingProvider {
+        fn role(&self) -> omnesagent_api::attribution::Role {
+            omnesagent_api::attribution::Role::Provider(
+                omnesagent_api::attribution::ProviderKind::Model(
+                    omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "failing-provider"
+        }
+    }
+
+    /// Build an `Agent` around the given provider and register it directly in
+    /// `sessions` as a Chat-mode RPC session, bypassing `session/new` so the
+    /// provider can be a test double. Also stamps the durable metadata row
+    /// under the same `rpc_{sid}` key `session/new` would, since
+    /// `set_session_state` only ever `UPDATE`s an existing row.
+    async fn install_state_test_session(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<omnesagent_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl omnesagent_api::model_provider::ModelProvider + 'static,
+    ) -> String {
+        install_state_test_session_with_owner(sessions, chat_backend, sid, provider, None).await
+    }
+
+    async fn install_state_test_session_with_owner(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<omnesagent_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl omnesagent_api::model_provider::ModelProvider + 'static,
+        owner_tui_id: Option<&str>,
+    ) -> String {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        )
+        .with_owner(owner_tui_id.map(str::to_string));
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let session_key = format!("rpc_{sid}");
+        chat_backend
+            .set_session_agent_alias(&session_key, "test-agent")
+            .unwrap();
+        session_key
+    }
+
+    #[tokio::test]
+    async fn owner_cancelled_rpc_prompt_returns_durable_chat_state_to_idle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let sid = "rpc-state-owner-cancel";
+        let owner = "cancel-owner";
+        let session_key = install_state_test_session_with_owner(
+            &sessions,
+            &chat_backend,
+            sid,
+            GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            },
+            Some(owner),
+        )
+        .await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            omnesagent_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-owner-cancel:pid=1".into());
+        dispatcher.set_tui_id_for_test(Some(owner.to_string()));
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt_task = omnesagent_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "wait for owner cancellation",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("the real Chat prompt must reach its gated provider");
+
+        let running = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the admitted Chat turn must have durable state");
+        assert_eq!(running.state, "running");
+        assert!(running.turn_id.is_some());
+
+        let cancelled = dispatcher
+            .handle_session_cancel(&json!({"session_id": sid}))
+            .await
+            .expect("the owning dispatcher must be allowed to cancel its turn");
+        assert_eq!(cancelled["cancelled"], true);
+
+        let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+            .await
+            .expect("owner cancellation must release the blocked prompt")
+            .expect("prompt task must not panic")
+            .expect("cancelled prompt must settle normally");
+        assert_eq!(prompt_result["stop_reason"], "cancelled");
+        assert!(
+            release_tx.send(()).is_err(),
+            "cancellation must drop the gated provider future"
+        );
+
+        let idle = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the cancelled Chat turn must retain its durable row");
+        assert_eq!(idle.state, "idle");
+        assert!(
+            idle.turn_id.is_none(),
+            "a cancelled terminal turn must clear its durable turn id"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_reports_running_during_turn_and_idle_after() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let provider = GatedProvider {
+            started: started_tx,
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+
+        let sid = "rpc-state-turn";
+        let session_key = install_state_test_session(&sessions, &chat_backend, sid, provider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            omnesagent_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-state:pid=1".into());
+
+        let before = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.state, "idle",
+            "session must start idle before any turn runs"
+        );
+
+        let handle = dispatcher.spawn_handle();
+        let sid_owned = sid.to_string();
+        let turn_task = omnesagent_spawn::spawn!(async move {
+            handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_owned,
+                    "prompt": "hello",
+                }))
+                .await
+        });
+
+        started_rx
+            .recv()
+            .await
+            .expect("provider must be invoked once the turn starts");
+
+        let mid_turn = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("state row must exist once the turn has started");
+        assert_eq!(
+            mid_turn.state, "running",
+            "session state must be running while the RPC turn is in flight"
+        );
+        assert!(
+            mid_turn.turn_id.is_some(),
+            "a running state must carry a turn id"
+        );
+
+        release_tx
+            .send(())
+            .expect("test harness must still hold the release channel");
+
+        let result = turn_task.await.expect("turn task must not panic");
+        assert!(result.is_ok(), "turn should complete: {result:?}");
+
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state, "idle",
+            "session state must return to idle once the turn completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_reports_error_state_on_provider_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "rpc-state-error";
+        let session_key =
+            install_state_test_session(&sessions, &chat_backend, sid, FailingProvider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            omnesagent_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-error:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a failing provider must surface as an RPC error"
+        );
+
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state, "error",
+            "session state must record error after a failed turn"
+        );
+        assert!(
+            after.turn_id.is_some(),
+            "the error state must still carry the turn id it failed under"
+        );
+    }
+
+    /// `session/new` with `chat_mode: "acp"` never creates a `session_backend`
+    /// row — ACP sessions live entirely in `acp_session_store` — and
+    /// `set_session_state` only `UPDATE`s an existing row. So the
+    /// running/idle/error write in `handle_session_prompt` is a silent no-op
+    /// for ACP-mode turns, and `session/state` (which probes `session_backend`
+    /// under the bare id, `rpc_{id}`, and `gw_{id}`) reports session-not-found
+    /// rather than idle or running, both before and after the turn.
+    #[tokio::test]
+    async fn acp_mode_session_prompt_leaves_session_backend_state_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(omnesagent_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "acp-state-gap";
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(FailingProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Acp,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let candidates = [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")];
+        for key in &candidates {
+            assert!(
+                chat_backend.get_session_state(key).unwrap().is_none(),
+                "an ACP session must have no session_backend row under {key} before a turn"
+            );
+        }
+
+        let ctx = RpcContext::for_persistence_tests(
+            omnesagent_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-acp-gap:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "the failing provider still surfaces as an RPC error under ACP mode"
+        );
+
+        for key in &candidates {
+            assert!(
+                chat_backend.get_session_state(key).unwrap().is_none(),
+                "an ACP session must still have no session_backend row under {key} after a \
+                 turn — the running/idle/error write is a no-op for chat_mode: acp"
+            );
+        }
+
+        let state_result = dispatcher
+            .handle_session_state(&json!({ "session_id": sid }))
+            .await;
+        assert!(
+            state_result.is_err(),
+            "session/state must report the ACP session as not found rather than idle or \
+             running, since chat_mode: acp never populates session_backend"
+        );
+    }
+
+    /// Session IDs are caller-supplied and the Chat and ACP persistence modes
+    /// share that namespace, so a closed or replaced Chat session can leave a
+    /// durable `rpc_{sid}` row behind that an ACP session later reuses the ID
+    /// of. The lifecycle writes must be scoped by `chat_mode`, or the ACP turn
+    /// mutates the retained Chat row — making a stale Chat record report
+    /// `running`/`idle`/`error` from an ACP turn and surfacing it in
+    /// stuck-session queries.
+    ///
+    /// Unlike `acp_mode_session_prompt_leaves_session_backend_state_absent`,
+    /// this starts *with* a Chat row present, which is the only way to observe
+    /// the cross-store mutation: `set_session_state` only `UPDATE`s an
+    /// existing row, so the no-row case cannot catch the collision.
+    #[tokio::test]
+    async fn acp_prompt_does_not_mutate_a_retained_chat_row_with_the_same_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(omnesagent_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "shared-id-collision";
+        let session_key = format!("rpc_{sid}");
+
+        // A Chat session existed under this id and left its durable row
+        // behind, carrying a terminal state from its own last turn.
+        chat_backend
+            .set_session_agent_alias(&session_key, "test-agent")
+            .unwrap();
+        chat_backend
+            .set_session_state(&session_key, "error", Some("chat-era-turn"))
+            .unwrap();
+        let retained = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the retained Chat row must exist before the ACP turn");
+        assert_eq!(retained.state, "error");
+        assert_eq!(retained.turn_id.as_deref(), Some("chat-era-turn"));
+
+        // An ACP session now reuses the same caller-supplied id.
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(FailingProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Acp,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let ctx = RpcContext::for_persistence_tests(
+            omnesagent_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-collision:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "the failing provider still surfaces as an RPC error under ACP mode"
+        );
+
+        // The ACP turn ran start-to-error. Had the lifecycle writes not been
+        // mode-scoped, this row would now read "error" under a fresh uuid
+        // turn id — an ACP turn overwriting Chat-owned durable state.
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the retained Chat row must still exist");
+        assert_eq!(
+            after.state, "error",
+            "an ACP turn must not rewrite the retained Chat row's state"
+        );
+        assert_eq!(
+            after.turn_id.as_deref(),
+            Some("chat-era-turn"),
+            "an ACP turn must not stamp its own turn id onto the retained Chat row"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_id_chat_replacement_waits_for_blocked_acp_prompt_finalization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-replaced-by-chat";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let sid_for_prompt = sid.to_string();
+        let prompt_task = omnesagent_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_for_prompt,
+                    "prompt": "blocked ACP turn",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("ACP provider must block after prompt admission");
+
+        let replacement_handle = dispatcher.spawn_handle();
+        let sid_for_replacement = sid.to_string();
+        let replacement_task = omnesagent_spawn::spawn!(async move {
+            replacement_handle
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid_for_replacement,
+                    "chat_mode": "chat",
+                }))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if sessions.session_queue.queue_depth(sid).await == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-ID replacement must register behind the admitted ACP prompt");
+        assert!(
+            !replacement_task.is_finished(),
+            "session/new must not replace a same-ID session while its prompt owns admission"
+        );
+        assert!(
+            chat_backend
+                .get_session_state(&format!("rpc_{sid}"))
+                .unwrap()
+                .is_none(),
+            "the blocked ACP incarnation must not create Chat durable state"
+        );
+
+        release_tx.send(()).unwrap();
+        let prompt_result = prompt_task.await.expect("prompt task must not panic");
+        assert!(
+            prompt_result.is_ok(),
+            "ACP prompt should finish: {prompt_result:?}"
+        );
+        let replacement_result = replacement_task
+            .await
+            .expect("replacement task must not panic");
+        assert!(
+            replacement_result.is_ok(),
+            "Chat replacement should succeed after ACP finalization: {replacement_result:?}"
+        );
+
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        );
+        let key = format!("rpc_{sid}");
+        let replacement_state = chat_backend
+            .get_session_state(&key)
+            .unwrap()
+            .expect("Chat replacement must create its durable row");
+        assert_eq!(replacement_state.state, "idle");
+        assert!(replacement_state.turn_id.is_none());
+        assert!(
+            chat_backend.load(&key).is_empty(),
+            "the finalized ACP prompt must not append into the replacement Chat transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn removals_cancel_after_prompt_admission_before_fallible_setup() {
+        #[derive(Clone, Copy, Debug)]
+        enum Removal {
+            Close,
+            Kill,
+            Delete,
+        }
+
+        for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let chat_backend = Arc::new(
+                omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+                4, 2, 60,
+            ));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let (provider_started_tx, mut provider_started_rx) =
+                tokio::sync::mpsc::unbounded_channel();
+            let (_provider_release_tx, provider_release_rx) = tokio::sync::oneshot::channel();
+            let sid = format!("pre-setup-removal-{removal:?}").to_ascii_lowercase();
+            install_state_test_session(
+                &sessions,
+                &chat_backend,
+                &sid,
+                GatedProvider {
+                    started: provider_started_tx,
+                    release: tokio::sync::Mutex::new(Some(provider_release_rx)),
+                },
+            )
+            .await;
+
+            let ctx = RpcContext::for_persistence_tests(
+                omnesagent_config::schema::Config::default(),
+                Arc::clone(&sessions),
+                Some(chat_backend.clone()
+                    as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+                None,
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-pre-setup-removal".into());
+            let (prompt_admitted, release_prompt) = sessions.set_test_prompt_registration_pause();
+
+            let prompt_handle = dispatcher.spawn_handle();
+            let sid_for_prompt = sid.clone();
+            let prompt_task = omnesagent_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": sid_for_prompt,
+                        "prompt": "must be cancelled",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                prompt_admitted.notified(),
+            )
+            .await
+            .expect("prompt must own admission with its cancel token registered");
+            assert!(sessions.has_inflight_turn(&sid));
+
+            let removal_handle = dispatcher.spawn_handle();
+            let sid_for_removal = sid.clone();
+            let removal_task = omnesagent_spawn::spawn!(async move {
+                match removal {
+                    Removal::Close => {
+                        removal_handle
+                            .handle_session_close(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Kill => {
+                        removal_handle
+                            .handle_session_kill(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Delete => {
+                        removal_handle
+                            .handle_session_delete(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must signal cancellation before waiting on prompt admission");
+
+            release_prompt.notify_one();
+            let prompt_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+                    .await
+                    .expect("the pre-setup removal signal must cancel the admitted prompt")
+                    .expect("prompt task must not panic");
+            let prompt_result = prompt_result.expect("prompt should settle as cancelled");
+            assert_eq!(prompt_result["stop_reason"], "cancelled");
+            let removal_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), removal_task)
+                    .await
+                    .expect("removal must complete instead of timing out behind the prompt")
+                    .expect("removal task must not panic");
+            assert!(
+                removal_result.is_ok(),
+                "{removal:?} should complete after cancelling setup: {removal_result:?}"
+            );
+            assert!(sessions.chat_mode(&sid).await.is_none());
+            assert!(
+                provider_started_rx.try_recv().is_err(),
+                "{removal:?} must cancel before provider execution begins"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_setup_failure_unregisters_its_cancel_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+            4, 2, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let sid = "prompt-setup-failure";
+        install_state_test_session(&sessions, &chat_backend, sid, FailingProvider).await;
+        let ctx = RpcContext::for_persistence_tests(
+            omnesagent_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn omnesagent_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-setup-failure".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "attachment should fail before provider execution",
+                "attachments": [{
+                    "data_b64": "not-valid-base64!!!",
+                    "filename": "bad.txt",
+                    "source": "file",
+                }],
+            }))
+            .await;
+        assert!(result.is_err(), "malformed attachment must fail setup");
+        assert!(
+            !sessions.has_inflight_turn(sid),
+            "RAII cleanup must remove the admitted prompt token on setup errors"
+        );
+        assert_eq!(sessions.take_cancel_cause(sid), None);
+    }
+
+    #[tokio::test]
+    async fn session_removals_wait_for_prompt_finalization_before_same_id_reuse() {
+        #[derive(Clone, Copy, Debug)]
+        enum Removal {
+            Close,
+            Kill,
+            Delete,
+        }
+
+        for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+
+            let sid = format!("acp-removal-{removal:?}").to_ascii_lowercase();
+            acp_store
+                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap())
+                .unwrap();
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(GatedProvider {
+                    started: started_tx,
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .agent_alias("test-agent".to_string())
+                .build()
+                .expect("test agent should build");
+            sessions
+                .insert(
+                    sid.clone(),
+                    crate::rpc::session::RpcSession::new(
+                        agent,
+                        "test-agent",
+                        tmp.path().to_str().unwrap(),
+                        crate::rpc::types::ChatMode::Acp,
+                    ),
+                )
+                .await
+                .unwrap();
+
+            // Hold admission so both operations queue deterministically. The
+            // prompt registers first; the removal must remain behind it until
+            // that ACP incarnation has finalized all durable work.
+            let admission_guard = sessions.session_queue.acquire(&sid).await.unwrap();
+            let prompt_handle = dispatcher.spawn_handle();
+            let sid_for_prompt = sid.clone();
+            let prompt_task = omnesagent_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": sid_for_prompt,
+                        "prompt": "blocked ACP turn",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("prompt must register behind the test admission guard");
+
+            let removal_handle = dispatcher.spawn_handle();
+            let sid_for_removal = sid.clone();
+            let removal_task = omnesagent_spawn::spawn!(async move {
+                match removal {
+                    Removal::Close => {
+                        removal_handle
+                            .handle_session_close(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Kill => {
+                        removal_handle
+                            .handle_session_kill(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Delete => {
+                        removal_handle
+                            .handle_session_delete(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must register behind the admitted prompt");
+            assert!(
+                !removal_task.is_finished(),
+                "{removal:?} must not remove an incarnation that still owns admission"
+            );
+            assert_eq!(
+                sessions.chat_mode(&sid).await,
+                Some(crate::rpc::types::ChatMode::Acp)
+            );
+
+            drop(admission_guard);
+            started_rx
+                .recv()
+                .await
+                .expect("the queued ACP prompt must run before removal");
+            assert!(
+                !removal_task.is_finished(),
+                "{removal:?} must wait while the ACP provider is blocked"
+            );
+            release_tx.send(()).unwrap();
+
+            let prompt_result = prompt_task.await.expect("prompt task must not panic");
+            assert!(
+                prompt_result.is_ok(),
+                "ACP prompt should finalize before {removal:?}: {prompt_result:?}"
+            );
+            let removal_result = removal_task.await.expect("removal task must not panic");
+            assert!(
+                removal_result.is_ok(),
+                "{removal:?} should succeed after prompt finalization: {removal_result:?}"
+            );
+            assert!(sessions.chat_mode(&sid).await.is_none());
+
+            let replacement = dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                    "chat_mode": "chat",
+                }))
+                .await;
+            assert!(
+                replacement.is_ok(),
+                "same-ID Chat replacement should succeed after {removal:?}: {replacement:?}"
+            );
+            let key = format!("rpc_{sid}");
+            let replacement_state = chat_backend
+                .get_session_state(&key)
+                .unwrap()
+                .expect("Chat replacement must own a fresh durable row");
+            assert_eq!(replacement_state.state, "idle");
+            assert!(replacement_state.turn_id.is_none());
+            assert!(
+                chat_backend.load(&key).is_empty(),
+                "old ACP turn must not contaminate Chat transcript after {removal:?}"
+            );
+        }
+    }
+
+    // ── generation-gated stale-refresh in-flight race tests ──
+    //
+    // These tests use a SessionStore test-only gate to pause stale work
+    // after the generation is captured but before the gated method commits,
+    // then replace the session through session/new while the stale work is
+    // paused. After releasing the gate they wait for the gated method to
+    // exit (done notification), then assert the successor is untouched.
+
+    /// Deterministic race: `session/configure` captures the original
+    /// generation, enters the gated method, then the session is replaced
+    /// via `session/new` while the stale configure is paused. The stale
+    /// work must be rejected and the successor must remain untouched.
+    #[tokio::test]
+    async fn session_configure_stale_gen_replaced_during_provider_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+        let sid = session_id.clone();
+        let workspace = tmp.path().join("workspace");
+
+        // Spawn the configure handler — it will capture the generation,
+        // acquire the per-session lock, build the provider, then block at
+        // the gate inside set_overrides_gated.
+        let handle = omnesagent_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": sid,
+                    "overrides": {
+                        "model_provider": "openai.test-provider",
+                        "model": "intruder-model",
+                        "temperature": 0.99,
+                    }
+                }))
+                .await
+        });
+
+        // Wait for the handler to enter the gate (generation captured,
+        // commit pending).
+        entered.notified().await;
+
+        // Replace the session via session/new while the stale configure
+        // is paused — this is caller-supplied same-ID replacement.
+        let dispatcher2 = make_shared_sessions_dispatcher(
+            make_model_refresh_test_config(&tmp),
+            Arc::clone(&sessions),
+        );
+        let replace_res = dispatcher2
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace,
+                "session_id": session_id,
+            }))
+            .await;
+        assert!(
+            replace_res.is_ok(),
+            "session/new replacement must succeed: {replace_res:?}"
+        );
+
+        // Release the gate — stale work sees the generation mismatch.
+        release.notify_one();
+
+        // Wait for the gated method to exit.
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        let res = handle.await.expect("spawned configure must not panic");
+        assert!(
+            res.is_err(),
+            "stale-generation configure after replacement must fail; got: {res:?}"
+        );
+
+        // Successor must be completely untouched — it was created from
+        // config by session/new and must still have its original values.
+        let overrides = sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("successor still exists");
+        assert_eq!(overrides.model_provider, None);
+        assert_eq!(overrides.model, None);
+        assert_eq!(overrides.temperature, None);
+
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("successor agent exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        // Successor was built from the test config with
+        // model_provider = "openai.test-provider", model = "old-model".
+        // The stale configure tried to change these to "intruder-model";
+        // if the generation gate held, the successor keeps its original
+        // config values.
+        assert_eq!(
+            model_name, "old-model",
+            "successor model must not be overwritten by stale configure"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "successor temperature must not be overwritten"
+        );
+    }
+
+    /// Deterministic race: config/set triggers an async refresh. The
+    /// refresh snapshots the session identity, acquires the per-session
+    /// lock, builds the provider, then blocks at `apply_model_provider`.
+    /// The session is replaced via `session/new` while paused. The stale
+    /// refresh must skip the successor.
+    #[tokio::test]
+    async fn config_set_refresh_stale_gen_replaced_during_provider_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+
+        // Trigger config/set — schedules an async refresh that will
+        // snapshot, lock, build provider, then block at apply_model_provider.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "refreshed-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // Wait for the async refresh to reach the gate (snapshot captured,
+        // provider built, apply pending).
+        entered.notified().await;
+
+        // Replace the session via session/new while the stale refresh is
+        // paused.
+        let dispatcher2 = make_shared_sessions_dispatcher(
+            make_model_refresh_test_config(&tmp),
+            Arc::clone(&sessions),
+        );
+        let workspace = tmp.path().join("workspace");
+        let replace_res = dispatcher2
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace,
+                "session_id": session_id,
+            }))
+            .await;
+        assert!(
+            replace_res.is_ok(),
+            "session/new replacement must succeed: {replace_res:?}"
+        );
+
+        // Release the gate — stale refresh sees generation mismatch.
+        release.notify_one();
+
+        // Wait for the gated method to exit, then clean up.
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        // Successor must be untouched by the stale refresh — it was
+        // created from config with model "old-model". The refresh tried
+        // to change it to "refreshed-model"; gen-gating must prevent that.
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("successor agent exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(
+            model_name, "old-model",
+            "successor model must not be overwritten by stale config/set refresh"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "successor temperature must not be overwritten"
+        );
+    }
+
+    /// Deterministic race: config/set triggers an async refresh that pauses
+    /// at `apply_model_provider` after capturing the old generation. While
+    /// paused, the session is replaced through ACP rehydration
+    /// (`rehydrate_reaped_session`), which installs a same-ID successor via
+    /// `SessionStore::insert`. The stale refresh must skip the rehydrated
+    /// successor.
+    #[tokio::test]
+    async fn config_set_refresh_stale_gen_replaced_by_acp_rehydration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        // Persist a restorable ACP row for the same session ID so
+        // rehydrate_reaped_session can reinstall it under the same ID.
+        let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
+        acp_store
+            .create_session(&session_id, "test-agent", &workspace)
+            .expect("ACP session row must be created");
+
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+
+        // Trigger config/set — schedules an async refresh that pauses at
+        // apply_model_provider after capturing the old generation.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "refreshed-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // Wait for the async refresh to reach the gate.
+        entered.notified().await;
+
+        // Rewind the provider model so the rehydrated successor is built
+        // from "old-model" while the paused refresh still targets
+        // "refreshed-model". This makes the two distinguishable: if the
+        // stale refresh leaks through, the successor would flip to
+        // "refreshed-model".
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai.test-provider slot exists")
+            .model = Some("old-model".into());
+
+        // Replace the session via ACP rehydration while the stale refresh
+        // is paused. This installs a same-ID successor via SessionStore::insert.
+        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        assert!(
+            rehydrated.is_some(),
+            "ACP rehydration must install the same-ID successor"
+        );
+
+        // Release the gate — the stale refresh sees the generation mismatch.
+        release.notify_one();
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        // The rehydrated successor must retain its provider, model, and
+        // temperature — untouched by the stale config/set refresh.
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("rehydrated successor exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(
+            model_name, "old-model",
+            "rehydrated successor model must not be overwritten by stale config/set refresh"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "rehydrated successor temperature must not be overwritten"
+        );
+    }
+
+    /// Reverse-order regression: `session/configure` queues before a provider
+    /// refresh. The configure commits a `model_provider` override, then the
+    /// refresh — which captured its generation before blocking on the
+    /// ordering lock — must re-read the committed override inside the lock
+    /// and skip the session instead of applying a stale pre-lock snapshot.
+    #[tokio::test]
+    async fn model_provider_update_queued_refresh_reads_newer_configure_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Hold the per-session ordering lock so both configure and refresh
+        // queue behind it.
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        // Point the agent at other-provider so a refresh that does NOT see
+        // the configure override would rebuild the agent to other-model.
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+
+        // Queue configure FIRST — it will commit a model_provider override.
+        let configure_dispatcher = Arc::new(dispatcher);
+        let configure_task_dispatcher = Arc::clone(&configure_dispatcher);
+        let configure_session_id = session_id.clone();
+        let configure_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = omnesagent_spawn::spawn!(async move {
+            configure_task_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": configure_session_id,
+                    "overrides": { "model_provider": "openai.test-provider" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must queue first on the provider update boundary");
+
+        // Queue refresh SECOND — it captures its generation then blocks on
+        // the same ordering lock behind configure.
+        let refresh_ctx = Arc::clone(&configure_dispatcher.ctx);
+        let refresh_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let refresh_wait = refresh_waiting.notified();
+        let refresh = omnesagent_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
+            .await
+            .expect("agent refresh must queue behind the configure");
+
+        drop(update_guard);
+
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must commit the override");
+        refresh.await.expect("agent refresh task must complete");
+
+        // The refresh must resolve the committed configure override and skip
+        // the session, preserving the newer override instead of applying its
+        // stale pre-lock snapshot.
+        assert_eq!(
+            model_name_for_session(&configure_dispatcher, &session_id).await,
+            "old-model",
+            "a later refresh must not overwrite a configure override that committed first"
+        );
+        assert_eq!(
+            configure_dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.model_provider),
+            Some("openai.test-provider".to_string())
+        );
+    }
+}

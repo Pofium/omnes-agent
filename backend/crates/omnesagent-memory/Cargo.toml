@@ -1,0 +1,37 @@
+[package]
+name = "omnesagent-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Memory backends, embeddings, consolidation, and retrieval for OmnesAgent."
+publish = false
+
+[dependencies]
+omnesagent-log.workspace = true
+omnesagent-api.workspace = true
+omnesagent-kag.workspace = true
+omnesagent-providers.workspace = true
+omnesagent-spawn.workspace = true
+omnesagent-config = { workspace = true, default-features = false }
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+parking_lot = "0.12"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "macros", "process", "sync", "time"] }
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+
+[features]
+memory-postgres = ["dep:postgres", "omnesagent-config/memory-postgres", "tokio/rt"]
+
+[dev-dependencies]
+filetime = "0.2"
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+toml = "1.0"

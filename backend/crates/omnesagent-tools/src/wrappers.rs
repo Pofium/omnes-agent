@@ -1,0 +1,654 @@
+//! Generic tool wrappers for crosscutting concerns.
+
+use async_trait::async_trait;
+use std::sync::Arc;
+use omnesagent_api::attribution::{Attributable, Role, ToolProvenance};
+use omnesagent_api::tool::{Tool, ToolOutput, ToolResult};
+use omnesagent_config::policy::SecurityPolicy;
+
+/// Type alias for a path-extraction closure used by [`PathGuardedTool`].
+type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
+
+// ── RateLimitedTool ───────────────────────────────────────────────────────────
+
+pub struct RateLimitedTool<T: Tool> {
+    inner: T,
+    security: Arc<SecurityPolicy>,
+}
+
+impl<T: Tool> RateLimitedTool<T> {
+    pub fn new(inner: T, security: Arc<SecurityPolicy>) -> Self {
+        Self { inner, security }
+    }
+}
+
+impl<T: Tool> Attributable for RateLimitedTool<T> {
+    fn role(&self) -> Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
+    }
+}
+
+#[async_trait]
+impl<T: Tool> Tool for RateLimitedTool<T> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, omnesagent_api::tool::OptionDomain)> {
+        self.inner.param_domains()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let reservation = match self.security.reserve_action() {
+            Some(reservation) => reservation,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                });
+            }
+        };
+
+        let result = self.inner.execute(args).await?;
+
+        if result.success {
+            reservation.commit();
+        }
+
+        Ok(result)
+    }
+}
+
+// ── PathGuardedTool ───────────────────────────────────────────────────────────
+
+pub struct PathGuardedTool<T: Tool> {
+    inner: T,
+    security: Arc<SecurityPolicy>,
+    /// Optional override: extract a path string from the args JSON.
+    extractor: Option<Box<PathExtractor>>,
+}
+
+impl<T: Tool> PathGuardedTool<T> {
+    pub fn new(inner: T, security: Arc<SecurityPolicy>) -> Self {
+        Self {
+            inner,
+            security,
+            extractor: None,
+        }
+    }
+
+    /// Supply a custom path-extraction closure for tools with non-standard arg names.
+    pub fn with_extractor<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&serde_json::Value) -> Option<String> + Send + Sync + 'static,
+    {
+        self.extractor = Some(Box::new(f));
+        self
+    }
+
+    fn extract_path_string(&self, args: &serde_json::Value) -> Option<String> {
+        if let Some(ref f) = self.extractor {
+            return f(args);
+        }
+        // Default: check common argument names used across OmnesAgent tools.
+        for field in &["path", "command", "pattern", "query", "file"] {
+            if let Some(s) = args.get(field).and_then(|v| v.as_str()) {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
+}
+
+impl<T: Tool> Attributable for PathGuardedTool<T> {
+    fn role(&self) -> Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
+    }
+}
+
+#[async_trait]
+impl<T: Tool> Tool for PathGuardedTool<T> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn param_domains(&self) -> Vec<(&'static str, omnesagent_api::tool::OptionDomain)> {
+        self.inner.param_domains()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Some(arg) = self.extract_path_string(&args) {
+            // For shell command arguments, use the full token-aware scanner.
+            // For plain path values (e.g. "path" or custom extractor), fall back
+            // to the direct path check.
+            let blocked = if self.extractor.is_none()
+                && args.get("command").and_then(|v| v.as_str()).is_some()
+            {
+                self.security.forbidden_workspace_path_argument(&arg)
+            } else if !self.security.is_path_allowed(&arg) {
+                Some(arg.clone())
+            } else {
+                None
+            };
+
+            if let Some(path) = blocked {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Path blocked by security policy: {path}")),
+                });
+            }
+        }
+
+        self.inner.execute(args).await
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+    use omnesagent_config::autonomy::AutonomyLevel;
+    use omnesagent_config::policy::SecurityPolicy;
+
+    omnesagent_api::mock_tool_attribution!(CountingTool);
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn policy(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
+    /// A minimal tool that records how many times `execute` was called.
+    struct CountingTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingTool {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let counter = Arc::new(AtomicUsize::new(0));
+            (
+                CountingTool {
+                    calls: counter.clone(),
+                },
+                counter,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "counting"
+        }
+        fn description(&self) -> &str {
+            "counts calls"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    // ── RateLimitedTool tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rate_limited_allows_call_within_budget() {
+        let (inner, counter) = CountingTool::new();
+        let tool = RateLimitedTool::new(inner, policy(AutonomyLevel::Full));
+        let result = tool
+            .execute(serde_json::json!({}))
+            .await
+            .expect("should succeed");
+        assert!(result.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_delegates_name_and_schema() {
+        let (inner, _) = CountingTool::new();
+        let tool = RateLimitedTool::new(inner, policy(AutonomyLevel::Full));
+        assert_eq!(tool.name(), "counting");
+        assert_eq!(tool.description(), "counts calls");
+        assert!(tool.parameters_schema().is_object());
+    }
+
+    #[tokio::test]
+    async fn rate_limited_blocks_when_exhausted() {
+        // Use a policy with a tiny action budget (1 action per window).
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = RateLimitedTool::new(inner, sec);
+
+        let r1 = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(r1.success, "first call should succeed");
+
+        let r2 = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!r2.success, "second call should be rate-limited");
+        assert!(r2.error.unwrap().contains("Rate limit exceeded"));
+        // Inner tool must NOT have been called on the blocked attempt.
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    struct BlockingTool {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    omnesagent_api::mock_tool_attribution!(BlockingTool);
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+        fn description(&self) -> &str {
+            "waits until released"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_parallel_calls_cannot_overbook_one_slot() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let first = RateLimitedTool::new(
+            BlockingTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+            sec.clone(),
+        );
+        let first_call =
+            omnesagent_spawn::spawn!(async move { first.execute(serde_json::json!({})).await });
+        entered.notified().await;
+
+        let (second_inner, second_calls) = CountingTool::new();
+        let second = RateLimitedTool::new(second_inner, sec);
+        let blocked = second.execute(serde_json::json!({})).await.unwrap();
+        assert!(!blocked.success, "the in-flight call owns the only slot");
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+
+        release.notify_one();
+        assert!(first_call.await.unwrap().unwrap().success);
+    }
+
+    // ── PathGuardedTool tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn path_guard_allows_safe_path() {
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
+        let result = tool
+            .execute(serde_json::json!({"path": "src/main.rs"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn path_guard_blocks_forbidden_path() {
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
+        let result = tool
+            .execute(serde_json::json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Path blocked"));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "inner must not be called"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_guard_no_path_arg_passes_through() {
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
+        // No recognised path field — wrapper must not block.
+        let result = tool
+            .execute(serde_json::json!({"value": "hello"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn path_guard_custom_extractor() {
+        let (inner, counter) = CountingTool::new();
+        let tool =
+            PathGuardedTool::new(inner, policy(AutonomyLevel::Full)).with_extractor(|args| {
+                args.get("target")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+        let result = tool
+            .execute(serde_json::json!({"target": absolute_path_outside_workspace()}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Path blocked"));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Composition test ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn composed_wrappers_both_enforce() {
+        // RateLimited(PathGuarded(CountingTool)) — path check happens inside
+        // the rate-limit window, so a forbidden path must still be blocked
+        // (and not consume a rate-limit slot).
+        let sec = policy(AutonomyLevel::Full);
+        let (inner, counter) = CountingTool::new();
+        let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
+
+        let blocked = tool
+            .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))
+            .await
+            .unwrap();
+        assert!(!blocked.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_does_not_consume_budget_on_failure() {
+        // Inner tool that always reports failure (e.g. validation error).
+        // Its reservation must be released so a later successful call can run.
+        struct AlwaysFails;
+        impl ::omnesagent_api::attribution::Attributable for AlwaysFails {
+            fn role(&self) -> ::omnesagent_api::attribution::Role {
+                ::omnesagent_api::attribution::Role::Tool(
+                    ::omnesagent_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
+        #[async_trait]
+        impl Tool for AlwaysFails {
+            fn name(&self) -> &str {
+                "always_fails"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("validation failed".into()),
+                })
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let failing = RateLimitedTool::new(AlwaysFails, sec.clone());
+
+        // Three failed calls — none should consume the single-slot budget.
+        for _ in 0..3 {
+            let r = failing.execute(serde_json::json!({})).await.unwrap();
+            assert!(!r.success);
+            assert!(r.error.unwrap().contains("validation failed"));
+        }
+
+        // Now a fresh successful tool wrapped against the same policy must
+        // still have its slot available.
+        let (success_inner, counter) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(success_inner, sec);
+        let r = succeeding.execute(serde_json::json!({})).await.unwrap();
+        assert!(r.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_on_inner_error() {
+        struct AlwaysErrors;
+        omnesagent_api::mock_tool_attribution!(AlwaysErrors);
+
+        #[async_trait]
+        impl Tool for AlwaysErrors {
+            fn name(&self) -> &str {
+                "always_errors"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                anyhow::bail!("inner error")
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let erroring = RateLimitedTool::new(AlwaysErrors, sec.clone());
+        assert!(erroring.execute(serde_json::json!({})).await.is_err());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_when_call_is_cancelled() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let entered = Arc::new(Notify::new());
+        let tool = RateLimitedTool::new(
+            BlockingTool {
+                entered: entered.clone(),
+                release: Arc::new(Notify::new()),
+            },
+            sec.clone(),
+        );
+        let call = omnesagent_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        entered.notified().await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_when_inner_panics() {
+        struct PanickingTool;
+        omnesagent_api::mock_tool_attribution!(PanickingTool);
+
+        #[async_trait]
+        impl Tool for PanickingTool {
+            fn name(&self) -> &str {
+                "panicking"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                panic!("inner panic")
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = RateLimitedTool::new(PanickingTool, sec.clone());
+        let call = omnesagent_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        assert!(call.await.unwrap_err().is_panic());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composed_wrappers_path_block_preserves_budget() {
+        // RateLimited(PathGuarded(CountingTool)) — PathGuard blocks the call,
+        // budget must NOT be consumed, so a subsequent allowed call still runs.
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
+
+        let blocked = tool
+            .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))
+            .await
+            .unwrap();
+        assert!(!blocked.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Budget intact: an allowed call should still pass.
+        let allowed = tool
+            .execute(serde_json::json!({"path": "src/main.rs"}))
+            .await
+            .unwrap();
+        assert!(allowed.success, "budget should still have a slot");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+}

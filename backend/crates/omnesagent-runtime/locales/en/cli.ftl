@@ -1,0 +1,1230 @@
+cli-about = The fastest, smallest AI assistant.
+cli-no-command-provided = No command provided.
+cli-try-quickstart = Try `omnesagent quickstart` to create your first agent.
+
+cli-quickstart-about = Create your first agent end-to-end
+cli-agent-about = Start the AI agent loop
+cli-gateway-about = Manage the gateway server (webhooks, websockets)
+cli-acp-about = Start the ACP server (JSON-RPC 2.0 over stdio)
+cli-daemon-about = Start the long-running autonomous daemon
+cli-service-about = Manage OS service lifecycle (launchd/systemd user service)
+cli-doctor-about = Run diagnostics for daemon/scheduler/channel freshness
+cli-status-about = Show system status (full details)
+cli-estop-about = Engage, inspect, and resume emergency-stop states
+cli-cron-about = Configure and manage scheduled tasks
+cli-models-about = Manage provider model catalogs
+cli-providers-about = List supported AI providers
+cli-channel-about = Manage communication channels
+cli-integrations-about = Browse 50+ integrations
+cli-skills-about = Manage skills (user-defined capabilities)
+cli-sop-about = Manage standard operating procedures (SOPs)
+cli-migrate-about = Migrate data from other agent runtimes
+cli-auth-about = Manage provider subscription authentication profiles
+cli-hardware-about = Discover and introspect USB hardware
+cli-peripheral-about = Manage hardware peripherals
+cli-memory-about = Manage agent memory entries
+cli-config-about = Manage OmnesAgent configuration
+cli-update-about = Check for and apply OmnesAgent updates
+cli-self-test-about = Run diagnostic self-tests
+cli-completions-about = Generate shell completion scripts
+cli-desktop-about = Launch the companion desktop app, or open its download page
+
+cli-config-schema-about = Dump the full configuration JSON Schema to stdout
+cli-config-list-about = List all config properties with current values
+cli-config-get-about = Get a config property value
+cli-config-set-about = Set a config property (secret fields auto-prompt for masked input)
+cli-config-init-about = Initialize unconfigured sections with defaults (enabled=false)
+cli-config-migrate-about = Migrate config.toml to the current schema version on disk (preserves comments)
+
+cli-service-install-about = Install daemon service unit for auto-start and restart
+cli-service-start-about = Start daemon service
+cli-service-stop-about = Stop daemon service
+cli-service-restart-about = Restart daemon service to apply latest config
+cli-service-status-about = Check daemon service status
+cli-service-uninstall-about = Uninstall daemon service unit
+cli-service-logs-about = Tail daemon service logs
+
+cli-channel-list-about = List all configured channels
+cli-channel-start-about = Start all configured channels
+cli-channel-doctor-about = Run health checks for configured channels
+cli-channel-add-about = Add a new channel configuration
+cli-channel-remove-about = Remove a channel configuration
+cli-channel-send-about = Send a one-off message to a configured channel
+cli-wechat-pairing-required = 🔐 WeChat pairing required. One-time bind code: {$code}
+cli-wechat-send-bind-command = Send `{$command} <code>` from your WeChat.
+cli-wechat-qr-login = 📱 WeChat QR Login ({$attempt}/{$max})
+cli-wechat-scan-to-connect = Scan with WeChat to connect.
+cli-wechat-qr-url = QR URL: {$url}
+cli-wechat-qr-expired-giving-up = WeChat QR code expired {$max} times, giving up.
+cli-wechat-qr-fetch-failed = Failed to fetch WeChat QR code.
+cli-wechat-qr-fetch-status-failed = WeChat QR code fetch failed ({$status}): {$body}
+cli-wechat-missing-response-field = Missing {$field} in WeChat response.
+cli-wechat-scanned-confirm = 👀 Scanned! Confirm on your phone...
+cli-wechat-qr-expired-refreshing = ⏳ QR code expired, refreshing...
+cli-wechat-login-confirmed-missing-field = Login confirmed but {$field} missing.
+cli-wechat-connected = ✅ WeChat connected!
+cli-wechat-bound-success = ✅ WeChat account bound successfully. You can talk to OmnesAgent now.
+cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
+
+cli-skills-list-about = List all installed skills
+cli-skills-audit-about = Audit a skill source directory or installed skill name
+cli-skills-audit-failed = Skill audit failed.
+cli-skills-install-about = Install a new skill from a URL or local path
+cli-skills-remove-about = Remove an installed skill
+cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
+cli-skills-review-summary = { "  " }💾 Skill review: {$summary}
+cli-skills-install-start = Installing skill from: {$source}
+cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
+cli-skills-install-resolving-extra-registry = { "  " }Resolving '{$source}' from registry '{$registry}'...
+cli-skills-install-skill-requires-git = --skill <name> requires a git repository URL as the source (got '{$source}')
+cli-skills-install-catalog-failed = failed to install skill '{$skill}' from catalog {$source}
+cli-skills-install-invalid-skill-name = invalid --skill name '{$skill}': use a bare skill name (letters, digits, '-', '_')
+cli-skills-install-catalog-clone-failed = failed to clone skill catalog {$url}
+cli-skills-install-skill-not-in-catalog-empty = skill '{$skill}' not found in {$url}: no skills/ directory, or it is empty
+cli-skills-install-skill-not-in-catalog =
+    skill '{$skill}' not found in {$url}.
+    Available skills: {$available}
+cli-skills-install-catalog-root-symlink = skill catalog {$url} has a symlinked skills/ directory; refusing to inspect it
+cli-skills-install-catalog-root-escapes = skill catalog {$url} has a skills/ directory that resolves outside the cloned catalog; refusing to inspect it
+cli-skills-install-catalog-skill-symlink = skill '{$skill}' in {$url} is a symlink; catalog skills must be real directories inside the repository
+cli-skills-install-catalog-skill-escapes = skill '{$skill}' in {$url} resolves outside the cloned catalog; refusing to install
+cli-skills-install-git-failed = failed to install git skill source: {$source}
+cli-skills-install-registry-failed = failed to install skill from registry: {$source}
+cli-skills-install-extra-registry-failed = failed to install skill from extra registry: {$source}
+cli-skills-install-local-failed = failed to install local skill source: {$source}
+cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
+cli-skills-install-security-audit-completed = { "  " }Security audit completed successfully.
+cli-skills-install-into-bundle = { "  " }Installed into bundle '{$alias}'. Agents that list this bundle in skill_bundles will load it.
+cli-skills-install-global-note = { "  " }Note: installed into the global skills dir, which no agent loads automatically. Re-run with --bundle <alias>, or assign a bundle to an agent, to make it loadable.
+cli-skills-removed-archived = { "  " }{$status} Skill '{$name}' removed from bundle '{$bundle}' (archived under shared/skills/_deleted/).
+cli-skills-removed-global = { "  " }{$status} Skill '{$name}' removed from the global skills dir.
+cli-skills-install-tier-official = Installing {$name} v{$version} — Official (omnesagent-labs maintained)
+cli-skills-install-tier-community =
+    Installing {$name} v{$version} — Community submission
+    This skill is not audited by OmnesAgent. Review the skill content
+    and run `omnesagent skills audit {$name}` before granting any
+    permissions or running it in production.
+
+cli-skills-add-scaffolded = Scaffolded skill {$target} at {$dir}
+
+cli-skills-bundle-add-prompt =
+    To create skill-bundle '{$alias}' with directory '{$dir}', run:
+      omnesagent config map-key skill-bundles {$alias}
+      omnesagent config set skill-bundles.{$alias}.directory {$dir}
+
+    (Direct bundle creation through `omnesagent skills bundle add` would duplicate the config mutation surface.)
+
+cli-skills-bundle-remove-prompt =
+    To remove skill-bundle '{$alias}', run:
+      omnesagent config map-key-delete skill-bundles {$alias}
+
+    (Removes the config entry; the bundle's directory on disk is left in place.)
+
+cli-skills-bundle-list-empty =
+    No skill bundles configured.
+      Create one: omnesagent config set skill-bundles.default.directory shared/skills/default
+cli-skills-bundle-list-header = Skill bundles ({$count}):
+cli-skills-bundle-entry = {$alias} -> {$dir}
+cli-skills-bundle-include = include: {$values}
+cli-skills-bundle-exclude = exclude: {$values}
+cli-skills-bundle-show-no-skills = (no skills installed)
+cli-skills-bundle-show-skills-header = skills ({$count}):
+cli-skills-bundle-show-skill = {$name}: {$description}
+
+cli-cron-list-about = List all scheduled tasks
+cli-cron-add-about = Add a new recurring scheduled task
+cli-cron-add-at-about = Add a one-shot task that fires at a specific UTC timestamp
+cli-cron-add-every-about = Add a task that repeats at a fixed interval
+cli-cron-once-about = Add a one-shot task that fires after a delay from now
+cli-cron-remove-about = Remove a scheduled task
+cli-cron-update-about = Update one or more fields of an existing scheduled task
+cli-cron-pause-about = Pause a scheduled task
+cli-cron-resume-about = Resume a paused task
+
+cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
+cli-auth-refresh-about = Refresh OAuth access token using refresh token
+cli-auth-logout-about = Remove auth profile
+cli-auth-use-about = Set active profile for a provider
+cli-auth-list-about = List auth profiles
+cli-auth-status-about = Show auth status with active profile and token expiry info
+
+cli-memory-list-about = List memory entries with optional filters
+cli-memory-get-about = Get a specific memory entry by key
+cli-memory-stats-about = Show memory backend statistics and health
+cli-memory-clear-about = Clear memories by category, by key, or clear all
+cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
+
+cli-estop-status-about = Print current estop status
+cli-estop-resume-about = Resume from an engaged estop level
+
+cli-models-refresh-about = Refresh and cache provider models
+cli-models-list-about = List cached models for a provider
+cli-models-set-about = Set the default model in config
+cli-models-status-about = Show current model configuration and cache status
+
+cli-doctor-models-about = Probe model catalogs across providers and report availability
+cli-doctor-traces-about = Query runtime trace events (tool diagnostics and model replies)
+cli-doctor-update-context-windows-about = Update context_window in config.toml from provider /models endpoints
+
+cli-hardware-discover-about = Enumerate USB devices and show known boards
+cli-hardware-introspect-about = Introspect a device by its serial or device path
+cli-hardware-info-about = Get chip info via USB using probe-rs over ST-Link
+
+cli-peripheral-list-about = List configured peripherals
+cli-peripheral-add-about = Add a peripheral by board type and transport path
+cli-peripheral-flash-about = Flash OmnesAgent firmware to an Arduino board
+
+cli-sop-list-about = List loaded SOPs
+cli-sop-validate-about = Validate SOP definitions
+cli-sop-show-about = Show details of an SOP
+
+cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this OmnesAgent workspace
+cli-migrate-openclaw-qdrant-unsupported = Qdrant is not currently supported as an OpenClaw migration target. Set memory.backend to sqlite, lucid, or markdown and retry.
+
+cli-agent-long-about =
+    Start the AI agent loop.
+
+    Launches an interactive chat session with the configured AI provider. Use --message for single-shot queries without entering interactive mode.
+
+    Examples:
+      omnesagent agent                              # interactive session
+      omnesagent agent -m "Summarize today's logs"  # single message
+      omnesagent agent -p anthropic --model claude-sonnet-4-20250514
+      omnesagent agent --peripheral nucleo-f401re:/dev/ttyACM0
+
+cli-gateway-long-about =
+    Manage the gateway server (webhooks, websockets).
+
+    Start, restart, or inspect the HTTP/WebSocket gateway that accepts incoming webhook events and WebSocket connections.
+
+    Examples:
+      omnesagent gateway start              # start gateway
+      omnesagent gateway restart            # restart gateway
+      omnesagent gateway get-paircode       # show pairing code
+
+cli-acp-long-about =
+    Start the ACP server (JSON-RPC 2.0 over stdio).
+
+    Launches a JSON-RPC 2.0 server on stdin/stdout for IDE and tool integration. Supports session management and streaming agent responses as notifications.
+
+    Methods: initialize, session/new, session/prompt, session/stop.
+
+    Examples:
+      omnesagent acp                        # start ACP server
+      omnesagent acp --max-sessions 5       # limit concurrent sessions
+
+cli-daemon-long-about =
+    Start the long-running autonomous daemon.
+
+    Launches the full OmnesAgent runtime: gateway server, all configured channels (Telegram, Discord, Slack, etc.), heartbeat monitor, and the cron scheduler. This is the recommended way to run OmnesAgent in production or as an always-on assistant.
+
+    Use 'omnesagent service install' to register the daemon as an OS service (systemd/launchd) for auto-start on boot.
+
+    Examples:
+      omnesagent daemon                   # use config defaults
+      omnesagent daemon -p 9090           # gateway on port 9090
+      omnesagent daemon --host 127.0.0.1  # localhost only
+
+cli-cron-long-about =
+    Configure and manage scheduled tasks.
+
+    Schedule recurring, one-shot, or interval-based tasks using cron expressions, RFC 3339 timestamps, durations, or fixed intervals.
+
+    Cron expressions use the standard 5-field format: 'min hour day month weekday'. Timezones default to UTC; override with --tz and an IANA timezone name.
+
+    Examples:
+      omnesagent cron list
+      omnesagent cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+      omnesagent cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+      omnesagent cron add '*/5 * * * *' 'echo ok' --agent sentinel
+      omnesagent cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+      omnesagent cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+      omnesagent cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
+      omnesagent cron pause TASK_ID
+      omnesagent cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
+
+cli-channel-long-about =
+    Manage communication channels.
+
+    Add, remove, list, send, and health-check channels that connect OmnesAgent to messaging platforms. Supported channel types: telegram, discord, slack, whatsapp, matrix, imessage, email.
+
+    Examples:
+      omnesagent channel list
+      omnesagent channel doctor
+      omnesagent channel add telegram '{ "{" }"bot_token":"...","name":"my-bot"{ "}" }'
+      omnesagent channel remove my-bot
+      omnesagent channel bind-telegram omnesagent_user
+      omnesagent channel send 'Alert!' --channel-id telegram --recipient 123456789
+
+cli-hardware-long-about =
+    Discover and introspect USB hardware.
+
+    Enumerate connected USB devices, identify known development boards (STM32 Nucleo, Arduino, ESP32), and retrieve chip information via probe-rs / ST-Link.
+
+    Examples:
+      omnesagent hardware discover
+      omnesagent hardware introspect /dev/ttyACM0
+      omnesagent hardware info --chip STM32F401RETx
+
+cli-peripheral-long-about =
+    Manage hardware peripherals.
+
+    Add, list, flash, and configure hardware boards that expose tools to the agent (GPIO, sensors, actuators). Supported boards: nucleo-f401re, rpi-gpio, esp32, arduino-uno.
+
+    Examples:
+      omnesagent peripheral list
+      omnesagent peripheral add nucleo-f401re /dev/ttyACM0
+      omnesagent peripheral add rpi-gpio native
+      omnesagent peripheral flash --port /dev/cu.usbmodem12345
+      omnesagent peripheral flash-nucleo
+
+cli-memory-long-about =
+    Manage agent memory entries.
+
+    List, inspect, and clear memory entries stored by the agent. Supports filtering by category and session, pagination, and batch clearing with confirmation.
+
+    Examples:
+      omnesagent memory stats
+      omnesagent memory list
+      omnesagent memory list --category core --limit 10
+      omnesagent memory get KEY
+      omnesagent memory clear --category conversation --yes
+
+cli-config-long-about =
+    Manage OmnesAgent configuration.
+
+    View, set, or initialize config properties by dotted path. Use 'schema' to dump the full JSON Schema for the config file.
+
+    Properties are addressed by dotted path (e.g. channels.matrix.mention-only).
+    Secret fields (API keys, tokens) automatically use masked input.
+    Enum fields offer interactive selection when value is omitted.
+
+    Examples:
+      omnesagent config list                                  # list all properties
+      omnesagent config list --secrets                        # list only secrets
+      omnesagent config list --filter channels.matrix         # filter by prefix
+      omnesagent config get channels.matrix.mention-only      # get a value
+      omnesagent config set channels.matrix.mention-only true # set a value
+      omnesagent config set channels.matrix.access-token      # secret: masked input
+      omnesagent config set channels.matrix.stream-mode       # enum: interactive select
+      omnesagent config init channels.matrix                  # init section with defaults
+      omnesagent config schema                                # print JSON Schema to stdout
+      omnesagent config schema > schema.json
+
+    Property path tab completion is included automatically in `omnesagent completions <shell>`.
+
+cli-update-long-about =
+    Check for and apply OmnesAgent updates.
+
+    By default, downloads and installs the latest release with a 6-phase pipeline: preflight, download, backup, validate, swap, and smoke test. Automatic rollback on failure.
+
+    Use --check to only check for updates without installing.
+    Use --force to skip the confirmation prompt.
+    Use --version to target a specific release instead of latest.
+
+    Examples:
+      omnesagent update                      # download and install latest
+      omnesagent update --check              # check only, don't install
+      omnesagent update --force              # install without confirmation
+      omnesagent update --version 0.6.0      # install specific version
+
+cli-self-test-long-about =
+    Run diagnostic self-tests to verify the OmnesAgent installation.
+
+    By default, runs the full test suite including network checks (gateway health, memory round-trip). Use --quick to skip network checks for faster offline validation.
+
+    Examples:
+      omnesagent self-test             # full suite
+      omnesagent self-test --quick     # quick checks only (no network)
+
+cli-skills-install-suggestion =
+    It looks like this request needs the `{$name}` skill, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
+
+cli-plugin-install-suggestion =
+    It looks like this request needs the `{$name}` plugin, but it is not installed.
+
+    Matched capability: {$matched}
+    Next: Run `{$install_command}` to install it.
+
+cli-completions-long-about =
+    Generate shell completion scripts for `omnesagent`.
+
+    The script is printed to stdout so it can be sourced directly:
+
+    Examples:
+      source <(omnesagent completions bash)
+      omnesagent completions zsh > ~/.zfunc/_omnesagent
+      omnesagent completions fish > ~/.config/fish/completions/omnesagent.fish
+
+cli-desktop-long-about =
+    Launch the OmnesAgent companion desktop app.
+
+    The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
+
+    Use --install to open the download page for your platform. It does not install anything itself.
+
+    Examples:
+      omnesagent desktop              # launch the companion app
+      omnesagent desktop --install    # open the download page
+
+# Channel-side reply emitted when chat dispatch refuses because the
+# gateway has no model configured. Used by the gateway crate channel
+# webhook handlers (WhatsApp, Linq, Nextcloud Talk).
+channel-needs-quickstart-reply = This agent isn't fully set up yet. The operator needs to run Quickstart before I can reply.
+
+channel-whatsapp-web-feature-missing-warning =   ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in.
+channel-whatsapp-web-feature-missing-build =     Build/run with: cargo build --features whatsapp-web
+channel-whatsapp-web-feature-missing-install =     If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web
+channel-whatsapp-web-feature-missing-error = WhatsApp Web channel requires the 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)
+
+channel-wecom-ws-stream-bootstrap = Working on it, please wait.
+channel-wecom-ws-stop-ack = Stopped the current message.
+channel-wecom-ws-voice-unavailable = I can't process voice messages right now {$emoji}
+channel-wecom-ws-unsupported-message = This message type is not supported yet.
+channel-wecom-ws-welcome = Hi, welcome to chat with me {$emoji}
+channel-wecom-ws-supplemental-message =
+    {"["}Supplemental message]
+    {$extra}
+channel-wecom-ws-group-allowlist-missing =
+    The WeCom allowlist is not configured, so this bot is not accepting group messages.
+
+    Group chatid: {$chatid}
+    Sender userid: {$userid}
+
+    Add an allowed entry to {$allowed_groups_path} or {$allowed_users_path}. You can also temporarily set it to ["*"] for testing.
+channel-wecom-ws-group-access-denied =
+    This group is not allowed to use this bot.
+
+    Group chatid: {$chatid}
+    Sender userid: {$userid}
+
+    Ask an administrator to add this group to {$allowed_groups_path}, or add your userid to {$allowed_users_path}.
+channel-wecom-ws-dm-allowlist-missing =
+    The WeCom allowlist is not configured, so this bot is not accepting messages.
+
+    Your userid: {$userid}
+
+    Add an allowed entry to {$allowed_users_path}. You can also temporarily set it to ["*"] for testing.
+channel-wecom-ws-dm-access-denied =
+    You do not have permission to use this bot.
+
+    Your userid: {$userid}
+
+    Ask an administrator to add your userid to {$allowed_users_path}.
+channel-discord-interaction-unauthorized = You're not authorized to use this command here.
+channel-discord-interaction-malformed = Unknown or malformed command.
+channel-discord-interaction-unavailable = That command is no longer available, or its input was empty.
+channel-discord-component-expired = This button or menu has expired or was already used.
+channel-discord-approval-recorded = Your decision has been recorded.
+channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
+channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
+channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
+channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
+channel-line-bind-success = ✅ Paired! You can now chat.
+channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
+channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
+channel-telegram-cmd-new-desc = Start a new conversation session
+channel-telegram-cmd-clear-desc = Clear this conversation session
+channel-telegram-cmd-stop-desc = Cancel the current in-flight task
+channel-telegram-cmd-model-desc = Show or switch the current model
+channel-telegram-cmd-models-desc = List available model_providers or switch model_provider
+channel-telegram-cmd-config-desc = Show current configuration
+
+# Onboarding — OpenAI auth picker
+onboard-openai-auth-note =
+    OpenAI authentication:
+    • API key — standard API access via platform.openai.com (sk-...)
+    • Codex subscription — uses your ChatGPT Plus/Pro account (no API key needed)
+onboard-openai-auth-prompt = Authentication
+onboard-openai-auth-api-key = API key
+onboard-openai-auth-codex = Codex subscription
+onboard-openai-codex-followup =
+    Codex subscription auth uses your ChatGPT account.
+    Run `omnesagent auth login --model-provider openai-codex` to authenticate before starting your agent.
+
+# Diagnostics emitted by `omnesagent doctor` and `omnesagent self-test` for
+# `gateway.web_dist_dir` values that rely on shell-style expansion the
+# gateway never performs (a leading `~` or any `$VAR` / `${VAR}`).
+# Issue #6079; companion runtime check in
+# `crates/omnesagent-runtime/src/doctor/mod.rs` and `src/commands/self_test.rs`.
+cli-web-dist-dir-reason-tilde = starts with `~` which is not expanded
+cli-web-dist-dir-reason-dollar = contains `$` which is not expanded
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+# Diagnostics emitted by `omnesagent doctor` cross-checking OpenAI Codex
+# (OAuth/subscription) credentials against OpenAI provider slots that opt in
+# via `requires_openai_auth = true`. A signed-in credential with no slot — or a
+# slot with no credential — otherwise stays silent until the first model call,
+# where it surfaces as a confusing auth error. Companion runtime check in
+# `crates/omnesagent-runtime/src/doctor/mod.rs`.
+cli-doctor-codex-auth-profile-no-slot = OpenAI Codex credentials are signed in but no model provider slot uses them. Set `requires_openai_auth = true` on an OpenAI provider slot and point an agent's `model_provider` at it, or run `omnesagent quickstart`.
+cli-doctor-codex-auth-slot-no-profile = OpenAI slot(s) {$slots} set `requires_openai_auth = true` but no OpenAI Codex credentials are signed in. Run `omnesagent auth login --provider openai-codex`.
+cli-doctor-codex-auth-ok = OpenAI Codex credentials are signed in and referenced by a model provider slot.
+cli-doctor-systemd-linger-enabled = systemd user lingering enabled
+cli-doctor-systemd-linger-disabled = systemd user lingering disabled; user service may stop after logout. Enable with: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = systemd user lingering could not be checked with loginctl
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
+cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
+cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+
+# Service lifecycle warnings.
+cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. OmnesAgent's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+
+# ── peripherals (omnesagent peripheral) ──
+cli-peripherals-none = No peripherals configured.
+cli-peripherals-add-hint = Add one with: omnesagent peripheral add <board> <path>
+cli-peripherals-add-example = {"  "}Example: omnesagent peripheral add nucleo-f401re <serial-path>
+cli-peripherals-config-hint = Or add to config.toml:
+cli-peripherals-configured = Configured peripherals:
+cli-peripherals-already-configured = Board {$board} at {$path} already configured.
+cli-peripherals-added = Added {$board} at {$path}. Restart daemon to apply.
+cli-peripherals-flash-needs-hardware = Arduino flash requires the 'hardware' feature.
+cli-peripherals-unoq-needs-hardware = Uno Q setup requires the 'hardware' feature.
+cli-peripherals-nucleo-needs-hardware = Nucleo flash requires the 'hardware' feature.
+
+# ── skills (omnesagent skills list) ──
+cli-skills-none-installed = No skills installed.
+cli-skills-create-hint = {"  "}Create one: omnesagent skills add my-skill --bundle <alias>
+cli-skills-install-hint = {"  "}Or install: omnesagent skills install <source>
+cli-skills-installed-header = Installed skills ({$count}):
+cli-skills-list-group-bundle = bundle: {$alias}
+cli-skills-list-group-agent = loaded by agent '{$alias}'
+cli-skills-list-group-global = global / open-skills / plugins (not from a bundle)
+cli-skills-agent-not-configured = agent '{$alias}' is not configured
+cli-skills-agent-multiple-bundles = agent '{$alias}' has multiple skill bundles ({$bundles}); pass --bundle to choose one
+cli-skills-multiple-locations-bundle = skill '{$name}' exists in multiple locations ({$locations}); pass --bundle to choose one
+cli-skills-multiple-locations-path = skill '{$name}' exists in multiple locations ({$locations}); pass an explicit path to disambiguate
+cli-skills-tags = Tags:  {$tags}
+cli-skills-skipped-header = Skipped ({$count}):
+cli-skills-skipped-reason = {"    "}Reason: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}Set `skills.allow_scripts = true` in your omnesagent config to enable it.
+
+# ── sop (omnesagent sop) ──
+cli-sop-none = No SOPs found.
+cli-sop-pending-none = No SOP runs waiting for approval.
+cli-sop-pending-header = SOP runs waiting for approval:
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+cli-sop-status-failure-reason = Failure reason: {$reason}
+# gateway WebSocket SOP approval error frames (UI-surfaced)
+cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
+cli-sop-ws-resolve-failed = sop resolve failed: {$error}
+cli-sop-ws-engine-lock-poisoned = SOP engine lock poisoned
+cli-sop-ws-subsystem-disabled = SOP subsystem not enabled
+cli-sop-create-hint = {"  "}Create one: mkdir -p <shared>/sops/my-sop
+cli-sop-create-hint-2 = {"              "}then add SOP.toml and SOP.md
+cli-sop-loaded-header = Loaded SOPs ({$count}):
+cli-sop-none-to-validate = No SOPs found to validate.
+cli-sop-valid = ✅ {$name} — valid
+cli-sop-deleted = Deleted SOP: {$name}
+cli-sop-warnings = ⚠️  {$name} — {$count} warning(s):
+cli-sop-all-passed = All SOPs passed validation.
+cli-sop-priority = {"  "}Priority:       {$value}
+cli-sop-execution-mode = {"  "}Execution mode: {$value}
+cli-sop-deterministic = {"  "}Deterministic:  {$value}
+cli-sop-cooldown = {"  "}Cooldown:       {$value}s
+cli-sop-max-concurrent = {"  "}Max concurrent: {$value}
+cli-sop-admission-policy = {"  "}Admission:      {$value}
+cli-sop-max-pending-approvals = {"  "}Max pending:    {$value}
+cli-sop-location = {"  "}Location:       {$value}
+cli-sop-triggers = {"  "}Triggers:
+cli-sop-steps = {"  "}Steps:
+cli-sop-step-tools = Tools: {$tools}
+
+# ── memory (omnesagent memory) ──
+cli-memory-reindexing = Reindexing memory backend...
+cli-memory-none = No memory entries found.
+cli-memory-none-at-offset = No entries at offset {$offset} (total: {$total}).
+cli-memory-next-page = Use --offset {$offset} to see the next page.
+cli-memory-key-not-found = No memory entry found for key: {$key}
+cli-memory-prefix-matched = Prefix '{$key}' matched {$n} entries:
+cli-memory-narrow-prefix = Specify a longer prefix to narrow the match.
+cli-memory-key = Key:       {$value}
+cli-memory-category = Category:  {$value}
+cli-memory-timestamp = Timestamp: {$value}
+cli-memory-session = Session:   {$value}
+cli-memory-stats-header = Memory Statistics:
+cli-memory-backend = {"  "}Backend:  {$value}
+cli-memory-total = {"  "}Total:    {$value}
+cli-memory-by-category = {"  "}By category:
+cli-memory-none-to-clear = No entries to clear.
+cli-memory-found-in-scope = Found {$count} entries in '{$scope}'.
+cli-memory-aborted = Aborted.
+cli-memory-deleted-key = Deleted key: {$key}
+
+# ── cron (omnesagent cron) ──
+cli-cron-none = No scheduled tasks yet.
+cli-cron-usage = Usage:
+cli-cron-jobs-header = 🕒 Scheduled jobs ({$count}):
+cli-cron-list-cmd = {"    "}cmd: {$cmd}
+cli-cron-list-prompt = {"    "}prompt: {$prompt}
+cli-cron-added-agent = ✅ Added agent cron job {$id}
+cli-cron-added = ✅ Added cron job {$id}
+cli-cron-added-oneshot-agent = ✅ Added one-shot agent cron job {$id}
+cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
+cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
+cli-cron-added-interval = ✅ Added interval cron job {$id}
+cli-cron-updated = ✅ Updated cron job {$id}
+cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, --uses-memory, or a delivery flag (--channel, --to, --thread, --best-effort, --no-best-effort) must be provided
+cli-cron-removed = ✅ Removed cron job {$id}
+cli-cron-paused = ⏸️  Paused cron job {$id}
+cli-cron-resumed = ▶️  Resumed cron job {$id}
+cli-cron-expr = {"  "}Expr  : {$v}
+cli-cron-expr2 = {"  "}Expr: {$v}
+cli-cron-next = {"  "}Next  : {$v}
+cli-cron-next2 = {"  "}Next: {$v}
+cli-cron-next3 = {"  "}Next     : {$v}
+cli-cron-prompt = {"  "}Prompt: {$v}
+cli-cron-prompt3 = {"  "}Prompt   : {$v}
+cli-cron-cmd = {"  "}Cmd : {$v}
+cli-cron-cmd3 = {"  "}Cmd      : {$v}
+cli-cron-at = {"  "}At    : {$v}
+cli-cron-at2 = {"  "}At  : {$v}
+cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}Delivery: {$v}
+cli-cron-delivery-disabled = disabled (output is not sent anywhere)
+
+# ── main / status / quickstart / pairing / desktop ──
+cli-no-command = No command provided.
+cli-press-enter = Press Enter to exit...
+cli-quickstart-title = Quickstart — create one working agent end-to-end.
+cli-quickstart-needs-tty = Quickstart is interactive and needs a terminal on stdin and stderr. Run it from an interactive shell, or use `omnesagent config set <path> <value>` for headless configuration.
+cli-quickstart-cancelled = Quickstart cancelled. No config written.
+cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
+cli-quickstart-create-agent = ── Create agent
+cli-quickstart-create-agent-locked = ── Create agent (locked — fill every selector first)
+cli-quickstart-open-selector-prompt = Open a selector (Enter), or pick Create. Esc to quit.
+cli-quickstart-use-existing = Use existing
+cli-quickstart-create-new = Create new
+cli-quickstart-model-provider-prompt = Model provider
+cli-quickstart-pick-configured-provider = Pick a configured provider
+cli-quickstart-row-model-provider = {$glyph} Model provider     — {$summary}
+cli-quickstart-row-risk-profile = {$glyph} Risk profile       — {$summary}
+cli-quickstart-row-memory = {$glyph} Memory             — {$summary}
+cli-quickstart-row-channels = {$glyph} Channels (0..N)    — {$summary}
+cli-quickstart-row-peer-groups = {$glyph} Peer groups        — {$summary}
+cli-quickstart-row-agent-identity = {$glyph} Agent identity     — {$summary}
+cli-quickstart-summary-not-yet-chosen = not yet chosen
+cli-quickstart-summary-not-yet-visited = not yet visited
+cli-quickstart-summary-not-yet-named = not yet named
+cli-quickstart-summary-provider-fresh = {$name} (alias: {$alias}, model: {$model})
+cli-quickstart-summary-use-existing = use existing {$reference}
+cli-quickstart-summary-preset-fresh = preset: {$name}
+cli-quickstart-summary-channels-none = none (chat via `omnesagent agent` only)
+cli-quickstart-summary-agent = alias: {$alias}, system prompt: {$chars} chars, {$files} personality file(s)
+cli-quickstart-summary-peer-groups-none = none — channels accept no peers
+cli-quickstart-channel-remove-row = {"  "}{$reference} (remove)
+cli-quickstart-peer-group-row = {$channel} → {$name} ({$count} peers)
+cli-quickstart-provider-local-label = {$name} (local)
+cli-quickstart-provider-type-prompt = Provider type
+cli-quickstart-alias-for = Alias for {$name}
+cli-quickstart-openai-auth-mode-label = Authentication
+cli-quickstart-openai-auth-mode-help = Choose `codex` to use a ChatGPT/Codex subscription auth profile. If you already signed in with the Codex CLI, run `omnesagent auth login --model-provider openai-codex --import ~/.codex/auth.json`; otherwise run `omnesagent auth login --model-provider openai-codex`.
+cli-quickstart-anthropic-auth-mode-label = Authentication
+cli-quickstart-anthropic-auth-mode-help = Choose `api_key` for an Anthropic Console key, or `setup_token` if you will run `claude setup-token` for Claude Max and paste the generated token.
+cli-quickstart-anthropic-api-key-help = Paste an Anthropic Console API key or the token generated by `claude setup-token`.
+cli-quickstart-auth-codex-prompt = Sign in to OpenAI Codex with your ChatGPT account now?
+cli-quickstart-auth-codex-import-prompt = Found an existing Codex login (~/.codex/auth.json) — import it now?
+cli-quickstart-auth-codex-skip-hint = {"  "}Finish later with: omnesagent auth login --model-provider openai-codex
+cli-quickstart-auth-anthropic-prompt = Run `claude setup-token` for Anthropic provider `{$alias}` now?
+cli-quickstart-auth-anthropic-token-prompt = Paste the token from `claude setup-token`
+cli-quickstart-auth-anthropic-saved = {"  "}Saved Claude setup token for anthropic.{$alias}
+cli-quickstart-auth-anthropic-skip-hint = {"  "}Finish later with: claude setup-token, then omnesagent config set providers.models.anthropic.{$alias}.api_key <token>
+cli-quickstart-auth-failed = {"  "}Auth setup didn't complete: {$error}
+cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
+cli-quickstart-model-id-for = Model id for {$name}
+cli-quickstart-risk-profile-prompt = Risk profile
+cli-quickstart-memory-backend-prompt = Memory backend
+cli-quickstart-add-channel = + Add a channel
+cli-quickstart-channels-done = Done (channels selector counts as visited)
+cli-quickstart-channels-prompt = Channels (optional, 0..N)
+cli-quickstart-channel-source-prompt = Channel source
+cli-quickstart-all-channels-bound = {"  "}Every configured channel is already bound to an agent. Free one with `omnesagent config set agents.<alias>.channels ...` before reusing it here.
+cli-quickstart-pick-configured-channel = Pick a configured channel
+cli-quickstart-channel-type-prompt = Channel type
+cli-quickstart-add-peer-group = + Add peer group
+cli-quickstart-done = Done
+cli-quickstart-peer-groups-prompt = Peer groups (Enter on a row to remove, + Add to create)
+cli-quickstart-channel-to-authorize-prompt = Channel to authorize
+cli-quickstart-external-peers-prompt = External peers (comma- or newline-separated, blank for none)
+cli-quickstart-agent-alias-prompt = Agent alias
+cli-quickstart-edit-system-prompt = Edit system prompt in $EDITOR? (blank if you skip)
+cli-quickstart-personality-start-template = Start with template (open in $EDITOR)
+cli-quickstart-personality-start-current = Start from current content (open in $EDITOR)
+cli-quickstart-personality-start-scratch = Start from scratch (open in $EDITOR)
+cli-quickstart-personality-skip = Skip
+cli-quickstart-esc-go-back = {" "}(Esc to go back)
+cli-quickstart-esc-return-checklist = {" "}(Esc to return to checklist)
+cli-quickstart-personality-file-prompt = {$filename}{$position} — what next?{$back_hint}
+cli-quickstart-next-agent-command = {"  "}omnesagent agent -a {$alias}  # chat with this agent in your terminal
+cli-quickstart-fix-and-rerun = Your existing config is untouched. Fix the following and run quickstart again:
+cli-quickstart-could-not-finish = quickstart could not finish: {$count} problem(s) to fix
+cli-quickstart-pick-preset = Pick a preset
+cli-quickstart-pick-existing-prompt = Pick an existing {$prompt}
+cli-quickstart-pick-preset-prompt = Pick a {$prompt} preset
+cli-quickstart-step-model-provider = Model provider
+cli-quickstart-step-risk-profile = Risk profile
+cli-quickstart-step-runtime-profile = Runtime profile
+cli-quickstart-step-memory = Memory
+cli-quickstart-step-channels = Channels
+cli-quickstart-step-peer-groups = Peer groups
+cli-quickstart-step-agent = Agent
+cli-quickstart-error-internal-no-result = internal error: apply_into returned no result despite no validation errors
+cli-quickstart-error-completion-flag = failed to flip quickstart-completed: {$err}
+cli-quickstart-error-persist-config = failed to persist config: {$err}
+cli-quickstart-error-not-type-alias-ref = `{$reference}` is not a `<type>.<alias>` reference
+cli-quickstart-error-no-configured-path = no `{$path}` configured
+cli-quickstart-error-provider-required = provider type, alias, and model are required
+cli-quickstart-error-unknown-provider-type = unknown model provider type `{$provider}` — pick one from the provider list
+cli-quickstart-error-unknown-openai-auth-mode = unknown OpenAI auth mode `{$mode}` — pick `api_key` or `codex`
+cli-quickstart-error-unknown-anthropic-auth-mode = unknown Anthropic auth mode `{$mode}` — pick `api_key` or `setup_token`
+cli-quickstart-error-alias-exists = alias `{$alias}` already exists
+cli-quickstart-error-no-profile = no `{$alias}` profile configured
+cli-quickstart-error-unknown-risk-preset = unknown risk preset `{$preset}`
+cli-quickstart-error-unknown-runtime-preset = unknown runtime preset `{$preset}`
+cli-quickstart-error-channel-bound = channel `{$reference}` is already bound to agent `{$owner}`
+cli-quickstart-error-channel-required = channel type and alias are required
+cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
+cli-quickstart-error-channel-token-required = Telegram bot token is required
+cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
+cli-quickstart-error-webhook-port-conflict = webhook port {$port} is already used by enabled webhook `{$alias}` — each enabled webhook needs its own port
+cli-quickstart-error-peer-group-name-required = peer-group name is required
+cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
+cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
+cli-quickstart-error-peer-group-exists = peer-group `{$name}` already exists
+cli-quickstart-error-personality-workspace = could not create agent workspace: {$err}
+cli-quickstart-error-personality-filename-required = filename is required
+cli-quickstart-error-personality-not-editable = `{$filename}` is not an editable personality file
+cli-quickstart-error-personality-too-large = content exceeds {$limit} char limit
+cli-quickstart-error-personality-stage-failed = stage {$filename} failed: {$err}
+cli-quickstart-error-personality-write-failed = write {$path} failed: {$err}
+cli-quickstart-error-agent-name-required = agent name is required
+cli-quickstart-error-agent-exists = agent `{$name}` already exists
+cli-no-channels-compiled = {"  "}No channel types are compiled into this binary.
+cli-quickstart-complete = Quickstart complete. Created agent `{$alias}`.
+cli-next-steps = Next steps:
+cli-agent-not-created = Your agent was not created — and nothing on disk was changed.
+cli-onboard-deprecated = `omnesagent onboard` is deprecated — use `omnesagent quickstart`.
+cli-otp-initialized = Initialized OTP secret for OmnesAgent.
+cli-otp-enrollment-uri = Enrollment URI: {$uri}
+cli-otp-received = {"  "}✓ OTP received
+cli-secret-captured = {"  "}● Value captured — press Enter to save
+cli-secret-received = {"  "}✓ Secret received
+cli-secret-needs-tty = Secret input requires a terminal on stdin and stderr.
+cli-secret-empty = Value cannot be empty.
+cli-pairing-enabled = 🔐 Gateway pairing is enabled.
+cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
+cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
+cli-pairing-restart = {"   "}Restart the gateway to generate a new pairing code.
+cli-pairing-disabled = ⚠️  Gateway pairing is disabled in config.
+cli-pairing-fetch-failed = ❌ Failed to fetch pairing code from gateway at {$endpoint}
+cli-pairing-no-code = 🔐 Gateway pairing is enabled, but no active pairing code is available.
+cli-pairing-requests-accepted = All requests will be accepted without authentication.
+cli-pairing-enable-config = To enable pairing, set [gateway] require_pairing = true.
+cli-pairing-show-only = `omnesagent gateway get-paircode` only displays an existing active code; it does not mint a new one.
+cli-pairing-pair-another = To pair another device, run:
+cli-pairing-revoke-replace = To revoke existing pairings and mint a replacement code, run:
+cli-pairing-new-code-unavailable = The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.
+cli-pairing-retry-or-rotate = Try again shortly, or revoke existing pairings and mint a replacement code:
+cli-pairing-rotate-no-code = The rotate request completed without returning a replacement code.
+cli-pairing-check-enabled = Check whether pairing is enabled, then request a new device code:
+cli-pairing-inspect = To inspect the running gateway:
+cli-gateway-running-q = {"   "}Is the gateway running? Start it with:
+cli-status-title = 🦀 OmnesAgent Status
+cli-security-status-title = OmnesAgent Security Status
+cli-security-status-source = Source:      {$v}
+cli-security-status-agent = Agent:       {$v}
+cli-security-status-agent-enabled = Agent enabled: {$enabled}
+cli-security-status-risk-profile = Risk profile: {$v}
+cli-security-status-autonomy = Autonomy:   {$v}
+cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
+cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
+cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
+cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
+cli-security-status-credentials-classes-none = none
+cli-security-status-gateway = Gateway:    {$host}:{$port}; pairing required: {$pairing}; public bind: {$public_bind}; TLS: {$tls}
+cli-security-status-warnings = Warnings:   {$v}
+cli-security-status-warnings-none = Warnings:   none
+cli-security-status-warning-agent-disabled = agent is disabled
+cli-security-status-warning-sandbox-disabled = sandboxing is disabled for this agent risk profile
+cli-security-status-warning-optional-sandbox-disabled-docker-runtime = additional OS sandboxing is disabled; Docker runtime containment remains active
+cli-security-status-warning-sandbox-none = active sandbox is application-layer only
+cli-security-status-warning-sandbox-fallback = requested sandbox backend `{$requested}` fell back to `{$active}`
+cli-security-status-warning-workspace-not-restricted = workspace-only filesystem policy is disabled
+cli-security-status-warning-shell-env-passthrough = {$count} shell environment variable(s) are passed through
+cli-security-status-warning-secrets-unencrypted = config secret encryption is disabled
+cli-security-status-warning-credential-follow-up = some credential-shaped config surfaces still require follow-up
+cli-security-status-warning-pairing-disabled = gateway pairing is not required
+cli-security-status-warning-public-bind-no-tls = gateway allows public bind without TLS enabled
+cli-status-provider-none = 🤖 ModelProvider:      (none configured)
+cli-status-agents-none = 🛡️  Agents:        (none configured)
+cli-status-service-running = 🟢 Service:       running
+cli-status-service-stopped = 🔴 Service:       stopped
+cli-status-channels = Channels:
+cli-status-cli-always = {"  "}CLI:      ✅ always
+cli-status-peripherals = Peripherals:
+cli-desktop-download = Opening the OmnesAgent companion app download page:
+cli-desktop-homebrew = Or install via Homebrew (coming soon):
+cli-desktop-linux-pkg = {"  "}The page provides .deb and .AppImage downloads by architecture.
+cli-desktop-launching = Launching OmnesAgent companion app...
+
+# ── status fields ──
+cli-status-version = Version:     {$v}
+cli-status-workspace = Workspace:   {$v}
+cli-status-config = Config:      {$v}
+cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
+cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
+cli-status-model = {"   "}Model:         {$model}
+cli-status-observability = 📊 Observability:  {$v}
+cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
+cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-runtime = ⚙️  Runtime:       {$v}
+cli-status-heartbeat = 💓 Heartbeat:      {$v}
+cli-status-heartbeat-every-minutes = every {$minutes}min
+cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
+cli-status-security-noprofile = Security ({$alias}): <no risk_profile>
+cli-status-security = Security ({$alias}):
+cli-status-workspace-only = {"  "}Workspace only:    {$v}
+cli-status-allowed-roots = {"  "}Allowed roots:     {$v}
+cli-status-allowed-commands = {"  "}Allowed commands:  {$v}
+cli-status-max-actions = {"  "}Max actions/hour:  {$v}
+cli-status-cost-tracking = {"  "}Cost tracking:     {$v}
+cli-status-max-cost-day = {"  "}Max cost/day:      ${$v}
+cli-status-max-cost-month = {"  "}Max cost/month:    ${$v}
+cli-status-spent-today = {"  "}Spent today:       ${$spent} / ${$limit}
+cli-status-spent-month = {"  "}Spent this month:  ${$spent} / ${$limit}
+cli-status-otp = {"  "}OTP enabled:       {$v}
+cli-status-estop = {"  "}E-stop enabled:    {$v}
+cli-status-peripherals-enabled = {"  "}Enabled:   {$v}
+cli-status-boards = {"  "}Boards:    {$v}
+cli-status-word-enabled = enabled
+cli-status-word-disabled = disabled
+cli-status-word-yes = yes
+cli-status-word-no = no
+cli-status-word-on = on
+cli-status-word-off = off
+cli-status-word-none = (none)
+cli-status-word-configured = configured
+cli-status-word-not-configured = not configured
+cli-status-channel-not-compiled = 🚫 configured, not compiled
+
+# ── desktop / config / plugins / estop / auth ──
+cli-desktop-not-installed = OmnesAgent companion app is not installed.
+cli-desktop-blurb1 = The companion app is a lightweight menu bar app that
+cli-desktop-blurb2 = connects to the same gateway as the CLI.
+cli-config-all-configured = All sections already configured.
+cli-config-schema-current = Config already at current schema version.
+cli-config-applied-ops = Applied {$count} operation(s):
+cli-plugins-none = No plugins installed.
+cli-plugins-installed = Installed plugins:
+cli-plugin-search-none = No plugins matching '{$query}'.
+cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
+cli-plugin-search-result =   {$name} v{$version} — {$description}
+cli-plugin-no-description = (no description)
+cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
+cli-plugin-installed-from = Plugin installed from {$source}
+cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
+cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `omnesagent config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
+cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `omnesagent config set plugins.entries.{$name}.config.<key>`.
+cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `omnesagent config migrate` to see the parse error, then repair the file.
+cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
+cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
+cli-plugin-removed = Plugin '{$name}' removed.
+cli-plugin-not-found = Plugin '{$name}' not found.
+cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `omnesagent plugin migrate` to move them into {$target}.
+cli-plugin-migrated = Moved {$count} plugin(s) from {$path} to {$target}.
+cli-plugin-migrate-none = Nothing to migrate.
+cli-estop-resume-done = Estop resume completed.
+cli-estop-engaged = Estop engaged.
+cli-estop-status = Estop status:
+cli-auth-none = No auth profiles configured.
+cli-auth-active = Active profiles:
+
+# ── misc main (errors, config, plugin info, estop fields, auth) ──
+cli-warn-crypto-provider = Warning: Failed to install default crypto provider: {$err}
+cli-error-label = {"   "}Error: {$err}
+cli-warn-cost-usage = {"  "}⚠ Could not load cost usage: {$err}
+cli-warn-cost-tracker = {"  "}⚠ Could not init cost tracker: {$err}
+cli-desktop-download-at = {"  "}Download it at: {$url}
+cli-config-legend = Legend: 💉 env-overridden  🔒 secret
+cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
+cli-config-secret-unset = {$path} is not set (encrypted secret)
+cli-config-updated = {$path} updated.
+cli-config-review-hint = Run `omnesagent config list` to review, then set required fields.
+cli-config-backed-up = Backed up to {$path}
+cli-plugin-name-version = Plugin: {$name} v{$version}
+cli-plugin-description = Description: {$desc}
+cli-plugin-capabilities = Capabilities: {$v}
+cli-plugin-permissions = Permissions: {$v}
+cli-plugin-wasm = WASM: {$path}
+cli-plugin-wasm-none = WASM: (skill-only plugin)
+cli-estop-domains-none = {"  "}domain_blocks:  (none)
+cli-estop-domains = {"  "}domain_blocks:  {$v}
+cli-estop-tools-none = {"  "}tool_freeze:    (none)
+cli-estop-tools = {"  "}tool_freeze:    {$v}
+cli-estop-updated-at = {"  "}updated_at:     {$v}
+cli-auth-saved = Saved profile {$profile}
+cli-auth-active-for = Active profile for {$provider}: {$profile}
+cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
+cli-auth-removed = Removed auth profile {$provider}:{$profile}
+cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
+cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-xai-device-code-started = xAI device-code login started.
+cli-auth-oauth-visit = Visit: {$uri}
+cli-auth-oauth-code = Code:  {$code}
+cli-auth-oauth-fast-link = Fast link: {$uri}
+cli-auth-xai-open-oauth-url = Open this xAI OAuth URL in your browser and authorize access:
+cli-auth-callback-capture-failed = Callback capture failed: {$error}
+cli-auth-run-paste-redirect = Run `omnesagent auth paste-redirect --model-provider {$provider} --profile {$profile}`
+cli-auth-xai-no-pending-login = No pending xAI login found. Run `omnesagent auth login --model-provider xai` first.
+cli-auth-paste-redirect-requires-input = paste-redirect requires the redirect URL or OAuth code
+
+# ── locales fetch ──
+cli-locales-fetched = {"  "}fetched {$name} -> {$path}
+cli-locales-skipped = {"  "}skipped {$name}: not on upstream ({$path}; tried {$refs})
+cli-locales-installed = Installed {$count} catalogue(s) for '{$locale}' under {$dir}
+
+# ── browse (omnesagent browse) ──
+cli-browse-header = {$path} ({$count} entries)
+cli-browse-empty = (empty)
+cli-browse-file-bytes = {$name} ({$bytes} bytes)
+
+# ── hardware (omnesagent hardware) ──
+cli-hardware-feature-required = Hardware discovery requires the 'hardware' feature.
+cli-hardware-feature-build = Build with: cargo build --features hardware
+cli-hardware-unsupported-platform = Hardware USB discovery is not supported on this platform.
+cli-hardware-supported-platforms = Supported platforms: Linux, macOS, Windows.
+
+# ── update (omnesagent update) ──
+cli-update-already-current = Already up to date (v{$version}).
+cli-update-success = Successfully updated to v{$version}!
+cli-update-prebuilt-channel-note = Pre-built updates use the lean standard distribution. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack and other channels outside that distribution.
+cli-update-available = Update available: v{$current} -> v{$latest}
+cli-update-forcing-reinstall = Forcing reinstall: v{$current} -> v{$latest}
+cli-update-not-writable = install directory {$dir} is not writable ({$error}); re-run `omnesagent update` with elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)
+
+# ── self-test (omnesagent self-test) ──
+cli-selftest-all-passed = All {$total} checks passed.
+cli-selftest-some-failed = {$failed}/{$total} checks failed.
+cli-selftest-channel-config-uncompiled = {$compiled} compiled channel types, {$configured} compiled/configured; configured but not compiled: {$names}. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
+
+# ── channels (omnesagent channel list) ──
+cli-channels-header = Channels:
+cli-channels-cli-always = {"  "}✅ CLI (always available)
+cli-channels-notion = {"  "}{$status} Notion
+cli-channels-not-compiled-header = {"  "}Configured but not compiled in this binary:
+cli-channels-not-compiled-entry = {"  "}🚫 {$name} (configured, not compiled)
+cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
+cli-channels-start-hint = To start channels: omnesagent channel start
+cli-channels-doctor-hint = To check health:    omnesagent channel doctor
+cli-channels-configure-hint = To configure:      omnesagent config set channels.<name>.<field>=<value>
+
+cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
+cli-models-status-current = Default model: { $model } (provider: { $provider })
+cli-models-status-none = No default model configured.
+
+# ── Agent turn-engine user-visible markers (#7415) ────────────────────
+# Appended to (or persisted as) assistant output when a turn is cut short;
+# shown to end users across every transport (channels, WS, RPC, ACP, CLI).
+turn-interrupted-by-user = [interrupted by user]
+# Shown when a turn ends because the client RPC channel cancelled it. The actor
+# is not verified: human interrupt and programmatic client cancels both arrive
+# on this path, so the wording names the channel, not a user.
+turn-cancelled-client-rpc = [turn cancelled via client]
+turn-stream-interrupted = [stream interrupted]
+# Trailing notice appended (and streamed as a final chunk) when the resilient
+# provider wrapper served the turn with a different model or provider than the
+# one requested, so silent model downgrades stay visible on direct-turn
+# surfaces (WS, RPC/ZeroCode, ACP).
+turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
+# Shown at the end of agent output when the tool call loop exhausted its
+# iteration budget and the agent cannot continue without exceeding limits.
+turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
+# Breadcrumb injected into history where older turns were dropped to fit the
+# context budget; user-visible across channels, WS, RPC, ACP.
+history-trim-breadcrumb = [earlier turns omitted to fit the context window]
+# Reason carried on every history_trimmed event (WS, SSE, ACP).
+history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = history message limit exceeded
+# Remediation surfaced when the system prompt + inlined tool definitions alone
+# meet or exceed the context budget, so no amount of conversation trimming can
+# fit the request (#5808).
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
+# Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
+# turn before it reaches the model. Unreachable under the default `Loop` policy
+# (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
+turn-ingress-dropped = This request was not processed: { $reason }
+turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
+# Safe reply delivered when the model repeatedly emits malformed internal
+# tool-call protocol and the turn gives up retrying.
+channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-progress-received = Received
+channel-runtime-progress-planning = Planning
+channel-runtime-progress-waiting-on-model = Waiting on model
+channel-runtime-progress-running-tool = Running tool
+channel-runtime-progress-compacting-context = Compacting context
+channel-runtime-progress-finalizing-response = Finalizing response
+channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
+channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-stop-sent = Stop signal sent.
+channel-runtime-stop-no-task = No in-flight task for this sender scope.
+channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
+channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
+channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
+channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-no-reply-refused = 🚫 I can't help with that request.
+channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
+channel-runtime-current-model-status =
+    Current model_provider: `{ $provider }`
+    Current model: `{ $model }`
+channel-runtime-model-switch-hint = Switch model with `/model <model-id>` or `/model <hint>`.
+channel-runtime-provider-switch-hint = Switch model_provider with `/models <model_provider>`.
+channel-runtime-available-providers-header = Available model_providers:
+channel-runtime-configured-routes-header = Configured model routes:
+channel-runtime-no-cached-models = No cached model list found for `{ $provider }`. Ask the operator to run `omnesagent models refresh --model-provider { $provider }`.
+channel-runtime-cached-model-ids-header = Cached model IDs (top { $count }):
+channel-runtime-config-switch-hints =
+    Use `/models <model_provider>` to switch model_provider.
+    Use `/model <model-id>` to switch model.
+channel-runtime-config-block-title =
+    { "*" }Model Configuration{ "*" }
+    Current: `{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = Select model_provider
+channel-runtime-config-select-model-placeholder = Select model
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *Model*
+channel-runtime-scope-user = user
+channel-runtime-scope-agent = agent
+channel-runtime-scope-overrides-summary =
+    { "**" }Model overrides{ "**" } (session-only; precedence user > agent > session > default):
+    • user: { $user }
+    • agent: { $agent }
+    • session (this chat): { $session }
+    • default (config): { $default }
+    Set a scope with `/model --user|--agent <model-id>`; clear by setting it back to the default.
+channel-runtime-set-provider-switched =
+    ModelProvider switched to `{ $provider }` for this sender session. Current model is `{ $model }`.
+    Use `/model <model-id>` to set a provider-compatible model.
+channel-runtime-set-provider-init-failed =
+    Failed to initialize model_provider `{ $provider }`. Route unchanged.
+    Details: { $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` has multiple configured aliases. Qualify which one with `/models { $family }.<alias>`: { $list }
+channel-runtime-provider-no-alias = No configured provider entry for `{ $provider }`. Add `[providers.models.{ $provider }]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones.
+channel-runtime-provider-unknown = Unknown model_provider `{ $provider }`. Use `/models` to list valid model_providers.
+channel-runtime-scoped-model-empty = Model ID cannot be empty. Use `/model --user|--agent <model-id>`.
+channel-runtime-scoped-model-switched = Model set to `{ $model }` (model_provider: `{ $provider }`) for the **{ $scope }** scope. Session-only — resets on restart.
+channel-runtime-shadow-note = ⚠️ A higher-precedence override is active, so messages will use `{ $model }` (`{ $provider }`) instead — see `/model`.
+channel-runtime-thinking-set =
+    Thinking set to `{ $level }` for this sender session.
+    Use `/thinking reset` to return to the agent default.
+channel-runtime-thinking-cleared = Thinking override cleared. Using agent default `{ $default }` for this sender session.
+channel-runtime-thinking-default =
+    Thinking is already using agent default `{ $default }` for this sender session.
+    Use `/thinking high`, `/thinking max`, or `/thinking off` to override it.
+channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`.
+channel-runtime-provider-turn-init-failed =
+    ⚠️ Failed to initialize model_provider `{ $provider }`. Please run `/models` to choose another model_provider.
+    Details: { $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
+    Switch model: /models
+
+delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
+turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
+delegate-provider-fallback-header = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model })]
+delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model }, agentic)]
+
+# ── Alias CRUD CLI — omnesagent {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
+cli-alias-list-empty = (no entries under {$section})
+cli-alias-created = created {$section}.{$alias}
+cli-alias-exists = {$section}.{$alias} already exists (no change)
+cli-alias-impact-scrub-header = deleting {$section}.{$alias} would scrub {$count} reference(s):
+cli-alias-impact-blocked-header = deleting {$section}.{$alias} is BLOCKED by {$count} hard reference(s):
+cli-alias-impact-blocker = ✗ {$path} (hard reference)
+cli-alias-impact-scrub = • {$path} (would be scrubbed)
+cli-alias-no-changes = No changes made. Re-run with --yes to apply (or --dry-run to preview).
+cli-alias-warn-workspace-archive = warning: workspace archive failed: {$error}
+cli-alias-owned-cascaded = owned-state cascaded: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions} → {$archive}
+cli-alias-owned-repointed = owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
+cli-alias-warn-workspace-move = warning: workspace move failed: {$error}
+cli-alias-warn = warning: {$warning}
+cli-alias-deleted = deleted {$section}.{$alias} (scrubbed {$count} reference(s))
+cli-alias-delete-refused-header = refused: {$count} hard reference(s) block the delete:
+cli-alias-delete-refused-hint = delete refused — resolve the hard references first
+cli-alias-not-configured = {$path} is not configured
+cli-alias-delete-failed = delete failed: {$error}
+cli-alias-delete-reserved-default = the `default` agent is reserved and cannot be deleted
+cli-alias-create-reserved-default = the `default` agent is reserved and cannot be created
+cli-alias-renamed = renamed {$section}.{$from} → {$section}.{$to} (rewrote {$count} reference path(s))
+cli-alias-rename-invalid = invalid new alias: {$message}
+cli-alias-rename-reserved = alias `{$alias}` is reserved and cannot be renamed
+cli-alias-rename-postcondition = rename cascade post-condition failed: {$message}
+cli-alias-unknown-provider-category = unknown provider category `{$category}` (expected models | tts | transcription)
+cli-alias-no-such-section = no such config section: {$section}
+cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — end them first
+cli-alias-owned-state-unavailable = note: config references were updated, but the agent's owned state (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded by this CLI yet — use the gateway API for the full owned-state cascade.
+cli-bundle-not-configured = skill bundle '{$alias}' is not configured
+cli-bundle-rename-failed = rename failed: {$error}
+
+# ── Skill-bundle CLI — omnesagent skills bundle {add,remove,rename} (#7468 / #7175) ──
+cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
+cli-bundle-created = created skill_bundles.{$alias} (dir: {$dir})
+cli-bundle-created-warn = created skill_bundles.{$alias} (warning: dir resolve failed: {$error})
+cli-bundle-impact-header = deleting skill_bundles.{$alias} would strip it from {$count} agent reference(s):
+cli-bundle-no-changes = No changes made. Re-run with --yes to apply.
+cli-bundle-archived = archived bundle directory → {$path}
+cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
+cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
+cli-bundle-warn-move = warning: bundle directory move failed: {$error}
+cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Web dashboard restart hints — RestartInfo.hint shown after an in-app upgrade (PR #8173) ──
+# The first four are shell command templates shown verbatim; they are not translated.
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/omnesagent
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart omnesagent
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-omnesagent-label>
+cli-gateway-restart-hint-process = restart the `omnesagent daemon` process
+
+# ── daemon gateway bind pre-flight — omnesagent daemon (#7895) ──
+# Emitted by the daemon startup guard in src/main.rs when the configured gateway
+# address is already bound. The daemon supervises its own in-process gateway
+# (shared event bus / canvas / reload channel) and cannot adopt a separate
+# process, so it fails fast with an actionable message instead of degrading into
+# a supervisor retry loop. The two variants differ only by who holds the port.
+cli-daemon-gateway-already-running = A OmnesAgent gateway is already running on {$host}:{$port}. The daemon supervises its own gateway and will not start a second one on the same address. Stop that gateway (or point the daemon at a free port with `omnesagent config set gateway.port <port>`), then run the daemon again.
+cli-daemon-gateway-port-occupied = Gateway address {$host}:{$port} is already in use by another process. Free the port or point the daemon at a free port (`omnesagent config set gateway.port <port>`), then run the daemon again.
+cli-daemon-starting-title = 🧠 OmnesAgent daemon starting…
+cli-daemon-starting-detail = Preparing configured daemon endpoints
+cli-daemon-started-title = 🧠 OmnesAgent daemon ready
+cli-daemon-started-gateway = Gateway:  {$url}
+cli-daemon-started-socket = Socket:   {$path}
+cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for current status)
+cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
+
+# ── daemon mTLS and enrollment operator output ──
+cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
+cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
+cli-mtls-issued-cert-path = {"  "}cert: {$path}
+cli-mtls-issued-key-path = {"  "}key:  {$path}
+cli-mtls-issued-ca-path = {"  "}CA:   {$path}
+cli-mtls-dropin-line-1 = Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /
+cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and zerocode finds
+cli-mtls-dropin-line-3 = {"  "}the material automatically - no --tls-* flags needed.
+cli-mtls-relay-connect-header = Reach this daemon THROUGH its configured relay:
+cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca is the RELAY's CA - copy it from the relay to the client;
+cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert is the DAEMON's CA, already in the bundle.)
+cli-mtls-direct-connect-header = Connect with zerocode (direct):
+cli-mtls-revoked-certificate = Revoked certificate {$fingerprint}.
+cli-mtls-revoke-no-active-fingerprint = No active certificate with fingerprint {$fingerprint} (already revoked or never issued).
+cli-mtls-revoked-device-certs = Revoked {$count} active certificate(s) for device '{$device}'.
+cli-mtls-revoked-list-updated = Updated {$path}; the daemon refuses the revoked certificate(s) at the next connection.
+cli-mtls-list-no-active-certs = No active client certificates issued by this daemon's CA.
+cli-mtls-list-active-header = Active client certificates ({$count}):
+cli-enroll-endpoint-ready = Enrollment endpoint ready on {$bind}:{$port}. To enroll a client, give it
+cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short-auth-string (SAS)
+cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
+cli-enroll-pairing-code = {"    "}pairing code : {$code}
+cli-enroll-sas = {"    "}SAS          : {$sas}
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
+cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
+cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
+cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
+cli-agent-vision-unsupported-by-fallback = received {$marker_count} image marker(s), but fallback model_provider={$fallback_name} does not support vision input
+cli-agent-vision-unsupported-by-provider = received {$marker_count} image marker(s), but this model_provider does not support vision input
+cli-agent-error-provider-context-window = The request is too large for the selected model. Reduce the conversation or choose a model with a larger context window.
+cli-agent-error-provider-credentials-missing = The selected model provider has no configured credentials. Add its API key or choose another provider.
+cli-agent-error-provider-credentials-missing-named = The model provider {$provider} has no configured credentials. Add its API key or choose another provider.
+cli-agent-error-provider-authentication = The selected model provider rejected its credentials. Check the configured credentials.
+cli-agent-error-provider-authentication-named = The model provider {$provider} rejected its credentials. Check the configured credentials.
+cli-agent-error-provider-rate-limited = The selected model provider rate-limited the request. Wait, review quota, or choose another provider.
+cli-agent-error-provider-server = The selected model provider returned a server error. Try again or choose another provider.
+cli-agent-error-provider-model-not-found = The selected model is unavailable. Check the configured model name.
+cli-agent-error-provider-client-request = The selected model provider rejected the request. Check the provider configuration and request.
+cli-agent-error-provider-connection-local = The local model server at {$endpoint} is unavailable. Start it or update the endpoint.
+cli-agent-error-provider-connection-remote = Cannot reach the model provider at {$endpoint}. Check network access or choose another provider.
+cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
+cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
+cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
+cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
+cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
+cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: unknown / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: already has context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: no model configured, skipping
+cli-doctor-ctxwin-would-set = {$provider_ref}: would set context_window = {$ctx} (dry run)
+cli-doctor-ctxwin-set = {$provider_ref}: set context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: could not find entry to update
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: provider does not expose context window or fetch failed
+cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
+cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
+cli-doctor-ctxwin-none = No updates needed.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
+cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalogs may be unreachable. You can retry Doctor to refresh.
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `omnesagent config migrate` to see the parse error, then repair the file.
+cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `omnesagent config migrate` to see the parse error, then repair the file.
+cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
+sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
+sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
+sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
+sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
+sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
+
+# ── Runtime command construction — shell and skill shell tools ──
+tool-runtime-command-build-failed = Failed to build runtime command: {$error}
+tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
+tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Terminal tool approval ──
+# The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
+cli-approval-request = 🔧 Agent wants to execute: {$tool}
+cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Tool approval required
+channel-approval-heading-shout = APPROVAL REQUIRED
+channel-approval-tool-label = Tool
+channel-approval-args-label = Args
+channel-approval-btn-approve = Approve
+channel-approval-btn-deny = Deny
+channel-approval-btn-always = Always
+channel-approval-tap-instruction = Tap a button below:
+channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Reply `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    This is a group chat, so everyone here can see this code and the tool arguments shown above. Only an authorized peer for this channel can answer.
+channel-telegram-approval-ack-approved = Approved
+channel-telegram-approval-ack-always-approved = Always approved
+channel-telegram-approval-ack-denied = Denied
+channel-telegram-approval-ack-not-accepted = Approval not accepted
+channel-telegram-approval-ack-unknown = Unknown action
+channel-telegram-approval-ack-already-resolved = Approval already resolved
+channel-discord-approval-btn-allow-once = Allow once
+channel-discord-approval-btn-allow-session = Allow this session
+channel-discord-approval-btn-allow-always = Always allow
+channel-approval-title = Approve { $tool }?
+channel-approval-opt-allow-once = Allow once
+channel-approval-opt-allow-always = Always allow
+channel-approval-opt-reject = Reject
+channel-approval-opt-reject-with-edit = Reject with edit

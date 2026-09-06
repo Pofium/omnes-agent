@@ -1,0 +1,81 @@
+# Canonical container base-image pins for the generated container surfaces
+# (Dockerfile, Dockerfile.debian, Dockerfile.alpine). Edit
+# registry/repo/image_ref/tag here; `tag`
+# records the intended policy and `digest` is rewritten live by `cargo generate
+# installers`. A row with discover=true refreshes the digest for its declared
+# tag from the registry; Node discover rows must use a plain
+# <major>-bookworm-slim tag. StageX pins in the Containerfile are excluded on
+# purpose: digest-only, reproducible-build intent, no tag to follow.
+
+[[image]]
+zone = "base-arg-node"
+arg = "OMNESAGENT_BASE_NODE"
+registry = "dockerhub"
+repo = "library/node"
+image_ref = "node"
+discover = true
+tag = "24-bookworm-slim"
+digest = "sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03"
+
+[[image]]
+zone = "base-arg-rust-slim"
+arg = "OMNESAGENT_BASE_RUST_SLIM"
+registry = "dockerhub"
+repo = "library/rust"
+image_ref = "rust"
+tag = "1.98-slim"
+digest = "sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078"
+
+[[image]]
+zone = "base-arg-rust-bookworm"
+arg = "OMNESAGENT_BASE_RUST_BOOKWORM"
+registry = "dockerhub"
+repo = "library/rust"
+image_ref = "rust"
+tag = "1.98-bookworm"
+digest = "sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7"
+
+[[image]]
+zone = "base-arg-debian"
+arg = "OMNESAGENT_BASE_DEBIAN"
+registry = "dockerhub"
+repo = "library/debian"
+image_ref = "debian"
+tag = "trixie-slim"
+digest = "sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
+
+[[image]]
+zone = "base-arg-distroless"
+arg = "OMNESAGENT_BASE_DISTROLESS"
+registry = "gcr"
+repo = "distroless/cc-debian13"
+image_ref = "gcr.io/distroless/cc-debian13"
+tag = "nonroot"
+digest = "sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775"
+
+[[image]]
+zone = "base-arg-node-alpine"
+arg = "OMNESAGENT_BASE_NODE_ALPINE"
+registry = "dockerhub"
+repo = "library/node"
+image_ref = "node"
+tag = "24-alpine3.23"
+digest = "sha256:244cc2b53f46f9e876304391d17682b0ddae9ac33491f4857e25e35a36ba7995"
+
+[[image]]
+zone = "base-arg-rust-alpine"
+arg = "OMNESAGENT_BASE_RUST_ALPINE"
+registry = "dockerhub"
+repo = "library/rust"
+image_ref = "rust"
+tag = "1.98-alpine3.23"
+digest = "sha256:4743b6231029d726d7a0f81d730a7c9f4eff23225a4499c01e275efb5e260235"
+
+[[image]]
+zone = "base-arg-alpine"
+arg = "OMNESAGENT_BASE_ALPINE"
+registry = "dockerhub"
+repo = "library/alpine"
+image_ref = "alpine"
+tag = "3.23"
+digest = "sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40"

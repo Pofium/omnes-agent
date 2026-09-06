@@ -1,0 +1,983 @@
+//! Voice Wake Word detection channel.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Result, bail};
+use async_trait::async_trait;
+use cpal::Sample;
+use tokio::sync::mpsc;
+
+use crate::transcription::TranscriptionManager;
+use omnesagent_config::schema::TranscriptionConfig;
+use omnesagent_config::schema::VoiceWakeConfig;
+
+use omnesagent_api::channel::{Channel, ChannelMessage, SendMessage};
+
+fn normalize_samples<T>(data: &[T]) -> Vec<f32>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    data.iter().copied().map(f32::from_sample).collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PcmSampleFormat {
+    F32,
+    F64,
+    I8,
+    I16,
+    I24,
+    I32,
+    I64,
+    U8,
+    U16,
+    U24,
+    U32,
+    U64,
+}
+
+impl TryFrom<cpal::SampleFormat> for PcmSampleFormat {
+    type Error = anyhow::Error;
+
+    fn try_from(format: cpal::SampleFormat) -> Result<Self> {
+        match format {
+            cpal::SampleFormat::F32 => Ok(Self::F32),
+            cpal::SampleFormat::F64 => Ok(Self::F64),
+            cpal::SampleFormat::I8 => Ok(Self::I8),
+            cpal::SampleFormat::I16 => Ok(Self::I16),
+            cpal::SampleFormat::I24 => Ok(Self::I24),
+            cpal::SampleFormat::I32 => Ok(Self::I32),
+            cpal::SampleFormat::I64 => Ok(Self::I64),
+            cpal::SampleFormat::U8 => Ok(Self::U8),
+            cpal::SampleFormat::U16 => Ok(Self::U16),
+            cpal::SampleFormat::U24 => Ok(Self::U24),
+            cpal::SampleFormat::U32 => Ok(Self::U32),
+            cpal::SampleFormat::U64 => Ok(Self::U64),
+            format => bail!("Unsupported input sample format: {format}"),
+        }
+    }
+}
+
+fn build_input_stream<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    audio_tx: mpsc::Sender<Vec<f32>>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    use cpal::traits::DeviceTrait;
+
+    device.build_input_stream(
+        config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            let samples = normalize_samples(data);
+            // Non-blocking: try_send and drop if full.
+            let _ = audio_tx.try_send(samples);
+        },
+        move |err| {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "VoiceWake: audio stream error"
+            );
+        },
+        None,
+    )
+}
+
+// ── State machine ──────────────────────────────────────────────
+
+/// Internal states for the wake-word detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeState {
+    /// Passively monitoring microphone energy levels.
+    Listening,
+    /// Energy spike detected — capturing a short window to check for wake word.
+    Triggered,
+    /// Wake word confirmed — capturing the full utterance that follows.
+    Capturing,
+    /// Captured audio is being transcribed.
+    Processing,
+}
+
+impl std::fmt::Display for WakeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listening => write!(f, "Listening"),
+            Self::Triggered => write!(f, "Triggered"),
+            Self::Capturing => write!(f, "Capturing"),
+            Self::Processing => write!(f, "Processing"),
+        }
+    }
+}
+
+// ── Channel implementation ─────────────────────────────────────
+
+/// Voice wake-word channel that activates on a spoken keyword.
+pub struct VoiceWakeChannel {
+    config: VoiceWakeConfig,
+    /// The alias key under `[channels.voice_wake.<alias>]` this handle is
+    /// bound to. Used for attribution and message routing only — never as
+    /// a transcription-provider key.
+    alias: String,
+    /// Materializes transcription state from its canonical source when the
+    /// listener starts. The orchestrator replaces the compatibility factory
+    /// with a resolver over live `Config` so reloadable provider policy is
+    /// not copied into this long-lived channel handle.
+    transcription_manager_factory:
+        Arc<dyn Fn() -> Result<TranscriptionManager> + Send + Sync + 'static>,
+}
+
+impl VoiceWakeChannel {
+    /// Create a new `VoiceWakeChannel` from its config sections.
+    pub fn new(
+        alias: impl Into<String>,
+        config: VoiceWakeConfig,
+        transcription_config: TranscriptionConfig,
+    ) -> Self {
+        let transcription_manager_factory =
+            Arc::new(move || TranscriptionManager::new(&transcription_config));
+        Self {
+            config,
+            alias: alias.into(),
+            transcription_manager_factory,
+        }
+    }
+
+    /// Bind this channel to the resolved `transcription_provider` of the
+    /// agent that owns it. Distinct from `alias`, which only scopes
+    /// `[channels.voice_wake.<alias>]` routing and must never be used to
+    /// select a transcription provider.
+    pub fn with_agent_transcription_provider(mut self, provider: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let base_factory = Arc::clone(&self.transcription_manager_factory);
+        self.transcription_manager_factory = Arc::new(move || {
+            Ok(base_factory()?.with_agent_transcription_provider(provider.clone()))
+        });
+        self
+    }
+
+    /// Replace the compatibility transcription factory with the channel
+    /// runtime's live-config resolver.
+    pub(crate) fn with_transcription_manager_factory(
+        mut self,
+        factory: impl Fn() -> Result<TranscriptionManager> + Send + Sync + 'static,
+    ) -> Self {
+        self.transcription_manager_factory = Arc::new(factory);
+        self
+    }
+
+    /// Build the transcription manager bound to this channel's resolved
+    /// agent transcription provider. Split out of `listen()` so the wiring
+    /// can be exercised without standing up an audio input stream.
+    fn build_transcription_manager(&self) -> Result<TranscriptionManager> {
+        (self.transcription_manager_factory)()
+    }
+}
+
+impl ::omnesagent_api::attribution::Attributable for VoiceWakeChannel {
+    fn role(&self) -> ::omnesagent_api::attribution::Role {
+        ::omnesagent_api::attribution::Role::Channel(
+            ::omnesagent_api::attribution::ChannelKind::VoiceWake,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[async_trait]
+impl Channel for VoiceWakeChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Voice-wake has no text typing indicator.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Voice-wake has no text typing indicator.
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "voice_wake"
+    }
+
+    async fn send(&self, _message: &SendMessage) -> Result<()> {
+        // Voice wake is input-only; outbound messages are not supported.
+        Ok(())
+    }
+
+    fn supports_outbound_send(&self) -> bool {
+        false
+    }
+
+    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+        let self_alias = self.alias.clone();
+        let config = self.config.clone();
+        let transcription_manager = self.build_transcription_manager()?;
+
+        // Run the blocking audio capture loop on a dedicated thread.
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(4);
+
+        let energy_threshold = config.energy_threshold;
+        let silence_timeout = Duration::from_millis(u64::from(config.silence_timeout_ms));
+        let max_capture = Duration::from_secs(u64::from(config.max_capture_secs));
+        let sample_rate: u32;
+        let channels_count: u16;
+
+        // ── Initialise cpal stream ────────────────────────────
+        {
+            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+            let host = cpal::default_host();
+            let device = host.default_input_device().ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                    "No default audio input device available"
+                );
+                anyhow::Error::msg("No default audio input device available")
+            })?;
+
+            let supported = device.default_input_config()?;
+            let sample_format = PcmSampleFormat::try_from(supported.sample_format())?;
+            sample_rate = supported.sample_rate();
+            channels_count = supported.channels();
+            let device_name = device
+                .description()
+                .map(|description| description.name().to_owned())
+                .unwrap_or_default();
+
+            ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"device": device_name, "sample_rate": sample_rate, "channels": channels_count})), "VoiceWake: opening audio input");
+
+            let stream_config: cpal::StreamConfig = supported.into();
+            let stream = match sample_format {
+                PcmSampleFormat::F32 => {
+                    build_input_stream::<f32>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::F64 => {
+                    build_input_stream::<f64>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I8 => {
+                    build_input_stream::<i8>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I16 => {
+                    build_input_stream::<i16>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I24 => {
+                    build_input_stream::<cpal::I24>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I32 => {
+                    build_input_stream::<i32>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I64 => {
+                    build_input_stream::<i64>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U8 => {
+                    build_input_stream::<u8>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U16 => {
+                    build_input_stream::<u16>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U24 => {
+                    build_input_stream::<cpal::U24>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U32 => {
+                    build_input_stream::<u32>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U64 => {
+                    build_input_stream::<u64>(&device, stream_config, audio_tx.clone())?
+                }
+            };
+
+            stream.play()?;
+
+            // Keep the stream alive for the lifetime of the channel.
+            // We leak it intentionally — the channel runs until the daemon shuts down.
+            std::mem::forget(stream);
+        }
+
+        // Drop the extra sender so the channel closes when the stream sender drops.
+        drop(audio_tx);
+
+        // ── Main detection loop ───────────────────────────────
+        let wake_word = config.wake_word.to_lowercase();
+        let mut state = WakeState::Listening;
+        let mut capture_buf: Vec<f32> = Vec::new();
+        let mut last_voice_at = Instant::now();
+        let mut capture_start = Instant::now();
+        let mut msg_counter: u64 = 0;
+
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_attrs(::serde_json::json!({"wake_word": wake_word})),
+            "VoiceWake: entering listen loop"
+        );
+
+        while let Some(chunk) = audio_rx.recv().await {
+            let energy = compute_rms_energy(&chunk);
+
+            match state {
+                WakeState::Listening => {
+                    if energy >= energy_threshold {
+                        ::omnesagent_log::record!(
+                            DEBUG,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"energy": energy})),
+                            "VoiceWake: energy spike — transitioning to Triggered"
+                        );
+                        state = WakeState::Triggered;
+                        capture_buf.clear();
+                        capture_buf.extend_from_slice(&chunk);
+                        last_voice_at = Instant::now();
+                        capture_start = Instant::now();
+                    }
+                }
+                WakeState::Triggered => {
+                    capture_buf.extend_from_slice(&chunk);
+
+                    if energy >= energy_threshold {
+                        last_voice_at = Instant::now();
+                    }
+
+                    let since_voice = last_voice_at.elapsed();
+                    let since_start = capture_start.elapsed();
+
+                    // After enough silence or max time, transcribe to check for wake word.
+                    if since_voice >= silence_timeout || since_start >= max_capture {
+                        ::omnesagent_log::record!(
+                            DEBUG,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            ),
+                            "VoiceWake: Triggered window closed — transcribing for wake word"
+                        );
+
+                        let wav_bytes =
+                            encode_wav_from_f32(&capture_buf, sample_rate, channels_count);
+
+                        match transcription_manager
+                            .transcribe(&wav_bytes, "wake_check.wav")
+                            .await
+                        {
+                            Ok(text) => {
+                                let lower = text.to_lowercase();
+                                if lower.contains(&wake_word) {
+                                    ::omnesagent_log::record!(
+                                        INFO,
+                                        ::omnesagent_log::Event::new(
+                                            module_path!(),
+                                            ::omnesagent_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"text": text})),
+                                        "VoiceWake: wake word detected — capturing utterance"
+                                    );
+                                    state = WakeState::Capturing;
+                                    capture_buf.clear();
+                                    last_voice_at = Instant::now();
+                                    capture_start = Instant::now();
+                                } else {
+                                    ::omnesagent_log::record!(
+                                        DEBUG,
+                                        ::omnesagent_log::Event::new(
+                                            module_path!(),
+                                            ::omnesagent_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"text": text})),
+                                        "VoiceWake: no wake word — back to Listening"
+                                    );
+                                    state = WakeState::Listening;
+                                    capture_buf.clear();
+                                }
+                            }
+                            Err(e) => {
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Note
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "VoiceWake: transcription error during wake check"
+                                );
+                                state = WakeState::Listening;
+                                capture_buf.clear();
+                            }
+                        }
+                    }
+                }
+                WakeState::Capturing => {
+                    capture_buf.extend_from_slice(&chunk);
+
+                    if energy >= energy_threshold {
+                        last_voice_at = Instant::now();
+                    }
+
+                    let since_voice = last_voice_at.elapsed();
+                    let since_start = capture_start.elapsed();
+
+                    if since_voice >= silence_timeout || since_start >= max_capture {
+                        ::omnesagent_log::record!(
+                            DEBUG,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            ),
+                            "VoiceWake: utterance capture complete — transcribing"
+                        );
+
+                        let wav_bytes =
+                            encode_wav_from_f32(&capture_buf, sample_rate, channels_count);
+
+                        match transcription_manager
+                            .transcribe(&wav_bytes, "utterance.wav")
+                            .await
+                        {
+                            Ok(text) => {
+                                let trimmed = text.trim().to_string();
+                                if !trimmed.is_empty() {
+                                    msg_counter += 1;
+                                    let ts = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+
+                                    let msg = ChannelMessage {
+                                        id: format!("voice_wake_{msg_counter}"),
+                                        sender: "voice_user".into(),
+                                        reply_target: "voice_user".into(),
+                                        content: trimmed,
+                                        channel: "voice_wake".into(),
+                                        channel_alias: Some(self_alias.clone()),
+                                        timestamp: ts,
+                                        thread_ts: None,
+                                        interruption_scope_id: None,
+                                        attachments: vec![],
+                                        subject: None,
+
+                                        ..Default::default()
+                                    };
+
+                                    if let Err(e) = tx.send(msg).await {
+                                        ::omnesagent_log::record!(
+                                            WARN,
+                                            ::omnesagent_log::Event::new(
+                                                module_path!(),
+                                                ::omnesagent_log::Action::Note
+                                            )
+                                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                            .with_attrs(
+                                                ::serde_json::json!({"error": format!("{}", e)})
+                                            ),
+                                            "VoiceWake: failed to dispatch message"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Note
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "VoiceWake: transcription error for utterance"
+                                );
+                            }
+                        }
+
+                        state = WakeState::Listening;
+                        capture_buf.clear();
+                    }
+                }
+                WakeState::Processing => {
+                    // Should not receive chunks while processing, but just buffer them.
+                    // State transitions happen above synchronously after transcription.
+                }
+            }
+        }
+
+        bail!("VoiceWake: audio stream ended unexpectedly");
+    }
+}
+
+// ── Audio utilities ────────────────────────────────────────────
+
+/// Compute RMS (root-mean-square) energy of an audio chunk.
+pub fn compute_rms_energy(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Encode raw f32 PCM samples as a WAV byte buffer (16-bit PCM).
+/// This produces a minimal valid WAV file that Whisper-compatible APIs accept.
+pub fn encode_wav_from_f32(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
+    let bits_per_sample: u16 = 16;
+    let byte_rate = u32::from(channels) * sample_rate * u32::from(bits_per_sample) / 8;
+    let block_align = channels * bits_per_sample / 8;
+    #[allow(clippy::cast_possible_truncation)]
+    let data_len = (samples.len() * 2) as u32; // 16-bit = 2 bytes per sample; max ~25 MB
+    let file_len = 36 + data_len;
+
+    let mut buf = Vec::with_capacity(file_len as usize + 8);
+
+    // RIFF header
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&file_len.to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+
+    // fmt chunk
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    buf.extend_from_slice(&channels.to_le_bytes());
+    buf.extend_from_slice(&sample_rate.to_le_bytes());
+    buf.extend_from_slice(&byte_rate.to_le_bytes());
+    buf.extend_from_slice(&block_align.to_le_bytes());
+    buf.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data chunk
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+
+    for &sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        #[allow(clippy::cast_possible_truncation)]
+        let pcm16 = (clamped * 32767.0) as i16; // clamped to [-1,1] so fits i16
+        buf.extend_from_slice(&pcm16.to_le_bytes());
+    }
+
+    buf
+}
+
+// ── Tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omnesagent_config::traits::ChannelConfig;
+
+    // ── State machine tests ────────────────────────────────
+
+    #[test]
+    fn wake_state_display() {
+        assert_eq!(WakeState::Listening.to_string(), "Listening");
+        assert_eq!(WakeState::Triggered.to_string(), "Triggered");
+        assert_eq!(WakeState::Capturing.to_string(), "Capturing");
+        assert_eq!(WakeState::Processing.to_string(), "Processing");
+    }
+
+    #[test]
+    fn wake_state_equality() {
+        assert_eq!(WakeState::Listening, WakeState::Listening);
+        assert_ne!(WakeState::Listening, WakeState::Triggered);
+    }
+
+    // ── Energy computation tests ───────────────────────────
+
+    #[test]
+    fn rms_energy_of_silence_is_zero() {
+        let silence = vec![0.0f32; 1024];
+        assert_eq!(compute_rms_energy(&silence), 0.0);
+    }
+
+    #[test]
+    fn rms_energy_of_empty_is_zero() {
+        assert_eq!(compute_rms_energy(&[]), 0.0);
+    }
+
+    #[test]
+    fn all_pcm_formats_are_classified() {
+        let cases = [
+            (cpal::SampleFormat::F32, PcmSampleFormat::F32),
+            (cpal::SampleFormat::F64, PcmSampleFormat::F64),
+            (cpal::SampleFormat::I8, PcmSampleFormat::I8),
+            (cpal::SampleFormat::I16, PcmSampleFormat::I16),
+            (cpal::SampleFormat::I24, PcmSampleFormat::I24),
+            (cpal::SampleFormat::I32, PcmSampleFormat::I32),
+            (cpal::SampleFormat::I64, PcmSampleFormat::I64),
+            (cpal::SampleFormat::U8, PcmSampleFormat::U8),
+            (cpal::SampleFormat::U16, PcmSampleFormat::U16),
+            (cpal::SampleFormat::U24, PcmSampleFormat::U24),
+            (cpal::SampleFormat::U32, PcmSampleFormat::U32),
+            (cpal::SampleFormat::U64, PcmSampleFormat::U64),
+        ];
+
+        for (format, expected) in cases {
+            assert_eq!(PcmSampleFormat::try_from(format).unwrap(), expected);
+        }
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU8).is_err());
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU16).is_err());
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU32).is_err());
+    }
+
+    #[test]
+    fn all_pcm_formats_normalize_nonzero_samples() {
+        fn assert_round_trip<T>()
+        where
+            T: cpal::SizedSample + cpal::FromSample<f32>,
+            f32: cpal::FromSample<T>,
+        {
+            let input = T::from_sample(0.5);
+            let normalized = normalize_samples(&[input]);
+            assert!((normalized[0] - 0.5).abs() < 0.01);
+        }
+
+        assert_round_trip::<f32>();
+        assert_round_trip::<f64>();
+        assert_round_trip::<i8>();
+        assert_round_trip::<i16>();
+        assert_round_trip::<cpal::I24>();
+        assert_round_trip::<i32>();
+        assert_round_trip::<i64>();
+        assert_round_trip::<u8>();
+        assert_round_trip::<u16>();
+        assert_round_trip::<cpal::U24>();
+        assert_round_trip::<u32>();
+        assert_round_trip::<u64>();
+    }
+
+    #[test]
+    fn rms_energy_of_constant_signal() {
+        // Constant signal at 0.5 → RMS should be 0.5
+        let signal = vec![0.5f32; 100];
+        let energy = compute_rms_energy(&signal);
+        assert!((energy - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rms_energy_above_threshold() {
+        let loud = vec![0.8f32; 256];
+        let energy = compute_rms_energy(&loud);
+        assert!(energy > 0.01, "Loud signal should exceed default threshold");
+    }
+
+    #[test]
+    fn rms_energy_below_threshold_for_quiet() {
+        let quiet = vec![0.001f32; 256];
+        let energy = compute_rms_energy(&quiet);
+        assert!(
+            energy < 0.01,
+            "Very quiet signal should be below default threshold"
+        );
+    }
+
+    // ── WAV encoding tests ─────────────────────────────────
+
+    #[test]
+    fn wav_header_is_valid() {
+        let samples = vec![0.0f32; 100];
+        let wav = encode_wav_from_f32(&samples, 16000, 1);
+
+        // RIFF header
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+
+        // fmt chunk
+        assert_eq!(&wav[12..16], b"fmt ");
+        let fmt_size = u32::from_le_bytes(wav[16..20].try_into().unwrap());
+        assert_eq!(fmt_size, 16);
+
+        // PCM format
+        let format = u16::from_le_bytes(wav[20..22].try_into().unwrap());
+        assert_eq!(format, 1);
+
+        // Channels
+        let channels = u16::from_le_bytes(wav[22..24].try_into().unwrap());
+        assert_eq!(channels, 1);
+
+        // Sample rate
+        let sr = u32::from_le_bytes(wav[24..28].try_into().unwrap());
+        assert_eq!(sr, 16000);
+
+        // data chunk
+        assert_eq!(&wav[36..40], b"data");
+        let data_size = u32::from_le_bytes(wav[40..44].try_into().unwrap());
+        assert_eq!(data_size, 200); // 100 samples * 2 bytes each
+    }
+
+    #[test]
+    fn wav_total_size_correct() {
+        let samples = vec![0.0f32; 50];
+        let wav = encode_wav_from_f32(&samples, 44100, 2);
+        // header (44 bytes) + data (50 * 2 = 100 bytes)
+        assert_eq!(wav.len(), 144);
+    }
+
+    #[test]
+    fn wav_encodes_clipped_samples() {
+        // Samples outside [-1, 1] should be clamped
+        let samples = vec![-2.0f32, 2.0, 0.0];
+        let wav = encode_wav_from_f32(&samples, 16000, 1);
+
+        let s0 = i16::from_le_bytes(wav[44..46].try_into().unwrap());
+        let s1 = i16::from_le_bytes(wav[46..48].try_into().unwrap());
+        let s2 = i16::from_le_bytes(wav[48..50].try_into().unwrap());
+
+        assert_eq!(s0, -32767); // clamped to -1.0
+        assert_eq!(s1, 32767); // clamped to 1.0
+        assert_eq!(s2, 0);
+    }
+
+    // ── Config parsing tests ───────────────────────────────
+
+    #[test]
+    fn voice_wake_config_defaults() {
+        let config = VoiceWakeConfig::default();
+        assert_eq!(config.wake_word, "hey omnesagent");
+        assert_eq!(config.silence_timeout_ms, 2000);
+        assert!((config.energy_threshold - 0.01).abs() < f32::EPSILON);
+        assert_eq!(config.max_capture_secs, 30);
+    }
+
+    #[test]
+    fn voice_wake_config_deserialize_partial() {
+        let toml_str = r#"
+            wake_word = "okay agent"
+            max_capture_secs = 60
+        "#;
+        let config: VoiceWakeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.wake_word, "okay agent");
+        assert_eq!(config.max_capture_secs, 60);
+        // Defaults preserved for unset fields
+        assert_eq!(config.silence_timeout_ms, 2000);
+        assert!((config.energy_threshold - 0.01).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn voice_wake_config_deserialize_all_fields() {
+        let toml_str = r#"
+            wake_word = "hello bot"
+            silence_timeout_ms = 3000
+            energy_threshold = 0.05
+            max_capture_secs = 15
+        "#;
+        let config: VoiceWakeConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.wake_word, "hello bot");
+        assert_eq!(config.silence_timeout_ms, 3000);
+        assert!((config.energy_threshold - 0.05).abs() < f32::EPSILON);
+        assert_eq!(config.max_capture_secs, 15);
+    }
+
+    #[test]
+    fn voice_wake_config_channel_config_trait() {
+        assert_eq!(VoiceWakeConfig::name(), "VoiceWake");
+        assert_eq!(VoiceWakeConfig::desc(), "voice wake word detection");
+    }
+
+    // ── State transition logic tests ───────────────────────
+
+    #[test]
+    fn energy_threshold_determines_trigger() {
+        let threshold = 0.01f32;
+        let quiet_energy = compute_rms_energy(&vec![0.005f32; 256]);
+        let loud_energy = compute_rms_energy(&vec![0.5f32; 256]);
+
+        assert!(quiet_energy < threshold, "Quiet should not trigger");
+        assert!(loud_energy >= threshold, "Loud should trigger");
+    }
+
+    #[test]
+    fn state_transitions_are_deterministic() {
+        // Verify that the state enum values are distinct and copyable
+        let states = [
+            WakeState::Listening,
+            WakeState::Triggered,
+            WakeState::Capturing,
+            WakeState::Processing,
+        ];
+        for (i, a) in states.iter().enumerate() {
+            for (j, b) in states.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn channel_config_impl() {
+        // VoiceWakeConfig implements ChannelConfig
+        assert_eq!(VoiceWakeConfig::name(), "VoiceWake");
+        assert!(!VoiceWakeConfig::desc().is_empty());
+    }
+
+    #[test]
+    fn voice_wake_channel_name() {
+        let config = VoiceWakeConfig::default();
+        let transcription_config = TranscriptionConfig::default();
+        let channel = VoiceWakeChannel::new("testbot", config, transcription_config);
+        assert_eq!(channel.name(), "voice_wake");
+    }
+
+    #[test]
+    fn voice_wake_does_not_support_outbound_send() {
+        let channel = VoiceWakeChannel::new(
+            "testbot",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        );
+        assert!(!channel.supports_outbound_send());
+    }
+
+    // ── Transcription provider binding tests ───────────────────
+
+    #[tokio::test]
+    async fn with_agent_transcription_provider_binds_provider_not_alias() {
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        )
+        .with_agent_transcription_provider("groq.default");
+
+        let manager = channel.build_transcription_manager().unwrap();
+        let err = manager
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("groq.default"), "got: {err}");
+        assert!(!err.contains("'frontdoor'"), "got: {err}");
+        assert_eq!(channel.alias, "frontdoor");
+    }
+
+    #[tokio::test]
+    async fn agent_transcription_provider_defaults_empty_when_unset() {
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        );
+        let err = channel
+            .build_transcription_manager()
+            .unwrap()
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no transcription_provider configured"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dotted_typed_provider_dispatches_through_voice_wake_manager() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use omnesagent_config::schema::{Config, LocalWhisperTranscriptionProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "typed provider selected"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut runtime_config = Config::default();
+        runtime_config.providers.transcription.local_whisper.insert(
+            "office".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", server.uri()),
+                ..LocalWhisperTranscriptionProviderConfig::default()
+            },
+        );
+
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        )
+        .with_transcription_manager_factory(move || {
+            TranscriptionManager::from_config_with_provider(
+                &runtime_config,
+                "local_whisper.office".to_string(),
+            )
+        });
+
+        let result = channel
+            .build_transcription_manager()
+            .unwrap()
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "typed provider selected");
+    }
+
+    #[tokio::test]
+    async fn unset_agent_transcription_provider_fails_with_useful_error() {
+        let transcription_config = TranscriptionConfig {
+            api_key: Some("test-groq-key".to_string()),
+            ..TranscriptionConfig::default()
+        };
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            transcription_config,
+        );
+
+        let manager = channel.build_transcription_manager().unwrap();
+        let err = manager
+            .transcribe(&[0u8; 16], "clip.wav")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no transcription_provider configured"),
+            "expected a no-provider-configured error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_agent_transcription_provider_fails_with_useful_error() {
+        let transcription_config = TranscriptionConfig {
+            api_key: Some("test-groq-key".to_string()),
+            ..TranscriptionConfig::default()
+        };
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            transcription_config,
+        )
+        .with_agent_transcription_provider("nonexistent.provider");
+
+        let manager = channel.build_transcription_manager().unwrap();
+        let err = manager
+            .transcribe(&[0u8; 16], "clip.wav")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not configured"),
+            "expected a not-configured error naming the missing provider, got: {msg}"
+        );
+        assert!(
+            msg.contains("nonexistent.provider"),
+            "error should name the missing provider, got: {msg}"
+        );
+    }
+}

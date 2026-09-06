@@ -1,0 +1,8 @@
+[workspace]
+changelog_update = true
+git_tag_enable = true
+semver_check = false
+
+[[package]]
+name = "omnesagent-api"
+semver_check = true

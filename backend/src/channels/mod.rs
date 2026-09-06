@@ -1,0 +1,94 @@
+pub use omnesagent_channels::orchestrator::*;
+#[cfg(feature = "channel-matrix")]
+pub mod matrix;
+#[cfg(feature = "channel-telegram")]
+pub mod telegram;
+pub mod session_backend {
+    pub use omnesagent_infra::session_backend::*;
+}
+pub mod session_sqlite {
+    pub use omnesagent_infra::session_sqlite::*;
+}
+
+use crate::config::Config;
+use anyhow::Result;
+use omnesagent_runtime::i18n::get_required_cli_string;
+use omnesagent_runtime::i18n::get_required_cli_string_with_args;
+
+pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
+    match command {
+        crate::ChannelCommands::Start => {
+            anyhow::bail!("Start must be handled in main.rs (requires async runtime)")
+        }
+        crate::ChannelCommands::Doctor => {
+            anyhow::bail!("Doctor must be handled in main.rs (requires async runtime)")
+        }
+        crate::ChannelCommands::List => {
+            println!("{}", get_required_cli_string("cli-channels-header"));
+            println!("{}", get_required_cli_string("cli-channels-cli-always"));
+            for entry in omnesagent_channels::listing::compiled_channels(&config.channels) {
+                println!(
+                    "  {} {}",
+                    if entry.configured { "✅" } else { "❌" },
+                    entry.name
+                );
+            }
+            let uncompiled =
+                omnesagent_channels::listing::configured_uncompiled_channels(&config.channels);
+            if !uncompiled.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    get_required_cli_string("cli-channels-not-compiled-header")
+                );
+                for entry in &uncompiled {
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-channels-not-compiled-entry",
+                            &[("name", entry.name)]
+                        )
+                    );
+                }
+                println!("{}", get_required_cli_string("cli-channels-build-hint"));
+            }
+            // Notion is a top-level config section, not part of ChannelsConfig
+            #[cfg(feature = "channel-notion")]
+            {
+                let notion_configured =
+                    config.notion.enabled && !config.notion.database_id.trim().is_empty();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-channels-notion",
+                        &[("status", if notion_configured { "✅" } else { "❌" })],
+                    )
+                );
+            }
+            println!();
+            println!("{}", get_required_cli_string("cli-channels-start-hint"));
+            println!("{}", get_required_cli_string("cli-channels-doctor-hint"));
+            println!("{}", get_required_cli_string("cli-channels-configure-hint"));
+            Ok(())
+        }
+        crate::ChannelCommands::Add {
+            channel_type,
+            config: _,
+        } => {
+            anyhow::bail!(
+                "Channel type '{channel_type}' — use `omnesagent config set channels.{channel_type}.<alias>.<field>=<value>` to configure"
+            );
+        }
+        crate::ChannelCommands::Remove { name } => {
+            anyhow::bail!("Remove channel '{name}' — edit ~/.omnesagent/config.toml directly");
+        }
+        crate::ChannelCommands::BindTelegram { identity, alias } => {
+            Box::pin(bind_telegram_identity(config, &identity, &alias)).await
+        }
+        crate::ChannelCommands::Send {
+            message,
+            channel_id,
+            recipient,
+        } => send_channel_message(config, &channel_id, &recipient, &message).await,
+    }
+}

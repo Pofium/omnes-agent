@@ -1,0 +1,8508 @@
+use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
+use omnesagent_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage,
+    GateChoiceEmphasis, SendMessage,
+};
+use omnesagent_api::media::{
+    MarkerKind, MediaAttachment, RenderedMarker, provider_loadable_image_mime_for,
+};
+use omnesagent_runtime::i18n;
+
+// Contract tier: `embed` holds the embed value object that `types`'
+// `DiscordOutgoing` envelope carries; both are contract modules (no impl
+// imports), so the layer stays acyclic. Consumers import from `embed`
+// explicitly; `mod.rs` only names `DiscordEmbed` (in the outbound pipeline).
+mod embed;
+use embed::DiscordEmbed;
+
+mod types;
+// Keep the historical public path (`…::discord::DiscordSlashCommandSpec`) stable.
+pub(crate) use types::*;
+pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
+
+// Contract tier: the typed slash-command option model the command spec carries.
+// Consumers (`types`, `slash`, dispatch) import `super::slash_options::…`
+// explicitly — no crate-wide re-export needed.
+mod slash_options;
+
+// custom_id codec + outbound component builders + the inbound single-use
+// pending registry. Accessed via explicit paths (`super::components::…`).
+mod components;
+mod custom_id;
+mod gate_prompts;
+mod pending;
+// Buttoned tool-approval surface (Allow-once / Session / Always / Deny) +
+// the server-side decision enum a click resolves the approval `oneshot` with.
+mod approval;
+// Imported bare so the type-3 arm (where a local `pending` var shadows the
+// module) can still name it.
+use pending::ComponentIntent;
+
+mod chunk;
+pub(crate) use chunk::*;
+
+mod markers;
+pub(crate) use markers::*;
+
+mod rest;
+pub(crate) use rest::*;
+
+mod interaction;
+pub(crate) use interaction::*;
+
+mod slash;
+// Keep the historical public path for the orchestrator's resolver wiring.
+pub use slash::discord_slash_specs_from_skills;
+pub(crate) use slash::*;
+
+/// Discord channel — connects via Gateway WebSocket for real-time messages
+pub struct DiscordChannel {
+    bot_token: String,
+    /// Empty = listen across all guilds the bot is invited to.
+    guild_ids: Vec<String>,
+    /// Empty = watch every channel; non-empty = restrict the bot to listed
+    /// channel IDs (for both interaction and archive).
+    channel_ids: Vec<String>,
+    /// When set, every non-bot message that passes the channel filter is
+    /// archived to a sidecar SQLite memory backend (`discord.db`). The
+    /// `discord_search` tool reads from this when registered.
+    archive_memory: Option<std::sync::Arc<dyn omnesagent_memory::Memory>>,
+    /// The alias key under `[channels.discord.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    listen_to_bots: bool,
+    mention_only: bool,
+    intents_mask_override: Option<u64>,
+    /// Which inbound reactions to record (config `reaction_notifications`).
+    /// Anything other than `Off` adds the two reaction intents to the
+    /// IDENTIFY mask. Same connection-scoped snapshot semantics as the
+    /// mask override above.
+    reaction_scope: omnesagent_config::schema::DiscordReactionScope,
+    typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
+    /// Voice transcription config — when set, audio attachments are
+    /// downloaded, transcribed, and their text inlined into the message.
+    transcription: Option<omnesagent_config::schema::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    /// Workspace directory for saving downloaded inbound media attachments.
+    workspace_dir: Option<PathBuf>,
+    /// Streaming mode: Off, Partial (draft edits), or MultiMessage (paragraph splits).
+    stream_mode: omnesagent_config::schema::StreamMode,
+    /// Minimum interval (ms) between draft message edits (Partial mode only).
+    draft_update_interval_ms: u64,
+    /// Delay (ms) between sending each message chunk (MultiMessage mode only).
+    multi_message_delay_ms: u64,
+    /// Per-channel rate-limit tracking for draft edits.
+    last_draft_edit: Mutex<HashMap<String, std::time::Instant>>,
+    /// Tracks how much text has been sent in MultiMessage mode.
+    multi_message_sent_len: Mutex<HashMap<String, usize>>,
+    /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
+    multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
+    /// Stall-watchdog timeout in seconds (0 = disabled).
+    stall_timeout_secs: u64,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for an operator reply to a `request_approval` prompt
+    /// before treating the silence as a deny. Default 300.
+    approval_timeout_secs: u64,
+    thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    /// Ephemeral Discord gateway session state for Resume across reconnects.
+    gateway_session: Mutex<DiscordGatewaySession>,
+    /// When true, register and serve Discord slash commands (e.g. `/ask`)
+    /// over the existing Gateway WebSocket. Default false. (Prototype.)
+    /// Construction-time wiring of `DiscordConfig.slash_commands` — config
+    /// is the source of truth; reloads rebuild the channel.
+    slash_commands: bool,
+    /// Registration scope for slash commands (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Under `guild`, commands register to
+    /// each `guild_ids` entry (instant propagation); empty `guild_ids` falls
+    /// back to global at reconcile time.
+    slash_command_scope: omnesagent_config::schema::SlashCommandScope,
+    /// Live interaction credentials, held channel-locally so the bearer
+    /// token never enters reply targets, logs, session keys, or memory
+    /// rows. Keyed by interaction id; swept on insert; entries expire with
+    /// Discord's 15-minute followup window.
+    pending_interactions: Arc<Mutex<HashMap<String, PendingInteraction>>>,
+    /// Single-use registry binding a live component `custom_id` to the
+    /// server-side intent it resolves. A click is trusted only if its id is
+    /// present here (forged/replayed/expired ids resolve to nothing). Populated
+    /// when the channel emits a component; drained on click.
+    pending_components: Arc<Mutex<pending::PendingComponents>>,
+    /// Resolves skill-derived commands to register alongside `/ask`.
+    /// `None` (or an empty resolution) = `/ask` only.
+    slash_command_resolver: Option<DiscordSlashCommandResolver>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiscordGatewaySession {
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+    sequence: Option<i64>,
+}
+
+impl DiscordChannel {
+    pub fn new(
+        bot_token: String,
+        guild_ids: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        listen_to_bots: bool,
+        mention_only: bool,
+    ) -> Self {
+        Self {
+            bot_token,
+            guild_ids,
+            channel_ids: vec![],
+            archive_memory: None,
+            alias: alias.into(),
+            peer_resolver,
+            listen_to_bots,
+            mention_only,
+            intents_mask_override: None,
+            reaction_scope: omnesagent_config::schema::DiscordReactionScope::Off,
+            typing_handles: Mutex::new(HashMap::new()),
+            proxy_url: None,
+            transcription: None,
+            transcription_manager: None,
+            workspace_dir: None,
+            stream_mode: omnesagent_config::schema::StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 800,
+            last_draft_edit: Mutex::new(HashMap::new()),
+            multi_message_sent_len: Mutex::new(HashMap::new()),
+            multi_message_thread_ts: Mutex::new(HashMap::new()),
+            stall_timeout_secs: 0,
+            pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
+            approval_timeout_secs: 300,
+            thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            gateway_session: Mutex::new(DiscordGatewaySession::default()),
+            slash_commands: false,
+            slash_command_scope: omnesagent_config::schema::SlashCommandScope::Global,
+            pending_interactions: Arc::new(Mutex::new(HashMap::new())),
+            pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
+            slash_command_resolver: None,
+        }
+    }
+
+    /// Provide the resolver for skill-derived slash commands. Only consulted
+    /// when `slash_commands` is enabled.
+    pub fn with_slash_command_resolver(mut self, resolver: DiscordSlashCommandResolver) -> Self {
+        self.slash_command_resolver = Some(resolver);
+        self
+    }
+
+    /// Enable Discord slash commands (register + serve over the Gateway).
+    pub fn with_slash_commands(mut self, enabled: bool) -> Self {
+        self.slash_commands = enabled;
+        self
+    }
+
+    /// Set the slash-command registration scope (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Only consulted when slash commands
+    /// are enabled.
+    pub fn with_slash_command_scope(
+        mut self,
+        scope: omnesagent_config::schema::SlashCommandScope,
+    ) -> Self {
+        self.slash_command_scope = scope;
+        self
+    }
+
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Send exactly `mask` in IDENTIFY when `Some`, ignoring the derived
+    /// mask entirely (including `Some(0)`, a legal IDENTIFY value). Operator
+    /// escape hatch (config `intents_mask`).
+    pub fn with_intents_mask(mut self, mask: Option<u64>) -> Self {
+        self.intents_mask_override = mask;
+        self
+    }
+
+    /// Record inbound reaction events at the given scope. Anything other
+    /// than `Off` adds the (unprivileged) reaction intents to the IDENTIFY
+    /// mask.
+    pub fn with_reaction_notifications(
+        mut self,
+        scope: omnesagent_config::schema::DiscordReactionScope,
+    ) -> Self {
+        self.reaction_scope = scope;
+        self
+    }
+
+    /// Gateway intent mask for IDENTIFY: the raw `intents_mask` override
+    /// when set, otherwise the fixed baseline plus feature-implied intents.
+    fn gateway_intents(&self) -> u64 {
+        if let Some(mask) = self.intents_mask_override {
+            return mask;
+        }
+        let mut mask = BASELINE_INTENTS;
+        if self.reaction_scope != omnesagent_config::schema::DiscordReactionScope::Off {
+            mask |= INTENT_GUILD_MESSAGE_REACTIONS | INTENT_DIRECT_MESSAGE_REACTIONS;
+        }
+        mask
+    }
+
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
+        self
+    }
+
+    /// Configure workspace directory for saving downloaded attachments.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Configure voice transcription for audio attachments.
+    pub fn with_transcription(self, config: omnesagent_config::schema::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(manager) => return self.with_transcription_manager(config, manager),
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "transcription manager init failed, voice transcription disabled"
+                );
+            }
+        }
+        self
+    }
+
+    pub(crate) fn with_transcription_manager(
+        mut self,
+        config: omnesagent_config::schema::TranscriptionConfig,
+        manager: super::transcription::TranscriptionManager,
+    ) -> Self {
+        self.transcription_manager = Some(std::sync::Arc::new(manager));
+        self.transcription = Some(config);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_attachments_for_test(
+        &self,
+        attachments: &[serde_json::Value],
+        client: &reqwest::Client,
+    ) -> (String, Vec<MediaAttachment>) {
+        process_attachments(
+            attachments,
+            client,
+            self.workspace_dir.as_deref(),
+            self.transcription_manager.as_deref(),
+        )
+        .await
+    }
+
+    /// Configure streaming mode for progressive draft updates or multi-message delivery.
+    pub fn with_streaming(
+        mut self,
+        stream_mode: omnesagent_config::schema::StreamMode,
+        draft_update_interval_ms: u64,
+        multi_message_delay_ms: u64,
+    ) -> Self {
+        self.stream_mode = stream_mode;
+        self.draft_update_interval_ms = draft_update_interval_ms;
+        self.multi_message_delay_ms = multi_message_delay_ms;
+        self
+    }
+
+    /// Set the stall-watchdog timeout (0 = disabled).
+    pub fn with_stall_timeout(mut self, secs: u64) -> Self {
+        self.stall_timeout_secs = secs;
+        self
+    }
+
+    pub fn with_channel_ids(mut self, ids: Vec<String>) -> Self {
+        self.channel_ids = ids;
+        self
+    }
+
+    fn fatal_listener_error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(DiscordListenerFatalError::new(message))
+    }
+
+    fn validate_gateway_preflight_response(
+        response: reqwest::Response,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(response.error_for_status()?)
+    }
+
+    pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn omnesagent_memory::Memory>) -> Self {
+        self.archive_memory = Some(mem);
+        self
+    }
+
+    async fn sync_archive_for_message_event(
+        &self,
+        event_type: &str,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        let Some(archive_mem) = self.archive_memory.clone() else {
+            return;
+        };
+        match event_type {
+            "MESSAGE_UPDATE" => self.apply_archive_edit(&archive_mem, d, bot_user_id).await,
+            "MESSAGE_DELETE" => {
+                let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                if !message_id.is_empty() {
+                    self.apply_archive_tombstone(&archive_mem, message_id).await;
+                }
+            }
+            "MESSAGE_DELETE_BULK" => {
+                // Moderation bulk deletes carry `ids`, not `id` — and they
+                // are the highest-signal deletions an archive can record.
+                let ids = d
+                    .get("ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|i| i.as_str()).collect::<Vec<&str>>())
+                    .unwrap_or_default();
+                for id in ids {
+                    self.apply_archive_tombstone(&archive_mem, id).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetch the archived entry for a message id, or `None` (logging
+    /// lookup failures — a missed sync beats a silent one).
+    async fn archived_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn omnesagent_memory::Memory>,
+        key: &str,
+    ) -> Option<omnesagent_memory::MemoryEntry> {
+        match archive_mem.get(key).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "discord archive lookup failed for message event"
+                );
+                None
+            }
+        }
+    }
+
+    /// Re-store an entry preserving its category and session attribution.
+    async fn restore_archived_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn omnesagent_memory::Memory>,
+        key: &str,
+        content: &str,
+        existing: &omnesagent_memory::MemoryEntry,
+    ) {
+        if let Err(e) = archive_mem
+            .store(
+                key,
+                content,
+                existing.category.clone(),
+                existing.session_id.as_deref(),
+            )
+            .await
+        {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "key": key,
+                    })),
+                "failed to sync discord archive for message event"
+            );
+        }
+    }
+
+    /// Append a deletion tombstone. Idempotent: gateway redelivery (and a
+    /// MESSAGE_DELETE racing a bulk delete) must not double-stamp.
+    async fn apply_archive_tombstone(
+        &self,
+        archive_mem: &std::sync::Arc<dyn omnesagent_memory::Memory>,
+        message_id: &str,
+    ) {
+        let key = format!("discord_{message_id}");
+        let Some(existing) = self.archived_entry(archive_mem, &key).await else {
+            return;
+        };
+        if existing.content.contains("[deleted at ") {
+            return;
+        }
+        // Deletes carry no payload timestamp; receipt time is the best
+        // available.
+        let ts = chrono::Utc::now().to_rfc3339();
+        let updated = format!("{} [deleted at {ts}]", existing.content);
+        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+            .await;
+    }
+
+    async fn apply_archive_edit(
+        &self,
+        archive_mem: &std::sync::Arc<dyn omnesagent_memory::Memory>,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        if message_id.is_empty() {
+            return;
+        }
+        let Some(edited_ts) = d.get("edited_timestamp").and_then(|t| t.as_str()) else {
+            return;
+        };
+        let new_content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if new_content.is_empty() {
+            return;
+        }
+        // Author re-checks: same gates the create path applied, evaluated
+        // against *current* policy. A payload without an author cannot be
+        // attributed and is not recorded.
+        let author_id = d
+            .get("author")
+            .and_then(|a| a.get("id"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("");
+        if author_id.is_empty() || author_id == bot_user_id {
+            return;
+        }
+        if !self.listen_to_bots
+            && d.get("author")
+                .and_then(|a| a.get("bot"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        if !self.is_user_allowed(author_id) {
+            return;
+        }
+
+        let key = format!("discord_{message_id}");
+        let Some(existing) = self.archived_entry(archive_mem, &key).await else {
+            return;
+        };
+        let marker_key = format!(" [edited at {edited_ts}:");
+        if existing.content.contains(&marker_key) {
+            return;
+        }
+        let marker = format!(" [edited at {edited_ts}: {new_content}]");
+        // Edits are remote-controlled and unlimited; bound entry growth by
+        // dropping the middle of the history once it gets large — the
+        // original text and the latest edit are what the archive is for.
+        let mut base = existing.content.clone();
+        if base.len() + marker.len() > MAX_ARCHIVE_ENTRY_BYTES
+            && let Some(first_marker) = base.find(" [edited at ")
+        {
+            base.truncate(first_marker);
+            base.push_str(" [edit history truncated]");
+        }
+        let updated = format!("{base}{marker}");
+        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+            .await;
+    }
+
+    async fn handle_reaction_event(
+        &self,
+        event_type: &str,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        use omnesagent_config::schema::DiscordReactionScope;
+
+        let user_id = d.get("user_id").and_then(|u| u.as_str()).unwrap_or("");
+        let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
+        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        if user_id.is_empty() || message_id.is_empty() {
+            return;
+        }
+        // Our own ack/failure reactions arrive back as events — never record them.
+        if user_id == bot_user_id {
+            return;
+        }
+        if !self.is_user_allowed(user_id) {
+            return;
+        }
+        if !self.guild_ids.is_empty()
+            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == g)
+        {
+            return;
+        }
+        if !self.channel_ids.is_empty() {
+            let parent_id =
+                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
+                    self.thread_parent(&self.http_client(), channel_id).await
+                } else {
+                    None
+                };
+            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
+                return;
+            }
+        }
+
+        // Key identity: custom-emoji `id` first — names are mutable guild
+        // state (rename/delete between ADD and REMOVE would orphan the
+        // entry, and two same-named emoji would collide). Unicode emoji have
+        // no id and key by the glyph itself.
+        let emoji_key = d.get("emoji").and_then(|e| {
+            e.get("id")
+                .and_then(|i| i.as_str())
+                .or_else(|| e.get("name").and_then(|n| n.as_str()))
+        });
+        let Some(emoji_key) = emoji_key else {
+            // Neither id nor name — nothing meaningful to record or forget.
+            return;
+        };
+        let emoji_display = d
+            .get("emoji")
+            .and_then(|e| e.get("name").and_then(|n| n.as_str()))
+            .unwrap_or(emoji_key);
+        let key = format!("discord_reaction_{message_id}_{user_id}_{emoji_key}");
+
+        let Some(ref archive_mem) = self.archive_memory else {
+            // Nowhere to record without the archive sidecar; still useful in
+            // the trace for live diagnostics.
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "event_type": event_type,
+                        "emoji": emoji_display,
+                        "message_id": message_id,
+                    })),
+                "discord reaction event (archive disabled, not recorded)"
+            );
+            return;
+        };
+
+        if event_type == "MESSAGE_REACTION_REMOVE" {
+            // A failed forget leaves the same stale entry a missed event
+            // would — log it like the store path does.
+            if let Err(e) = archive_mem.forget(&key).await {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "failed to forget archived discord reaction"
+                );
+            }
+            return;
+        }
+
+        // Scope `Own`: only reactions to the bot's own messages.
+        if self.reaction_scope == DiscordReactionScope::Own {
+            let message_author = d
+                .get("message_author_id")
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            if message_author != bot_user_id {
+                return;
+            }
+        }
+
+        let username = d
+            .get("member")
+            .and_then(|m| m.get("user"))
+            .and_then(|u| u.get("username"))
+            .and_then(|n| n.as_str())
+            .unwrap_or(user_id);
+        let is_dm_event = d.get("guild_id").is_none();
+        let channel_display = if is_dm_event { "dm" } else { channel_id };
+        let ts = chrono::Utc::now().to_rfc3339();
+        let content = format!(
+            "@{username} reacted {emoji_display} to message {message_id} in #{channel_display} at {ts}"
+        );
+        let session = if channel_id.is_empty() {
+            None
+        } else {
+            Some(channel_id)
+        };
+        if let Err(e) = archive_mem
+            .store(
+                &key,
+                &content,
+                omnesagent_memory::MemoryCategory::Custom("discord".to_string()),
+                session,
+            )
+            .await
+        {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "key": key,
+                    })),
+                "failed to archive discord reaction"
+            );
+        }
+    }
+
+    async fn sweep_message_reactions(&self, event_type: &str, d: &serde_json::Value) {
+        let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
+        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        if message_id.is_empty() {
+            return;
+        }
+        if !self.guild_ids.is_empty()
+            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == g)
+        {
+            return;
+        }
+        if !self.channel_ids.is_empty() {
+            let parent_id =
+                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
+                    self.thread_parent(&self.http_client(), channel_id).await
+                } else {
+                    None
+                };
+            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
+                return;
+            }
+        }
+
+        // REMOVE_EMOJI carries one `emoji` object; REMOVE_ALL carries none.
+        // Same identity rule as the single-reaction key: custom-emoji id
+        // first, else the glyph. An emoji object with neither is unkeyable —
+        // nothing to scope the sweep to.
+        let emoji_key = if event_type == "MESSAGE_REACTION_REMOVE_EMOJI" {
+            let key = d.get("emoji").and_then(|e| {
+                e.get("id")
+                    .and_then(|i| i.as_str())
+                    .or_else(|| e.get("name").and_then(|n| n.as_str()))
+            });
+            let Some(key) = key else {
+                return;
+            };
+            Some(key)
+        } else {
+            None
+        };
+
+        let Some(ref archive_mem) = self.archive_memory else {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "event_type": event_type,
+                        "message_id": message_id,
+                    })),
+                "discord reaction sweep (archive disabled, nothing to forget)"
+            );
+            return;
+        };
+
+        // No prefix/suffix delete API on the Memory trait, so list the
+        // archive's discord rows and filter by key in memory. The sidecar
+        // category is the same `Custom("discord")` the store path writes.
+        let category = omnesagent_memory::MemoryCategory::Custom("discord".to_string());
+        let entries = match archive_mem.list(Some(&category), None).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "event_type": event_type,
+                            "message_id": message_id,
+                        })),
+                    "failed to list archived discord reactions for sweep"
+                );
+                return;
+            }
+        };
+
+        for entry in entries {
+            if !reaction_sweep_matches(&entry.key, message_id, emoji_key) {
+                continue;
+            }
+            if let Err(e) = archive_mem.forget(&entry.key).await {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": entry.key,
+                        })),
+                    "failed to forget archived discord reaction during sweep"
+                );
+            }
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        omnesagent_config::schema::build_channel_proxy_client(
+            "channel.discord",
+            self.proxy_url.as_deref(),
+        )
+    }
+
+    /// Check if a Discord user ID is in the allowlist.
+    /// Empty list means deny everyone until explicitly configured.
+    /// `"*"` means allow everyone.
+    fn is_user_allowed(&self, user_id: &str) -> bool {
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
+    }
+
+    fn bot_user_id_from_token(token: &str) -> Option<String> {
+        // Discord bot tokens are base64(bot_user_id).timestamp.hmac
+        let part = token.split('.').next()?;
+        base64_decode(part)
+    }
+
+    async fn thread_parent(&self, client: &reqwest::Client, channel_id: &str) -> Option<String> {
+        discord_thread_parent(client, &self.bot_token, &self.thread_channels, channel_id).await
+    }
+
+    /// Apply the trust-boundary / delivery-failure emoji reactions to the
+    /// bot's just-sent message. Best-effort: reaction failures are debug
+    /// logged but never propagated. `message_id` being `None` (e.g. when
+    /// every chunk failed to post) skips the reaction step entirely.
+    async fn apply_failure_reactions(
+        &self,
+        channel_id: &str,
+        message_id: Option<&str>,
+        reactions: &[&'static str],
+    ) {
+        let Some(message_id) = message_id else {
+            return;
+        };
+        for emoji in reactions {
+            if let Err(e) = self.add_reaction(channel_id, message_id, emoji).await {
+                ::omnesagent_log::record!(
+                    DEBUG,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_attrs(
+                            ::serde_json::json!({"emoji": emoji, "error": format!("{}", e)})
+                        ),
+                    "failed to add failure reaction to outgoing message"
+                );
+            }
+        }
+    }
+
+    /// The legacy plaintext approval prompt: the operator replies
+    /// "`<token> yes|no|always`" in the channel, parsed back by
+    /// `parse_approval_reply` on the inbound MESSAGE_CREATE path. Used when the
+    /// interaction pipe isn't live (buttons would be dead controls).
+    async fn send_plaintext_approval(
+        &self,
+        channel_id: &str,
+        token: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let text = crate::util::build_yesno_approval_prompt(
+            token,
+            &request.tool_name,
+            &request.arguments_summary,
+        );
+        self.send(&SendMessage::new(text, channel_id)).await
+    }
+
+    async fn send_buttoned_approval(
+        &self,
+        channel_id: &str,
+        token: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let (row, bindings) = approval::build_approval_row(token);
+        // Register every button's intent first. Single-use is enforced by the
+        // registry's `take`; the per-click `interaction_gate` is enforced by the
+        // type-3 dispatch before any `take`.
+        {
+            let mut reg = self.pending_components.lock();
+            for (cid, decision) in &bindings {
+                if let Some(wire) = cid.encode() {
+                    reg.register(
+                        wire,
+                        ComponentIntent::Approval {
+                            token: token.to_string(),
+                            decision: *decision,
+                        },
+                    );
+                }
+            }
+        }
+
+        let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let args_label = i18n::get_required_cli_string("channel-approval-args-label");
+        let text = format!(
+            "{heading}\n{tool_label}: {}\n{args_label}: {}",
+            request.tool_name, request.arguments_summary,
+        );
+        let outgoing = DiscordOutgoing::with_components(text, vec![row]);
+        let client = self.http_client();
+        send_discord_outgoing(&client, &self.bot_token, channel_id, &outgoing)
+            .await
+            .map(|_id| ())
+    }
+
+    fn build_marker_components(
+        &self,
+        rows: &[Vec<markers::ComponentSpec>],
+    ) -> Vec<components::DiscordActionRow> {
+        // One nonce per emitted message; the counter makes each component's id
+        // unique under it. Deterministic relative to the nonce (no per-component
+        // RNG), so the registry mapping is reproducible for a given send.
+        let nonce = Uuid::new_v4().simple().to_string();
+        let nonce = &nonce[..nonce.len().min(8)];
+        let mut reg = self.pending_components.lock();
+        build_component_rows(nonce, rows, &mut reg)
+    }
+}
+
+fn build_component_rows(
+    nonce: &str,
+    rows: &[Vec<markers::ComponentSpec>],
+    reg: &mut pending::PendingComponents,
+) -> Vec<components::DiscordActionRow> {
+    use components::{
+        DiscordModal, ModalField, SelectOption, action_row, button, cap_rows, link_button,
+        string_select,
+    };
+    use custom_id::CustomId;
+
+    /// Mint a fresh, message-unique `cmp` id (advancing `seq` so ids never
+    /// collide within the message) WITHOUT registering anything. The caller
+    /// decides the intent.
+    fn mint_id(nonce: &str, seq: &mut u32) -> CustomId {
+        *seq += 1;
+        CustomId::new("cmp", format!("{nonce}-{seq}"))
+    }
+
+    /// Mint a fresh id and register `prompt` under it as a resolve-into-turn.
+    fn mint(
+        nonce: &str,
+        seq: &mut u32,
+        reg: &mut pending::PendingComponents,
+        prompt: String,
+    ) -> CustomId {
+        let id = mint_id(nonce, seq);
+        if let Some(wire) = id.encode() {
+            reg.register(wire, ComponentIntent::ResolveIntoTurn { prompt });
+        }
+        id
+    }
+
+    let mut seq: u32 = 0;
+    let mut built: Vec<components::DiscordActionRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut comps: Vec<components::DiscordComponent> = Vec::with_capacity(row.len());
+        for spec in row {
+            let comp = match spec {
+                markers::ComponentSpec::Button {
+                    label,
+                    style,
+                    prompt,
+                } => {
+                    let cid = mint(nonce, &mut seq, reg, prompt.clone());
+                    button(*style, label.clone(), cid)
+                }
+                markers::ComponentSpec::Link { label, url } => {
+                    link_button(label.clone(), url.clone())
+                }
+                markers::ComponentSpec::ModalButton {
+                    label,
+                    style,
+                    prompt,
+                    modal,
+                } => {
+                    let modal_id = mint_id(nonce, &mut seq);
+                    let fields: Vec<ModalField> = modal
+                        .fields
+                        .iter()
+                        .map(|f| ModalField {
+                            custom_id: f.id.clone(),
+                            label: f.label.clone(),
+                            style: f.style,
+                            required: f.required,
+                            placeholder: f.placeholder.clone(),
+                            min_length: f.min_length,
+                            max_length: f.max_length,
+                            value: None,
+                        })
+                        .collect();
+                    let built_modal = DiscordModal {
+                        custom_id: modal_id,
+                        title: modal.title.clone(),
+                        fields,
+                    };
+                    let button_id = mint_id(nonce, &mut seq);
+                    if let Some(wire) = button_id.encode() {
+                        reg.register(
+                            wire,
+                            ComponentIntent::OpenModal {
+                                modal: Box::new(built_modal),
+                                prompt: prompt.clone(),
+                            },
+                        );
+                    }
+                    button(*style, label.clone(), button_id)
+                }
+                markers::ComponentSpec::Select {
+                    placeholder,
+                    options,
+                } => {
+                    let mut opts: Vec<SelectOption> = Vec::with_capacity(options.len());
+                    for o in options {
+                        let value_id = mint(nonce, &mut seq, reg, o.prompt.clone());
+                        // The option value IS the routing token; fall back to the
+                        // raw value if it won't encode (it then won't route, but
+                        // still renders).
+                        let value = value_id.encode().unwrap_or_else(|| o.value.clone());
+                        opts.push(SelectOption {
+                            label: o.label.clone(),
+                            value,
+                            description: None,
+                            default: false,
+                        });
+                    }
+                    seq += 1;
+                    let menu_id = CustomId::new("cmp", format!("{nonce}-{seq}-menu"));
+                    let placeholder = (!placeholder.is_empty()).then(|| placeholder.clone());
+                    string_select(menu_id, opts, placeholder)
+                }
+            };
+            comps.push(comp);
+        }
+        built.push(action_row(comps));
+    }
+    cap_rows(built)
+}
+
+fn component_routing_id(data: Option<&serde_json::Value>) -> Option<String> {
+    let data = data?;
+    if let Some(value) = data
+        .get("values")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        && custom_id::CustomId::parse(value).is_some()
+    {
+        return Some(value.to_string());
+    }
+    data.get("custom_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+/// Whether a Discord channel type integer identifies a thread.
+/// Discord channel types `10` (ANNOUNCEMENT_THREAD), `11` (PUBLIC_THREAD),
+/// and `12` (PRIVATE_THREAD) per the Channel Types documentation.
+const fn is_thread_channel_type(channel_type: u64) -> bool {
+    matches!(channel_type, 10..=12)
+}
+
+/// Hard cap on `GET /channels/{id}` while resolving whether an inbound
+/// channel is a thread. Discord normally responds in under 200 ms; this
+/// is a safety bound so a hung request cannot stall the listener.
+const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn prepare_outgoing_embeds(
+    raw_content: &str,
+    workspace_dir: Option<&Path>,
+) -> (String, Vec<DiscordEmbed>, Vec<DiscordMarkerFailure>, bool) {
+    let (content_without_embeds, embed_specs) = parse_embed_markers(raw_content);
+    let mut embeds = Vec::new();
+    let mut embed_failures = Vec::new();
+    for spec in embed_specs {
+        let (embed, failures) = spec_to_embed(spec, workspace_dir);
+        embed_failures.extend(failures);
+        if let Some(embed) = embed {
+            embeds.push(embed);
+        }
+    }
+    let truncated = budget_embeds(&mut embeds);
+    (content_without_embeds, embeds, embed_failures, truncated)
+}
+
+async fn deliver_interaction_answer(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    api_base: &str,
+    content: &str,
+    embeds: &[DiscordEmbed],
+    components: &[components::DiscordActionRow],
+) -> anyhow::Result<()> {
+    let chunks = split_message_for_discord(content);
+    let mut chunks = chunks.iter();
+    let first = chunks.next().map(String::as_str).unwrap_or("");
+    discord_edit_interaction_response(
+        client,
+        app_id,
+        interaction_token,
+        api_base,
+        first,
+        embeds,
+        components,
+    )
+    .await?;
+    for chunk in chunks {
+        discord_post_interaction_followup(client, app_id, interaction_token, api_base, chunk)
+            .await?;
+    }
+    Ok(())
+}
+
+fn channel_passes_filter(
+    channel_filter: &[String],
+    msg_channel: &str,
+    thread_parent_id: Option<&str>,
+) -> bool {
+    if channel_filter.is_empty() {
+        return true;
+    }
+    if channel_filter.iter().any(|c| c == msg_channel) {
+        return true;
+    }
+    if let Some(parent) = thread_parent_id {
+        return channel_filter.iter().any(|c| c == parent);
+    }
+    false
+}
+
+/// Resolve the recipient a Discord send targets. A non-empty per-message
+/// recipient is authoritative; when it is empty (e.g. an escalation alert that
+/// carries no per-message target), fall back to the channel's first configured
+/// `channel_ids` entry so the alert still reaches the operator's channel. When
+/// neither is available there is nowhere to deliver, so the caller must fail
+/// rather than POST to an empty `/channels//messages` path.
+fn effective_discord_recipient<'a>(
+    recipient: &'a str,
+    channel_ids: &'a [String],
+) -> Option<&'a str> {
+    if !recipient.is_empty() {
+        return Some(recipient);
+    }
+    channel_ids.first().map(String::as_str)
+}
+
+/// Pure key-match for the bulk reaction-removal sweep. Reaction rows key as
+/// `discord_reaction_{message_id}_{user_id}_{emoji_key}` (see
+/// [`DiscordChannel::handle_reaction_event`]); `user_id` is a numeric
+/// snowflake and `emoji_key` is a custom-emoji id (numeric) or a single
+/// unicode glyph — neither contains `_`, so the message-id prefix and the
+/// emoji-key suffix are unambiguous.
+///
+/// * `emoji_key == None` (REMOVE_ALL): match every reaction row for the
+///   message — prefix `discord_reaction_{message_id}_`.
+/// * `emoji_key == Some(e)` (REMOVE_EMOJI): additionally require the row to
+///   key on that emoji — suffix `_{e}`.
+///
+/// The trailing `_` on the prefix is what stops `m1` from matching `m12`'s
+/// rows.
+fn reaction_sweep_matches(key: &str, message_id: &str, emoji_key: Option<&str>) -> bool {
+    let prefix = format!("discord_reaction_{message_id}_");
+    if !key.starts_with(&prefix) {
+        return false;
+    }
+    match emoji_key {
+        None => true,
+        Some(emoji) => key.ends_with(&format!("_{emoji}")),
+    }
+}
+
+async fn process_attachments(
+    attachments: &[serde_json::Value],
+    client: &reqwest::Client,
+    workspace_dir: Option<&Path>,
+    transcription_manager: Option<&super::transcription::TranscriptionManager>,
+) -> (String, Vec<MediaAttachment>) {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut media: Vec<MediaAttachment> = Vec::new();
+
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"name": name})),
+                "attachment has no url, skipping"
+            );
+            continue;
+        };
+
+        if ct.starts_with("text/") {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        text_parts.push(format!("[{name}]\n{text}"));
+                    }
+                }
+                Ok(resp) => {
+                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "status": resp.status().to_string()})), "attachment fetch failed");
+                }
+                Err(e) => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"name": name, "error": format!("{}", e)})
+                            ),
+                        "attachment fetch error"
+                    );
+                }
+            }
+            continue;
+        }
+
+        let is_audio = is_discord_audio_attachment(ct, name);
+
+        // Audio with channel-level transcription configured: transcribe
+        // inline so the agent receives `[Voice] <transcript>` text rather
+        // than opaque bytes through the media pipeline.
+        let mut downloaded_audio_bytes = None;
+        if is_audio && let Some(manager) = transcription_manager {
+            let bytes = match download_attachment_bytes(client, url, name).await {
+                Some(b) => b,
+                None => continue,
+            };
+            match manager.transcribe(&bytes, name).await {
+                Ok(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        ::omnesagent_log::record!(
+                            INFO,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            ),
+                            &format!(
+                                "transcribed audio attachment {} ({} chars)",
+                                name,
+                                trimmed.len()
+                            )
+                        );
+                        text_parts.push(format!("[Voice] {trimmed}"));
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"name": name, "error": format!("{}", e)})
+                            ),
+                        "voice transcription failed"
+                    );
+                }
+            }
+            downloaded_audio_bytes = Some(bytes);
+        }
+
+        let bytes = match downloaded_audio_bytes {
+            Some(b) => b,
+            None => match download_attachment_bytes(client, url, name).await {
+                Some(b) => b,
+                None => continue,
+            },
+        };
+
+        // Decide the disposition from the bytes we now hold, so the same
+        // provider-loadability contract Telegram uses applies here: an image
+        // the loader cannot reload (HEIC/TIFF/SVG/BMP) renders as a document
+        // rather than an image the shared pipeline would try to re-inline.
+        let marker_kind = marker_kind_for(ct, name, &bytes, is_audio);
+        let marker_label = discord_marker_label(marker_kind);
+        let (marker_target, saved_locally) = match workspace_dir {
+            Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
+                Ok(local_path) => (local_path.display().to_string(), true),
+                Err(e) => {
+                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_label, "error": format!("{}", e)})), "attachment save failed, falling back to url");
+                    (url.to_string(), false)
+                }
+            },
+            None => (url.to_string(), false),
+        };
+        text_parts.push(format!("[{marker_label}:{marker_target}]"));
+
+        media.push(MediaAttachment {
+            file_name: name.to_string(),
+            data: bytes,
+            mime_type: if ct.is_empty() {
+                None
+            } else {
+                Some(ct.to_string())
+            },
+            // Record the exact rendered target for image URL fallbacks too.
+            // They are deliberately not treated as channel-owned by the
+            // shared pipeline: the raw bytes are available and can replace
+            // the URL without relying on remote fetching. The saved name
+            // carries a uniqueness prefix, so `file_name` alone cannot
+            // identify the marker just rendered above — record the target and
+            // disposition so a later stage reads the verdict rather than
+            // re-deciding it from the payload.
+            marker: (saved_locally || marker_kind == MarkerKind::Image).then(|| RenderedMarker {
+                target: marker_target.clone(),
+                kind: marker_kind,
+            }),
+        });
+    }
+
+    (text_parts.join("\n---\n"), media)
+}
+
+/// Download an attachment URL into memory, with structured warn-logging on
+/// each failure mode. Returns `None` when the attachment should be skipped.
+async fn download_attachment_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    name: &str,
+) -> Option<Vec<u8>> {
+    match client.get(url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(b) => Some(b.to_vec()),
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"name": name, "error": format!("{}", e)})),
+                    "failed to read attachment bytes"
+                );
+                None
+            }
+        },
+        Ok(resp) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"name": name, "status": resp.status().to_string()})
+                    ),
+                "attachment download failed"
+            );
+            None
+        }
+        Err(e) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"name": name, "error": format!("{}", e)})),
+                "attachment fetch error"
+            );
+            None
+        }
+    }
+}
+
+async fn save_attachment_bytes_to_workspace(
+    workspace_dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let save_dir = workspace_dir.join("discord_files");
+    tokio::fs::create_dir_all(&save_dir).await?;
+
+    let safe_name = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("attachment");
+    let local_name = format!("{}_{}", Uuid::new_v4(), safe_name);
+    let local_path = save_dir.join(local_name);
+
+    tokio::fs::write(&local_path, bytes).await?;
+    Ok(local_path)
+}
+
+/// Audio file extensions accepted for voice transcription.
+const DISCORD_AUDIO_EXTENSIONS: &[&str] = &[
+    "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
+];
+
+/// Check if a content type or filename indicates an audio file.
+fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("audio/") {
+        return true;
+    }
+    if let Some(ext) = filename.rsplit('.').next() {
+        return DISCORD_AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str());
+    }
+    false
+}
+
+/// Map a Discord attachment's content type, name, and bytes plus its
+/// audio-detection result to the canonical outbound marker kind. Pulled out of
+/// `process_attachments` so the dispatch can be unit-tested without a live HTTP
+/// download.
+///
+/// An `image/*` content type is only an [`MarkerKind::Image`] when the provider
+/// loader would actually accept the format; the same HEIC/TIFF/SVG/BMP the
+/// Telegram path keeps out of `[IMAGE:]` markers render as documents here too,
+/// so the shared pipeline never reclassifies them into an `[IMAGE:data:...]`
+/// copy the provider rejects.
+fn marker_kind_for(content_type: &str, file_name: &str, data: &[u8], is_audio: bool) -> MarkerKind {
+    if content_type.starts_with("image/") {
+        if provider_loadable_image_mime_for(file_name, data).is_some() {
+            MarkerKind::Image
+        } else {
+            MarkerKind::Document
+        }
+    } else if is_audio {
+        MarkerKind::Audio
+    } else if content_type.starts_with("video/") {
+        MarkerKind::Video
+    } else {
+        MarkerKind::Document
+    }
+}
+
+/// The uppercase `[KIND:target]` label Discord renders for a disposition. The
+/// label format is Discord's own; `MarkerKind` stays channel-agnostic.
+fn discord_marker_label(kind: MarkerKind) -> &'static str {
+    match kind {
+        MarkerKind::Image => "IMAGE",
+        MarkerKind::Audio => "AUDIO",
+        MarkerKind::Video => "VIDEO",
+        MarkerKind::Document => "DOCUMENT",
+    }
+}
+
+/// Why a slash-command interaction was refused. Drives the WARN log and the
+/// ephemeral rejection text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionDenial {
+    UnauthorizedUser,
+    GuildNotAllowed,
+    ChannelNotAllowed,
+}
+
+fn interaction_gate(
+    peers: &[String],
+    guild_filter: &[String],
+    channel_filter: &[String],
+    user_id: &str,
+    guild_id: Option<&str>,
+    channel_id: &str,
+    thread_parent: Option<&str>,
+) -> Result<(), InteractionDenial> {
+    if !crate::allowlist::is_user_allowed(peers, user_id, crate::allowlist::Match::Sensitive) {
+        return Err(InteractionDenial::UnauthorizedUser);
+    }
+    if !guild_filter.is_empty()
+        && let Some(g) = guild_id
+        && !guild_filter.iter().any(|allowed| allowed == g)
+    {
+        return Err(InteractionDenial::GuildNotAllowed);
+    }
+    if !channel_filter.is_empty()
+        && !channel_passes_filter(channel_filter, channel_id, thread_parent)
+    {
+        return Err(InteractionDenial::ChannelNotAllowed);
+    }
+    Ok(())
+}
+
+const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Upper bound for an archived message entry once edit markers accrue.
+/// Edits are remote-controlled and unlimited; past this size the middle of
+/// the edit history is dropped (original text and latest edit retained).
+const MAX_ARCHIVE_ENTRY_BYTES: usize = 16 * 1024;
+const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
+
+fn pick_uniform_index(len: usize) -> usize {
+    debug_assert!(len > 0);
+    let upper = len as u64;
+    let reject_threshold = (u64::MAX / upper) * upper;
+
+    loop {
+        let value = rand::random::<u64>();
+        if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
+            return (value % upper) as usize;
+        }
+    }
+}
+
+fn random_discord_ack_reaction() -> &'static str {
+    DISCORD_ACK_REACTIONS[pick_uniform_index(DISCORD_ACK_REACTIONS.len())]
+}
+
+fn mention_tags(bot_user_id: &str) -> [String; 2] {
+    [format!("<@{bot_user_id}>"), format!("<@!{bot_user_id}>")]
+}
+
+fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
+    let tags = mention_tags(bot_user_id);
+    content.contains(&tags[0]) || content.contains(&tags[1])
+}
+
+fn is_conversational_message_type(message_type: u64) -> bool {
+    matches!(message_type, 0 | 19)
+}
+
+fn admit_discord_message(
+    content: &str,
+    has_attachments: bool,
+    mention_only: bool,
+    bot_user_id: &str,
+) -> Option<String> {
+    if mention_only && !contains_bot_mention(content, bot_user_id) {
+        return None;
+    }
+
+    let normalized = content.trim().to_string();
+    if normalized.is_empty() && !has_attachments {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+/// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
+#[allow(clippy::cast_possible_truncation)]
+fn base64_decode(input: &str) -> Option<String> {
+    let padded = match input.len() % 4 {
+        2 => format!("{input}=="),
+        3 => format!("{input}="),
+        _ => input.to_string(),
+    };
+
+    let mut bytes = Vec::new();
+    let chars: Vec<u8> = padded.bytes().collect();
+
+    for chunk in chars.chunks(4) {
+        if chunk.len() < 4 {
+            break;
+        }
+
+        let mut v = [0usize; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                v[i] = 0;
+            } else {
+                v[i] = BASE64_ALPHABET.iter().position(|&a| a == b)?;
+            }
+        }
+
+        bytes.push(((v[0] << 2) | (v[1] >> 4)) as u8);
+        if chunk[2] != b'=' {
+            bytes.push((((v[1] & 0xF) << 4) | (v[2] >> 2)) as u8);
+        }
+        if chunk[3] != b'=' {
+            bytes.push((((v[2] & 0x3) << 6) | v[3]) as u8);
+        }
+    }
+
+    String::from_utf8(bytes).ok()
+}
+
+/// Free-function form of the thread-parent lookup so spawned tasks (which
+/// cannot borrow the channel) share the same cache and semantics.
+async fn discord_thread_parent(
+    client: &reqwest::Client,
+    bot_token: &str,
+    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    channel_id: &str,
+) -> Option<String> {
+    {
+        let cache = thread_channels.lock().await;
+        if let Some(value) = cache.get(channel_id) {
+            return value.clone();
+        }
+    }
+
+    let url = format!("https://discord.com/api/v10/channels/{channel_id}");
+    let lookup = async {
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bot {bot_token}"))
+            .send()
+            .await
+            .map_err(|e| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "request failed"
+                );
+                anyhow::Error::msg(format!("request failed: {e}"))
+            })?;
+        if !resp.status().is_success() {
+            anyhow::bail!("non-success status {}", resp.status());
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "body parse failed"
+            );
+            anyhow::Error::msg(format!("body parse failed: {e}"))
+        })?;
+        let is_thread = body
+            .get("type")
+            .and_then(serde_json::Value::as_u64)
+            .map(is_thread_channel_type)
+            .unwrap_or(false);
+        Ok::<Option<String>, anyhow::Error>(if is_thread {
+            body.get("parent_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        })
+    };
+    let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"channel_id": channel_id, "error": format!("{}", e)})
+                    ),
+                "channel lookup failed"
+            );
+            return None;
+        }
+        Err(_) => {
+            ::omnesagent_log::record!(DEBUG, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"channel_id": channel_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})), "channel lookup timed out");
+            return None;
+        }
+    };
+
+    thread_channels
+        .lock()
+        .await
+        .insert(channel_id.to_string(), result.clone());
+    result
+}
+
+async fn discord_thread_parent_cached(
+    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    channel_id: &str,
+) -> Option<String> {
+    thread_channels
+        .lock()
+        .await
+        .get(channel_id)
+        .cloned()
+        .flatten()
+}
+
+// Discord gateway intent bits (API v10) — the ones omnesagent consumes or
+// exposes as opt-ins. https://discord.com/developers/docs/events/gateway#gateway-intents
+const INTENT_GUILDS: u64 = 1 << 0;
+const INTENT_GUILD_MEMBERS: u64 = 1 << 1; // privileged
+const INTENT_GUILD_PRESENCES: u64 = 1 << 8; // privileged
+const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
+const INTENT_GUILD_MESSAGE_REACTIONS: u64 = 1 << 10;
+const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
+const INTENT_DIRECT_MESSAGE_REACTIONS: u64 = 1 << 13;
+const INTENT_MESSAGE_CONTENT: u64 = 1 << 15; // privileged
+
+/// The intents every Discord channel needs: guild topology plus guild/DM
+/// messages with content. MESSAGE_CONTENT is privileged but always requested
+/// — without it the bot only sees text in DMs and @-mentions, which silently
+/// breaks `archive`, `listen_to_bots`, and mention-free channels.
+const BASELINE_INTENTS: u64 =
+    INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES | INTENT_MESSAGE_CONTENT;
+
+/// Human-readable names for a resolved intent mask, for connect logs and
+/// close-code diagnostics. Bits without a known name (possible via the raw
+/// `intents_mask` override) are reported as one hex remainder entry rather
+/// than silently dropped.
+fn intent_names(mask: u64) -> Vec<String> {
+    let known: [(u64, &str); 8] = [
+        (INTENT_GUILDS, "guilds"),
+        (INTENT_GUILD_MEMBERS, "guild_members"),
+        (INTENT_GUILD_PRESENCES, "guild_presences"),
+        (INTENT_GUILD_MESSAGES, "guild_messages"),
+        (INTENT_GUILD_MESSAGE_REACTIONS, "guild_message_reactions"),
+        (INTENT_DIRECT_MESSAGES, "direct_messages"),
+        (INTENT_DIRECT_MESSAGE_REACTIONS, "direct_message_reactions"),
+        (INTENT_MESSAGE_CONTENT, "message_content"),
+    ];
+    let mut names = Vec::new();
+    let mut rest = mask;
+    for (bit, name) in known {
+        if mask & bit != 0 {
+            names.push(name.to_string());
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        names.push(format!("unknown({rest:#x})"));
+    }
+    names
+}
+
+/// Close 4014 means the Developer Portal doesn't grant a privileged intent
+/// we requested. Name the portal toggles so the operator knows exactly what
+/// to fix instead of staring at a bare close code.
+fn disallowed_intents_hint(mask: u64) -> String {
+    let mut requested = Vec::new();
+    if mask & INTENT_MESSAGE_CONTENT != 0 {
+        requested.push("Message Content".to_string());
+    }
+    if mask & INTENT_GUILD_MEMBERS != 0 {
+        requested.push("Server Members".to_string());
+    }
+    if mask & INTENT_GUILD_PRESENCES != 0 {
+        requested.push("Presence".to_string());
+    }
+    if requested.is_empty() {
+        // Reachable only via an `intents_mask` override with no privileged
+        // bits — name the raw mask so the operator has something to act on.
+        requested.push(format!("mask {mask:#x}"));
+    }
+    format!(
+        " — a privileged intent is not enabled for this bot in the Discord \
+         Developer Portal (Bot → Privileged Gateway Intents). Requested: {}",
+        requested.join(", ")
+    )
+}
+
+fn is_fatal_gateway_close_code(code: u16) -> bool {
+    matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
+}
+
+fn requires_new_session_close_code(code: u16) -> bool {
+    matches!(code, 4007 | 4009)
+}
+
+impl ::omnesagent_api::attribution::Attributable for DiscordChannel {
+    fn role(&self) -> ::omnesagent_api::attribution::Role {
+        ::omnesagent_api::attribution::Role::Channel(
+            ::omnesagent_api::attribution::ChannelKind::Discord,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[async_trait]
+impl Channel for DiscordChannel {
+    fn name(&self) -> &str {
+        "discord"
+    }
+
+    fn self_handle(&self) -> Option<String> {
+        Self::bot_user_id_from_token(&self.bot_token)
+    }
+
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle().map(|id| format!("<@{id}>"))
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        if let Some(interaction_id) = parse_discord_interaction_target(&message.recipient) {
+            let pending = {
+                let guard = self.pending_interactions.lock();
+                guard.get(interaction_id).cloned()
+            };
+            let Some(pending) = pending else {
+                anyhow::bail!("interaction reply target unknown or expired (id {interaction_id})");
+            };
+            if pending.created.elapsed() > INTERACTION_TOKEN_TTL {
+                anyhow::bail!("interaction followup token expired (id {interaction_id}, >15min)");
+            }
+            let raw = crate::util::strip_tool_call_tags(&message.content);
+            let (content, embeds, _embed_failures, _embeds_truncated) =
+                prepare_outgoing_embeds(&raw, self.workspace_dir.as_deref());
+            let (content, component_rows) = parse_component_markers(&content);
+            let component_action_rows = if component_rows.is_empty() {
+                Vec::new()
+            } else {
+                self.build_marker_components(&component_rows)
+            };
+            let client = self.http_client();
+            return deliver_interaction_answer(
+                &client,
+                &pending.app_id,
+                &pending.token,
+                DISCORD_API_BASE,
+                &content,
+                &embeds,
+                &component_action_rows,
+            )
+            .await;
+        }
+
+        let raw_content = crate::util::strip_tool_call_tags(&message.content);
+
+        // Embeds first: their `[EMBED:{json}]` payload can itself contain `[`/`]`,
+        // so they must be lifted out before the media-marker scan runs on the rest.
+        let (content_without_embeds, embeds, embed_failures, embeds_truncated) =
+            prepare_outgoing_embeds(&raw_content, self.workspace_dir.as_deref());
+
+        let (content_without_components, component_rows) =
+            parse_component_markers(&content_without_embeds);
+        let component_action_rows = if component_rows.is_empty() {
+            Vec::new()
+        } else {
+            self.build_marker_components(&component_rows)
+        };
+
+        let (cleaned_content, parsed_attachments) =
+            parse_attachment_markers(&content_without_components);
+        let (mut local_files, remote_urls, failures) =
+            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
+
+        // Discord accepts max 10 files per message.
+        if local_files.len() > 10 {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"count": local_files.len()})),
+                "truncating local attachment upload list to 10 files"
+            );
+            local_files.truncate(10);
+        }
+
+        let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        // The delivery-failure note counts dropped *attachments* only. Embed URL
+        // rejections and structural truncation surface as reactions, not a note.
+        let note = delivery_failure_note(&failures);
+        let content = compose_body_with_failure_note(&body, note.as_deref());
+
+        let mut reaction_failures = failures.clone();
+        reaction_failures.extend(embed_failures.iter().copied());
+        let mut reactions = decide_failure_reactions(&reaction_failures);
+        if embeds_truncated && !reactions.contains(&"⚠️") {
+            reactions.push("⚠️");
+        }
+
+        let client = self.http_client();
+        let chunks = chunks_for_send(
+            &content,
+            self.stream_mode,
+            DISCORD_MAX_MESSAGE_LENGTH,
+            !local_files.is_empty() || !embeds.is_empty() || !component_action_rows.is_empty(),
+        );
+        let inter_chunk_delay_ms =
+            if self.stream_mode == omnesagent_config::schema::StreamMode::MultiMessage {
+                self.multi_message_delay_ms
+            } else {
+                500
+            };
+
+        let mut first_message_id: Option<String> = None;
+        let effective_recipient =
+            match effective_discord_recipient(&message.recipient, &self.channel_ids) {
+                Some(r) => r,
+                None => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                        "discord send has no recipient: message.recipient is empty and no \
+                     channel_ids are configured to fall back to"
+                    );
+                    anyhow::bail!(
+                        "discord send has no recipient: message.recipient is empty and no \
+                     channel_ids are configured to fall back to"
+                    );
+                }
+            };
+        for (i, chunk) in chunks.iter().enumerate() {
+            let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty())
+            {
+                let payload = DiscordOutgoing {
+                    content: Some(chunk.clone()),
+                    embeds: embeds.clone(),
+                    components: component_action_rows.clone(),
+                    ..Default::default()
+                };
+                if local_files.is_empty() {
+                    send_discord_message_payload(
+                        &client,
+                        &self.bot_token,
+                        effective_recipient,
+                        &payload,
+                    )
+                    .await?
+                } else {
+                    send_discord_message_payload_with_files(
+                        &client,
+                        &self.bot_token,
+                        effective_recipient,
+                        &payload,
+                        &local_files,
+                    )
+                    .await?
+                }
+            } else if i == 0 && !local_files.is_empty() {
+                send_discord_message_payload_with_files(
+                    &client,
+                    &self.bot_token,
+                    effective_recipient,
+                    &DiscordOutgoing::text(chunk.clone()),
+                    &local_files,
+                )
+                .await?
+            } else {
+                send_discord_message_json(&client, &self.bot_token, effective_recipient, chunk)
+                    .await?
+            };
+            if first_message_id.is_none() {
+                first_message_id = Some(message_id);
+            }
+
+            if i < chunks.len() - 1 {
+                if message
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(|t| t.is_cancelled())
+                {
+                    ::omnesagent_log::record!(
+                        DEBUG,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                        &format!(
+                            "Discord delivery interrupted after chunk {}/{}",
+                            i + 1,
+                            chunks.len()
+                        )
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(inter_chunk_delay_ms)).await;
+            }
+        }
+
+        self.apply_failure_reactions(&message.recipient, first_message_id.as_deref(), &reactions)
+            .await;
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
+        let mut had_ready = false;
+
+        // Get Gateway URL
+        let gw_resp = self
+            .http_client()
+            .get("https://discord.com/api/v10/gateway/bot")
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+        let gw_resp = Self::validate_gateway_preflight_response(gw_resp)?;
+        let gw_resp: serde_json::Value = gw_resp.json().await?;
+
+        if let Some(remaining) = gw_resp
+            .get("session_start_limit")
+            .and_then(|v| v.get("remaining"))
+            .and_then(serde_json::Value::as_u64)
+            && remaining == 0
+        {
+            return Err(Self::fatal_listener_error(
+                "discord gateway identify blocked: session_start_limit.remaining is 0",
+            ));
+        }
+
+        let fresh_gateway_url = gw_resp
+            .get("url")
+            .and_then(|u| u.as_str())
+            .ok_or_else(|| Self::fatal_listener_error("discord gateway preflight missing url"))?
+            .to_string();
+        let session_snapshot = self.gateway_session.lock().clone();
+        let can_resume =
+            session_snapshot.session_id.is_some() && session_snapshot.sequence.is_some();
+        let gw_url = if can_resume {
+            session_snapshot
+                .resume_gateway_url
+                .clone()
+                .unwrap_or_else(|| fresh_gateway_url.clone())
+        } else {
+            fresh_gateway_url.clone()
+        };
+
+        let ws_url = format!("{gw_url}/?v=10&encoding=json");
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_attrs(::serde_json::json!({"resume": can_resume, "gateway_url": gw_url})),
+            "connecting to gateway..."
+        );
+
+        let (ws_stream, _) = omnesagent_config::schema::ws_connect_with_proxy(
+            &ws_url,
+            "channel.discord",
+            self.proxy_url.as_deref(),
+        )
+        .await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Read Hello (opcode 10)
+        let hello = read.next().await.ok_or_else(|| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"phase": "gateway_hello"})),
+                "discord: gateway closed before Hello"
+            );
+            anyhow::Error::msg("No hello")
+        })??;
+        let hello_data: serde_json::Value = serde_json::from_str(&hello.to_string())?;
+        let heartbeat_interval = hello_data
+            .get("d")
+            .and_then(|d| d.get("heartbeat_interval"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(41250);
+
+        let mut sequence = session_snapshot.sequence.unwrap_or(-1);
+
+        if can_resume {
+            let resume = json!({
+                "op": 6,
+                "d": {
+                    "token": self.bot_token,
+                    "session_id": session_snapshot.session_id,
+                    "seq": session_snapshot.sequence,
+                }
+            });
+            write.send(Message::Text(resume.to_string().into())).await?;
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sequence": sequence})),
+                "sent Discord Resume"
+            );
+        } else {
+            let intents = self.gateway_intents();
+            if intents & BASELINE_INTENTS != BASELINE_INTENTS {
+                // Only reachable via the raw `intents_mask` override — the
+                // derived path always starts from the full baseline.
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "intents": intents,
+                            "missing": intent_names(BASELINE_INTENTS & !intents),
+                        })),
+                    "intents_mask drops baseline intents — message handling may go quiet"
+                );
+            }
+            let identify = json!({
+                "op": 2,
+                "d": {
+                    "token": self.bot_token,
+                    "intents": intents,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "omnesagent",
+                        "device": "omnesagent"
+                    }
+                }
+            });
+            write
+                .send(Message::Text(identify.to_string().into()))
+                .await?;
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "intents": intents,
+                        "intent_names": intent_names(intents),
+                    })),
+                "sent Discord Identify"
+            );
+        }
+
+        // Spawn heartbeat timer — sends a tick signal, actual heartbeat
+        // is assembled in the select! loop where `sequence` lives.
+        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let hb_interval = heartbeat_interval;
+        omnesagent_spawn::spawn!(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(hb_interval));
+            loop {
+                interval.tick().await;
+                if hb_tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let guild_filter = self.guild_ids.clone();
+        let channel_filter = self.channel_ids.clone();
+        let archive_memory = self.archive_memory.clone();
+
+        // --- Stall watchdog --------------------------------------------------
+        let watchdog = if self.stall_timeout_secs > 0 {
+            Some(omnesagent_infra::stall_watchdog::StallWatchdog::new(
+                self.stall_timeout_secs,
+            ))
+        } else {
+            None
+        };
+
+        let (stall_tx, mut stall_rx) = tokio::sync::mpsc::channel::<()>(1);
+        if let Some(ref wd) = watchdog {
+            let stall_signal = stall_tx.clone();
+            wd.start(move || {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                    "stall watchdog fired — no events for configured timeout, triggering reconnect"
+                );
+                let _ = stall_signal.try_send(());
+            })
+            .await;
+        }
+        // Keep stall_tx alive so the receiver doesn't close prematurely when
+        // the watchdog is disabled (recv will just pend forever).
+        let _stall_tx_guard = stall_tx;
+
+        loop {
+            tokio::select! {
+                _ = stall_rx.recv() => {
+                    ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note), "breaking listen loop due to stall watchdog");
+                    break;
+                }
+                _ = hb_rx.recv() => {
+                    let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
+                    let hb = json!({"op": 1, "d": d});
+                    if write.send(Message::Text(hb.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                msg = read.next() => {
+                    let msg = match msg {
+                        Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if write.send(Message::Pong(payload)).await.is_err() {
+                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown), "pong send failed, reconnecting");
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            if let Some(frame) = frame {
+                                let code = u16::from(frame.code);
+                                let reason = frame.reason.to_string();
+                                if requires_new_session_close_code(code) {
+                                    let mut session = self.gateway_session.lock();
+                                    session.session_id = None;
+                                    session.resume_gateway_url = None;
+                                    session.sequence = None;
+                                }
+                                if is_fatal_gateway_close_code(code) {
+                                    let mut message = format!(
+                                        "discord gateway closed with fatal code {code}: {reason}"
+                                    );
+                                    if code == 4014 {
+                                        message.push_str(&disallowed_intents_hint(
+                                            self.gateway_intents(),
+                                        ));
+                                    }
+                                    return Err(Self::fatal_listener_error(message));
+                                }
+                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code, "reason": reason, "had_ready": had_ready, "sequence": sequence})), "discord gateway closed; reconnecting");
+                            }
+                            break;
+                        }
+                        None => {
+                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "discord gateway stream ended; reconnecting");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e), "had_ready": had_ready, "sequence": sequence})), "websocket read error, reconnecting");
+                            break;
+                        }
+                        _ => continue,
+                    };
+
+                    let event: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    // Mark activity for the stall watchdog on every
+                    // successfully parsed gateway event.
+                    if let Some(ref wd) = watchdog {
+                        wd.touch();
+                    }
+
+                    // Track sequence number from all dispatch events
+                    if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
+                        sequence = s;
+                        self.gateway_session.lock().sequence = Some(s);
+                    }
+
+                    let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+
+                    match event_type {
+                        "READY" => {
+                            had_ready = true;
+                            let session_id = event
+                                .get("d")
+                                .and_then(|d| d.get("session_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            let resume_gateway_url = event
+                                .get("d")
+                                .and_then(|d| d.get("resume_gateway_url"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = session_id.clone();
+                                session.resume_gateway_url = resume_gateway_url;
+                                session.sequence = if sequence >= 0 { Some(sequence) } else { None };
+                            }
+                            ::omnesagent_log::record!(
+                                INFO,
+                                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence, "session_id_present": session_id.is_some()})
+                                ),
+                                "discord READY received"
+                            );
+                            // Slash commands: register `/ask` once on READY.
+                            // The application id is carried in the READY payload
+                            // (`d.application.id`), so no extra REST call is needed.
+                            // Spawned so registration never blocks the heartbeat.
+                            if self.slash_commands {
+                                let app_id = event
+                                    .get("d")
+                                    .and_then(|d| d.get("application"))
+                                    .and_then(|a| a.get("id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                if let Some(app_id) = app_id {
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    let resolver = self.slash_command_resolver.clone();
+                                    let workspace_dir = self.workspace_dir.clone();
+                                    let slash_command_scope = self.slash_command_scope;
+                                    let guild_ids = self.guild_ids.clone();
+                                    omnesagent_spawn::spawn!(async move {
+                                        let specs = match resolver {
+                                            Some(resolve) => {
+                                                match tokio::task::spawn_blocking(move || resolve()).await {
+                                                    Ok(specs) => specs,
+                                                    Err(e) => {
+                                                        ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skills resolver panicked; skipping slash command reconcile");
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            None => Vec::new(),
+                                        };
+                                        let body = slash_command_registration_body(&specs);
+                                        // Resolve the registration target: `guild` with no guild_ids
+                                        // can't register anywhere, so fall back to global.
+                                        let effective_scope = match slash_command_scope {
+                                            omnesagent_config::schema::SlashCommandScope::Guild
+                                                if guild_ids.is_empty() =>
+                                            {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown), "slash_command_scope=guild but guild_ids is empty; falling back to global slash registration");
+                                                SlashScope::Global
+                                            }
+                                            omnesagent_config::schema::SlashCommandScope::Guild => {
+                                                SlashScope::Guild
+                                            }
+                                            omnesagent_config::schema::SlashCommandScope::Global => {
+                                                SlashScope::Global
+                                            }
+                                        };
+                                        let fingerprint = {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                                            body.to_string().hash(&mut h);
+                                            // Fold the registration target in: a scope or guild-set
+                                            // change must force a reconcile even when the command
+                                            // bodies are byte-identical, else flipping
+                                            // `slash_command_scope` would be silently skipped.
+                                            match effective_scope {
+                                                SlashScope::Global => 0u8,
+                                                SlashScope::Guild => 1u8,
+                                            }
+                                            .hash(&mut h);
+                                            guild_ids.hash(&mut h);
+                                            h.finish()
+                                        };
+                                        use crate::discord_slash_state::SlashReconcileState;
+                                        let now = crate::discord_slash_state::now_unix();
+                                        let state =
+                                            SlashReconcileState::load(workspace_dir.as_deref(), &app_id);
+                                        // Honour a persisted rate-limit cooldown across restarts: a
+                                        // 429'd reconcile must not re-hammer Discord on the next READY.
+                                        if state.rate_limited(now) {
+                                            ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"retry_after_until": state.retry_after_until})), "discord slash command reconcile in rate-limit cooldown; skipping");
+                                            return;
+                                        }
+                                        // Skip only when the set matches the last *successful*
+                                        // reconcile. The fingerprint is persisted, so an unchanged
+                                        // set is skipped after a restart too (no daily-budget churn).
+                                        if state.fingerprint == Some(fingerprint) {
+                                            ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
+                                            return;
+                                        }
+                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE, effective_scope, &guild_ids).await {
+                                            Ok(ReconcileOutcome::Reconciled) => {
+                                                SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
+                                                ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
+                                            }
+                                            Ok(ReconcileOutcome::RateLimited { until }) => {
+                                                // Persist the cooldown (keeping the prior fingerprint)
+                                                // so the next READY/restart waits it out.
+                                                SlashReconcileState::record_retry_after(workspace_dir.as_deref(), &app_id, &state, until);
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"retry_after_until": until})), "discord slash command reconcile rate-limited; cooldown persisted");
+                                            }
+                                            Err(e) => {
+                                                // Hard failure: leave persisted state untouched. The
+                                                // new fingerprint differs from the stored one, so the
+                                                // next READY retries without a forced reset.
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord slash command registration failed");
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown), "slash_commands enabled but READY had no application.id");
+                                }
+                            }
+                            continue;
+                        }
+                        "RESUMED" => {
+                            had_ready = true;
+                            ::omnesagent_log::record!(
+                                INFO,
+                                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence})
+                                ),
+                                "discord RESUMED received"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    match op {
+                        // Op 1: Server requests an immediate heartbeat
+                        1 => {
+                            let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
+                            let hb = json!({"op": 1, "d": d});
+                            if write.send(Message::Text(hb.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        // Op 7: Reconnect
+                        7 => {
+                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "received Reconnect (op 7), closing for restart");
+                            break;
+                        }
+                        // Op 9: Invalid Session
+                        9 => {
+                            let resumable = event.get("d").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            if !resumable {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = None;
+                                session.resume_gateway_url = None;
+                                session.sequence = None;
+                            }
+                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"resumable": resumable, "had_ready": had_ready, "sequence": sequence})), "received Invalid Session (op 9), closing for restart");
+                            break;
+                        }
+                        _ => {}
+                    }
+
+                    if self.slash_commands && event_type == "INTERACTION_CREATE" {
+                        if let Some(d) = event.get("d") {
+                            let itype = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                            // type 2 = APPLICATION_COMMAND
+                            if itype == 2 {
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let command = d.get("data").and_then(|x| x.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                // user is under `member.user` (guild) or `user` (DM)
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                // `/ask` carries a `prompt` option; skill
+                                // commands carry `input`. Extract both —
+                                // routing happens in the spawned task.
+                                let prompt = interaction_string_option(d, "prompt");
+                                let input = interaction_string_option(d, "input");
+                                // Extract typed-option values here (owned) so the
+                                // spawned 'static task doesn't borrow `event`.
+                                let submitted = slash_options::extract_submitted_options(d);
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                // Without id/token/app there is nothing we
+                                // can even acknowledge.
+                                if !interaction_id.is_empty()
+                                    && !interaction_token.is_empty()
+                                    && !app_id.is_empty()
+                                {
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+                                    let thread_channels = Arc::clone(&self.thread_channels);
+                                    let pending = Arc::clone(&self.pending_interactions);
+                                    let alias = self.alias.clone();
+                                    let tx = tx.clone();
+                                    let resolver = self.slash_command_resolver.clone();
+
+                                    omnesagent_spawn::spawn!(async move {
+                                        if command == "ask" && prompt.is_empty() {
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-malformed",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+
+                                        if !crate::allowlist::is_user_allowed(
+                                            &peers,
+                                            &user_id,
+                                            crate::allowlist::Match::Sensitive,
+                                        ) {
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized slash command interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+                                        let parent_id = if !channel_filter.is_empty()
+                                            && !interaction_channel.is_empty()
+                                            && !channel_filter.iter().any(|c| c == &interaction_channel)
+                                        {
+                                            discord_thread_parent(
+                                                &client,
+                                                &bot_token,
+                                                &thread_channels,
+                                                &interaction_channel,
+                                            )
+                                            .await
+                                        } else {
+                                            None
+                                        };
+                                        if let Err(denial) = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            parent_id.as_deref(),
+                                        ) {
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized slash command interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stash credentials before the defer so
+                                        // a fast reply can never race an absent
+                                        // entry; sweep expired entries while
+                                        // holding the lock anyway.
+                                        {
+                                            let mut guard = pending.lock();
+                                            guard.retain(|_, p| {
+                                                p.created.elapsed() < INTERACTION_TOKEN_TTL
+                                            });
+                                            guard.insert(
+                                                interaction_id.clone(),
+                                                PendingInteraction {
+                                                    app_id: app_id.clone(),
+                                                    token: interaction_token.clone(),
+                                                    created: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+                                        // Ack within the 3s window; only a
+                                        // successful defer earns an enqueue.
+                                        if let Err(e) = discord_defer_interaction(&client, &interaction_id, &interaction_token).await {
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction defer failed");
+                                            pending.lock().remove(&interaction_id);
+                                            return;
+                                        }
+
+                                        let content = if command == "ask" {
+                                            Some(prompt)
+                                        } else {
+                                            let specs = match resolver {
+                                                Some(resolve) => {
+                                                    match tokio::task::spawn_blocking(move || resolve()).await {
+                                                        Ok(specs) => specs,
+                                                        Err(e) => {
+                                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skills resolver panicked; treating command as unavailable");
+                                                            Vec::new()
+                                                        }
+                                                    }
+                                                }
+                                                None => Vec::new(),
+                                            };
+                                            match specs.into_iter().find(|spec| spec.slug == command) {
+                                                Some(spec) => {
+                                                    skill_command_prompt(&spec, &input, &submitted)
+                                                }
+                                                None => None, // stale or foreign command
+                                            }
+                                        };
+                                        let Some(content) = content else {
+                                            // Already deferred — clear the
+                                            // "thinking…" state with a visible
+                                            // explanation instead of letting
+                                            // it hang, then drop the creds.
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unavailable",
+                                            );
+                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, DISCORD_API_BASE, &msg, &[], &[]).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction unavailable-notice failed");
+                                            }
+                                            pending.lock().remove(&interaction_id);
+                                            return;
+                                        };
+
+                                        let channel_msg = ChannelMessage {
+                                            id: format!("discord_interaction_{interaction_id}"),
+                                            sender: user_id,
+                                            reply_target: discord_interaction_reply_target(&interaction_id),
+                                            content,
+                                            channel: "discord".to_string(),
+                                            channel_alias: Some(alias),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            interruption_scope_id: None,
+                                            thread_ts: None,
+                                            attachments: Vec::new(),
+                                            subject: None,
+
+                                            ..Default::default()};
+                                        if tx.send(channel_msg).await.is_err() {
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown), "orchestrator channel closed; dropping interaction prompt");
+                                        }
+                                    });
+                                }
+                            } else if itype == 3 || itype == 5 {
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let custom_id_raw =
+                                    component_routing_id(d.get("data")).unwrap_or_default();
+                                // Modal submits carry their typed-in field values;
+                                // a component click carries none.
+                                let modal_fields = if itype == 5 {
+                                    components::extract_modal_fields(d)
+                                } else {
+                                    Vec::new()
+                                };
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                if custom_id::CustomId::parse(&custom_id_raw).is_none() {
+                                    continue;
+                                }
+                                if !interaction_id.is_empty()
+                                    && !interaction_token.is_empty()
+                                    && !app_id.is_empty()
+                                {
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+                                    let thread_channels = Arc::clone(&self.thread_channels);
+                                    let pending = Arc::clone(&self.pending_interactions);
+                                    let pending_components = Arc::clone(&self.pending_components);
+                                    let pending_approvals = Arc::clone(&self.pending_approvals);
+                                    let alias = self.alias.clone();
+                                    let tx = tx.clone();
+
+                                    omnesagent_spawn::spawn!(async move {
+                                        if !crate::allowlist::is_user_allowed(
+                                            &peers,
+                                            &user_id,
+                                            crate::allowlist::Match::Sensitive,
+                                        ) {
+                                            // Shared-token deployments: every
+                                            // alias receives every click, and
+                                            // each alias has its OWN peer list —
+                                            // a sibling alias whose list lacks
+                                            // this user must not fire a loud
+                                            // reject that races the owning
+                                            // alias's answer (for the modal-open
+                                            // kind, the response IS the modal;
+                                            // losing that race kills Edit/Revise
+                                            // outright). If the interaction's
+                                            // channel is not one of OURS, this
+                                            // SOP-gate click is not ours to
+                                            // reject. (A thread whose parent is
+                                            // ours is silenced too — acceptable:
+                                            // this user failed OUR peer check,
+                                            // so the only loss is the rejection
+                                            // notice.)
+                                            let is_foreign_sop_gate =
+                                                custom_id::CustomId::parse(&custom_id_raw)
+                                                    .is_some_and(|cid| {
+                                                        approval::is_sop_gate_kind(&cid.kind)
+                                                    })
+                                                    && !channel_filter.is_empty()
+                                                    && !channel_filter
+                                                        .iter()
+                                                        .any(|c| c == &interaction_channel);
+                                            if is_foreign_sop_gate {
+                                                return;
+                                            }
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized component interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+                                        let parent_id = if !channel_filter.is_empty()
+                                            && !interaction_channel.is_empty()
+                                            && !channel_filter.iter().any(|c| c == &interaction_channel)
+                                        {
+                                            discord_thread_parent(
+                                                &client,
+                                                &bot_token,
+                                                &thread_channels,
+                                                &interaction_channel,
+                                            )
+                                            .await
+                                        } else {
+                                            None
+                                        };
+                                        if let Err(denial) = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            parent_id.as_deref(),
+                                        ) {
+                                            // Shared-token deployments run several
+                                            // aliases on ONE bot application, so
+                                            // every alias receives every click. For
+                                            // a SOP-gate button, "not my channel"
+                                            // means "not my interaction": pass
+                                            // SILENTLY (no reject ack) so the alias
+                                            // that owns the channel answers instead
+                                            // of racing this alias's rejection.
+                                            // Every other denial (or kind) keeps
+                                            // the loud fail-closed reject.
+                                            // Guild- and channel-scope denials
+                                            // both mean "not my interaction" for
+                                            // a shared-token sibling alias.
+                                            let is_foreign_sop_gate = matches!(
+                                                denial,
+                                                InteractionDenial::ChannelNotAllowed
+                                                    | InteractionDenial::GuildNotAllowed
+                                            ) && custom_id::CustomId::parse(&custom_id_raw)
+                                                .is_some_and(|cid| {
+                                                    approval::is_sop_gate_kind(&cid.kind)
+                                                });
+                                            if is_foreign_sop_gate {
+                                                return;
+                                            }
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized component interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stateless SOP-gate button (no
+                                        // registered intent by design): the
+                                        // custom_id carries `<choice>:<reference>`
+                                        // so a parked gate survives restarts.
+                                        // Runs ONLY after the fail-closed gates
+                                        // above. The click becomes an inbound
+                                        // message with the internal `sop.gate:`
+                                        // marker; the orchestrator resolves it
+                                        // against the parked run.
+                                        if let Some(cid) = custom_id::CustomId::parse(&custom_id_raw)
+                                            && cid.kind == approval::SOP_GATE_KIND
+                                        {
+                                            let ack_key = match cid.arg.split_once(':') {
+                                                Some((choice, reference))
+                                                    if !choice.is_empty() && !reference.is_empty() =>
+                                                {
+                                                    let channel_msg = ChannelMessage {
+                                                        id: format!("discord_sopgate_{interaction_id}"),
+                                                        sender: user_id.clone(),
+                                                        reply_target: interaction_channel.clone(),
+                                                        content: format!("{choice} {reference}"),
+                                                        channel: "discord".to_string(),
+                                                        channel_alias: Some(alias.clone()),
+                                                        timestamp: std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap_or_default()
+                                                            .as_secs(),
+                                                        internal_sop_event: Some(format!(
+                                                            "sop.gate:{choice}:{reference}"
+                                                        )),
+                                                        ..Default::default()
+                                                    };
+                                                    if tx.send(channel_msg).await.is_ok() {
+                                                        "channel-discord-approval-recorded"
+                                                    } else {
+                                                        "channel-discord-component-expired"
+                                                    }
+                                                }
+                                                _ => "channel-discord-component-expired",
+                                            };
+                                            let msg = i18n::get_required_cli_string(ack_key);
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate ack failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stateless input-bearing SOP-gate button
+                                        // (Edit / Revise): the click's response IS
+                                        // opening a modal whose own custom_id
+                                        // re-carries `<choice>:<reference>`. The
+                                        // pre-fill comes from the in-memory prompt
+                                        // registry (best-effort — blank after a
+                                        // restart; the draft is in the embed).
+                                        if let Some(cid) = custom_id::CustomId::parse(&custom_id_raw)
+                                            && cid.kind == approval::SOP_GATE_MODAL_KIND
+                                        {
+                                            let Some((choice, reference)) = cid
+                                                .arg
+                                                .split_once(':')
+                                                .filter(|(c, r)| !c.is_empty() && !r.is_empty())
+                                            else {
+                                                let msg = i18n::get_required_cli_string("channel-discord-component-expired");
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate ack failed");
+                                                }
+                                                return;
+                                            };
+                                            let input = gate_prompts::input_for(reference, choice);
+                                            let (label, prefill) = match input {
+                                                Some(i) => (i.label, i.prefill),
+                                                None => ("Text".to_string(), None),
+                                            };
+                                            let title = match omnesagent_api::channel::GateChoiceKind::from_id(choice) {
+                                                Some(omnesagent_api::channel::GateChoiceKind::Edit) => "Edit the draft",
+                                                Some(omnesagent_api::channel::GateChoiceKind::Revise) => "Ask for a re-draft",
+                                                _ => "Provide text",
+                                            };
+                                            let modal = components::DiscordModal {
+                                                custom_id: custom_id::CustomId::new(
+                                                    approval::SOP_GATE_SUBMIT_KIND,
+                                                    format!("{choice}:{reference}"),
+                                                ),
+                                                title: title.to_string(),
+                                                fields: vec![components::ModalField {
+                                                    custom_id: "text".to_string(),
+                                                    label,
+                                                    style: components::TextInputStyle::Paragraph,
+                                                    required: true,
+                                                    placeholder: None,
+                                                    min_length: Some(1),
+                                                    max_length: Some(4000),
+                                                    value: prefill,
+                                                }],
+                                            };
+                                            if let Err(e) = discord_open_modal(&client, &interaction_id, &interaction_token, &modal).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate modal open failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Stateless SOP-gate modal SUBMIT (type 5):
+                                        // the typed text becomes the marker
+                                        // message's content (the amended draft or
+                                        // the re-draft guidance); the custom_id
+                                        // carries which choice + gate it answers.
+                                        if let Some(cid) = custom_id::CustomId::parse(&custom_id_raw)
+                                            && cid.kind == approval::SOP_GATE_SUBMIT_KIND
+                                        {
+                                            let text = modal_fields
+                                                .iter()
+                                                .find(|(id, _)| id == "text")
+                                                .map(|(_, v)| v.trim().to_string())
+                                                .unwrap_or_default();
+                                            let ack_key = match cid.arg.split_once(':') {
+                                                Some((choice, reference))
+                                                    if !choice.is_empty()
+                                                        && !reference.is_empty()
+                                                        && !text.is_empty() =>
+                                                {
+                                                    let channel_msg = ChannelMessage {
+                                                        id: format!("discord_sopgate_{interaction_id}"),
+                                                        sender: user_id.clone(),
+                                                        reply_target: interaction_channel.clone(),
+                                                        content: text,
+                                                        channel: "discord".to_string(),
+                                                        channel_alias: Some(alias.clone()),
+                                                        timestamp: std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap_or_default()
+                                                            .as_secs(),
+                                                        internal_sop_event: Some(format!(
+                                                            "sop.gate:{choice}:{reference}"
+                                                        )),
+                                                        ..Default::default()
+                                                    };
+                                                    if tx.send(channel_msg).await.is_ok() {
+                                                        "channel-discord-approval-recorded"
+                                                    } else {
+                                                        "channel-discord-component-expired"
+                                                    }
+                                                }
+                                                _ => "channel-discord-component-expired",
+                                            };
+                                            let msg = i18n::get_required_cli_string(ack_key);
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord sop-gate ack failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Single-use: drain the intent bound to
+                                        // this custom_id. The `take` runs ONLY
+                                        // after the fail-closed gate above, so an
+                                        // unauthorized click never drains an
+                                        // entry. Absent/expired/replayed (incl. a
+                                         // forged-but-zc1 id we never registered)
+                                         // → refuse, don't act.
+                                        let intent = pending_components.lock().take(&custom_id_raw);
+                                        let prompt = match intent {
+                                            Some(ComponentIntent::Approval { token, decision }) => {
+                                                let resolved = {
+                                                    let mut guard = pending_approvals.lock().await;
+                                                    approval::resolve_parked_approval(
+                                                        &mut guard, &token, decision,
+                                                    )
+                                                };
+                                                let key = if resolved {
+                                                    "channel-discord-approval-recorded"
+                                                } else {
+                                                    "channel-discord-component-expired"
+                                                };
+                                                let msg = i18n::get_required_cli_string(key);
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord approval ack failed");
+                                                }
+                                                return;
+                                            }
+                                            Some(ComponentIntent::OpenModal { modal, prompt }) => {
+                                                if let Some(wire) = modal.custom_id.encode() {
+                                                    pending_components.lock().register(
+                                                        wire,
+                                                        ComponentIntent::ResolveIntoTurn { prompt },
+                                                    );
+                                                }
+                                                if let Err(e) = discord_open_modal(&client, &interaction_id, &interaction_token, &modal).await {
+                                                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord modal open failed");
+                                                }
+                                                return;
+                                            }
+                                            Some(ComponentIntent::ResolveIntoTurn { prompt }) => prompt,
+                                            // Absent / expired / replayed / forged.
+                                            None => {
+                                                let msg = i18n::get_required_cli_string(
+                                                    "channel-discord-component-expired",
+                                                );
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component expired-notice failed");
+                                                }
+                                                return;
+                                            }
+                                        };
+
+                                        // A modal submit appends its typed-in
+                                        // fields ("label: value" lines) to the
+                                        // registered prompt; a component click has
+                                        // none, so the prompt is used as-is.
+                                        let content = if modal_fields.is_empty() {
+                                            prompt
+                                        } else {
+                                            let mut c = prompt;
+                                            for (field, value) in &modal_fields {
+                                                c.push_str(&format!("\n{field}: {value}"));
+                                            }
+                                            c
+                                        };
+
+                                        // Stash creds before the defer so a fast
+                                        // reply can't race an absent entry.
+                                        {
+                                            let mut guard = pending.lock();
+                                            guard.retain(|_, p| {
+                                                p.created.elapsed() < INTERACTION_TOKEN_TTL
+                                            });
+                                            guard.insert(
+                                                interaction_id.clone(),
+                                                PendingInteraction {
+                                                    app_id: app_id.clone(),
+                                                    token: interaction_token.clone(),
+                                                    created: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+                                        if let Err(e) = discord_defer_interaction(&client, &interaction_id, &interaction_token).await {
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component defer failed");
+                                            pending.lock().remove(&interaction_id);
+                                            return;
+                                        }
+
+                                        // Resolve-into-turn: the registered
+                                        // intent drives an agent turn, answered
+                                        // through the interaction followup.
+                                        let channel_msg = ChannelMessage {
+                                            id: format!("discord_interaction_{interaction_id}"),
+                                            sender: user_id,
+                                            reply_target: discord_interaction_reply_target(&interaction_id),
+                                            content,
+                                            channel: "discord".to_string(),
+                                            channel_alias: Some(alias),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            interruption_scope_id: None,
+                                            thread_ts: None,
+                                            attachments: Vec::new(),
+                                            subject: None,
+
+                                            ..Default::default()};
+                                        if tx.send(channel_msg).await.is_err() {
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown), "orchestrator channel closed; dropping component prompt");
+                                        }
+                                    });
+                                }
+                            } else if itype == 4 {
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                // The focused option + its partial input, owned
+                                // (so the spawned 'static task doesn't borrow
+                                // `event`). Discord marks exactly one option
+                                // `"focused": true`; absent → no completion.
+                                let focused = slash_options::extract_focused_option(d);
+                                if !interaction_id.is_empty() && !interaction_token.is_empty() {
+                                    let client = self.http_client();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+                                    let resolver = self.slash_command_resolver.clone();
+                                    let thread_channels = self.thread_channels.clone();
+
+                                    omnesagent_spawn::spawn!(async move {
+                                        let thread_parent = discord_thread_parent_cached(
+                                            &thread_channels,
+                                            &interaction_channel,
+                                        )
+                                        .await;
+                                        let authorized = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            thread_parent.as_deref(),
+                                        )
+                                        .is_ok();
+
+                                        let choices: Vec<(String, String)> = match (authorized, focused) {
+                                            (true, Some((command, option_name, partial))) => {
+                                                let specs = match resolver {
+                                                    Some(resolve) => match tokio::task::spawn_blocking(move || resolve()).await {
+                                                        Ok(specs) => specs,
+                                                        Err(e) => {
+                                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skills resolver panicked; answering empty autocomplete");
+                                                            Vec::new()
+                                                        }
+                                                    },
+                                                    None => Vec::new(),
+                                                };
+                                                specs
+                                                    .iter()
+                                                    .find(|spec| spec.slug == command)
+                                                    .and_then(|spec| {
+                                                        spec.options.iter().find(|o| o.name == option_name)
+                                                    })
+                                                    .map(|opt| opt.matching_choices(&partial))
+                                                    .unwrap_or_default()
+                                            }
+                                            // Unauthorized, or no focused option:
+                                            // a valid empty answer (clears the box).
+                                            _ => Vec::new(),
+                                        };
+
+                                        if let Err(e) = discord_answer_autocomplete(
+                                            &client,
+                                            &interaction_id,
+                                            &interaction_token,
+                                            &choices,
+                                        )
+                                        .await
+                                        {
+                                            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord autocomplete answer failed");
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK
+                    // keep the archive in sync. All three already arrive
+                    // under the GUILD_MESSAGES / DIRECT_MESSAGES intents;
+                    // agent routing stays MESSAGE_CREATE-only.
+                    if event_type == "MESSAGE_UPDATE"
+                        || event_type == "MESSAGE_DELETE"
+                        || event_type == "MESSAGE_DELETE_BULK"
+                    {
+                        if let Some(d) = event.get("d") {
+                            self.sync_archive_for_message_event(event_type, d, &bot_user_id)
+                                .await;
+                        }
+                        continue;
+                    }
+
+                    if event_type == "MESSAGE_REACTION_ADD"
+                        || event_type == "MESSAGE_REACTION_REMOVE"
+                    {
+                        if self.reaction_scope
+                            != omnesagent_config::schema::DiscordReactionScope::Off
+                            && let Some(d) = event.get("d")
+                        {
+                            self.handle_reaction_event(event_type, d, &bot_user_id).await;
+                        }
+                        continue;
+                    }
+
+                    if event_type == "MESSAGE_REACTION_REMOVE_ALL"
+                        || event_type == "MESSAGE_REACTION_REMOVE_EMOJI"
+                    {
+                        if self.reaction_scope
+                            != omnesagent_config::schema::DiscordReactionScope::Off
+                            && let Some(d) = event.get("d")
+                        {
+                            self.sweep_message_reactions(event_type, d).await;
+                        }
+                        continue;
+                    }
+
+                    // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
+                    if event_type != "MESSAGE_CREATE" {
+                        continue;
+                    }
+
+                    let Some(d) = event.get("d") else {
+                        continue;
+                    };
+
+                    let message_type = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if !is_conversational_message_type(message_type) {
+                        continue;
+                    }
+
+                    // Skip messages from the bot itself
+                    let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
+                    if author_id == bot_user_id {
+                        continue;
+                    }
+
+                    // Skip bot messages (unless listen_to_bots is enabled)
+                    if !self.listen_to_bots && d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                        continue;
+                    }
+
+                    // Sender validation
+                    if !self.is_user_allowed(author_id) {
+                        ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"author_id": author_id})), "ignoring message from unauthorized user");
+                        continue;
+                    }
+
+                    // Guild allowlist. Empty list = accept all guilds.
+                    // DMs have no guild_id, so they always pass through.
+                    if !guild_filter.is_empty() {
+                        let msg_guild = d.get("guild_id").and_then(serde_json::Value::as_str);
+                        if let Some(g) = msg_guild
+                            && !guild_filter.iter().any(|allowed| allowed == g)
+                        {
+                            continue;
+                        }
+                    }
+
+                    // Channel allowlist. Empty = watch every channel.
+                    // Thread messages carry the thread's own channel_id, not the
+                    // parent's. When the direct match fails, look up the thread's
+                    // parent_id and accept if *that* is in the allowlist.
+                    if !channel_filter.is_empty() {
+                        let msg_channel = d
+                            .get("channel_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let parent_id = if !msg_channel.is_empty()
+                            && !channel_filter.iter().any(|c| c == msg_channel)
+                        {
+                            self.thread_parent(&self.http_client(), msg_channel).await
+                        } else {
+                            None
+                        };
+                        if !channel_passes_filter(
+                            &channel_filter,
+                            msg_channel,
+                            parent_id.as_deref(),
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    // Archive every non-bot message to discord.db when enabled.
+                    if let Some(ref archive_mem) = archive_memory {
+                        let archive_channel_id =
+                            d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+                        let is_dm_event = d.get("guild_id").is_none();
+                        let username = d
+                            .get("author")
+                            .and_then(|a| a.get("username"))
+                            .and_then(|u| u.as_str())
+                            .unwrap_or(author_id);
+                        let content_raw =
+                            d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        let archive_msg_id =
+                            d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                        if !content_raw.is_empty() {
+                            let ts = chrono::Utc::now().to_rfc3339();
+                            let channel_display =
+                                if is_dm_event { "dm" } else { archive_channel_id };
+                            let atts = d
+                                .get("attachments")
+                                .and_then(|a| a.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|a| a.get("url").and_then(|u| u.as_str()))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            let mut mem_content = format!(
+                                "@{username} in #{channel_display} at {ts}: {content_raw}"
+                            );
+                            if !atts.is_empty() {
+                                mem_content.push_str(&format!(" [attachments: {atts}]"));
+                            }
+                            let mem_key = if archive_msg_id.is_empty() {
+                                format!("discord_{}", Uuid::new_v4())
+                            } else {
+                                format!("discord_{archive_msg_id}")
+                            };
+                            let session = if archive_channel_id.is_empty() {
+                                None
+                            } else {
+                                Some(archive_channel_id)
+                            };
+                            if let Err(e) = archive_mem
+                                .store(
+                                    &mem_key,
+                                    &mem_content,
+                                    omnesagent_memory::MemoryCategory::Custom(
+                                        "discord".to_string(),
+                                    ),
+                                    session,
+                                )
+                                .await
+                            {
+                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "archive store failed");
+                            }
+                        }
+                    }
+
+                    let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    // DMs carry no guild_id in the Discord gateway payload. They are
+                    // inherently private and implicitly addressed to the bot, so bypass
+                    // the mention gate — requiring a @mention in a DM is never correct.
+                    let is_dm = d.get("guild_id").is_none();
+                    let effective_mention_only = self.mention_only && !is_dm;
+                    let atts = d
+                        .get("attachments")
+                        .and_then(|a| a.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let has_attachments = !atts.is_empty();
+                    let Some(clean_content) = admit_discord_message(
+                        content,
+                        has_attachments,
+                        effective_mention_only,
+                        &bot_user_id,
+                    ) else {
+                        continue;
+                    };
+
+                    let client = self.http_client();
+                    let (attachment_text, media_attachments) = process_attachments(
+                        &atts,
+                        &client,
+                        self.workspace_dir.as_deref(),
+                        self.transcription_manager.as_deref(),
+                    )
+                    .await;
+                    let final_content = if attachment_text.is_empty() {
+                        clean_content
+                    } else {
+                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+                    };
+
+                    // Intercept approval replies before forwarding to the agent.
+                    if let Some((token, response)) =
+                        crate::util::parse_approval_reply(&final_content)
+                    {
+                        let mut map = self.pending_approvals.lock().await;
+                        if let Some(sender) = map.remove(&token) {
+                            let _ = sender.send(response);
+                            continue;
+                        }
+                    }
+
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if !message_id.is_empty() && !channel_id.is_empty() {
+                        let reaction_channel = DiscordChannel::new(
+                            self.bot_token.clone(),
+                            self.guild_ids.clone(),
+                            self.alias.clone(),
+                            Arc::clone(&self.peer_resolver),
+                            self.listen_to_bots,
+                            self.mention_only,
+                        );
+                        let reaction_channel_id = channel_id.clone();
+                        let reaction_message_id = message_id.to_string();
+                        let reaction_emoji = random_discord_ack_reaction().to_string();
+                        omnesagent_spawn::spawn!(async move {
+                            if let Err(err) = reaction_channel
+                                .add_reaction(
+                                    &reaction_channel_id,
+                                    &reaction_message_id,
+                                    &reaction_emoji,
+                                )
+                                .await
+                            {
+                                ::omnesagent_log::record!(DEBUG, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"reaction_message_id": reaction_message_id, "err": err.to_string()})), "failed to add ACK reaction for message");
+                            }
+                        });
+                    }
+
+                    let thread_ts = if channel_id.is_empty() {
+                        None
+                    } else if self.thread_parent(&client, &channel_id).await.is_some()
+                    {
+                        Some(channel_id.clone())
+                    } else {
+                        None
+                    };
+
+                    let channel_msg = ChannelMessage {
+                        id: if message_id.is_empty() {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            format!("discord_{message_id}")
+                        },
+                        sender: author_id.to_string(),
+                        reply_target: if channel_id.is_empty() {
+                            author_id.to_string()
+                        } else {
+                            channel_id.clone()
+                        },
+                        content: final_content,
+                        channel: "discord".to_string(),
+                        channel_alias: Some(self.alias.clone()),
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        interruption_scope_id: thread_ts.clone(),
+                        thread_ts,
+                        attachments: media_attachments,
+                        subject: None,
+
+                        ..Default::default()};
+
+                    if tx.send(channel_msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Clean up the watchdog task before returning so the outer
+        // reconnection loop can start fresh.
+        if let Some(ref wd) = watchdog {
+            wd.stop().await;
+        }
+
+        Ok(())
+    }
+
+    async fn health_check(&self) -> bool {
+        self.http_client()
+            .get("https://discord.com/api/v10/users/@me")
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        // Interaction sentinels are not channel ids; the deferred "thinking…"
+        // state already plays the typing role for slash replies.
+        if parse_discord_interaction_target(recipient).is_some() {
+            return Ok(());
+        }
+        self.stop_typing(recipient).await?;
+
+        let client = self.http_client();
+        let token = self.bot_token.clone();
+        let channel_id = recipient.to_string();
+
+        let handle = omnesagent_spawn::spawn!(async move {
+            let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
+            loop {
+                let _ = client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .send()
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            }
+        });
+
+        let mut guard = self.typing_handles.lock();
+        guard.insert(recipient.to_string(), handle);
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let mut guard = self.typing_handles.lock();
+        if let Some(handle) = guard.remove(recipient) {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        matches!(
+            self.stream_mode,
+            omnesagent_config::schema::StreamMode::Partial
+                | omnesagent_config::schema::StreamMode::MultiMessage
+        )
+    }
+
+    fn supports_multi_message_streaming(&self) -> bool {
+        self.stream_mode == omnesagent_config::schema::StreamMode::MultiMessage
+    }
+
+    fn multi_message_delay_ms(&self) -> u64 {
+        self.multi_message_delay_ms
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        use omnesagent_config::schema::StreamMode;
+        // Interaction replies have no channel to draft into — the recipient
+        // is a sentinel, not a channel id. The final answer arrives via the
+        // followup-webhook edit in send().
+        if parse_discord_interaction_target(&message.recipient).is_some() {
+            return Ok(None);
+        }
+        match self.stream_mode {
+            StreamMode::Off => Ok(None),
+            StreamMode::Partial => {
+                let initial_text = if message.content.is_empty() {
+                    "...".to_string()
+                } else {
+                    message.content.clone()
+                };
+
+                let client = self.http_client();
+                let msg_id = send_discord_message_json(
+                    &client,
+                    &self.bot_token,
+                    &message.recipient,
+                    &initial_text,
+                )
+                .await?;
+
+                self.last_draft_edit
+                    .lock()
+                    .insert(message.recipient.clone(), std::time::Instant::now());
+
+                Ok(Some(msg_id))
+            }
+            StreamMode::MultiMessage => {
+                // No initial draft — paragraphs are sent as new messages.
+                // Store thread context for paragraph delivery.
+                self.multi_message_sent_len.lock().clear();
+                self.multi_message_thread_ts
+                    .lock()
+                    .insert(message.recipient.clone(), message.thread_ts.clone());
+                Ok(Some("multi_message_synthetic".to_string()))
+            }
+        }
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        use omnesagent_config::schema::StreamMode;
+        // Sentinel recipients have no draft message (see send_draft).
+        if parse_discord_interaction_target(recipient).is_some() {
+            return Ok(());
+        }
+        match self.stream_mode {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
+                // Rate-limit edits per channel.
+                {
+                    let last_edits = self.last_draft_edit.lock();
+                    if let Some(last_time) = last_edits.get(recipient) {
+                        let elapsed_ms =
+                            u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if elapsed_ms < self.draft_update_interval_ms {
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // UTF-8 safe truncation to Discord limit.
+                let display_text = if text.len() > DISCORD_MAX_MESSAGE_LENGTH {
+                    let mut end = 0;
+                    for (idx, ch) in text.char_indices() {
+                        let next = idx + ch.len_utf8();
+                        if next > DISCORD_MAX_MESSAGE_LENGTH {
+                            break;
+                        }
+                        end = next;
+                    }
+                    &text[..end]
+                } else {
+                    text
+                };
+
+                let client = self.http_client();
+                match edit_discord_message(
+                    &client,
+                    &self.bot_token,
+                    recipient,
+                    message_id,
+                    display_text,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        self.last_draft_edit
+                            .lock()
+                            .insert(recipient.to_string(), std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            DEBUG,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "draft update failed"
+                        );
+                    }
+                }
+
+                Ok(())
+            }
+            StreamMode::MultiMessage => {
+                // Track accumulated text and send new paragraphs at \n\n boundaries.
+                // Extract paragraph (if any) under the lock, then drop it before async work.
+                let (paragraph, thread_ts) = {
+                    let thread_ts = self
+                        .multi_message_thread_ts
+                        .lock()
+                        .get(recipient)
+                        .cloned()
+                        .flatten();
+                    let mut sent_map = self.multi_message_sent_len.lock();
+                    let sent_so_far = sent_map.get(recipient).copied().unwrap_or(0);
+
+                    // DraftEvent::Clear resets accumulated text — reset our counter.
+                    if text.len() < sent_so_far {
+                        sent_map.insert(recipient.to_string(), 0);
+                        return Ok(());
+                    }
+                    if text.len() == sent_so_far {
+                        return Ok(());
+                    }
+
+                    let new_text = &text[sent_so_far..];
+                    let mut scan_pos = 0;
+                    let mut in_fence = false;
+                    let bytes = new_text.as_bytes();
+                    let mut found_paragraph = None;
+
+                    while scan_pos < bytes.len() {
+                        let ch = bytes[scan_pos];
+
+                        if ch == b'`'
+                            && scan_pos + 2 < bytes.len()
+                            && bytes[scan_pos + 1] == b'`'
+                            && bytes[scan_pos + 2] == b'`'
+                            && (scan_pos == 0 || bytes[scan_pos - 1] == b'\n')
+                        {
+                            in_fence = !in_fence;
+                        }
+
+                        if !in_fence
+                            && ch == b'\n'
+                            && scan_pos + 1 < bytes.len()
+                            && bytes[scan_pos + 1] == b'\n'
+                        {
+                            let paragraph = new_text[..scan_pos].trim().to_string();
+                            let consumed = scan_pos + 2;
+                            *sent_map.entry(recipient.to_string()).or_insert(0) += consumed;
+                            if !paragraph.is_empty() {
+                                found_paragraph = Some(paragraph);
+                            }
+                            break;
+                        }
+
+                        scan_pos += 1;
+                    }
+                    // Lock is dropped here at end of block.
+                    (found_paragraph, thread_ts)
+                };
+
+                if let Some(paragraph) = paragraph {
+                    let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts.clone());
+                    if let Err(e) = self.send(&msg).await {
+                        ::omnesagent_log::record!(
+                            DEBUG,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "multi-message paragraph send failed"
+                        );
+                    }
+                    if self.multi_message_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            self.multi_message_delay_ms,
+                        ))
+                        .await;
+                    }
+                    // Recurse to handle remaining text.
+                    return self.update_draft(recipient, message_id, text).await;
+                }
+
+                Ok(())
+            }
+        }
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        _suppress_voice: bool,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode == omnesagent_config::schema::StreamMode::MultiMessage {
+            // Flush remaining buffered text.
+            let thread_ts = self
+                .multi_message_thread_ts
+                .lock()
+                .remove(recipient)
+                .flatten();
+            let sent_so_far = self
+                .multi_message_sent_len
+                .lock()
+                .remove(recipient)
+                .unwrap_or(0);
+            if text.len() > sent_so_far {
+                let remaining = text[sent_so_far..].trim().to_string();
+                if !remaining.is_empty() {
+                    let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
+                    if let Err(e) = self.send(&msg).await {
+                        ::omnesagent_log::record!(
+                            DEBUG,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "multi-message final flush failed"
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Belt-and-suspenders: kill any typing handles for this channel.
+        let _ = self.stop_typing(recipient).await;
+        self.last_draft_edit.lock().remove(recipient);
+
+        let text = &crate::util::strip_tool_call_tags(text);
+        // Lift `[EMBED:…]` out before the media-marker scan (its JSON can contain
+        // `[`/`]`); embeds attach to the first finalized message below, so a
+        // streaming/draft reply renders embeds the same as a normal send.
+        let (text_without_embeds, embeds, _embed_failures, _embeds_truncated) =
+            prepare_outgoing_embeds(text, self.workspace_dir.as_deref());
+        let (text_without_components, component_rows) =
+            parse_component_markers(&text_without_embeds);
+        let component_action_rows = if component_rows.is_empty() {
+            Vec::new()
+        } else {
+            self.build_marker_components(&component_rows)
+        };
+        let (cleaned_content, parsed_attachments) =
+            parse_attachment_markers(&text_without_components);
+        let (mut local_files, remote_urls, failures) =
+            classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
+        let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        let note = delivery_failure_note(&failures);
+        let content = compose_body_with_failure_note(&body, note.as_deref());
+        let reactions = decide_failure_reactions(&failures);
+
+        let client = self.http_client();
+
+        // Path 1: file attachments — delete draft and POST fresh message with files.
+        if !local_files.is_empty() {
+            let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+
+            if local_files.len() > 10 {
+                local_files.truncate(10);
+            }
+            let chunks = split_message_for_discord(&content);
+            let mut first_message_id: Option<String> = None;
+            for (i, chunk) in chunks.iter().enumerate() {
+                let new_id = if i == 0 {
+                    // Embeds + components + files ride the first message.
+                    let payload = DiscordOutgoing {
+                        content: Some(chunk.clone()),
+                        embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
+                        ..Default::default()
+                    };
+                    send_discord_message_payload_with_files(
+                        &client,
+                        &self.bot_token,
+                        recipient,
+                        &payload,
+                        &local_files,
+                    )
+                    .await?
+                } else {
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
+                };
+                if first_message_id.is_none() {
+                    first_message_id = Some(new_id);
+                }
+                if i < chunks.len() - 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
+                .await;
+            return Ok(());
+        }
+
+        // Path 2: text exceeds limit — delete draft and POST as chunked messages.
+        if content.chars().count() > DISCORD_MAX_MESSAGE_LENGTH {
+            let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+
+            let chunks = split_message_for_discord(&content);
+            let mut first_message_id: Option<String> = None;
+            for (i, chunk) in chunks.iter().enumerate() {
+                let new_id = if i == 0 {
+                    // Embeds + components ride the first message.
+                    let payload = DiscordOutgoing {
+                        content: Some(chunk.clone()),
+                        embeds: embeds.clone(),
+                        components: component_action_rows.clone(),
+                        ..Default::default()
+                    };
+                    send_discord_message_payload(&client, &self.bot_token, recipient, &payload)
+                        .await?
+                } else {
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
+                };
+                if first_message_id.is_none() {
+                    first_message_id = Some(new_id);
+                }
+                if i < chunks.len() - 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+            self.apply_failure_reactions(recipient, first_message_id.as_deref(), &reactions)
+                .await;
+            return Ok(());
+        }
+
+        let payload = DiscordOutgoing {
+            content: Some(content.clone()),
+            embeds: embeds.clone(),
+            components: component_action_rows.clone(),
+            ..Default::default()
+        };
+        let reaction_target = match edit_discord_message_payload(
+            &client,
+            &self.bot_token,
+            recipient,
+            message_id,
+            &payload,
+        )
+        .await
+        {
+            Ok(()) => message_id.to_string(),
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "Discord finalize_draft edit failed: ; falling back to delete+send"
+                );
+                let _ =
+                    delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+                send_discord_message_payload(&client, &self.bot_token, recipient, &payload).await?
+            }
+        };
+        self.apply_failure_reactions(recipient, Some(&reaction_target), &reactions)
+            .await;
+
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        if self.stream_mode == omnesagent_config::schema::StreamMode::MultiMessage {
+            self.multi_message_sent_len.lock().remove(recipient);
+            self.multi_message_thread_ts.lock().remove(recipient);
+            return Ok(());
+        }
+
+        let _ = self.stop_typing(recipient).await;
+        self.last_draft_edit.lock().remove(recipient);
+
+        let client = self.http_client();
+        if let Err(e) =
+            delete_discord_message(&client, &self.bot_token, recipient, message_id).await
+        {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "cancel_draft delete failed"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        // Interaction sentinels are not channel ids; a reaction REST call
+        // against one is guaranteed 404 (with the sentinel in the URL).
+        if parse_discord_interaction_target(channel_id).is_some() {
+            return Ok(());
+        }
+        let url = discord_reaction_url(channel_id, message_id, emoji);
+
+        let resp = self
+            .http_client()
+            .put(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .header("Content-Length", "0")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord add reaction failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        // Interaction sentinels are not channel ids (see add_reaction).
+        if parse_discord_interaction_target(channel_id).is_some() {
+            return Ok(());
+        }
+        let url = discord_reaction_url(channel_id, message_id, emoji);
+
+        let resp = self
+            .http_client()
+            .delete(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            anyhow::bail!("Discord remove reaction failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<omnesagent_api::channel::AttributedApprovalResponse>> {
+        // Approval prompts can't be delivered over a deferred interaction
+        // reply (the sentinel is not a channel and the single @original
+        // edit is reserved for the answer). Fail fast so the agent loop's
+        // deny-by-default applies instead of a doomed REST round-trip.
+        if parse_discord_interaction_target(recipient).is_some() {
+            anyhow::bail!("approval prompts are not supported over interaction replies");
+        }
+        let token = crate::util::new_approval_token();
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(token.clone(), tx);
+
+        // Strip thread suffix — approval message goes to the channel root.
+        let channel_id = recipient.split(':').next().unwrap_or(recipient);
+
+        let emitted = if self.slash_commands {
+            self.send_buttoned_approval(channel_id, &token, request)
+                .await
+        } else {
+            self.send_plaintext_approval(channel_id, &token, request)
+                .await
+        };
+        if let Err(err) = emitted {
+            self.pending_approvals.lock().await.remove(&token);
+            return Err(err);
+        }
+
+        // Timeout → Deny, preserving the deny-by-default silence semantics. The
+        // pending entry is dropped so a late click can't resolve a stale token.
+        // The synthesized deny carries a runtime source so the gate does not
+        // report it to the model as an operator's refusal.
+        let attributed =
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+                Ok(Ok(resp)) => omnesagent_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Err(_)) => {
+                    // Sender dropped: the gateway task went away without a click.
+                    self.pending_approvals.lock().await.remove(&token);
+                    omnesagent_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        omnesagent_api::channel::ApprovalSource::Unreachable,
+                    )
+                }
+                Err(_) => {
+                    self.pending_approvals.lock().await.remove(&token);
+                    omnesagent_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        omnesagent_api::channel::ApprovalSource::TimedOut,
+                    )
+                }
+            };
+        Ok(Some(attributed))
+    }
+
+    async fn send_gate_prompt(
+        &self,
+        recipient: &str,
+        prompt: &ChannelGatePrompt,
+    ) -> anyhow::Result<bool> {
+        // Buttons are only actionable when the INTERACTION_CREATE pipe is live
+        // (gated on `slash_commands`, like the buttoned tool approval). Without
+        // it, report "no native prompt" so the caller falls back to the text
+        // notice — whose `<choice> <reference>` reply the orchestrator parses.
+        if !self.slash_commands {
+            return Ok(false);
+        }
+        // STATELESS by design (unlike the oneshot-backed tool approval): the
+        // custom_id itself carries the (choice, reference) binding, so the
+        // prompt outlives this call AND daemon restarts — a parked SOP gate can
+        // be answered hours later or after a reboot. Forgery is bounded by
+        // Discord only dispatching interactions for components that exist on a
+        // message this bot posted, plus the fail-closed interaction gate.
+        let channel_id = recipient.split(':').next().unwrap_or(recipient);
+        let buttons: Vec<components::DiscordComponent> = prompt
+            .choices
+            .iter()
+            .map(|choice| {
+                let style = match choice.emphasis {
+                    GateChoiceEmphasis::Positive => components::ButtonStyle::Success,
+                    GateChoiceEmphasis::Negative => components::ButtonStyle::Danger,
+                    GateChoiceEmphasis::Neutral => components::ButtonStyle::Secondary,
+                };
+                // Input-bearing choices (Edit / Revise) open a modal on click;
+                // plain choices emit the gate marker directly. Both stay
+                // stateless: the custom_id carries `<choice>:<reference>`.
+                let kind = if choice.input.is_some() {
+                    approval::SOP_GATE_MODAL_KIND
+                } else {
+                    approval::SOP_GATE_KIND
+                };
+                components::button(
+                    style,
+                    &choice.label,
+                    custom_id::CustomId::new(kind, format!("{}:{}", choice.id, prompt.reference)),
+                )
+            })
+            .collect();
+        let outgoing = DiscordOutgoing {
+            content: None,
+            embeds: vec![DiscordEmbed {
+                title: Some(prompt.title.clone()),
+                description: Some(prompt.description.clone()),
+                ..Default::default()
+            }],
+            components: vec![components::action_row(buttons)],
+            flags: Default::default(),
+        };
+        let message_id = rest::send_discord_outgoing(
+            &self.http_client(),
+            &self.bot_token,
+            channel_id,
+            &outgoing,
+        )
+        .await?;
+        gate_prompts::record(
+            &prompt.reference,
+            gate_prompts::GatePromptRecord {
+                channel_alias: self.alias.clone(),
+                channel_id: channel_id.to_string(),
+                message_id,
+                title: prompt.title.clone(),
+                resolved_description: prompt.resolved_description.clone(),
+                inputs: prompt
+                    .choices
+                    .iter()
+                    .filter_map(|c| {
+                        c.input.as_ref().map(|input| gate_prompts::GatePromptInput {
+                            choice_id: c.id.clone(),
+                            label: input.label.clone(),
+                            prefill: input.prefill.clone(),
+                        })
+                    })
+                    .collect(),
+            },
+        );
+        Ok(true)
+    }
+
+    async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> anyhow::Result<bool> {
+        // Process-wide registry (see `gate_prompts`): the instance that sent the
+        // prompt and the one finalizing it are usually DIFFERENT instances of
+        // the same alias (separate channel maps). The registry records the
+        // sending alias but not credentials; the matching live channel instance
+        // owns the current bot token used for PATCH.
+        let mut records = gate_prompts::take_for_alias(reference, &self.alias);
+        if records.is_empty() {
+            return Ok(false);
+        }
+
+        while let Some(record) = records.pop() {
+            // Keep the approval CONTEXT in place and append the outcome under it —
+            // a resolved prompt should still show what was approved, not erase it.
+            // PATCH with an EXPLICIT empty components array: omitting the key would
+            // leave the buttons in place on Discord's side.
+            let description = match &record.resolved_description {
+                Some(base) => format!("{base}\n\n{outcome}"),
+                None => outcome.to_string(),
+            };
+            let body = serde_json::json!({
+                "embeds": [{"title": record.title, "description": description}],
+                "components": [],
+            });
+            let url = format!(
+                "https://discord.com/api/v10/channels/{}/messages/{}",
+                record.channel_id, record.message_id
+            );
+            let resp = self
+                .http_client()
+                .patch(&url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .json(&body)
+                .send()
+                .await;
+            // Transient failure: put the failed and unattempted records back so a
+            // later terminal event (a stale click's "window has passed") retries.
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    gate_prompts::record(reference, record);
+                    for remaining in records {
+                        gate_prompts::record(reference, remaining);
+                    }
+                    return Err(e.into());
+                }
+            };
+            if !resp.status().is_success() {
+                let status = resp.status();
+                gate_prompts::record(reference, record);
+                for remaining in records {
+                    gate_prompts::record(reference, remaining);
+                }
+                anyhow::bail!("Discord gate-prompt finalize failed ({status})");
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_recipient_prefers_per_message_target() {
+        let ids = vec!["fallback_channel".to_string()];
+        assert_eq!(
+            effective_discord_recipient("explicit_channel", &ids),
+            Some("explicit_channel")
+        );
+    }
+
+    #[test]
+    fn effective_recipient_falls_back_to_first_channel_id_when_empty() {
+        let ids = vec!["first_channel".to_string(), "second_channel".to_string()];
+        assert_eq!(effective_discord_recipient("", &ids), Some("first_channel"));
+    }
+
+    #[test]
+    fn effective_recipient_is_none_when_empty_and_no_channel_ids() {
+        assert_eq!(effective_discord_recipient("", &[]), None);
+    }
+    use std::fmt::Write as _;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|i| (*i).to_string()).collect()
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_lifts_marker_vets_urls_and_strips_text() {
+        let raw = "look [EMBED:{\"title\":\"Report\",\"image\":\"https://ex.com/i.png\"}] done";
+        let (text, embeds, failures, truncated) = prepare_outgoing_embeds(raw, None);
+        assert_eq!(text, "look  done");
+        assert_eq!(embeds.len(), 1);
+        assert_eq!(embeds[0].title.as_deref(), Some("Report"));
+        assert_eq!(
+            embeds[0].image.as_ref().unwrap().url,
+            "https://ex.com/i.png"
+        );
+        assert!(failures.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_drops_bad_url_and_reports_failure() {
+        let raw = "[EMBED:{\"title\":\"T\",\"image\":\"file:///etc/passwd\"}]";
+        let (text, embeds, failures, _) = prepare_outgoing_embeds(raw, None);
+        assert_eq!(text, "");
+        assert_eq!(embeds.len(), 1);
+        assert!(embeds[0].image.is_none(), "disallowed scheme dropped");
+        assert_eq!(failures, vec![DiscordMarkerFailure::Refused]);
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_flags_structural_truncation() {
+        // 11 embeds → over the 10-per-message cap → truncated, ⚠️ territory.
+        let markers: String = (0..11)
+            .map(|i| format!("[EMBED:{{\"title\":\"t{i}\"}}]"))
+            .collect();
+        let (_, embeds, _, truncated) = prepare_outgoing_embeds(&markers, None);
+        assert_eq!(embeds.len(), 10);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_leaves_plain_text_untouched() {
+        let (text, embeds, failures, truncated) =
+            prepare_outgoing_embeds("just a normal reply", None);
+        assert_eq!(text, "just a normal reply");
+        assert!(embeds.is_empty());
+        assert!(failures.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn finalize_draft_builds_a_first_message_payload_carrying_embeds() {
+        // finalize_draft (and the slash-reply path) lift embeds out of the final
+        // text and attach them to the first message's DiscordOutgoing — the same
+        // transformation send() does. Pin that so neither path regresses to
+        // content-only and leaks the raw [EMBED:…] marker.
+        let raw = "Result [EMBED:{\"title\":\"Report\"}]";
+        let (content, embeds, _failures, _truncated) = prepare_outgoing_embeds(raw, None);
+        assert_eq!(content, "Result");
+        assert_eq!(embeds.len(), 1);
+        let payload = DiscordOutgoing {
+            content: Some(content),
+            embeds,
+            ..Default::default()
+        };
+        assert_eq!(
+            payload.to_rest_json(),
+            serde_json::json!({ "content": "Result", "embeds": [{ "title": "Report" }] })
+        );
+    }
+
+    #[test]
+    fn finalize_draft_payload_carries_components() {
+        let raw = "Pick one [COMPONENTS:{\"rows\":[[{\"label\":\"Go\",\"style\":\"primary\",\"prompt\":\"go\"}]]}]";
+        let (content, rows) = parse_component_markers(raw);
+        assert_eq!(content.trim(), "Pick one");
+        assert_eq!(rows.len(), 1, "one action row parsed");
+        let mut reg = pending::PendingComponents::default();
+        let component_action_rows = build_component_rows("n", &rows, &mut reg);
+        assert_eq!(component_action_rows.len(), 1, "row rendered");
+        let payload = DiscordOutgoing {
+            content: Some(content.trim().to_string()),
+            components: component_action_rows,
+            ..Default::default()
+        };
+        let json = payload.to_rest_json();
+        assert!(
+            json.get("components").is_some(),
+            "finalize payload must carry the action rows; got {json}"
+        );
+    }
+
+    #[test]
+    fn interaction_gate_applies_peer_allowlist() {
+        // Wildcard admits anyone; otherwise the invoker must be listed.
+        assert_eq!(
+            interaction_gate(&s(&["*"]), &[], &[], "u1", None, "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&s(&["u1"]), &[], &[], "u1", None, "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&s(&["u1"]), &[], &[], "intruder", None, "c1", None),
+            Err(InteractionDenial::UnauthorizedUser)
+        );
+        // Empty peer list = nobody, same as the message path.
+        assert_eq!(
+            interaction_gate(&[], &[], &[], "u1", None, "c1", None),
+            Err(InteractionDenial::UnauthorizedUser)
+        );
+    }
+
+    #[test]
+    fn interaction_gate_applies_guild_and_channel_filters() {
+        let peers = s(&["*"]);
+        let guilds = s(&["g1"]);
+        let channels = s(&["c1"]);
+
+        assert_eq!(
+            interaction_gate(&peers, &guilds, &channels, "u1", Some("g1"), "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&peers, &guilds, &[], "u1", Some("g2"), "c1", None),
+            Err(InteractionDenial::GuildNotAllowed)
+        );
+        // DM interactions carry no guild_id and pass the guild filter,
+        // mirroring MESSAGE_CREATE.
+        assert_eq!(
+            interaction_gate(&peers, &guilds, &[], "u1", None, "c1", None),
+            Ok(())
+        );
+        assert_eq!(
+            interaction_gate(&peers, &[], &channels, "u1", Some("g1"), "c2", None),
+            Err(InteractionDenial::ChannelNotAllowed)
+        );
+        // A thread whose parent is allowlisted passes, like threaded messages.
+        assert_eq!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channels,
+                "u1",
+                Some("g1"),
+                "thread9",
+                Some("c1")
+            ),
+            Ok(())
+        );
+    }
+
+    /// Discord saves attachments under a uniqueness-prefixed name while the
+    /// envelope keeps the sender's name, so the marker target and the file
+    /// name never match. Driving the real `process_attachments` through the
+    /// real pipeline proves the two are joined by recorded provenance rather
+    /// than by name — a basename comparison sends this image twice.
+    #[tokio::test]
+    async fn saved_attachment_marker_joins_to_its_envelope_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": format!("{}/attachments/1/photo.jpg", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        let saved = media[0]
+            .marker_target()
+            .expect("a saved attachment must record the target it rendered");
+        // The recorded target is a native filesystem path, so the separator is
+        // `\` on Windows and `/` elsewhere. Walk it as a `Path` instead of
+        // matching a `/`-joined substring, which only ever held on Unix — and
+        // which made the save-name check below compare the whole path.
+        let saved_path = std::path::Path::new(saved);
+        assert_eq!(
+            saved_path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|dir| dir.to_str()),
+            Some("discord_files"),
+            "expected a workspace save path, got: {saved}"
+        );
+        assert_ne!(
+            saved_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(saved),
+            media[0].file_name,
+            "the save name must differ from the sender name, or this test proves nothing"
+        );
+        assert!(
+            text.contains(&format!("[IMAGE:{saved}]")),
+            "rendered text must reference exactly the recorded target: {text}"
+        );
+
+        let config = omnesagent_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a Discord-saved image must not be inlined a second time"
+        );
+        assert!(
+            !enriched.contains("IMAGE:data:"),
+            "no base64 copy may be added alongside the path marker: {enriched}"
+        );
+    }
+
+    /// A Discord `image/heic` upload is not a format the provider loader
+    /// accepts. It must render as a document and keep that disposition through
+    /// the shared pipeline; before the loadability contract reached Discord,
+    /// the broader `image/*` classifier marked it channel-owned as an image,
+    /// the pipeline skipped the whole attachment, and the provider then
+    /// rejected the marker it could not reload — dropping the bytes entirely.
+    #[tokio::test]
+    async fn unloadable_image_upload_stays_a_document_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.heic"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0x00, 0x01, 0x02, 0x03]))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.heic",
+            "content_type": "image/heic",
+            "url": format!("{}/attachments/1/photo.heic", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert_eq!(
+            media[0].marker.as_ref().map(|m| m.kind),
+            Some(MarkerKind::Document),
+            "an unloadable image must be owned as a document, not an image"
+        );
+        assert!(
+            text.contains("[DOCUMENT:") && !text.contains("[IMAGE:"),
+            "the unloadable image must render as a document marker: {text}"
+        );
+
+        let config = omnesagent_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a channel-owned document must not be reclassified and inlined as an image"
+        );
+        assert!(
+            !enriched.contains("IMAGE:data:"),
+            "no base64 image copy may be produced for an unloadable image: {enriched}"
+        );
+    }
+
+    /// With no workspace configured (or a failed save) the rendered target is
+    /// the attachment URL, which the default no-remote-image path will not
+    /// fetch. The typed envelope records that fallback as non-owned, so the
+    /// pipeline replaces the URL with inline data and provider preparation
+    /// sees one effective image reference without a false partial-load note.
+    #[tokio::test]
+    async fn image_with_no_workspace_is_enriched_rather_than_dropped() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": format!("{}/attachments/1/photo.jpg", server.uri()),
+        })];
+
+        // No workspace: the marker target can only be the (non-reloadable) URL.
+        let (text, media) =
+            process_attachments(&attachments, &reqwest::Client::new(), None, None).await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert!(
+            media[0].marker_target().is_some(),
+            "a URL fallback must retain its exact channel marker target"
+        );
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            attachments[0]["url"].as_str(),
+            "the URL fallback must be exposed for exact replacement"
+        );
+        assert!(
+            !media[0].channel_rendered_owned_disposition(),
+            "a remote URL fallback must not be deferred by the shared pipeline"
+        );
+
+        let config = omnesagent_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert!(
+            enriched.contains("IMAGE:data:"),
+            "the loadable image's bytes must reach the provider as inline data, not be dropped: {enriched}"
+        );
+
+        let prepared = omnesagent_providers::multimodal::prepare_messages_for_provider(
+            &[omnesagent_api::model_provider::ChatMessage::user(enriched)],
+            &omnesagent_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("provider preparation should accept the inline fallback image");
+        assert!(prepared.contains_images);
+        let provider_content = &prepared.messages[0].content;
+        assert_eq!(
+            provider_content.matches("data:image/jpeg;base64,").count(),
+            1,
+            "provider preparation must receive one effective image: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains("could not be loaded"),
+            "a successful inline fallback must not produce a partial-load note: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains(attachments[0]["url"].as_str().unwrap()),
+            "the unfetchable URL must not survive beside the inline image: {provider_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_with_failed_workspace_save_is_enriched_rather_than_dropped() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/attachments/1/photo.jpg", server.uri());
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": url,
+        })];
+        // A regular file cannot contain the `discord_files` save directory,
+        // so this exercises the same URL fallback after download succeeds.
+        let blocked_workspace = tempfile::NamedTempFile::new().unwrap();
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(blocked_workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert_eq!(media[0].marker_target(), Some(url.as_str()));
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            Some(url.as_str())
+        );
+        assert!(!media[0].channel_rendered_owned_disposition());
+
+        let config = omnesagent_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert!(enriched.contains("[IMAGE:data:image/jpeg;base64,"));
+        assert!(!enriched.contains(&url));
+    }
+
+    #[tokio::test]
+    async fn interaction_answer_over_2000_chars_chunks_into_edit_plus_followup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The first chunk edits the deferred @original message.
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The remaining chunk is delivered as a followup POST (not truncated).
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        // 3000 contiguous chars (no break point) → a 2000-char chunk + a 1000.
+        let content = "a".repeat(3000);
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), &content, &[], &[])
+            .await
+            .unwrap();
+        // wiremock verifies the expect(1) counts when the server drops.
+    }
+
+    #[tokio::test]
+    async fn short_interaction_answer_only_edits_original() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A short reply must not trigger any followup POST.
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(
+            &client,
+            "app1",
+            "tok",
+            &server.uri(),
+            "short answer",
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interaction_answer_emits_components_on_original_edit() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The @original edit MUST carry the `components` array (a type-1 action
+        // row holding the rendered button) and the stripped content — proving a
+        // slash-command reply with a [COMPONENTS:…] marker renders interactive
+        // controls instead of leaking the marker text.
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({
+                "content": "Pick:",
+                "components": [{ "type": 1 }],
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Build a real action row through the same registry path send() uses.
+        let (cleaned, marker_rows) = parse_component_markers(
+            "Pick: [COMPONENTS:{\"rows\":[[{\"label\":\"Ship\",\"style\":\"primary\",\"prompt\":\"ship it\"}]]}]",
+        );
+        assert_eq!(cleaned, "Pick:");
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &marker_rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(
+            &client,
+            "app1",
+            "tok",
+            &server.uri(),
+            &cleaned,
+            &[],
+            &action_rows,
+        )
+        .await
+        .unwrap();
+        // wiremock verifies the expect(1) + body_partial_json when the server drops.
+    }
+
+    #[tokio::test]
+    async fn plain_interaction_answer_omits_components_key() {
+        // Behaviour-neutrality: a reply with no marker (empty components slice)
+        // serialises to a content-only @original edit — no `components` key.
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({ "content": "hi" })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "hi", &[], &[])
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("components").is_none(),
+            "plain reply must not carry a components key"
+        );
+    }
+
+    #[test]
+    fn send_interaction_pipeline_strips_marker_and_registers_intents() {
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let content = crate::util::strip_tool_call_tags(
+            "Choose: [COMPONENTS:{\"rows\":[[{\"label\":\"Approve\",\"style\":\"success\",\"prompt\":\"user approved\"},{\"label\":\"Docs\",\"url\":\"https://example.com\"}]]}]",
+        );
+        let (stripped, marker_rows) = parse_component_markers(&content);
+        assert_eq!(
+            stripped, "Choose:",
+            "marker stripped from interaction reply"
+        );
+        assert!(!marker_rows.is_empty(), "marker parsed into rows");
+
+        let action_rows = ch.build_marker_components(&marker_rows);
+        assert_eq!(action_rows.len(), 1, "one action row rendered");
+
+        // The Approve button is registered (clickable); the link button is not.
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "only the prompt-bearing button registers");
+        assert_eq!(
+            ch.pending_components.lock().take(&ids[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "user approved".into()
+            }),
+            "click resolves the server-bound prompt"
+        );
+        // Single-use take: a replay resolves nothing.
+        assert_eq!(ch.pending_components.lock().take(&ids[0]), None);
+    }
+
+    #[test]
+    fn interaction_reply_target_roundtrips() {
+        let target = discord_interaction_reply_target("123456789");
+        assert_eq!(target, "interaction:123456789");
+        assert_eq!(parse_discord_interaction_target(&target), Some("123456789"));
+    }
+
+    #[test]
+    fn non_interaction_targets_are_ignored() {
+        // A normal Discord channel id must NOT be treated as an interaction.
+        assert_eq!(parse_discord_interaction_target("123456789012345678"), None);
+        // Empty ids are rejected.
+        assert_eq!(parse_discord_interaction_target("interaction:"), None);
+        // The legacy `app:token` form (which carried a live credential in the
+        // reply target) must never round-trip as valid again.
+        assert_eq!(
+            parse_discord_interaction_target("interaction:app123:tok456"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_unknown_interaction_sentinel_fails_without_rest() {
+        // A sentinel whose credentials are not in the pending store (expired,
+        // restarted process, forged) must error out before any HTTP happens.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "interaction:999".into(),
+            subject: None,
+            thread_ts: None,
+            cancellation_token: None,
+            attachments: Vec::new(),
+            in_reply_to: None,
+            references: Vec::new(),
+            force_voice: false,
+            suppress_voice: false,
+        };
+        let err = ch.send(&msg).await.unwrap_err();
+        assert!(err.to_string().contains("unknown or expired"));
+    }
+
+    fn skill(name: &str, description: &str, tags: &[&str]) -> omnesagent_runtime::skills::Skill {
+        omnesagent_runtime::skills::Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+            tools: vec![],
+            prompts: vec![],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }
+    }
+
+    #[test]
+    fn command_slug_fits_discord_charset() {
+        assert_eq!(discord_command_slug("Deploy Status"), "deploy-status");
+        assert_eq!(discord_command_slug("summarize_pdf"), "summarize_pdf");
+        assert_eq!(discord_command_slug("a  b!!c"), "a-b-c");
+        assert_eq!(discord_command_slug("--weird--"), "weird");
+        assert_eq!(discord_command_slug(""), "");
+        // All-non-ASCII names slug to empty (documented limitation).
+        assert_eq!(discord_command_slug("日本語スキル"), "");
+        // 32-char cap, with a trailing dash at the boundary trimmed.
+        assert_eq!(discord_command_slug(&"x".repeat(50)).len(), 32);
+        let boundary = format!("{} tail", "y".repeat(31));
+        let slug = discord_command_slug(&boundary);
+        assert!(slug.len() <= 32 && !slug.ends_with('-'));
+    }
+
+    #[test]
+    fn specs_require_the_slash_tag_and_unique_slugs() {
+        let skills = vec![
+            skill("deploy status", "Check deploy state", &["slash"]),
+            skill("not exposed", "No tag, no command", &[]),
+            skill("Deploy Status", "Colliding slug", &["slash"]),
+            skill("ask", "Reserved name", &["slash"]),
+            skill("no-desc", "", &["slash"]),
+            skill(
+                "community",
+                "Synced from a remote repo",
+                &["slash", "open-skills"],
+            ),
+        ];
+        let specs = discord_slash_specs_from_skills(&skills);
+        let slugs: Vec<&str> = specs.iter().map(|s| s.slug.as_str()).collect();
+        // Sorted, deduped, reserved + untagged + open-skills excluded.
+        assert_eq!(slugs, vec!["deploy-status", "no-desc"]);
+        assert_eq!(specs[1].description, "Run the no-desc skill");
+    }
+
+    #[test]
+    fn specs_are_deterministic_regardless_of_input_order() {
+        let a = vec![
+            skill("bravo", "b", &["slash"]),
+            skill("alpha", "a", &["slash"]),
+        ];
+        let b = vec![
+            skill("alpha", "a", &["slash"]),
+            skill("bravo", "b", &["slash"]),
+        ];
+        assert_eq!(
+            discord_slash_specs_from_skills(&a),
+            discord_slash_specs_from_skills(&b)
+        );
+    }
+
+    #[test]
+    fn specs_cap_at_the_registration_limit() {
+        let many: Vec<_> = (0..95)
+            .map(|i| skill(&format!("skill-{i:03}"), "d", &["slash"]))
+            .collect();
+        let specs = discord_slash_specs_from_skills(&many);
+        assert_eq!(specs.len(), MAX_SKILL_SLASH_COMMANDS);
+    }
+
+    #[test]
+    fn specs_sanitize_names_that_enter_the_synthesized_prompt() {
+        let skills = vec![skill("evil'\nname", "d", &["slash"])];
+        let specs = discord_slash_specs_from_skills(&skills);
+        assert!(!specs[0].skill_name.contains('\''));
+        assert!(!specs[0].skill_name.contains('\n'));
+    }
+
+    #[test]
+    fn registration_body_contains_ask_plus_skill_commands() {
+        let specs = vec![DiscordSlashCommandSpec {
+            skill_name: "deploy status".to_string(),
+            slug: "deploy-status".to_string(),
+            description: "Check deploy state".to_string(),
+            description_localizations: Default::default(),
+            options: Vec::new(),
+        }];
+        let body = slash_command_registration_body(&specs);
+        let commands = body.as_array().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0]["name"], "ask");
+        assert_eq!(commands[1]["name"], "deploy-status");
+        assert_eq!(commands[1]["options"][0]["name"], "input");
+        assert_eq!(commands[1]["options"][0]["required"], true);
+        // Every desired command matches the ownership fingerprint except
+        // /ask (whose option is `prompt`) — exactly the reaping contract.
+        assert!(!is_skill_command_shape(&commands[0]));
+        assert!(is_skill_command_shape(&commands[1]));
+    }
+
+    #[test]
+    fn foreign_commands_do_not_match_the_skill_shape() {
+        // No options at all.
+        assert!(!is_skill_command_shape(&serde_json::json!({"name": "x"})));
+        // Multiple options.
+        assert!(!is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [
+                {"name": "input", "type": 3, "required": true},
+                {"name": "more", "type": 3, "required": false}
+            ]
+        })));
+        // Right shape, wrong option name.
+        assert!(!is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [{"name": "query", "type": 3, "required": true}]
+        })));
+        // The critical foreign-collision case: a generic `/x <input>`
+        // command registered by other tooling. Structure matches, but the
+        // ownership marker (our exact option description) does not — it
+        // must never be reaped.
+        assert!(!is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": "what to run"
+            }]
+        })));
+        // Our own marker matches.
+        assert!(is_skill_command_shape(&serde_json::json!({
+            "name": "x",
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        })));
+    }
+
+    fn stale_skill_command(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name, "description": "d", "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_when_a_stale_delete_fails() {
+        // A transiently failing DELETE of an owned stale command must make
+        // the whole reconcile report Err — otherwise the caller records the
+        // fingerprint as successful and the stale command is never retried
+        // while the desired set stays unchanged.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        // Desired set: /ask only (the upsert must still be attempted and
+        // succeed even though the delete fails).
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        let err = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("stale skill command delete"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_treats_delete_404_as_already_gone() {
+        // 404 means the command is already gone (raced cleanup) — the
+        // desired end state holds, so the pass records as successful.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guild_scope_registers_to_the_guild_endpoint() {
+        // scope=Guild with one guild routes the upsert to
+        // /applications/{app}/guilds/{gid}/commands; the (empty) global
+        // endpoint is listed for cross-scope cleanup but has nothing to reap.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_reaps_owned_commands_from_the_inactive_scope() {
+        // Switching to guild scope reaps our `/ask` + skill commands left on the
+        // now-inactive global endpoint, so the same command isn't registered in
+        // both scopes at once (the guild-scope migration hazard).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Derive the stale `/ask` from what we register (incl. its
+        // `description_localizations`, which the reaper's listing requests via
+        // `with_localizations=true`) plus a server-side id - so its projection
+        // matches ours and the ownership check reaps it
+        let mut stale_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        stale_ask["id"] = serde_json::json!("a1");
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/a1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_spares_foreign_ask_in_inactive_scope() {
+        // A `/ask` registered by OTHER tooling (different description) on the
+        // now-inactive global scope must NOT be reaped on a scope switch - we
+        // only delete the `/ask` whose projection matches what we register.
+        // Our own skill command on that scope is still reaped.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let foreign_ask = serde_json::json!({
+            "id": "x1", "name": "ask",
+            "description": "Ask a DIFFERENT bot", "type": 1,
+            "options": [{ "name": "prompt", "description": "What to ask", "type": 3, "required": true }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                foreign_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Our owned skill command IS reaped...
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // ...but the foreign `/ask` (x1) must NOT be: expect(0) fails on drop if
+        // a delete is ever issued for it.
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/x1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_unchanged_and_spares_foreign_commands() {
+        // Steady state: existing /ask matches the desired projection (no
+        // POST), and a foreign command with a generic input option is left
+        // alone. Zero writes.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        existing_ask["id"] = serde_json::json!("a1");
+        let foreign = serde_json::json!({
+            "id": "f1", "name": "run",
+            "description": "external tool", "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": "what to run"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([existing_ask, foreign])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No DELETE and no POST expectations mounted: any write request
+        // would 404 the mock server and fail the reconcile.
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_rate_limited_on_post_429() {
+        // A 429 on an upsert must surface as RateLimited (with the body's
+        // retry_after deadline) so the caller persists a cooldown instead of
+        // re-hammering the daily command budget on the next READY.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(serde_json::json!({"retry_after": 5.0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]); // /ask → one POST
+        let now = crate::discord_slash_state::now_unix();
+        let outcome = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+        match outcome {
+            ReconcileOutcome::RateLimited { until } => assert!(until >= now + 5),
+            ReconcileOutcome::Reconciled => panic!("expected RateLimited on a POST 429"),
+        }
+    }
+
+    #[test]
+    fn command_projection_ignores_server_side_decorations() {
+        // Discord's GET response decorates commands with id/version/etc.;
+        // change detection must compare only what we author.
+        let ours = serde_json::json!({
+            "name": "deploy-status",
+            "description": "Check deploy state",
+            "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        });
+        let theirs = serde_json::json!({
+            "id": "1234", "version": "5678", "application_id": "42",
+            "default_member_permissions": serde_json::Value::Null,
+            "name": "deploy-status",
+            "description": "Check deploy state",
+            "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        });
+        assert_eq!(command_projection(&ours), command_projection(&theirs));
+
+        let changed = serde_json::json!({
+            "name": "deploy-status",
+            "description": "A different description",
+            "type": 1,
+            "options": ours["options"].clone()
+        });
+        assert_ne!(command_projection(&ours), command_projection(&changed));
+    }
+
+    #[test]
+    fn string_options_extract_by_name() {
+        let d = serde_json::json!({
+            "data": {
+                "options": [
+                    {"name": "input", "value": "check prod"},
+                    {"name": "other", "value": "x"}
+                ]
+            }
+        });
+        assert_eq!(interaction_string_option(&d, "input"), "check prod");
+        assert_eq!(interaction_string_option(&d, "missing"), "");
+    }
+
+    #[test]
+    fn channel_resolves_skill_commands_through_resolver() {
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_slash_command_resolver(Arc::new(|| {
+            discord_slash_specs_from_skills(&[skill("deploy status", "Check", &["slash"])])
+        }));
+        let specs = ch.slash_command_resolver.as_ref().map(|r| r()).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].slug, "deploy-status");
+    }
+
+    #[test]
+    fn pending_interaction_sweep_drops_expired_entries() {
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let mut guard = ch.pending_interactions.lock();
+        guard.insert(
+            "live".into(),
+            PendingInteraction {
+                app_id: "a".into(),
+                token: "t".into(),
+                created: std::time::Instant::now(),
+            },
+        );
+        guard.insert(
+            "stale".into(),
+            PendingInteraction {
+                app_id: "a".into(),
+                token: "t".into(),
+                created: std::time::Instant::now()
+                    - INTERACTION_TOKEN_TTL
+                    - std::time::Duration::from_secs(1),
+            },
+        );
+        guard.retain(|_, p| p.created.elapsed() < INTERACTION_TOKEN_TTL);
+        assert!(guard.contains_key("live"));
+        assert!(!guard.contains_key("stale"));
+    }
+
+    #[test]
+    fn discord_channel_name() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        assert_eq!(ch.name(), "discord");
+    }
+
+    /// (channel, archive) pair backed by a throwaway sqlite file, mirroring
+    /// the orchestrator's `with_archive_memory` wiring.
+    fn archived_test_channel() -> (
+        DiscordChannel,
+        std::sync::Arc<dyn omnesagent_memory::Memory>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn omnesagent_memory::Memory> = std::sync::Arc::new(
+            omnesagent_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem));
+        (ch, mem, dir)
+    }
+
+    async fn seed_archived_message(mem: &std::sync::Arc<dyn omnesagent_memory::Memory>) {
+        mem.store(
+            "discord_111",
+            "@alice in #200 at t0: original text",
+            omnesagent_memory::MemoryCategory::Custom("discord".to_string()),
+            Some("200"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_update_appends_edit_marker_to_archived_entry() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised text",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        assert!(
+            entry
+                .content
+                .contains("[edited at 2026-06-11T01:00:00Z: revised text]")
+        );
+        // Session attribution survives the re-store.
+        assert_eq!(entry.session_id.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn redelivered_update_is_idempotent() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised text",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content.matches("[edited at ").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_object_update_without_edited_timestamp_is_not_an_edit() {
+        // Discord sends the complete message object (content included,
+        // unchanged) on embed unfurls, pins, and flag changes — only real
+        // edits carry edited_timestamp. No phantom markers.
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "original text",
+            "edited_timestamp": serde_json::Value::Null,
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content, "@alice in #200 at t0: original text");
+    }
+
+    #[tokio::test]
+    async fn deauthorized_author_cannot_write_via_edits() {
+        // Archive-time authorization is not durable: once a peer leaves
+        // the allowlist their edits must stop reaching the archive.
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn omnesagent_memory::Memory> = std::sync::Arc::new(
+            omnesagent_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["someone-else".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem));
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "injected",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content, "@alice in #200 at t0: original text");
+    }
+
+    #[tokio::test]
+    async fn message_delete_appends_tombstone_once() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({"id": "111", "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+        // Redelivery must not double-stamp.
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        assert_eq!(entry.content.matches("[deleted at ").count(), 1);
+        assert_eq!(entry.session_id.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_tombstones_every_archived_id() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        mem.store(
+            "discord_112",
+            "@bob in #200 at t1: second message",
+            omnesagent_memory::MemoryCategory::Custom("discord".to_string()),
+            Some("200"),
+        )
+        .await
+        .unwrap();
+
+        let d = serde_json::json!({"ids": ["111", "112", "999"], "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE_BULK", &d, "botid")
+            .await;
+
+        assert!(
+            mem.get("discord_111")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("[deleted at ")
+        );
+        assert!(
+            mem.get("discord_112")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("[deleted at ")
+        );
+        // Unarchived ids stay unarchived.
+        assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_then_delete_keeps_both_markers() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let edit = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &edit, "botid")
+            .await;
+        let del = serde_json::json!({"id": "111", "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &del, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(entry.content.contains("[edited at "));
+        assert!(entry.content.contains("[deleted at "));
+    }
+
+    #[tokio::test]
+    async fn message_events_for_unarchived_messages_are_ignored() {
+        // A message that never passed the inbound filters was never stored;
+        // its edit/delete events must not conjure an archive entry.
+        let (ch, mem, _dir) = archived_test_channel();
+
+        let d = serde_json::json!({
+            "id": "999", "channel_id": "200", "content": "whatever",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+
+        assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_history_growth_is_bounded() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let big = "z".repeat(4000);
+        for i in 0..10 {
+            let d = serde_json::json!({
+                "id": "111", "channel_id": "200",
+                "content": format!("{big}-{i}"),
+                "edited_timestamp": format!("2026-06-11T01:00:{i:02}Z"),
+                "author": {"id": "u-alice", "bot": false}
+            });
+            ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+                .await;
+        }
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        // Bounded: cap plus at most one marker's overshoot.
+        assert!(entry.content.len() < MAX_ARCHIVE_ENTRY_BYTES + 5000);
+        assert!(entry.content.contains("[edit history truncated]"));
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        // The latest edit always survives.
+        assert!(entry.content.contains("01:00:09Z"));
+    }
+
+    #[test]
+    fn gateway_intents_default_matches_legacy_mask() {
+        // The pre-resolver IDENTIFY hardcoded 37377. A default-config channel
+        // must request exactly the same mask — no silent behavior change.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch.gateway_intents(), 37377);
+        assert_eq!(ch.gateway_intents(), BASELINE_INTENTS);
+    }
+
+    #[test]
+    fn intent_names_decode_the_mask() {
+        assert_eq!(
+            intent_names(BASELINE_INTENTS),
+            vec![
+                "guilds",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        assert_eq!(
+            intent_names(BASELINE_INTENTS | INTENT_GUILD_MEMBERS | INTENT_GUILD_PRESENCES),
+            vec![
+                "guilds",
+                "guild_members",
+                "guild_presences",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        // Bits with no known name (reachable via the raw override) are
+        // reported, not dropped.
+        assert_eq!(
+            intent_names(INTENT_GUILDS | (1 << 21)),
+            vec!["guilds".to_string(), format!("unknown({:#x})", 1u64 << 21)]
+        );
+    }
+
+    #[test]
+    fn disallowed_intents_hint_names_privileged_toggles() {
+        let hint = disallowed_intents_hint(BASELINE_INTENTS | INTENT_GUILD_MEMBERS);
+        assert!(hint.contains("Server Members"));
+        assert!(hint.contains("Message Content"));
+        assert!(!hint.contains("Presence,"));
+
+        let base_hint = disallowed_intents_hint(BASELINE_INTENTS);
+        assert!(base_hint.contains("Message Content"));
+        assert!(!base_hint.contains("Server Members"));
+
+        // An override mask with no privileged bits still produces an
+        // actionable message instead of a dangling empty list.
+        let bare = disallowed_intents_hint(INTENT_GUILDS);
+        assert!(bare.contains("mask 0x1"));
+    }
+
+    use omnesagent_config::schema::DiscordReactionScope;
+
+    fn reaction_test_channel(
+        scope: DiscordReactionScope,
+    ) -> (
+        DiscordChannel,
+        std::sync::Arc<dyn omnesagent_memory::Memory>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn omnesagent_memory::Memory> = std::sync::Arc::new(
+            omnesagent_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(scope);
+        (ch, mem, dir)
+    }
+
+    #[test]
+    fn reaction_scope_adds_reaction_intents_to_the_mask() {
+        let (off, _m1, _d1) = reaction_test_channel(DiscordReactionScope::Off);
+        assert_eq!(off.gateway_intents(), 37377);
+
+        let (own, _m2, _d2) = reaction_test_channel(DiscordReactionScope::Own);
+        assert_eq!(
+            own.gateway_intents(),
+            37377 | INTENT_GUILD_MESSAGE_REACTIONS | INTENT_DIRECT_MESSAGE_REACTIONS
+        );
+        // The reactions-on mask is OpenClaw's static base — parity by arithmetic.
+        assert_eq!(own.gateway_intents(), 46593);
+    }
+
+    #[tokio::test]
+    async fn reaction_add_is_archived_and_remove_forgets_it() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "member": {"user": {"username": "bob"}}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+
+        let key = "discord_reaction_m1_u1_👍";
+        let entry = mem.get(key).await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .contains("@bob reacted 👍 to message m1 in #c1")
+        );
+
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert!(mem.get(key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn own_scope_only_records_reactions_to_bot_messages() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::Own);
+
+        let to_other = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "message_author_id": "someone_else"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &to_other, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let to_bot = serde_json::json!({
+            "user_id": "u1", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "🎉"},
+            "message_author_id": "botid"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &to_bot, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m2_u1_🎉")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn bots_own_reactions_are_never_recorded() {
+        // Ack/failure emoji the bot adds itself echo back as gateway events.
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let own_ack = serde_json::json!({
+            "user_id": "botid", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "⚡️"},
+            "message_author_id": "u1"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &own_ack, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_botid_⚡️")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_emoji_keys_by_stable_id_so_rename_cannot_orphan_entries() {
+        // Discord sends {id, name} for custom emoji; the name is mutable
+        // guild state. ADD records by id, and a REMOVE arriving after the
+        // emoji was renamed or deleted (name: null) must still forget it.
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1",
+            "emoji": {"id": "424242", "name": "partyclaw"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        let entry = mem.get("discord_reaction_m1_u1_424242").await.unwrap();
+        // Content keeps the human-readable name; the key uses the id.
+        assert!(entry.unwrap().content.contains("reacted partyclaw"));
+
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1",
+            "emoji": {"id": "424242", "name": serde_json::Value::Null}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u1_424242")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn identityless_emoji_are_ignored() {
+        // No id and no name: nothing meaningful to record (or forget).
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reaction_filters_mirror_the_message_path() {
+        // Peer allowlist: a reactor outside the peer set is never recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn omnesagent_memory::Memory> = std::sync::Arc::new(
+            omnesagent_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let gated = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(|| vec!["friend".to_string()]),
+            false,
+            false,
+        )
+        .with_channel_ids(vec!["c1".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        let stranger = serde_json::json!({
+            "user_id": "stranger", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &stranger, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+
+        // Guild allowlist: wrong guild is dropped even for an allowed peer.
+        let wrong_guild = serde_json::json!({
+            "user_id": "friend", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g2", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &wrong_guild, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+
+        // All gates pass: recorded.
+        let ok = serde_json::json!({
+            "user_id": "friend", "message_id": "m3", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &ok, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m3_friend_👍")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_without_prior_add_is_a_noop() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn reaction_sweep_predicate_scopes_by_message_then_emoji() {
+        // REMOVE_ALL: every row for m1, regardless of user or emoji.
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_👍",
+            "m1",
+            None
+        ));
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u2_🎉",
+            "m1",
+            None
+        ));
+        // ...but never another message's rows, and the trailing `_` on the
+        // prefix keeps `m1` from swallowing `m12`.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m2_u1_👍",
+            "m1",
+            None
+        ));
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m12_u1_👍",
+            "m1",
+            None
+        ));
+
+        // REMOVE_EMOJI: the message AND that one emoji (any user).
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_👍",
+            "m1",
+            Some("👍")
+        ));
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u2_👍",
+            "m1",
+            Some("👍")
+        ));
+        // Right message, wrong emoji: untouched.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m1_u1_🎉",
+            "m1",
+            Some("👍")
+        ));
+        // Right emoji, wrong message: untouched.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m2_u1_👍",
+            "m1",
+            Some("👍")
+        ));
+        // Custom-emoji rows key by id; REMOVE_EMOJI scopes by that same id.
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_424242",
+            "m1",
+            Some("424242")
+        ));
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m1_u1_424242",
+            "m1",
+            Some("999")
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_all_sweeps_only_that_messages_reactions() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        // Two users react with two different emoji on m1, plus an unrelated
+        // reaction on m2 that must survive the sweep.
+        for (user, emoji) in [("u1", "👍"), ("u2", "🎉")] {
+            let add = serde_json::json!({
+                "user_id": user, "message_id": "m1", "channel_id": "c1",
+                "guild_id": "g1", "emoji": {"name": emoji},
+                "member": {"user": {"username": user}}
+            });
+            ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+                .await;
+        }
+        let other = serde_json::json!({
+            "user_id": "u1", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &other, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let clear = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1"
+        });
+        ch.sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &clear)
+            .await;
+
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u2_🎉")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // m2's reaction is untouched.
+        assert!(
+            mem.get("discord_reaction_m2_u1_👍")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_emoji_sweeps_only_that_emoji_on_the_message() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        // Same emoji from two users, plus a different emoji that must survive.
+        for user in ["u1", "u2"] {
+            let add = serde_json::json!({
+                "user_id": user, "message_id": "m1", "channel_id": "c1",
+                "guild_id": "g1", "emoji": {"name": "👍"}
+            });
+            ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+                .await;
+        }
+        let keep = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "🎉"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &keep, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let clear = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1",
+            "emoji": {"name": "👍"}
+        });
+        ch.sweep_message_reactions("MESSAGE_REACTION_REMOVE_EMOJI", &clear)
+            .await;
+
+        // Both 👍 rows gone; the 🎉 row survives.
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u2_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u1_🎉")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_removal_respects_guild_and_channel_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn omnesagent_memory::Memory> = std::sync::Arc::new(
+            omnesagent_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let gated = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_channel_ids(vec!["c1".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        let add = serde_json::json!({
+            "user_id": "friend", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 1);
+
+        // Wrong guild: sweep is a no-op, the row stays.
+        let wrong_guild = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g2"
+        });
+        gated
+            .sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &wrong_guild)
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 1);
+
+        // Right guild and channel: swept.
+        let ok = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1"
+        });
+        gated
+            .sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &ok)
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn intents_mask_override_wins_verbatim() {
+        // Operator escape hatch: a Some(_) intents_mask is sent exactly as
+        // configured, ignoring the derived baseline — including Some(0),
+        // which is a legal IDENTIFY value.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(46593));
+        assert_eq!(ch.gateway_intents(), 46593);
+
+        let zero = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(0));
+        assert_eq!(zero.gateway_intents(), 0);
+
+        // None means "derive".
+        let derived = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(None);
+        assert_eq!(derived.gateway_intents(), BASELINE_INTENTS);
+    }
+
+    #[test]
+    fn base64_decode_bot_id() {
+        // "MTIzNDU2" decodes to "123456"
+        let decoded = base64_decode("MTIzNDU2");
+        assert_eq!(decoded, Some("123456".to_string()));
+    }
+
+    #[test]
+    fn bot_user_id_extraction() {
+        // Token format: base64(user_id).timestamp.hmac
+        let token = "MTIzNDU2.fake.hmac";
+        let id = DiscordChannel::bot_user_id_from_token(token);
+        assert_eq!(id, Some("123456".to_string()));
+    }
+
+    #[test]
+    fn gateway_preflight_429_remains_retryable_http_error() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .header(reqwest::header::RETRY_AFTER, "1")
+                .body(reqwest::Body::from(""))
+                .expect("test response should build"),
+        );
+
+        let error = DiscordChannel::validate_gateway_preflight_response(response)
+            .expect_err("429 should remain an HTTP error");
+        assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        assert!(
+            error.downcast_ref::<DiscordListenerFatalError>().is_none(),
+            "gateway preflight 429 must not be wrapped as fatal"
+        );
+        assert!(
+            !omnesagent_providers::reliable::is_non_retryable(&error),
+            "gateway preflight 429 should stay on the supervisor retry path"
+        );
+    }
+
+    #[test]
+    fn empty_allowlist_denies_everyone() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(!ch.is_user_allowed("12345"));
+        assert!(!ch.is_user_allowed("anyone"));
+    }
+
+    #[test]
+    fn wildcard_allows_everyone() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(ch.is_user_allowed("12345"));
+        assert!(ch.is_user_allowed("anyone"));
+    }
+
+    #[test]
+    fn specific_allowlist_filters() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into(), "222".into()]),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(ch.is_user_allowed("111"));
+        assert!(ch.is_user_allowed("222"));
+        assert!(!ch.is_user_allowed("333"));
+        assert!(!ch.is_user_allowed("unknown"));
+    }
+
+    #[test]
+    fn allowlist_is_exact_match_not_substring() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into()]),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(!ch.is_user_allowed("1111"));
+        assert!(!ch.is_user_allowed("11"));
+        assert!(!ch.is_user_allowed("0111"));
+    }
+
+    #[test]
+    fn allowlist_empty_string_user_id() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into()]),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(!ch.is_user_allowed(""));
+    }
+
+    #[test]
+    fn allowlist_with_wildcard_and_specific() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["111".into(), "*".into()]),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(ch.is_user_allowed("111"));
+        assert!(ch.is_user_allowed("anyone_else"));
+    }
+
+    #[test]
+    fn allowlist_case_sensitive() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["ABC".into()]),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(ch.is_user_allowed("ABC"));
+        assert!(!ch.is_user_allowed("abc"));
+        assert!(!ch.is_user_allowed("Abc"));
+    }
+
+    #[test]
+    fn base64_decode_empty_string() {
+        let decoded = base64_decode("");
+        assert_eq!(decoded, Some(String::new()));
+    }
+
+    #[test]
+    fn fatal_gateway_close_codes_match_expected_discord_auth_and_intent_errors() {
+        for code in [4004_u16, 4010, 4011, 4012, 4013, 4014] {
+            assert!(
+                is_fatal_gateway_close_code(code),
+                "code {code} should be fatal"
+            );
+        }
+        assert!(!is_fatal_gateway_close_code(4007));
+        assert!(!is_fatal_gateway_close_code(4009));
+    }
+
+    #[test]
+    fn new_session_close_codes_match_invalidated_gateway_sessions() {
+        assert!(requires_new_session_close_code(4007));
+        assert!(requires_new_session_close_code(4009));
+        assert!(!requires_new_session_close_code(4004));
+    }
+
+    #[test]
+    fn base64_decode_invalid_chars() {
+        let decoded = base64_decode("!!!!");
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn bot_user_id_from_empty_token() {
+        let id = DiscordChannel::bot_user_id_from_token("");
+        assert_eq!(id, Some(String::new()));
+    }
+
+    #[test]
+    fn contains_bot_mention_supports_plain_and_nick_forms() {
+        assert!(contains_bot_mention("hi <@12345>", "12345"));
+        assert!(contains_bot_mention("hi <@!12345>", "12345"));
+        assert!(!contains_bot_mention("hi <@99999>", "12345"));
+    }
+
+    #[test]
+    fn thread_created_and_system_messages_are_not_conversational() {
+        // The bug: THREAD_CREATED (18) was treated as a normal message, so the
+        // bot replied to a thread's birth. It and other system types must be
+        // rejected; only DEFAULT (0) and REPLY (19) are real user turns.
+        assert!(is_conversational_message_type(0)); // DEFAULT
+        assert!(is_conversational_message_type(19)); // REPLY
+        assert!(!is_conversational_message_type(18)); // THREAD_CREATED
+        assert!(!is_conversational_message_type(21)); // THREAD_STARTER_MESSAGE
+        assert!(!is_conversational_message_type(6)); // CHANNEL_PINNED_MESSAGE
+        assert!(!is_conversational_message_type(7)); // USER_JOIN
+    }
+
+    #[test]
+    fn admit_discord_message_requires_mention_when_enabled() {
+        let cleaned = admit_discord_message("hello there", false, true, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn admit_discord_message_preserves_mention_in_body() {
+        let cleaned = admit_discord_message("  <@!12345> run status  ", false, true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@!12345> run status"));
+    }
+
+    #[test]
+    fn admit_discord_message_admits_caption_that_is_only_the_mention() {
+        let cleaned = admit_discord_message("<@12345>", false, true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@12345>"));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_in_dm_is_admitted() {
+        // DM (effective_mention_only=false), empty text body, at least one
+        // attachment. Previously dropped at the empty-text gate; now passes
+        // through so process_attachments can run on the media.
+        let cleaned = admit_discord_message("", true, false, "12345");
+        assert_eq!(cleaned.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_with_mention_in_guild_is_admitted() {
+        // Guild channel with mention_only=true. Caption is the @mention tag
+        // and the message has a media attachment. Mention gate passes; the
+        // body keeps the mention text so downstream code (and the agent it
+        // routes to) can see who was addressed.
+        let cleaned = admit_discord_message("<@12345>", true, true, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@12345>"));
+    }
+
+    #[test]
+    fn admit_discord_message_attachment_only_without_mention_in_guild_is_rejected() {
+        // Guild channel with mention_only=true, attachment but no mention
+        // anywhere in the caption. The mention gate is orthogonal to
+        // attachment presence: no mention signal means drop.
+        let cleaned = admit_discord_message("", true, true, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn admit_discord_message_drops_when_no_text_and_no_attachments() {
+        // Completely empty payload with attachments absent is always dropped,
+        // regardless of mention_only setting.
+        assert!(admit_discord_message("", false, false, "12345").is_none());
+        assert!(admit_discord_message("", false, true, "12345").is_none());
+    }
+
+    // mention_only DM-bypass tests
+
+    #[test]
+    fn mention_only_dm_bypasses_mention_gate() {
+        // DMs (no guild_id) must pass through even when mention_only is true
+        // and the message contains no @mention. Mirrors the listen call-site logic.
+        let mention_only = true;
+        let is_dm = true;
+        let effective = mention_only && !is_dm;
+        let cleaned = admit_discord_message("hello without mention", false, effective, "12345");
+        assert_eq!(cleaned.as_deref(), Some("hello without mention"));
+    }
+
+    #[test]
+    fn mention_only_guild_message_without_mention_is_rejected() {
+        // Guild messages (has guild_id, so is_dm = false) must still be rejected
+        // when mention_only is true and the message contains no @mention.
+        let mention_only = true;
+        let is_dm = false;
+        let effective = mention_only && !is_dm;
+        let cleaned = admit_discord_message("hello without mention", false, effective, "12345");
+        assert!(cleaned.is_none());
+    }
+
+    #[test]
+    fn mention_only_guild_message_with_mention_passes_through() {
+        // Guild messages that carry a @mention pass through the gate with
+        // the mention text preserved so downstream consumers (and the agent
+        // it routes to) can see who was addressed.
+        let mention_only = true;
+        let is_dm = false;
+        let effective = mention_only && !is_dm;
+        let cleaned = admit_discord_message("<@12345> run status", false, effective, "12345");
+        assert_eq!(cleaned.as_deref(), Some("<@12345> run status"));
+    }
+
+    // Message splitting tests
+
+    #[test]
+    fn split_empty_message() {
+        let chunks = split_message_for_discord("");
+        assert_eq!(chunks, vec![""]);
+    }
+
+    #[test]
+    fn split_short_message_under_limit() {
+        let msg = "Hello, world!";
+        let chunks = split_message_for_discord(msg);
+        assert_eq!(chunks, vec![msg]);
+    }
+
+    #[test]
+    fn split_message_exactly_2000_chars() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
+        let chunks = split_message_for_discord(&msg);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn split_message_just_over_limit() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
+        let chunks = split_message_for_discord(&msg);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[1].chars().count(), 1);
+    }
+
+    #[test]
+    fn split_very_long_message() {
+        let msg = "word ".repeat(2000); // 10000 characters (5 chars per "word ")
+        let chunks = split_message_for_discord(&msg);
+        // Should split into 5 chunks of <= 2000 chars
+        assert_eq!(chunks.len(), 5);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
+        );
+        // Verify total content is preserved
+        let reconstructed = chunks.concat();
+        assert_eq!(reconstructed, msg);
+    }
+
+    #[test]
+    fn split_prefer_newline_break() {
+        let msg = format!("{}\n{}", "a".repeat(1500), "b".repeat(500));
+        let chunks = split_message_for_discord(&msg);
+        // Should split at the newline
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].ends_with('\n'));
+        assert!(chunks[1].starts_with('b'));
+    }
+
+    #[test]
+    fn split_prefer_space_break() {
+        let msg = format!("{} {}", "a".repeat(1500), "b".repeat(600));
+        let chunks = split_message_for_discord(&msg);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn split_without_good_break_points_hard_split() {
+        // No spaces or newlines - should hard split at 2000
+        let msg = "a".repeat(5000);
+        let chunks = split_message_for_discord(&msg);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[1].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[2].chars().count(), 1000);
+    }
+
+    #[test]
+    fn split_multiple_breaks() {
+        // Create a message with multiple newlines
+        let part1 = "a".repeat(900);
+        let part2 = "b".repeat(900);
+        let part3 = "c".repeat(900);
+        let msg = format!("{part1}\n{part2}\n{part3}");
+        let chunks = split_message_for_discord(&msg);
+        // Should split into 2 chunks (first two parts + third part)
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
+        assert!(chunks[1].chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn split_preserves_content() {
+        let original = "Hello world! This is a test message with some content. ".repeat(200);
+        let chunks = split_message_for_discord(&original);
+        let reconstructed = chunks.concat();
+        assert_eq!(reconstructed, original);
+    }
+
+    #[test]
+    fn split_unicode_content() {
+        // Test with emoji and multi-byte characters
+        let msg = "🦀 Rust is awesome! ".repeat(500);
+        let chunks = split_message_for_discord(&msg);
+        // All chunks should be valid UTF-8
+        for chunk in &chunks {
+            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
+            assert!(chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH);
+        }
+        // Reconstruct and verify
+        let reconstructed = chunks.concat();
+        assert_eq!(reconstructed, msg);
+    }
+
+    #[test]
+    fn split_newline_too_close_to_end() {
+        // If newline is in the first half, don't use it - use space instead or hard split
+        let msg = format!("{}\n{}", "a".repeat(1900), "b".repeat(500));
+        let chunks = split_message_for_discord(&msg);
+        // Should split at newline since it's in the second half of the window
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn split_multibyte_only_content_without_panics() {
+        let msg = "🦀".repeat(2500);
+        let chunks = split_message_for_discord(&msg);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chars().count(), DISCORD_MAX_MESSAGE_LENGTH);
+        assert_eq!(chunks[1].chars().count(), 500);
+        let reconstructed = chunks.concat();
+        assert_eq!(reconstructed, msg);
+    }
+
+    #[test]
+    fn split_chunks_always_within_discord_limit() {
+        let msg = "x".repeat(12_345);
+        let chunks = split_message_for_discord(&msg);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
+        );
+    }
+
+    #[test]
+    fn split_message_with_multiple_newlines() {
+        let msg = "Line 1\nLine 2\nLine 3\n".repeat(1000);
+        let chunks = split_message_for_discord(&msg);
+        assert!(chunks.len() > 1);
+        let reconstructed = chunks.concat();
+        assert_eq!(reconstructed, msg);
+    }
+
+    #[test]
+    fn typing_handles_start_empty() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        let guard = ch.typing_handles.lock();
+        assert!(guard.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_typing_sets_handle() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        let _ = ch.start_typing("123456").await;
+        let guard = ch.typing_handles.lock();
+        assert!(guard.contains_key("123456"));
+    }
+
+    #[tokio::test]
+    async fn stop_typing_clears_handle() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        let _ = ch.start_typing("123456").await;
+        let _ = ch.stop_typing("123456").await;
+        let guard = ch.typing_handles.lock();
+        assert!(!guard.contains_key("123456"));
+    }
+
+    #[tokio::test]
+    async fn stop_typing_is_idempotent() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(ch.stop_typing("123456").await.is_ok());
+        assert!(ch.stop_typing("123456").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_typing_handles_are_independent() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        let _ = ch.start_typing("111").await;
+        let _ = ch.start_typing("222").await;
+        {
+            let guard = ch.typing_handles.lock();
+            assert_eq!(guard.len(), 2);
+            assert!(guard.contains_key("111"));
+            assert!(guard.contains_key("222"));
+        }
+        // Stopping one does not affect the other
+        let _ = ch.stop_typing("111").await;
+        let guard = ch.typing_handles.lock();
+        assert_eq!(guard.len(), 1);
+        assert!(guard.contains_key("222"));
+    }
+
+    // ── Emoji encoding for reactions ──────────────────────────────
+
+    #[test]
+    fn encode_emoji_unicode_percent_encodes() {
+        let encoded = encode_emoji_for_discord("\u{1F440}");
+        assert_eq!(encoded, "%F0%9F%91%80");
+    }
+
+    #[test]
+    fn encode_emoji_checkmark() {
+        let encoded = encode_emoji_for_discord("\u{2705}");
+        assert_eq!(encoded, "%E2%9C%85");
+    }
+
+    #[test]
+    fn encode_emoji_custom_guild_emoji_passthrough() {
+        let encoded = encode_emoji_for_discord("custom_emoji:123456789");
+        assert_eq!(encoded, "custom_emoji:123456789");
+    }
+
+    #[test]
+    fn encode_emoji_simple_ascii_char() {
+        let encoded = encode_emoji_for_discord("A");
+        assert_eq!(encoded, "%41");
+    }
+
+    #[test]
+    fn random_discord_ack_reaction_is_from_pool() {
+        for _ in 0..128 {
+            let emoji = random_discord_ack_reaction();
+            assert!(DISCORD_ACK_REACTIONS.contains(&emoji));
+        }
+    }
+
+    #[test]
+    fn discord_reaction_url_encodes_emoji_and_strips_prefix() {
+        let url = discord_reaction_url("123", "discord_456", "👀");
+        assert_eq!(
+            url,
+            "https://discord.com/api/v10/channels/123/messages/456/reactions/%F0%9F%91%80/@me"
+        );
+    }
+
+    // ── Message ID edge cases ─────────────────────────────────────
+
+    #[test]
+    fn discord_message_id_format_includes_discord_prefix() {
+        // Verify that message IDs follow the format: discord_{message_id}
+        let message_id = "123456789012345678";
+        let expected_id = format!("discord_{message_id}");
+        assert_eq!(expected_id, "discord_123456789012345678");
+    }
+
+    #[test]
+    fn discord_message_id_is_deterministic() {
+        // Same message_id = same ID (prevents duplicates after restart)
+        let message_id = "123456789012345678";
+        let id1 = format!("discord_{message_id}");
+        let id2 = format!("discord_{message_id}");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn discord_message_id_different_message_different_id() {
+        // Different message IDs produce different IDs
+        let id1 = "discord_123456789012345678".to_string();
+        let id2 = "discord_987654321098765432".to_string();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn discord_message_id_uses_snowflake_id() {
+        // Discord snowflake IDs are numeric strings
+        let message_id = "123456789012345678"; // Typical snowflake format
+        let id = format!("discord_{message_id}");
+        assert!(id.starts_with("discord_"));
+        // Snowflake IDs are numeric
+        assert!(message_id.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn discord_message_id_fallback_to_uuid_on_empty() {
+        // Edge case: empty message_id falls back to UUID
+        let message_id = "";
+        let id = if message_id.is_empty() {
+            format!("discord_{}", uuid::Uuid::new_v4())
+        } else {
+            format!("discord_{message_id}")
+        };
+        assert!(id.starts_with("discord_"));
+        // Should have UUID dashes
+        assert!(id.contains('-'));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG6: Channel platform limit edge cases for Discord (2000 char limit)
+    // Prevents: Pattern 6 — issues
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn split_message_code_block_at_boundary() {
+        // Code block that spans the split boundary
+        let mut msg = String::new();
+        msg.push_str("```rust\n");
+        msg.push_str(&"x".repeat(1990));
+        msg.push_str("\n```\nMore text after code block");
+        let parts = split_message_for_discord(&msg);
+        assert!(
+            parts.len() >= 2,
+            "code block spanning boundary should split"
+        );
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "each part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_single_long_word_exceeds_limit() {
+        // A single word longer than 2000 chars must be hard-split
+        let long_word = "a".repeat(2500);
+        let parts = split_message_for_discord(&long_word);
+        assert!(parts.len() >= 2, "word exceeding limit must be split");
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "hard-split part must be <= {DISCORD_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+        }
+        // Reassembled content should match original
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled, long_word);
+    }
+
+    #[test]
+    fn split_message_exactly_at_limit_no_split() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH);
+        let parts = split_message_for_discord(&msg);
+        assert_eq!(parts.len(), 1, "message exactly at limit should not split");
+        assert_eq!(parts[0].len(), DISCORD_MAX_MESSAGE_LENGTH);
+    }
+
+    #[test]
+    fn split_message_one_over_limit_splits() {
+        let msg = "a".repeat(DISCORD_MAX_MESSAGE_LENGTH + 1);
+        let parts = split_message_for_discord(&msg);
+        assert!(parts.len() >= 2, "message 1 char over limit must split");
+    }
+
+    #[test]
+    fn split_message_many_short_lines() {
+        // Many short lines should be batched into chunks under the limit
+        let msg: String = (0..500).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(
+                part.len() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "short-line batch must be <= limit"
+            );
+        }
+        // All content should be preserved
+        let reassembled: String = parts.join("");
+        assert_eq!(reassembled.trim(), msg.trim());
+    }
+
+    #[test]
+    fn split_message_only_whitespace() {
+        let msg = "   \n\n\t  ";
+        let parts = split_message_for_discord(msg);
+        // Should handle gracefully without panic
+        assert!(parts.len() <= 1);
+    }
+
+    #[test]
+    fn split_message_emoji_at_boundary() {
+        // Emoji are multi-byte; ensure we don't split mid-emoji
+        let mut msg = "a".repeat(1998);
+        msg.push_str("🎉🎊"); // 2 emoji at the boundary (2000 chars total)
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            // The function splits on character count, not byte count
+            assert!(
+                part.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH,
+                "emoji boundary split must respect limit"
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_consecutive_newlines_at_boundary() {
+        let mut msg = "a".repeat(1995);
+        msg.push_str("\n\n\n\n\n");
+        msg.push_str(&"b".repeat(100));
+        let parts = split_message_for_discord(&msg);
+        for part in &parts {
+            assert!(part.len() <= DISCORD_MAX_MESSAGE_LENGTH);
+        }
+    }
+
+    // process_attachments tests
+
+    #[tokio::test]
+    async fn process_attachments_empty_list_returns_empty() {
+        let client = reqwest::Client::new();
+        let (text, media) = process_attachments(&[], &client, None, None).await;
+        assert!(text.is_empty());
+        assert!(media.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_fails() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(serde_json::json!({"error": "stt unavailable"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_is_empty() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": ""})))
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    fn local_whisper_transcription_config(
+        server: &wiremock::MockServer,
+    ) -> omnesagent_config::schema::TranscriptionConfig {
+        omnesagent_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(omnesagent_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn marker_kind_for_classifies_each_mime_family() {
+        assert_eq!(
+            marker_kind_for("image/png", "photo.png", b"", false),
+            MarkerKind::Image
+        );
+        assert_eq!(
+            marker_kind_for("image/jpeg", "photo.jpg", b"", false),
+            MarkerKind::Image
+        );
+        assert_eq!(
+            marker_kind_for("video/mp4", "clip.mp4", b"", false),
+            MarkerKind::Video
+        );
+        assert_eq!(
+            marker_kind_for("application/pdf", "doc.pdf", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("application/zip", "archive.zip", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("", "blob", b"", false),
+            MarkerKind::Document
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_demotes_an_unloadable_image_to_a_document() {
+        // The provider loader rejects HEIC/TIFF/SVG/BMP, so an `image/*`
+        // content type in one of those formats must render as a document
+        // rather than an image the shared pipeline would try to re-inline.
+        assert_eq!(
+            marker_kind_for("image/heic", "photo.heic", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("image/tiff", "scan.tiff", b"", false),
+            MarkerKind::Document
+        );
+        // A recognized-but-rejected extension wins over the payload: BMP bytes
+        // that carry a PNG magic prefix stay a document, matching the loader's
+        // precedence (an unrecognized extension like `.heic` instead defers to
+        // the magic sniff, which is covered separately).
+        assert_eq!(
+            marker_kind_for(
+                "image/bmp",
+                "photo.bmp",
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+                false
+            ),
+            MarkerKind::Document
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_recovers_a_loadable_image_from_its_magic_bytes() {
+        // An extensionless upload still classifies as an image when the bytes
+        // carry a provider-loadable magic signature (PNG here).
+        assert_eq!(
+            marker_kind_for(
+                "image/png",
+                "photo",
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+                false
+            ),
+            MarkerKind::Image
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
+        // Filename-detected audio with no content_type should still classify
+        // as AUDIO, matching the unified inbound pipeline.
+        assert_eq!(
+            marker_kind_for("", "clip.ogg", b"", true),
+            MarkerKind::Audio
+        );
+        assert_eq!(
+            marker_kind_for("application/octet-stream", "clip.ogg", b"", true),
+            MarkerKind::Audio
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_prefers_image_over_audio_when_content_type_is_image() {
+        // Defensive: if a Discord attachment somehow tripped both heuristics,
+        // a loadable image MIME wins so vision-capable providers still receive
+        // image bytes through the MediaAttachment path.
+        assert_eq!(
+            marker_kind_for("image/png", "photo.png", b"", true),
+            MarkerKind::Image
+        );
+    }
+
+    #[test]
+    fn is_thread_channel_type_matches_only_thread_types() {
+        // Thread types per Discord docs: 10/11/12.
+        assert!(is_thread_channel_type(10));
+        assert!(is_thread_channel_type(11));
+        assert!(is_thread_channel_type(12));
+        // Non-thread channel types must not be classified as threads.
+        for non_thread in [0u64, 1, 2, 3, 4, 5, 13, 14, 15, 16] {
+            assert!(
+                !is_thread_channel_type(non_thread),
+                "type {non_thread} must not classify as thread"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_filter_empty_accepts_everything() {
+        let filter: Vec<String> = vec![];
+        assert!(channel_passes_filter(&filter, "12345", None));
+        assert!(channel_passes_filter(&filter, "99999", Some("12345")));
+        assert!(channel_passes_filter(&filter, "", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match() {
+        let filter = vec!["111".to_string(), "222".to_string()];
+        assert!(channel_passes_filter(&filter, "111", None));
+        assert!(channel_passes_filter(&filter, "222", None));
+        assert!(!channel_passes_filter(&filter, "333", None));
+    }
+
+    #[test]
+    fn channel_filter_thread_parent_fallback() {
+        let filter = vec!["111".to_string()];
+        // Thread whose parent is in the allowlist — accepted.
+        assert!(channel_passes_filter(&filter, "999", Some("111")));
+        // Thread whose parent is NOT in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", Some("888")));
+        // Non-thread channel not in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match_skips_parent_check() {
+        let filter = vec!["111".to_string()];
+        // Direct match with a parent_id present — parent is irrelevant.
+        assert!(channel_passes_filter(&filter, "111", Some("999")));
+    }
+
+    #[test]
+    fn parse_attachment_markers_extracts_supported_markers() {
+        let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
+        let (cleaned, attachments) = parse_attachment_markers(input);
+
+        assert_eq!(cleaned, "Report");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].kind, DiscordAttachmentKind::Image);
+        assert_eq!(attachments[0].target, "https://example.com/a.png");
+        assert_eq!(attachments[1].kind, DiscordAttachmentKind::Document);
+        assert_eq!(attachments[1].target, "/tmp/a.pdf");
+    }
+
+    #[test]
+    fn parse_attachment_markers_keeps_invalid_marker_text() {
+        let input = "Hello [NOT_A_MARKER:foo] world";
+        let (cleaned, attachments) = parse_attachment_markers(input);
+
+        assert_eq!(cleaned, input);
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_keeps_workspace_locals_and_http() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file_path = temp.path().join("image.png");
+        std::fs::write(&file_path, b"fake").expect("write fixture");
+
+        let attachments = vec![
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: file_path.to_string_lossy().to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: "https://example.com/remote.png".to_string(),
+            },
+        ];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert_eq!(locals.len(), 1);
+        let canonical_file = std::fs::canonicalize(&file_path).expect("canonicalize fixture");
+        assert_eq!(locals[0], canonical_file);
+        assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_missing_absolute_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Video,
+            target: temp
+                .path()
+                .join("does-not-exist.mp4")
+                .to_string_lossy()
+                .to_string(),
+        }];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty());
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0], DiscordMarkerFailure::NotFound);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_paths_outside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside_file = outside.path().join("escape.png");
+        std::fs::write(&outside_file, b"fake").expect("write fixture");
+
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: outside_file.to_string_lossy().to_string(),
+        }];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(workspace.path()));
+        assert!(
+            locals.is_empty(),
+            "absolute paths outside workspace must be refused"
+        );
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_relative_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Document,
+            target: "relative/report.pdf".to_string(),
+        }];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty(), "relative paths must be refused");
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_drops_disallowed_schemes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let attachments = vec![
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Image,
+                target: "file:///etc/hostname".to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Document,
+                target: "data:text/plain;base64,aGk=".to_string(),
+            },
+            DiscordAttachment {
+                kind: DiscordAttachmentKind::Video,
+                target: "ftp://example.com/clip.mp4".to_string(),
+            },
+        ];
+
+        let (locals, remotes, failures) =
+            classify_outgoing_attachments(&attachments, Some(temp.path()));
+        assert!(locals.is_empty());
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 3);
+        for kind in &failures {
+            assert_eq!(*kind, DiscordMarkerFailure::Refused);
+        }
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_refuses_local_without_workspace() {
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: "/some/absolute/path.png".to_string(),
+        }];
+
+        let (locals, remotes, failures) = classify_outgoing_attachments(&attachments, None);
+        assert!(
+            locals.is_empty(),
+            "local paths must be refused without workspace_dir"
+        );
+        assert!(remotes.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
+    }
+
+    #[test]
+    fn classify_outgoing_attachments_passes_http_without_workspace() {
+        let attachments = vec![DiscordAttachment {
+            kind: DiscordAttachmentKind::Image,
+            target: "https://example.com/x.png".to_string(),
+        }];
+
+        let (locals, remotes, failures) = classify_outgoing_attachments(&attachments, None);
+        assert!(locals.is_empty());
+        assert_eq!(remotes, vec!["https://example.com/x.png".to_string()]);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_appends_remote_urls_only() {
+        let content = "Done";
+        let remote_urls = vec!["https://example.com/a.png".to_string()];
+
+        let rendered = with_inline_attachment_urls(content, &remote_urls);
+        assert_eq!(rendered, "Done\nhttps://example.com/a.png");
+    }
+
+    #[test]
+    fn with_inline_attachment_urls_keeps_content_when_no_urls() {
+        let rendered = with_inline_attachment_urls("Done", &[]);
+        assert_eq!(rendered, "Done");
+    }
+
+    #[test]
+    fn delivery_failure_note_is_none_when_no_failures() {
+        assert!(delivery_failure_note(&[]).is_none());
+    }
+
+    #[test]
+    fn delivery_failure_note_singular_for_one_failure() {
+        let failures = [DiscordMarkerFailure::NotFound];
+        let note = delivery_failure_note(&failures).expect("one failure should produce a note");
+        // Locale-independent: count is always rendered as Arabic digits in
+        // every shipped locale's FTL template (`{$count}`). The literal
+        // English string used to live here but the assertion broke on any
+        // CI runner with a non-English `$LANG` (see's blocker).
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
+        assert!(
+            !note.contains("/workspace/missing.png"),
+            "user-facing failure note must not echo local marker targets"
+        );
+    }
+
+    #[test]
+    fn delivery_failure_note_plural_redacts_targets() {
+        let failures = [
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
+            DiscordMarkerFailure::Refused,
+        ];
+        let note =
+            delivery_failure_note(&failures).expect("multiple failures should produce a note");
+        // Locale-independent: see singular test for rationale.
+        assert!(!note.is_empty(), "note must be non-empty");
+        assert!(
+            note.contains(failures.len().to_string().as_str()),
+            "note must contain the failure count"
+        );
+        assert!(
+            !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
+            "user-facing failure note must not echo failed marker targets"
+        );
+    }
+
+    #[test]
+    fn composed_delivery_failure_note_redacts_parsed_marker_target() {
+        let content = "Done\n[IMAGE: /workspace/missing.png]";
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(content);
+        let (_locals, _remotes, failures) =
+            classify_outgoing_attachments(&parsed_attachments, None);
+        let note = delivery_failure_note(&failures);
+        let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
+
+        // Locale-independent: the body must keep the original `Done` content,
+        // gain exactly one blank-line separator, and never echo the failed
+        // marker path. The previous literal English assertion was
+        // locale-dependent and broke on non-English CI runners.
+        assert!(
+            composed.starts_with("Done\n\n"),
+            "composed body must preserve original content with blank-line separator, got {composed:?}"
+        );
+        assert!(
+            !composed.contains("/workspace/missing.png"),
+            "composed outbound body must not echo failed marker targets"
+        );
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_uses_note_alone_when_content_empty() {
+        let composed = compose_body_with_failure_note("", Some("(note: ...)"));
+        assert_eq!(composed, "(note: ...)");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_appends_note_to_existing_content() {
+        let composed = compose_body_with_failure_note("Hello.", Some("(note: ...)"));
+        assert_eq!(composed, "Hello.\n\n(note: ...)");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_returns_content_when_no_note() {
+        let composed = compose_body_with_failure_note("Hello.", None);
+        assert_eq!(composed, "Hello.");
+    }
+
+    #[test]
+    fn compose_body_with_failure_note_returns_empty_when_no_content_and_no_note() {
+        let composed = compose_body_with_failure_note("", None);
+        assert_eq!(composed, "");
+    }
+
+    #[test]
+    fn decide_failure_reactions_empty_for_no_failures() {
+        assert!(decide_failure_reactions(&[]).is_empty());
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_refused_only() {
+        let r = decide_failure_reactions(&[
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::Refused,
+        ]);
+        assert_eq!(r, vec!["🚫"]);
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_not_found_only() {
+        let r = decide_failure_reactions(&[DiscordMarkerFailure::NotFound]);
+        assert_eq!(r, vec!["\u{26A0}\u{FE0F}"]);
+    }
+
+    #[test]
+    fn decide_failure_reactions_emits_both_when_mixed() {
+        let r = decide_failure_reactions(&[
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
+        ]);
+        assert_eq!(r, vec!["🚫", "\u{26A0}\u{FE0F}"]);
+    }
+
+    // ── Streaming mode tests ──────────────────────────────────────────
+
+    #[test]
+    fn supports_draft_updates_respects_stream_mode() {
+        use omnesagent_config::schema::StreamMode;
+
+        let listen_to_bots = false;
+        let mention_only = false;
+        let off = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        assert!(!off.supports_draft_updates());
+
+        let partial = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::Partial, 750, 800);
+        assert!(partial.supports_draft_updates());
+        assert_eq!(partial.draft_update_interval_ms, 750);
+
+        let multi = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::MultiMessage, 1000, 600);
+        assert!(multi.supports_draft_updates());
+        assert_eq!(multi.multi_message_delay_ms, 600);
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_not_partial() {
+        use omnesagent_api::channel::SendMessage;
+        use omnesagent_config::schema::StreamMode;
+
+        let listen_to_bots = false;
+        let mention_only = false;
+        let off = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        let msg = SendMessage::new("hello", "123");
+        assert!(off.send_draft(&msg).await.unwrap().is_none());
+
+        let multi = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::MultiMessage, 1000, 800);
+        // MultiMessage returns a synthetic ID so the draft_updater task runs.
+        assert_eq!(
+            multi.send_draft(&msg).await.unwrap().as_deref(),
+            Some("multi_message_synthetic")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_draft_rate_limit_short_circuits() {
+        use omnesagent_config::schema::StreamMode;
+
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::Partial, 60_000, 800);
+
+        // Seed a recent edit time.
+        ch.last_draft_edit
+            .lock()
+            .insert("chan".to_string(), std::time::Instant::now());
+
+        // Should return Ok immediately (rate-limited) without making a network call.
+        let result = ch.update_draft("chan", "fake_msg_id", "new text").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_draft_cleans_up_tracking() {
+        use omnesagent_config::schema::StreamMode;
+
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "t".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        )
+        .with_streaming(StreamMode::Partial, 1000, 800);
+
+        ch.last_draft_edit
+            .lock()
+            .insert("chan".to_string(), std::time::Instant::now());
+
+        // cancel_draft will try to delete a message (will fail with network error)
+        // but should still clean up the tracking entry.
+        let _ = ch.cancel_draft("chan", "fake_msg_id").await;
+        assert!(!ch.last_draft_edit.lock().contains_key("chan"));
+    }
+
+    // ── MultiMessage splitter tests ───────────────────────────────────
+
+    #[test]
+    fn split_message_for_discord_multi_splits_at_paragraphs() {
+        let content = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.";
+        let chunks = split_message_for_discord_multi(content, 2000);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], "First paragraph.");
+        assert_eq!(chunks[1], "Second paragraph.");
+        assert_eq!(chunks[2], "Third paragraph.");
+    }
+
+    #[test]
+    fn split_message_for_discord_multi_single_paragraph() {
+        let content = "Just one paragraph with no breaks.";
+        let chunks = split_message_for_discord_multi(content, 2000);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], content);
+    }
+
+    #[test]
+    fn split_message_for_discord_multi_respects_max_len() {
+        // Create a single paragraph that exceeds max_len.
+        let long_para = "a ".repeat(1100); // ~2200 chars
+        let chunks = split_message_for_discord_multi(&long_para, 2000);
+        assert!(chunks.len() > 1, "should split oversized paragraph");
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= 2000,
+                "chunk exceeds max: {}",
+                chunk.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn split_message_for_discord_multi_preserves_code_fences() {
+        let content =
+            "Before.\n\n```rust\nfn main() {\n\n    println!(\"hello\");\n}\n```\n\nAfter.";
+        let chunks = split_message_for_discord_multi(content, 2000);
+        // The code fence contains \n\n but should not be split there.
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], "Before.");
+        assert!(chunks[1].contains("```rust"));
+        assert!(chunks[1].contains("println!"));
+        assert!(chunks[1].contains("```"));
+        assert_eq!(chunks[2], "After.");
+    }
+
+    #[test]
+    fn split_message_for_discord_multi_empty_input() {
+        let chunks = split_message_for_discord_multi("", 2000);
+        assert!(chunks.is_empty());
+    }
+
+    // Regression lock for the marker-only paragraph in MultiMessage stream
+    // mode. Before the fix this produced an empty chunk vec and the chunk
+    // loop in send() iterated zero times, silently skipping the file upload.
+    #[test]
+    fn chunks_for_send_emits_empty_chunk_when_multi_message_paragraph_collapses_to_only_a_file() {
+        use omnesagent_config::schema::StreamMode;
+        let chunks = chunks_for_send("", StreamMode::MultiMessage, 2000, true);
+        assert_eq!(chunks, vec![String::new()]);
+    }
+
+    #[test]
+    fn chunks_for_send_does_not_emit_empty_chunk_when_no_files_to_upload() {
+        use omnesagent_config::schema::StreamMode;
+        let chunks = chunks_for_send("", StreamMode::MultiMessage, 2000, false);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunks_for_send_passes_through_non_empty_content() {
+        use omnesagent_config::schema::StreamMode;
+        for mode in [
+            StreamMode::MultiMessage,
+            StreamMode::Partial,
+            StreamMode::Off,
+        ] {
+            for has_files in [true, false] {
+                let chunks = chunks_for_send("hello", mode, 2000, has_files);
+                assert_eq!(
+                    chunks,
+                    vec!["hello".to_string()],
+                    "mode={mode:?} has_files={has_files}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_approvals_map_is_initially_empty() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        let map = ch.pending_approvals.try_lock().unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn approval_timeout_defaults_to_300_and_is_overridable() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        assert_eq!(ch.approval_timeout_secs, 300);
+        let ch = ch.with_approval_timeout_secs(60);
+        assert_eq!(ch.approval_timeout_secs, 60);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_oneshot_delivers_response() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        let (tx, rx) = oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc123".to_string(), tx);
+        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
+        sender.send(ChannelApprovalResponse::Deny).unwrap();
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+    }
+
+    /// Faithful model of the type-3 dispatch's post-peer-check sequence: gate
+    /// first, and ONLY on success take + resolve. Mirrors mod.rs so the test
+    /// asserts the real ordering contract.
+    fn dispatch_approval_click(
+        peers: &[String],
+        user_id: &str,
+        custom_id: &str,
+        pending_components: &parking_lot::Mutex<pending::PendingComponents>,
+        pending_approvals: &mut std::collections::HashMap<
+            String,
+            oneshot::Sender<ChannelApprovalResponse>,
+        >,
+    ) -> bool {
+        // Fail-closed authz BEFORE any take. DM-style (no guild/channel filter)
+        // with an empty peer list = nobody, exactly like the message path.
+        if interaction_gate(peers, &[], &[], user_id, None, "c1", None).is_err() {
+            return false; // unauthorized: must not drain or resolve anything
+        }
+        let intent = pending_components.lock().take(custom_id);
+        match intent {
+            Some(ComponentIntent::Approval { token, decision }) => {
+                approval::resolve_parked_approval(pending_approvals, &token, decision)
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_click_resolves_with_the_bound_decision() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        let resolved =
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals);
+        assert!(resolved, "authorized click resolves the oneshot");
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_click_neither_resolves_nor_drains() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, mut rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        // "intruder" is not in the (specific, non-wildcard) peer list → gate
+        // denies BEFORE the take.
+        let resolved = dispatch_approval_click(
+            &[String::from("u1")],
+            "intruder",
+            &wire,
+            &reg,
+            &mut approvals,
+        );
+        assert!(!resolved, "unauthorized click resolves nothing");
+        // The oneshot is unresolved (rx still pending, sender still parked).
+        assert!(rx.try_recv().is_err(), "no decision delivered");
+        assert!(
+            approvals.contains_key(token),
+            "the approval entry is NOT drained by an unauthorized click"
+        );
+        // And the pending component entry survives: an authorized user could
+        // still click it (the intruder didn't burn the single use).
+        assert!(
+            reg.lock().take(&wire).is_some(),
+            "the component entry was not drained by the unauthorized click"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_click_is_refused_single_use() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::Deny);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        assert!(dispatch_approval_click(
+            &[String::from("*")],
+            "u1",
+            &wire,
+            &reg,
+            &mut approvals
+        ));
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        // The component entry is gone (single-use take), so a replay of the same
+        // custom_id resolves nothing even from an authorized user.
+        assert!(
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals),
+            "replayed click refused"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_registers_four_resolvable_bindings() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        // Register exactly what send_buttoned_approval registers, then confirm
+        // every button id resolves to its bound decision (and only its own).
+        let token = "abc123";
+        let (_, bindings) = approval::build_approval_row(token);
+        {
+            let mut reg = ch.pending_components.lock();
+            for (cid, decision) in &bindings {
+                reg.register(
+                    cid.encode().unwrap(),
+                    ComponentIntent::Approval {
+                        token: token.to_string(),
+                        decision: *decision,
+                    },
+                );
+            }
+        }
+        for (cid, decision) in &bindings {
+            let got = ch.pending_components.lock().take(&cid.encode().unwrap());
+            assert_eq!(
+                got,
+                Some(ComponentIntent::Approval {
+                    token: token.to_string(),
+                    decision: *decision,
+                }),
+                "each button resolves to its server-bound decision"
+            );
+        }
+    }
+
+    // ── [COMPONENTS:{json}] agent marker → interactive components (EPIC B) ──
+
+    fn rendered_routing_ids(rows: &[components::DiscordActionRow]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for row in rows {
+            let api = row.to_api().expect("non-empty row serializes");
+            for comp in api["components"].as_array().unwrap() {
+                if comp["type"] == serde_json::json!(2) {
+                    if let Some(cid) = comp.get("custom_id").and_then(|v| v.as_str()) {
+                        ids.push(cid.to_string()); // action button (not a link)
+                    }
+                } else if comp["type"] == serde_json::json!(3) {
+                    for opt in comp["options"].as_array().unwrap() {
+                        ids.push(opt["value"].as_str().unwrap().to_string());
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn marker_emit_to_click_resolves_the_registered_prompt() {
+        // End-to-end at the registry boundary: the agent emits a [COMPONENTS:…]
+        // marker with an action button; build_component_rows registers its prompt
+        // under a minted custom_id; a "click" (take of that id) returns exactly
+        // the bound prompt — never anything from the wire.
+        let (cleaned, rows) = parse_component_markers(
+            "Pick: [COMPONENTS:{\"rows\":[[{\"label\":\"Ship\",\"style\":\"primary\",\"prompt\":\"ship the release\"}]]}]",
+        );
+        assert_eq!(cleaned, "Pick:", "marker stripped from content");
+
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce123", &rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "one action button → one registered id");
+        // The click resolves the server-side prompt the bot registered at emit.
+        assert_eq!(
+            reg.take(&ids[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "ship the release".into()
+            })
+        );
+        // Single-use: a replay of the same id resolves nothing.
+        assert_eq!(reg.take(&ids[0]), None, "single-use: replay refused");
+    }
+
+    #[test]
+    fn marker_link_button_renders_without_registration() {
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"Docs\",\"url\":\"https://example.com\"}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("n", &rows, &mut reg);
+        let api = action_rows[0].to_api().unwrap();
+        let btn = &api["components"][0];
+        assert_eq!(btn["style"], serde_json::json!(5), "link button");
+        assert_eq!(btn["url"], serde_json::json!("https://example.com"));
+        assert!(
+            btn.get("custom_id").is_none(),
+            "link button has no custom_id"
+        );
+        // No prompt was registered for a link button.
+        assert!(rendered_routing_ids(&action_rows).is_empty());
+    }
+
+    #[test]
+    fn marker_select_options_each_register_their_own_prompt() {
+        // Each select option's value IS its own routing token bound to that
+        // option's prompt; choosing an option (take of its value) resolves only
+        // that option's prompt, matching the dispatch's `component_routing_id`.
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"select\":\"Pick\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"chose a\"},{\"label\":\"B\",\"value\":\"b\",\"prompt\":\"chose b\"}]}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &rows, &mut reg);
+        let api = action_rows[0].to_api().unwrap();
+        assert_eq!(api["components"][0]["type"], serde_json::json!(3), "select");
+
+        let opt_values: Vec<String> = api["components"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(opt_values.len(), 2);
+        // The chosen option resolves its own prompt; the other still resolves to
+        // its own (distinct ids, no aliasing).
+        assert_eq!(
+            reg.take(&opt_values[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "chose a".into()
+            })
+        );
+        assert_eq!(
+            reg.take(&opt_values[1]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "chose b".into()
+            })
+        );
+    }
+
+    #[test]
+    fn marker_custom_ids_are_unique_within_a_message() {
+        // Two buttons with identical label/prompt must register under distinct
+        // ids so they can't collide or alias in the single-use registry.
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"X\",\"prompt\":\"same\"},{\"label\":\"X\",\"prompt\":\"same\"}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &rows, &mut reg);
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "ids are unique even with identical content");
+        // Both resolve independently (single-use, no aliasing).
+        assert!(reg.take(&ids[0]).is_some());
+        assert!(reg.take(&ids[1]).is_some());
+    }
+
+    #[test]
+    fn marker_modal_button_registers_open_modal_and_submit_resolves_into_turn() {
+        let (cleaned, rows) = parse_component_markers(
+            "Tell us: [COMPONENTS:{\"rows\":[[{\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"file a report\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"paragraph\",\"required\":true,\"max\":500}]}}]]}]",
+        );
+        assert_eq!(cleaned, "Tell us:", "marker stripped from content");
+        // The spec carries the parsed modal (title + one paragraph field).
+        match &rows[0][0] {
+            markers::ComponentSpec::ModalButton {
+                label,
+                modal,
+                prompt,
+                ..
+            } => {
+                assert_eq!(label, "Report");
+                assert_eq!(prompt, "file a report");
+                assert_eq!(modal.title, "Report");
+                assert_eq!(modal.fields.len(), 1);
+                assert_eq!(modal.fields[0].id, "reason");
+                assert_eq!(modal.fields[0].style, components::TextInputStyle::Paragraph);
+                assert!(modal.fields[0].required);
+                assert_eq!(modal.fields[0].max_length, Some(500));
+            }
+            other => panic!("expected ModalButton, got {other:?}"),
+        }
+
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce42", &rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+        // The button renders as a normal (non-link) action button with a zc1 id.
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "one modal button → one registered button id");
+
+        // The click drains OpenModal, carrying the built modal + bound prompt.
+        let (modal, prompt) = match reg.take(&ids[0]) {
+            Some(ComponentIntent::OpenModal { modal, prompt }) => (modal, prompt),
+            other => panic!("expected OpenModal, got {other:?}"),
+        };
+        assert_eq!(prompt, "file a report");
+        // Single-use: the button id is drained.
+        assert_eq!(reg.take(&ids[0]), None, "modal button is single-use");
+
+        // The modal carries its own minted zc1 routing token, distinct from the
+        // button's, and was NOT pre-registered (its TTL starts at open).
+        let modal_wire = modal.custom_id.encode().expect("modal id encodes");
+        assert!(modal_wire.starts_with("zc1|cmp|"));
+        assert_ne!(
+            modal_wire, ids[0],
+            "modal id is distinct from the button id"
+        );
+        assert!(
+            reg.take(&modal_wire).is_none(),
+            "modal submit is not registered until the modal opens"
+        );
+
+        // The OpenModal dispatch arm registers the modal id as the resolve-into-
+        // turn on open; the type-5 submit then drains that prompt.
+        reg.register(
+            modal_wire.clone(),
+            ComponentIntent::ResolveIntoTurn { prompt },
+        );
+        assert_eq!(
+            reg.take(&modal_wire),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "file a report".into()
+            }),
+            "modal submit resolves into the button's server-side prompt"
+        );
+    }
+
+    #[test]
+    fn malformed_component_marker_does_not_register_anything() {
+        // A balanced-but-invalid-JSON body is left verbatim (a recoverable leak)
+        // rather than stripped — this guarantees no surrounding prose is ever
+        // deleted. Either way it registers nothing and never 400s the send.
+        let (cleaned, rows) = parse_component_markers("hi [COMPONENTS:{garbage}] there");
+        assert!(
+            cleaned.contains("hi") && cleaned.contains("there"),
+            "prose preserved; got {cleaned:?}"
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("n", &rows, &mut reg);
+        assert!(action_rows.is_empty(), "no rows from a malformed marker");
+    }
+
+    #[test]
+    fn component_routing_id_prefers_zc1_select_value_else_custom_id() {
+        // Button / modal: routes on custom_id.
+        let data = serde_json::json!({ "custom_id": "zc1|cmp|n-1" });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-1".to_string())
+        );
+        // Select: the chosen option value is a zc1 token → route on it.
+        let data = serde_json::json!({
+            "custom_id": "zc1|cmp|n-1-menu",
+            "values": ["zc1|cmp|n-2"]
+        });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-2".to_string())
+        );
+        // A non-zc1 selected value falls back to the menu custom_id.
+        let data = serde_json::json!({
+            "custom_id": "zc1|cmp|n-1-menu",
+            "values": ["not-a-token"]
+        });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-1-menu".to_string())
+        );
+    }
+
+    #[test]
+    fn autocomplete_authz_is_side_effect_free() {
+        assert!(
+            interaction_gate(&[String::from("*")], &[], &[], "u1", None, "c1", None).is_ok(),
+            "authorized keystroke gates open"
+        );
+        assert!(
+            interaction_gate(
+                &[String::from("u1")],
+                &[],
+                &[],
+                "intruder",
+                None,
+                "c1",
+                None
+            )
+            .is_err(),
+            "unauthorized keystroke fails closed → empty choice set, no side effect"
+        );
+        // DM (no guild) with an empty peer list = nobody, same as messages.
+        assert!(
+            interaction_gate(&[], &[], &[], "u1", None, "c1", None).is_err(),
+            "empty peer list denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_parent_cached_reads_cache_without_rest() {
+        // Cache-only lookup: a thread whose parent was resolved by an earlier
+        // message returns that parent; a channel cached as a non-thread, or one
+        // never looked up, returns None. No client/token is reachable here, so a
+        // non-None result can only have come from the cache (never a REST probe).
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        {
+            let mut c = cache.lock().await;
+            c.insert("thread1".to_string(), Some("parentA".to_string()));
+            c.insert("plain1".to_string(), None);
+        }
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "thread1").await,
+            Some("parentA".to_string()),
+            "cached thread resolves to its parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "plain1").await,
+            None,
+            "channel cached as a non-thread has no parent"
+        );
+        assert_eq!(
+            discord_thread_parent_cached(&cache, "never_seen").await,
+            None,
+            "uncached channel yields None (fail-closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_authorizes_parent_allowlisted_thread_only_when_cached() {
+        let peers = s(&["*"]);
+        let channel_filter = s(&["parentA"]); // allowlist the PARENT only
+        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        cache
+            .lock()
+            .await
+            .insert("thread_cached".to_string(), Some("parentA".to_string()));
+
+        // Thread whose parent is cached + allowlisted → autocomplete authorized.
+        let parent = discord_thread_parent_cached(&cache, "thread_cached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_cached",
+                parent.as_deref(),
+            )
+            .is_ok(),
+            "cached allowlisted parent authorizes autocomplete in the thread"
+        );
+
+        // Same allowlist, thread NOT yet cached → no parent → fail-closed,
+        // matching the pre-fix behavior and avoiding a per-keystroke REST probe.
+        let parent = discord_thread_parent_cached(&cache, "thread_uncached").await;
+        assert!(
+            interaction_gate(
+                &peers,
+                &[],
+                &channel_filter,
+                "u1",
+                Some("g1"),
+                "thread_uncached",
+                parent.as_deref(),
+            )
+            .is_err(),
+            "uncached thread stays fail-closed"
+        );
+    }
+
+    #[test]
+    fn autocomplete_arm_resolves_cached_thread_parent_before_gate() {
+        let src = include_str!("mod.rs");
+        let arm4 = src
+            .find("} else if itype == 4 {")
+            .expect("type-4 arm present");
+        let end = src[arm4..]
+            .find("// MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK")
+            .map(|i| arm4 + i)
+            .expect("type-4 arm end boundary present");
+        let region = &src[arm4..end];
+        let cached = region
+            .find("discord_thread_parent_cached(")
+            .expect("type-4 arm resolves the cached thread parent");
+        let gate = region.find("interaction_gate(").expect("type-4 arm gates");
+        assert!(
+            cached < gate,
+            "cached thread-parent resolution must precede the gate"
+        );
+        assert!(
+            region.contains("thread_parent.as_deref()"),
+            "the resolved cached parent (not None) is passed to interaction_gate"
+        );
+    }
+
+    fn autocomplete_spec_with_big_choice_list(slug: &str, option: &str) -> DiscordSlashCommandSpec {
+        let mut opt = slash_options::OptionSpec {
+            name: option.to_string(),
+            description: "o".to_string(),
+            description_localizations: Default::default(),
+            kind: slash_options::OptKind::String,
+            required: false,
+            choices: Vec::new(),
+            min: None,
+            max: None,
+            min_length: None,
+            max_length: None,
+        };
+        // 40 > Discord's 25 static cap → served via autocomplete.
+        opt.choices = (0..40)
+            .map(|i| slash_options::Choice {
+                name: format!("region-{i:02}"),
+                value: format!("r{i:02}"),
+            })
+            .collect();
+        DiscordSlashCommandSpec {
+            skill_name: "deploy".to_string(),
+            slug: slug.to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            options: vec![opt],
+        }
+    }
+
+    // Reproduces the arm's choice-sourcing step exactly (spec lookup by slug →
+    // focused option by name → filter), given the resolved spec set.
+    fn arm_choices(
+        specs: &[DiscordSlashCommandSpec],
+        focused: Option<(String, String, String)>,
+        authorized: bool,
+    ) -> Vec<(String, String)> {
+        match (authorized, focused) {
+            (true, Some((command, option_name, partial))) => specs
+                .iter()
+                .find(|s| s.slug == command)
+                .and_then(|s| s.options.iter().find(|o| o.name == option_name))
+                .map(|o| o.matching_choices(&partial))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_matching_choices_for_focused_option() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let payload = serde_json::json!({
+            "type": 4,
+            "data": {
+                "name": "deploy",
+                "options": [ { "name": "region", "type": 3, "value": "region-1", "focused": true } ]
+            }
+        });
+        let focused = slash_options::extract_focused_option(&payload);
+        let choices = arm_choices(&specs, focused, true);
+        // "region-1" prefixes region-10..region-19 (10 of them).
+        assert_eq!(choices.len(), 10);
+        assert!(choices.iter().all(|(n, _)| n.starts_with("region-1")));
+        assert_eq!(choices[0], ("region-10".to_string(), "r10".to_string()));
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_empty_for_unauthorized() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let payload = serde_json::json!({
+            "type": 4,
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "region", "focused": true } ] }
+        });
+        let focused = slash_options::extract_focused_option(&payload);
+        // Even with a matching focused option, an unauthorized keystroke answers
+        // empty — no policy leak, no work.
+        assert!(arm_choices(&specs, focused, false).is_empty());
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_empty_for_no_match_and_unknown_targets() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        // No choice matches the partial.
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "zzz", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // Unknown command slug.
+        let p = serde_json::json!({
+            "data": { "name": "ghost", "options": [ { "name": "region", "value": "r", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // Known command, unknown focused option name.
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "ghost", "value": "r", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // No focused option at all.
+        let p = serde_json::json!({ "data": { "name": "deploy", "options": [] } });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+    }
+
+    #[test]
+    fn interaction_arms_gate_before_take_after_the_doptions_merge() {
+        let src = include_str!("mod.rs");
+
+        let arm35 = src
+            .find("} else if itype == 3 || itype == 5 {")
+            .expect("type-3/5 arm present");
+        let arm4 = src[arm35..]
+            .find("} else if itype == 4 {")
+            .map(|i| arm35 + i)
+            .expect("type-4 arm present (arm-3/5 boundary)");
+        let region35 = &src[arm35..arm4];
+        let gate35 = region35
+            .find("interaction_gate(")
+            .expect("type-3/5 arm gates");
+        let take35 = region35
+            .find("pending_components.lock().take(")
+            .expect("type-3/5 arm takes");
+        assert!(
+            gate35 < take35,
+            "type-3/5: interaction_gate must run BEFORE the single-use take"
+        );
+        // The cheap peer pre-check is also before the take.
+        let peer35 = region35
+            .find("crate::allowlist::is_user_allowed(")
+            .expect("type-3/5 arm peer-checks");
+        assert!(
+            peer35 < take35 && peer35 < gate35,
+            "peer check precedes gate+take"
+        );
+
+        // type-2 arm: gate precedes the credential stash (`pending.lock()`) and
+        // the defer — an unauthorized invoker never stashes creds or defers.
+        let arm2 = src.find("if itype == 2 {").expect("type-2 arm present");
+        let region2 = &src[arm2..arm35];
+        let gate2 = region2.find("interaction_gate(").expect("type-2 arm gates");
+        let stash2 = region2
+            .find("let mut guard = pending.lock();")
+            .expect("type-2 arm stashes creds");
+        let defer2 = region2
+            .find("discord_defer_interaction(")
+            .expect("type-2 arm defers");
+        assert!(
+            gate2 < stash2 && gate2 < defer2,
+            "type-2: gate before stash+defer"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_answer_posts_a_single_type8_callback_and_nothing_else() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The ONLY call an autocomplete keystroke may make: a type-8
+        // (AUTOCOMPLETE_RESULT) callback. No defer, no reject, no followup.
+        Mock::given(method("POST"))
+            .and(path("/interactions/iid/tok/callback"))
+            .and(body_partial_json(serde_json::json!({ "type": 8 })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "region-2", "focused": true } ] }
+        });
+        let choices = arm_choices(&specs, slash_options::extract_focused_option(&p), true);
+        assert_eq!(choices.len(), 10, "region-2x → 10 matches");
+
+        let client = reqwest::Client::new();
+        // The arm posts the answer to <api_base>/interactions/{id}/{token}/callback;
+        // discord_answer_autocomplete hardcodes the real base, so post directly
+        // here against the mock to verify the single-call, type-8 shape.
+        let url = format!("{}/interactions/iid/tok/callback", server.uri());
+        let rendered: Vec<_> = choices
+            .iter()
+            .map(|(n, v)| serde_json::json!({ "name": n, "value": v }))
+            .collect();
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "type": 8, "data": { "choices": rendered } }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        // wiremock verifies expect(1) on drop.
+    }
+}

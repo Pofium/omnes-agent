@@ -1,0 +1,470 @@
+use async_trait::async_trait;
+use serde_json::json;
+use std::sync::Arc;
+use omnesagent_api::tool::{Tool, ToolOutput, ToolResult};
+use omnesagent_config::policy::SecurityPolicy;
+use omnesagent_config::policy::ToolOperation;
+use omnesagent_config::schema::CodexCliConfig;
+
+use crate::coding_cli::{
+    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
+    add_coding_cli_env,
+};
+
+pub struct CodexCliTool {
+    security: Arc<SecurityPolicy>,
+    config: CodexCliConfig,
+    executor: Arc<dyn CodingCliExecutor>,
+}
+
+impl CodexCliTool {
+    /// Construct a standalone tool that executes directly on the host.
+    ///
+    /// Runtime registries should use `new_with_executor` so the configured
+    /// runtime and sandbox own process execution.
+    pub fn new(security: Arc<SecurityPolicy>, config: CodexCliConfig) -> Self {
+        Self::new_with_executor(security, config, DirectCodingCliExecutor::shared())
+    }
+
+    /// Construct the tool with an injected process executor.
+    pub fn new_with_executor(
+        security: Arc<SecurityPolicy>,
+        config: CodexCliConfig,
+        executor: Arc<dyn CodingCliExecutor>,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            executor,
+        }
+    }
+}
+
+fn codex_exec_args<'a>(config: &'a CodexCliConfig, prompt: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["exec"];
+    let mut has_terminator = false;
+
+    for (_, arg) in config.effective_extra_args() {
+        has_terminator |= arg == "--";
+        args.push(arg);
+    }
+
+    // Keep the model-supplied prompt in the positional-argument lane. Without
+    // this boundary, a dangling value-taking extra arg could consume the
+    // prompt as its value instead of letting Codex parse it as the prompt.
+    if !has_terminator {
+        args.push("--");
+    }
+    args.push(prompt);
+
+    args
+}
+
+#[async_trait]
+impl Tool for CodexCliTool {
+    fn name(&self) -> &str {
+        "codex_cli"
+    }
+
+    fn description(&self) -> &str {
+        "Delegate a coding task to Codex CLI (codex exec). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The coding task to delegate to Codex"
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Working directory within the workspace (must be inside workspace_dir)"
+                }
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see omnesagent-runtime::tools::mod).
+
+        // The production wrapper owns accounting; the adapter owns authorization.
+        if let Err(error) = self
+            .security
+            .authorize_tool_operation(ToolOperation::Act, "codex_cli")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
+        // Extract prompt (required)
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "prompt"})),
+                "codex_cli: missing prompt parameter"
+            );
+            anyhow::Error::msg("Missing 'prompt' parameter")
+        })?;
+
+        // Validate working directory — require both paths to exist (reject
+        // non-existent paths instead of falling back to the raw value, which
+        // could bypass the workspace containment check via symlinks or
+        // specially-crafted path components).
+        let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
+            let wd_path = std::path::PathBuf::from(wd);
+            let wd_path = if wd_path.is_relative() {
+                self.security.workspace_dir.join(&wd_path)
+            } else {
+                wd_path
+            };
+            let workspace = &self.security.workspace_dir;
+            let canonical_wd = match wd_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "working_directory '{}' does not exist or is not accessible",
+                            wd
+                        )),
+                    });
+                }
+            };
+            let canonical_ws = match workspace.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "workspace directory '{}' does not exist or is not accessible",
+                            workspace.display()
+                        )),
+                    });
+                }
+            };
+            if !canonical_wd.starts_with(&canonical_ws) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "working_directory '{}' is outside the workspace '{}'",
+                        wd,
+                        workspace.display()
+                    )),
+                });
+            }
+            canonical_wd
+        } else {
+            self.security.workspace_dir.clone()
+        };
+
+        // Build CLI command: `codex exec [extra_args...] <prompt>`
+        let mut cmd = CodingCliCommand::new("codex", work_dir.clone(), self.config.timeout_secs);
+        cmd.args(codex_exec_args(&self.config, prompt));
+
+        add_coding_cli_env(&mut cmd, &self.config.env_passthrough);
+
+        match self.executor.output(cmd).await {
+            Ok(output) => {
+                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                // Truncate to max_output_bytes with char-boundary safety
+                if stdout.len() > self.config.max_output_bytes {
+                    let mut b = self.config.max_output_bytes.min(stdout.len());
+                    while b > 0 && !stdout.is_char_boundary(b) {
+                        b -= 1;
+                    }
+                    stdout.truncate(b);
+                    stdout.push_str("\n... [output truncated]");
+                }
+
+                Ok(ToolResult {
+                    success: output.status.success(),
+                    output: stdout.into(),
+                    error: if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    },
+                })
+            }
+            Err(CodingCliExecutionError::Io(e)) => {
+                let err_msg = e.to_string();
+                let msg = if err_msg.contains("No such file or directory")
+                    || err_msg.contains("not found")
+                    || err_msg.contains("cannot find")
+                {
+                    "Codex CLI ('codex') not found in PATH. Install with: npm install -g @openai/codex".into()
+                } else {
+                    format!("Failed to execute codex: {e}")
+                };
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(msg),
+                })
+            }
+            Err(CodingCliExecutionError::Timeout) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Codex CLI timed out after {}s and was killed",
+                    self.config.timeout_secs
+                )),
+            }),
+            Err(CodingCliExecutionError::Prepare(e)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to prepare codex execution: {e}")),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omnesagent_config::autonomy::AutonomyLevel;
+    use omnesagent_config::policy::SecurityPolicy;
+    use omnesagent_config::schema::CodexCliConfig;
+
+    fn test_config() -> CodexCliConfig {
+        CodexCliConfig::default()
+    }
+
+    fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn test_security_with_workspace(
+        autonomy: AutonomyLevel,
+        workspace_dir: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir,
+            ..SecurityPolicy::default()
+        })
+    }
+
+    #[test]
+    fn codex_cli_tool_name() {
+        let tool = CodexCliTool::new(test_security(AutonomyLevel::Supervised), test_config());
+        assert_eq!(tool.name(), "codex_cli");
+    }
+
+    #[test]
+    fn codex_cli_tool_schema_has_prompt() {
+        let tool = CodexCliTool::new(test_security(AutonomyLevel::Supervised), test_config());
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["prompt"].is_object());
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("schema required should be an array")
+                .contains(&json!("prompt"))
+        );
+        assert!(schema["properties"]["working_directory"].is_object());
+    }
+
+    #[tokio::test]
+    async fn codex_cli_blocks_rate_limited() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            max_actions_per_hour: 0,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = crate::wrappers::RateLimitedTool::new(
+            CodexCliTool::new(security.clone(), test_config()),
+            security,
+        );
+        let result = tool
+            .execute(json!({"prompt": "hello"}))
+            .await
+            .expect("rate-limited should return a result");
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
+    }
+
+    #[tokio::test]
+    async fn codex_cli_blocks_readonly() {
+        let tool = CodexCliTool::new(test_security(AutonomyLevel::ReadOnly), test_config());
+        let result = tool
+            .execute(json!({"prompt": "hello"}))
+            .await
+            .expect("readonly should return a result");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only mode")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_cli_missing_prompt_param() {
+        let tool = CodexCliTool::new(test_security(AutonomyLevel::Supervised), test_config());
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("prompt"));
+    }
+
+    #[tokio::test]
+    async fn codex_cli_rejects_path_outside_workspace() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let outside = tempfile::TempDir::new().expect("temp directory outside workspace");
+        let tool = CodexCliTool::new(
+            test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
+            test_config(),
+        );
+        let result = tool
+            .execute(json!({
+                "prompt": "hello",
+                "working_directory": outside.path()
+            }))
+            .await
+            .expect("should return a result for path validation");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("outside the workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_cli_resolves_relative_working_directory_under_workspace() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let empty_path = tempfile::TempDir::new().expect("empty PATH dir");
+        let relative_working_directory = "relative-workdir";
+        std::fs::create_dir(workspace.path().join(relative_working_directory))
+            .expect("relative working directory");
+
+        let previous_path = std::env::var_os("PATH");
+        // SAFETY: this test is intended to run with `--test-threads=1` and
+        // restores PATH before returning.
+        unsafe { std::env::set_var("PATH", empty_path.path()) };
+        let _path_guard = scopeguard::guard(previous_path, |previous_path| match previous_path {
+            Some(previous_path) => {
+                // SAFETY: restoring the process PATH captured before this test.
+                unsafe { std::env::set_var("PATH", previous_path) }
+            }
+            None => {
+                // SAFETY: restoring the process PATH captured before this test.
+                unsafe { std::env::remove_var("PATH") }
+            }
+        });
+
+        let tool = CodexCliTool::new(
+            test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
+            test_config(),
+        );
+        let result = tool
+            .execute(json!({
+                "prompt": "hello",
+                "working_directory": relative_working_directory
+            }))
+            .await
+            .expect("should return a result after path validation");
+        let error = result.error.as_deref().unwrap_or("");
+
+        assert!(!result.success);
+        assert!(
+            !error.contains("outside the workspace"),
+            "relative working_directory should resolve inside workspace; got {error:?}"
+        );
+        assert!(
+            error.contains("Codex CLI ('codex') not found in PATH"),
+            "expected missing Codex CLI after path validation; got {error:?}"
+        );
+    }
+
+    #[test]
+    fn codex_cli_env_passthrough_defaults() {
+        let config = CodexCliConfig::default();
+        assert!(
+            config.env_passthrough.is_empty(),
+            "env_passthrough should default to empty"
+        );
+    }
+
+    #[test]
+    fn codex_cli_extra_args_defaults() {
+        let config = CodexCliConfig::default();
+        assert!(
+            config.extra_args.is_empty(),
+            "extra_args should default to empty"
+        );
+    }
+
+    #[test]
+    fn codex_cli_command_args_separate_prompt_from_dangling_value_flags() {
+        let prompt = "danger-full-access";
+
+        for flag in [
+            "--sandbox",
+            "--config",
+            "-c",
+            "--profile",
+            "--cd",
+            "-C",
+            "--add-dir",
+            "--enable",
+            "--disable",
+        ] {
+            let mut config = test_config();
+            config.extra_args = vec![flag.to_string()];
+
+            assert_eq!(
+                codex_exec_args(&config, prompt),
+                vec!["exec", flag, "--", prompt],
+                "{flag} must not consume the prompt as its value"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_cli_command_args_preserve_an_explicit_terminator() {
+        let mut config = test_config();
+        config.extra_args = vec!["  --skip-git-repo-check  ".to_string(), "--".to_string()];
+
+        assert_eq!(
+            codex_exec_args(&config, "--prompt-starting-with-a-dash"),
+            vec![
+                "exec",
+                "--skip-git-repo-check",
+                "--",
+                "--prompt-starting-with-a-dash"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_cli_default_config_values() {
+        let config = CodexCliConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.timeout_secs, 600);
+        assert_eq!(config.max_output_bytes, 2_097_152);
+    }
+}

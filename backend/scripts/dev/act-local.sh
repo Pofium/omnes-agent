@@ -1,0 +1,528 @@
+#!/usr/bin/env sh
+# act-local.sh — discover and run GitHub Actions workflows locally via act.
+#
+# Powers the release-runbook "Step 3 — Dry-run the release workflows
+# locally" instruction. Walks .github/workflows/, lets a maintainer pick
+# a job (or --all), ensures .secrets exists, and threads
+# --artifact-server-path plus a real GITHUB_TOKEN into every run. The
+# token is exported into the environment so act resolves it via
+# `-s GITHUB_TOKEN` (no token value lands in argv or process tables).
+#
+# Pinned action SHAs: workflows pin `uses:` to full 40-char commit SHAs,
+# and many of those commits are NOT ref tips (they're reachable only by
+# walking history, e.g. dtolnay/rust-toolchain@631a55b1...). act's
+# default on-disk action cache shells a shallow `git clone`/checkout that
+# can't resolve a non-tip SHA and dies with "reference not found". We run
+# act with its GoGitActionCache (--use-new-action-cache), which resolves
+# pinned non-tip SHAs correctly, plus --action-offline-mode so a cached
+# action is reused instead of re-fetched on every job in an --all sweep.
+#
+# --all enforces a hardcoded allowlist of dry-run-safe jobs. Anything
+# off the allowlist (publish, docker push, gh-pages deploys, external
+# dispatches, social posts, issue/PR/label writes — across every
+# workflow file, not just release-stable-manual.yml) is skipped from
+# --all by default and requires the explicit <wf>:<job> form or
+# --no-allowlist to run. act does not honor GitHub's environment-
+# protection gates, so a successful local run with the threaded real
+# GITHUB_TOKEN could perform the real mutation. The allowlist is
+# fail-closed: a new workflow added to the repo is treated as
+# potentially mutating until it's reviewed and explicitly added.
+#
+# POSIX sh — no bash required. Works on dash, busybox ash, mksh.
+#
+# Usage:
+#   ./scripts/dev/act-local.sh                       # interactive picker
+#   ./scripts/dev/act-local.sh --list                # list discovered jobs
+#   ./scripts/dev/act-local.sh <wf>:<job>            # explicit (e.g. release-stable-manual:web)
+#   ./scripts/dev/act-local.sh <job>                 # short form (errors on collision)
+#   ./scripts/dev/act-local.sh --all                 # every dry-run-safe job (allowlist enforced)
+#   ./scripts/dev/act-local.sh --all --no-allowlist
+#                                                    # combined: also runs jobs not on the allowlist
+#   ./scripts/dev/act-local.sh --help
+
+set -eu
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ARTIFACT_DIR="${ACT_LOCAL_ARTIFACT_DIR:-/tmp/act-artifacts}"
+ACT_CACHE_DIR="${HOME}/.cache/act"
+# actions/upload-artifact v7 and actions/download-artifact v8 need an
+# artifact-service protocol that no currently released act version
+# implements (checked through the latest release as of this writing).
+# ACT_ARTIFACT_MIN_VERSION is an unreachable sentinel, not a version to
+# tell users to install. It encodes that no verified act release is known
+# to round-trip the pinned upload/download-artifact protocol. It must
+# ONLY be lowered to a real version number in the same change that
+# records a passing, real artifact round-trip against that release, with
+# that evidence attached to the change itself. Until then,
+# every released act version — including any that happen to sort above
+# this sentinel numerically — fails the preflight below and the
+# GitHub-hosted workflow is the fallback. Keep this policy independent
+# from the pinned action refs: the GitHub-hosted workflow remains
+# canonical and must not be downgraded for a local runner.
+ACT_ARTIFACT_MIN_VERSION="999.0.0"
+NO_ALLOWLIST=false
+# Resolved at setup time. Prefers a standalone `act` on PATH, falls
+# back to `gh act` (the gh-act extension) — that's the install path
+# the runbook recommends, so make sure it works without forcing a
+# second download.
+ACT_BIN=""
+
+# Jobs proven safe to run locally under act with a real GITHUB_TOKEN.
+# Every entry here makes NO real-world side effects — no GitHub
+# Releases, no package pushes, no external dispatches, no
+# issue/PR/label/branch writes, no social posts. The contents are
+# limited to: artifact-only builds, semver validation, output-only
+# release-notes generation, and similar read/local-write steps.
+#
+# discover_jobs walks every standalone .github/workflows/*.yml in
+# the repo, including ones outside release-stable-manual.yml. A
+# denylist would be fail-open: a new workflow with a write surface
+# (gh-pages publish, issue creation, package-manager dispatch) added
+# without updating this list would silently get invoked by --all
+# with the maintainer's real GITHUB_TOKEN. An allowlist is
+# fail-closed — new workflows are treated as potentially mutating
+# until a maintainer reviews them and explicitly adds the safe job
+# IDs here.
+DRY_RUN_SAFE_JOBS="\
+cross-platform-build-manual:web
+cross-platform-build-manual:build
+release-stable-manual:validate
+release-stable-manual:web
+release-stable-manual:release-notes
+release-stable-manual:build
+release-stable-manual:build-desktop"
+
+log()  { printf '==> %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '4,41p' "$0" | sed 's/^#//; s/^ //'
+  exit 0
+}
+
+is_dry_run_safe_job() {
+  printf '%s\n' "$DRY_RUN_SAFE_JOBS" | grep -qx "$1"
+}
+
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 not found — install from $2"
+}
+
+parse_released_act_version() {
+  awk '
+    NR == 1 && NF == 3 && $1 == "act" && $2 == "version" {
+      candidate = $3
+      sub(/^v/, "", candidate)
+      if (candidate ~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/) {
+        print candidate
+      }
+      exit
+    }
+  '
+}
+
+version_at_least() {
+  awk -v current="$1" -v minimum="$2" '
+    BEGIN {
+      split(current, have, ".")
+      split(minimum, need, ".")
+      for (i = 1; i <= 3; i++) {
+        if ((have[i] + 0) > (need[i] + 0)) exit 0
+        if ((have[i] + 0) < (need[i] + 0)) exit 1
+      }
+      exit 0
+    }
+  '
+}
+
+job_requires_artifact_service() {
+  workflow_file="$1"
+  target_job="$2"
+
+  awk -v target="$target_job" '
+    /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+    in_jobs && /^[^[:space:]]/ { exit }
+    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
+      job = $0
+      sub(/^  /, "", job)
+      sub(/:[[:space:]]*$/, "", job)
+      in_target = (job == target)
+      next
+    }
+    in_target && /uses:[[:space:]]*actions\/(upload|download)-artifact@/ {
+      found = 1
+      exit
+    }
+    END { exit !found }
+  ' "$workflow_file"
+}
+
+job_local_reusable_workflows() {
+  workflow_file="$1"
+  target_job="$2"
+
+  awk -v target="$target_job" '
+    /^jobs:[[:space:]]*$/ { in_jobs = 1; next }
+    in_jobs && /^[^[:space:]]/ { exit }
+    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
+      job = $0
+      sub(/^  /, "", job)
+      sub(/:[[:space:]]*$/, "", job)
+      in_target = (job == target)
+      next
+    }
+    in_target && /^    uses:[[:space:]]*\.\/\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml[[:space:]]*$/ {
+      reusable = $0
+      sub(/^    uses:[[:space:]]*/, "", reusable)
+      print reusable
+    }
+  ' "$workflow_file"
+}
+
+workflow_requires_artifact_service() {
+  grep -qE 'uses:[[:space:]]*actions/(upload|download)-artifact@' "$1"
+}
+
+pair_requires_artifact_service() {
+  pair="$1"
+  stem=${pair%%:*}
+  job=${pair#*:}
+  workflow_file="$REPO_ROOT/.github/workflows/$stem.yml"
+  [ -f "$workflow_file" ] || return 1
+
+  planned_jobs=$($ACT_BIN -W "$workflow_file" -j "$job" -l 2>/dev/null \
+    | awk 'NR > 1 && NF >= 2 && $2 != "" { print $2 }') || {
+      die "could not inspect the act plan for ${pair}; refusing to bypass the artifact compatibility preflight"
+    }
+  [ -n "$planned_jobs" ] || {
+    die "act returned an empty plan for ${pair}; refusing to bypass the artifact compatibility preflight"
+  }
+
+  for planned_job in $planned_jobs; do
+    if job_requires_artifact_service "$workflow_file" "$planned_job"; then
+      return 0
+    fi
+    for reusable in $(job_local_reusable_workflows "$workflow_file" "$planned_job"); do
+      reusable_file="$REPO_ROOT/${reusable#./}"
+      if [ -f "$reusable_file" ] && workflow_requires_artifact_service "$reusable_file"; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+preflight_artifact_service() {
+  context="$1"
+  version_output=$($ACT_BIN --version 2>&1) || {
+    die "could not query act version before ${context}; use GitHub-hosted Actions as the fallback"
+  }
+  act_version=$(printf '%s\n' "$version_output" | parse_released_act_version)
+
+  if [ -z "$act_version" ]; then
+    die "could not parse the released act version; no currently released act version meets the artifact-service compatibility threshold (act >= ${ACT_ARTIFACT_MIN_VERSION}, not yet satisfied by any release). Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
+  fi
+
+  if ! version_at_least "$act_version" "$ACT_ARTIFACT_MIN_VERSION"; then
+    die "${context} requires the pinned artifact actions, but act ${act_version} does not support the artifact-service protocol they need, and no currently released act version does either (compatibility threshold act >= ${ACT_ARTIFACT_MIN_VERSION} is not yet satisfied by any release). Use GitHub-hosted Actions as the fallback; do not downgrade the pinned artifact actions"
+  fi
+}
+
+preflight_selected_jobs() {
+  pairs="$1"
+  context="$2"
+
+  for pair in $pairs; do
+    if pair_requires_artifact_service "$pair"; then
+      preflight_artifact_service "$context"
+      return
+    fi
+  done
+}
+
+# ── Setup ──────────────────────────────────────────────────────────
+
+ensure_setup() {
+  require_tool docker https://docs.docker.com/engine/install/
+  require_tool gh     https://cli.github.com
+  require_tool git    https://git-scm.com/
+
+  if command -v act >/dev/null 2>&1; then
+    ACT_BIN="act"
+  elif gh extension list 2>/dev/null | grep -q 'gh act'; then
+    ACT_BIN="gh act"
+  else
+    die "act not found. Install via: gh extension install nektos/gh-act
+       or download a binary from https://nektosact.com/installation/"
+  fi
+
+  if [ ! -f "$REPO_ROOT/.secrets" ]; then
+    log "creating .secrets (gitignored, empty by default)"
+    : > "$REPO_ROOT/.secrets"
+  fi
+
+  mkdir -p "$ARTIFACT_DIR"
+}
+
+# ── Workflow + job discovery ───────────────────────────────────────
+
+# Print a workflow file's job IDs, one per line, only if the workflow
+# has a standalone trigger (push / pull_request / workflow_dispatch /
+# schedule). workflow_call-only files are skipped — they need a parent
+# invocation and aren't useful to run in isolation through act.
+discover_workflow_jobs() {
+  workflow_file="$1"
+  if ! grep -qE '^[[:space:]]*(push|pull_request|workflow_dispatch|schedule):' \
+       "$workflow_file"; then
+    return
+  fi
+  # `act -W <file> -l` prints a header row plus one row per job. We
+  # want column 2 (Job ID). $ACT_BIN may be unset when discover is
+  # called from a context that doesn't pre-resolve (e.g. resolve_job
+  # short-form lookup); fall back to plain `act` then.
+  ${ACT_BIN:-act} -W "$workflow_file" -l 2>/dev/null \
+    | awk 'NR > 1 && NF >= 2 && $2 != "" { print $2 }'
+}
+
+# Print every "<workflow-stem>:<job-id>" pair, grouped by workflow.
+discover_jobs() {
+  for workflow_file in "$REPO_ROOT"/.github/workflows/*.yml; do
+    [ -f "$workflow_file" ] || continue
+    stem=$(basename "$workflow_file" .yml)
+    discover_workflow_jobs "$workflow_file" \
+      | while IFS= read -r job; do
+          [ -n "$job" ] && printf '%s:%s\n' "$stem" "$job"
+        done
+  done
+}
+
+list_jobs() {
+  prev_stem=""
+  discover_jobs | while IFS=: read -r stem job; do
+    if [ "$stem" != "$prev_stem" ]; then
+      [ -n "$prev_stem" ] && echo
+      printf '%s:\n' "$stem"
+      prev_stem="$stem"
+    fi
+    printf '  %s\n' "$job"
+  done
+}
+
+resolve_job() {
+  query="$1"
+  case "$query" in
+    *:*)
+      # Explicit <workflow>:<job> — verify it exists.
+      stem=${query%%:*}
+      job=${query#*:}
+      if discover_workflow_jobs "$REPO_ROOT/.github/workflows/$stem.yml" \
+           2>/dev/null | grep -qx "$job"; then
+        printf '%s\n' "$query"
+        return 0
+      fi
+      die "no such job: $query (try --list)"
+      ;;
+    *)
+      # Short form — must resolve to exactly one match.
+      matches=$(discover_jobs | awk -F: -v q="$query" '$2 == q { print }')
+      count=$(printf '%s\n' "$matches" | grep -c . || true)
+      if [ "$count" = 0 ]; then
+        die "no job named '$query' (try --list)"
+      elif [ "$count" -gt 1 ]; then
+        printf 'error: ambiguous job '\''%s'\'' — defined in:\n' \
+          "$query" >&2
+        printf '  %s\n' $matches >&2
+        printf 'use <workflow>:<job> form, e.g. %s\n' \
+          "$(printf '%s' "$matches" | head -1)" >&2
+        exit 1
+      fi
+      printf '%s\n' "$matches"
+      ;;
+  esac
+}
+
+# ── Run a single job ───────────────────────────────────────────────
+
+cargo_toml_version() {
+  awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{
+         split($0,a,"\""); print a[2]; exit }' \
+    "$REPO_ROOT/Cargo.toml"
+}
+
+# Detect whether a workflow file has a `version:` workflow_dispatch
+# input. If so, we'll auto-derive it from Cargo.toml.
+workflow_has_version_input() {
+  awk '
+    /^on:/ { in_on=1; next }
+    in_on && /^[a-z]/ { exit }
+    in_on && /workflow_dispatch:/ { in_wd=1; next }
+    in_wd && /^[[:space:]]+inputs:/ { in_inputs=1; next }
+    in_inputs && /^[[:space:]]+version:/ { found=1; exit }
+    in_inputs && /^[[:space:]]{0,4}[a-z]/ && !/^[[:space:]]+inputs:/ { in_inputs=0 }
+    END { exit !found }
+  ' "$1"
+}
+
+run_one() {
+  pair="$1"
+  preflight_done="${2:-false}"
+  stem=${pair%%:*}
+  job=${pair#*:}
+  workflow_file="$REPO_ROOT/.github/workflows/$stem.yml"
+  [ -f "$workflow_file" ] || die "workflow file missing: $workflow_file"
+
+  if [ "$preflight_done" != true ] && pair_requires_artifact_service "$pair"; then
+    preflight_artifact_service "$pair"
+  fi
+
+  # Export the token into the environment so act resolves `-s
+  # GITHUB_TOKEN` (no value) from getenv. Keeps the credential out of
+  # argv, the shell history, and the kernel's process table.
+  GITHUB_TOKEN=$(gh auth token)
+  export GITHUB_TOKEN
+
+  if ! is_dry_run_safe_job "$pair"; then
+    log "WARNING: ${pair} is not on the dry-run-safe allowlist."
+    log "         act does not honor environment-protection gates; this job"
+    log "         may publish, push, dispatch, post, or open issues against"
+    log "         real targets with the GITHUB_TOKEN threaded into this run."
+    log "         Continuing because you asked for this job explicitly."
+  fi
+
+  # Build the act command via positional params (POSIX sh has no arrays).
+  # --use-new-action-cache selects act's GoGitActionCache, the only cache
+  # backend that resolves pinned non-tip action SHAs (the default on-disk
+  # cache shells a shallow clone and 400s on them). --action-offline-mode
+  # reuses an already-cached action instead of re-fetching it on every job
+  # of an --all sweep, and --action-cache-path keeps that cache in a
+  # predictable location.
+  set -- workflow_dispatch \
+         -j "$job" \
+         -W "$workflow_file" \
+         -s GITHUB_TOKEN \
+         --use-new-action-cache \
+         --action-offline-mode \
+         --action-cache-path "$ACT_CACHE_DIR" \
+         --artifact-server-path "$ARTIFACT_DIR"
+
+  if workflow_has_version_input "$workflow_file"; then
+    version=$(cargo_toml_version)
+    if [ -n "$version" ]; then
+      set -- "$@" --input "version=$version"
+    fi
+  fi
+
+  log "run ${stem}:${job}"
+  $ACT_BIN "$@"
+}
+
+run_all() {
+  if [ "$NO_ALLOWLIST" = true ]; then
+    log "running all act-runnable jobs (allowlist filter disabled)"
+  else
+    log "running dry-run-safe jobs only (others skipped — pass --no-allowlist or run explicitly to override)"
+  fi
+  selected_pairs=""
+  skipped_pairs=""
+  all_pairs=$(discover_jobs)
+  for pair in $all_pairs; do
+    [ -n "$pair" ] || continue
+    if [ "$NO_ALLOWLIST" != true ] && ! is_dry_run_safe_job "$pair"; then
+      skipped_pairs="${skipped_pairs}${skipped_pairs:+
+}${pair}"
+      continue
+    fi
+    selected_pairs="${selected_pairs}${selected_pairs:+
+}${pair}"
+  done
+
+  # --all is atomic with respect to compatibility checks. If any selected job
+  # needs the local artifact service, reject an unsupported act version before
+  # starting even the non-artifact jobs. This avoids reporting a partial sweep
+  # as useful release evidence.
+  preflight_selected_jobs "$selected_pairs" "--all"
+
+  for pair in $skipped_pairs; do
+    log "skip ${pair} (not on dry-run-safe allowlist)"
+  done
+
+  for pair in $selected_pairs; do
+    run_one "$pair" true
+  done
+}
+
+# ── Interactive picker ─────────────────────────────────────────────
+
+interactive_pick() {
+  pairs=$(discover_jobs)
+  [ -n "$pairs" ] || die "no act-runnable jobs discovered"
+
+  printf '%s\n' "Available jobs:" >&2
+  printf '%s\n' "$pairs" \
+    | awk '{ printf "  [%2d] %s\n", NR, $0 }' >&2
+  printf '%s\n' "  [ 0] all" >&2
+  printf '\n  pick a number: ' >&2
+  read -r choice
+  case "$choice" in
+    0)         run_all; return ;;
+    ''|*[!0-9]*) die "not a number: $choice" ;;
+  esac
+  selected=$(printf '%s\n' "$pairs" | awk -v n="$choice" 'NR == n')
+  [ -n "$selected" ] || die "no job at index $choice"
+  run_one "$selected"
+}
+
+# ── Main ───────────────────────────────────────────────────────────
+
+main() {
+  # Parse all flags first regardless of position, then dispatch on the
+  # action (--list / --all / explicit job / interactive). The previous
+  # implementation dispatched on $1 immediately, so flags trailing
+  # `--all` (e.g. `--all --no-allowlist`) were silently ignored — the
+  # documented opt-out command-line worked one way and not the other.
+  action=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        usage
+        ;;
+      --no-allowlist)
+        NO_ALLOWLIST=true
+        ;;
+      -l|--list|-a|--all)
+        [ -z "$action" ] && action="$1"
+        ;;
+      -*)
+        die "unknown flag: $1"
+        ;;
+      *)
+        if [ -z "$action" ]; then
+          action="$1"
+        else
+          die "extra positional argument: $1 (already have action: $action)"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  ensure_setup
+
+  case "$action" in
+    -l|--list)
+      list_jobs
+      ;;
+    -a|--all)
+      run_all
+      ;;
+    '')
+      interactive_pick
+      ;;
+    *)
+      pair=$(resolve_job "$action")
+      run_one "$pair"
+      ;;
+  esac
+}
+
+main "$@"

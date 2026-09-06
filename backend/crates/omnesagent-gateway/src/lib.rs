@@ -1,0 +1,9890 @@
+#![allow(
+    clippy::to_string_in_format_args,
+    clippy::useless_format,
+    clippy::collapsible_if
+)]
+
+#[cfg(feature = "a2a")]
+pub mod a2a;
+pub mod acp;
+pub mod agent_owned_state;
+pub mod api;
+pub mod api_browse;
+pub mod api_config;
+pub mod api_logs;
+pub mod api_pairing;
+pub mod api_personality;
+#[cfg(feature = "plugins-wasm")]
+pub mod api_plugins;
+pub mod api_quickstart;
+pub mod api_sections;
+pub mod api_skills;
+pub mod api_sop;
+pub mod api_sop_author;
+mod api_sop_webhook;
+pub mod api_upload;
+#[cfg(feature = "webauthn")]
+pub mod api_webauthn;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+pub mod api_webhook;
+pub mod auth_rate_limit;
+pub mod canvas;
+pub mod hardware_context;
+pub mod node_tool;
+pub mod nodes;
+pub mod openapi;
+pub mod security_headers;
+pub mod session_queue;
+pub mod sse;
+pub mod static_files;
+pub mod tls;
+pub mod version;
+#[cfg(feature = "gateway-voice-duplex")]
+pub mod voice_duplex;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+mod webhook_ingress;
+pub mod ws;
+pub mod ws_approval;
+pub mod ws_sop_runs;
+
+use anyhow::{Context, Result};
+#[cfg(any(
+    feature = "channel-email",
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+use axum::body::Bytes;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+use axum::extract::Path;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+use axum::response::Response;
+use axum::{
+    Router,
+    extract::{ConnectInfo, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Json},
+    routing::{delete, get, post, put},
+};
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Backoff after a transient `accept()` error so the serve loop does not
+/// hot-spin while the condition (e.g. fd exhaustion) clears.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
+
+/// File-descriptor exhaustion errno values, stable across the Unix targets
+/// we support (Linux, macOS, BSD).
+#[cfg(unix)]
+const EMFILE: i32 = 24; // too many open files (this process)
+#[cfg(unix)]
+const ENFILE: i32 = 23; // too many open files (system-wide)
+
+fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        return true;
+    }
+    false
+}
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
+use uuid::Uuid;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+use omnesagent_api::channel::Channel;
+use omnesagent_api::memory_traits::MemoryStrategy;
+use omnesagent_api::tool::ToolSpec;
+#[cfg(feature = "channel-email")]
+use omnesagent_channels::gmail_push::GmailPushChannel;
+#[cfg(feature = "channel-linq")]
+use omnesagent_channels::linq::LinqChannel;
+#[cfg(feature = "channel-nextcloud")]
+use omnesagent_channels::nextcloud_talk::NextcloudTalkChannel;
+#[cfg(feature = "channel-whatsapp-cloud")]
+use omnesagent_channels::whatsapp::WhatsAppChannel;
+use omnesagent_config::policy::SecurityPolicy;
+use omnesagent_config::schema::Config;
+use omnesagent_infra::session_backend::SessionBackend;
+use omnesagent_memory::{self, Memory, MemoryCategory};
+use omnesagent_providers::{self, ModelProvider};
+use omnesagent_runtime::agent::memory_strategy::DefaultMemoryStrategy;
+use omnesagent_runtime::cost::CostTracker;
+use omnesagent_runtime::i18n;
+use omnesagent_runtime::platform;
+use omnesagent_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
+use omnesagent_runtime::tools;
+use omnesagent_runtime::tools::CanvasStore;
+use omnesagent_runtime::tools::scoped;
+
+/// Maximum request body size (64KB) — prevents memory exhaustion
+pub const MAX_BODY_SIZE: usize = 65_536;
+/// Default request timeout (30s) — prevents slow-loris attacks.
+pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
+
+/// Gateway request timeout (seconds) for routes other than the long-running
+/// cron-trigger endpoint. Reads from typed config.
+pub fn gateway_request_timeout_secs(cfg: &omnesagent_config::schema::GatewayConfig) -> u64 {
+    cfg.request_timeout_secs
+}
+
+/// Manual cron-trigger request timeout (seconds), exempt from the
+/// gateway-wide [`gateway_request_timeout_secs`] limit so synchronous agent
+/// jobs can run to completion. Reads from typed config.
+pub fn gateway_long_running_request_timeout_secs(
+    cfg: &omnesagent_config::schema::GatewayConfig,
+) -> u64 {
+    cfg.long_running_request_timeout_secs
+}
+/// Sliding window used by gateway rate limiting.
+pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// Fallback max distinct client keys tracked in gateway rate limiter.
+pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
+/// Fallback max distinct idempotency keys retained in gateway memory.
+pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+
+fn webhook_memory_key() -> String {
+    format!("webhook_msg_{}", Uuid::new_v4())
+}
+
+#[cfg(feature = "channel-whatsapp-cloud")]
+fn whatsapp_memory_key(msg: &omnesagent_api::channel::ChannelMessage) -> String {
+    format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
+
+#[cfg(feature = "channel-linq")]
+fn linq_memory_key(msg: &omnesagent_api::channel::ChannelMessage) -> String {
+    format!("linq_{}_{}", msg.sender, msg.id)
+}
+
+#[cfg(feature = "channel-nextcloud")]
+fn nextcloud_talk_memory_key(msg: &omnesagent_api::channel::ChannelMessage) -> String {
+    format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
+}
+
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+fn sender_session_id(channel: &str, msg: &omnesagent_api::channel::ChannelMessage) -> String {
+    match &msg.thread_ts {
+        Some(thread_id) => format!("{channel}_{thread_id}_{}", msg.sender),
+        None => format!("{channel}_{}", msg.sender),
+    }
+}
+
+#[cfg(feature = "channel-linq")]
+fn linq_channel_ref(alias: &str) -> String {
+    format!("linq.{alias}")
+}
+
+fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
+    const MAX_SESSION_ID_LEN: usize = 128;
+    headers
+        .get("X-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| value.len() <= MAX_SESSION_ID_LEN)
+        .filter(|value| {
+            value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        })
+        .map(str::to_owned)
+}
+
+fn hash_webhook_secret(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(digest)
+}
+
+/// How often the rate limiter sweeps stale IP entries from its map.
+const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
+
+#[derive(Debug)]
+struct SlidingWindowRateLimiter {
+    limit_per_window: u32,
+    window: Duration,
+    max_keys: usize,
+    requests: Mutex<(HashMap<String, Vec<Instant>>, Instant)>,
+}
+
+impl SlidingWindowRateLimiter {
+    fn new(limit_per_window: u32, window: Duration, max_keys: usize) -> Self {
+        Self {
+            limit_per_window,
+            window,
+            max_keys: max_keys.max(1),
+            requests: Mutex::new((HashMap::new(), Instant::now())),
+        }
+    }
+
+    fn prune_stale(requests: &mut HashMap<String, Vec<Instant>>, cutoff: Instant) {
+        requests.retain(|_, timestamps| {
+            timestamps.retain(|t| *t > cutoff);
+            !timestamps.is_empty()
+        });
+    }
+
+    fn allow(&self, key: &str) -> bool {
+        if self.limit_per_window == 0 {
+            return true;
+        }
+
+        let now = Instant::now();
+        let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
+
+        let mut guard = self.requests.lock();
+        let (requests, last_sweep) = &mut *guard;
+
+        // Periodic sweep: remove keys with no recent requests
+        if last_sweep.elapsed() >= Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS) {
+            Self::prune_stale(requests, cutoff);
+            *last_sweep = now;
+        }
+
+        if !requests.contains_key(key) && requests.len() >= self.max_keys {
+            // Opportunistic stale cleanup before eviction under cardinality pressure.
+            Self::prune_stale(requests, cutoff);
+            *last_sweep = now;
+
+            if requests.len() >= self.max_keys {
+                let evict_key = requests
+                    .iter()
+                    .min_by_key(|(_, timestamps)| timestamps.last().copied().unwrap_or(cutoff))
+                    .map(|(k, _)| k.clone());
+                if let Some(evict_key) = evict_key {
+                    requests.remove(&evict_key);
+                }
+            }
+        }
+
+        let entry = requests.entry(key.to_owned()).or_default();
+        entry.retain(|instant| *instant > cutoff);
+
+        if entry.len() >= self.limit_per_window as usize {
+            return false;
+        }
+
+        entry.push(now);
+        true
+    }
+}
+
+#[derive(Debug)]
+pub struct GatewayRateLimiter {
+    pair: SlidingWindowRateLimiter,
+    webhook: SlidingWindowRateLimiter,
+}
+
+impl GatewayRateLimiter {
+    pub fn new(pair_per_minute: u32, webhook_per_minute: u32, max_keys: usize) -> Self {
+        let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+        Self {
+            pair: SlidingWindowRateLimiter::new(pair_per_minute, window, max_keys),
+            webhook: SlidingWindowRateLimiter::new(webhook_per_minute, window, max_keys),
+        }
+    }
+
+    fn allow_pair(&self, key: &str) -> bool {
+        self.pair.allow(key)
+    }
+
+    fn allow_webhook(&self, key: &str) -> bool {
+        self.webhook.allow(key)
+    }
+}
+
+#[derive(Debug)]
+pub struct IdempotencyStore {
+    ttl: Duration,
+    max_keys: usize,
+    keys: Mutex<HashMap<String, Instant>>,
+}
+
+impl IdempotencyStore {
+    pub fn new(ttl: Duration, max_keys: usize) -> Self {
+        Self {
+            ttl,
+            max_keys: max_keys.max(1),
+            keys: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns true if this key is new and is now recorded.
+    fn record_if_new(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut keys = self.keys.lock();
+
+        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+
+        if keys.contains_key(key) {
+            return false;
+        }
+
+        if keys.len() >= self.max_keys {
+            let evict_key = keys
+                .iter()
+                .min_by_key(|(_, seen_at)| *seen_at)
+                .map(|(k, _)| k.clone());
+            if let Some(evict_key) = evict_key {
+                keys.remove(&evict_key);
+            }
+        }
+
+        keys.insert(key.to_owned(), now);
+        true
+    }
+}
+
+fn parse_client_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim().trim_matches('"').trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip);
+    }
+
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Some(addr.ip());
+    }
+
+    let value = value.trim_matches(['[', ']']);
+    value.parse::<IpAddr>().ok()
+}
+
+fn dirs_data_local() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf())
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+        for candidate in xff.split(',') {
+            if let Some(ip) = parse_client_ip(candidate) {
+                return Some(ip);
+            }
+        }
+    }
+
+    headers
+        .get("X-Real-IP")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_client_ip)
+}
+
+fn client_key_from_request(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+) -> String {
+    if trust_forwarded_headers && let Some(ip) = forwarded_client_ip(headers) {
+        return ip.to_string();
+    }
+
+    peer_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
+    if configured == 0 {
+        fallback.max(1)
+    } else {
+        configured
+    }
+}
+
+fn default_agent_alias(config: &Config) -> Option<String> {
+    config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .map(|(alias, _)| alias.clone())
+        .min()
+}
+
+/// Owned guard for [`AppState::config_write_lock`]. Owned (not borrowed) so
+/// a handler can release it explicitly at its commit point, or pass it by
+/// value into a delegated helper without lifetime coupling.
+pub(crate) type ConfigWriteGuard = tokio::sync::OwnedMutexGuard<()>;
+
+/// Shared state for all axum handlers
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<RwLock<Config>>,
+
+    /// Serializes the read-mutate-save-swap critical section of every HTTP
+    /// handler that mutates `config` (per-property PUT/DELETE/PATCH, map-key
+    /// create/delete/rename, channel bind, config migrate, section select,
+    /// quickstart apply, cron settings patch, pairing-token persistence). A
+    /// tokio mutex, not `parking_lot`, because the guard must survive the
+    /// `.await` on config-save I/O. Mirrors
+    /// `RpcContext::config_write_lock` in the RPC path.
+    ///
+    /// Invariant: every mutation of `config` must happen while holding this
+    /// mutex, acquired before the first `config` read-for-modify and held
+    /// through the swap that installs the mutated snapshot. Never acquire it
+    /// while holding a `config` guard — lock order is this mutex first,
+    /// `config` second, always. A writer that bypasses this lock and swaps
+    /// the live config while a concurrent writer's save is in flight loses
+    /// that writer's change — clobbered in memory and, if its save hadn't
+    /// landed yet, on disk too.
+    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub model_provider: Arc<dyn ModelProvider>,
+    pub model: String,
+    /// `None` means "let the provider decide" — required for models
+    /// (e.g. claude-opus-4-7) that reject the field. Always preserve
+    /// `Option<f64>` end-to-end; never substitute a hardcoded default.
+    pub temperature: Option<f64>,
+    pub mem: Arc<dyn Memory>,
+    pub memory_strategy: Arc<dyn MemoryStrategy>,
+    pub auto_save: bool,
+    pub pairing: Arc<PairingGuard>,
+    pub trust_forwarded_headers: bool,
+    pub rate_limiter: Arc<GatewayRateLimiter>,
+    pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
+    pub idempotency_store: Arc<IdempotencyStore>,
+    /// `WhatsApp` channel instances keyed by config alias. Webhooks route by
+    /// `/whatsapp/{alias}`; the bare `/whatsapp` path falls back to the first
+    /// instance (see [`api_webhook`]).
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    pub whatsapp: HashMap<String, Arc<WhatsAppChannel>>,
+    /// `WhatsApp` app secrets keyed by alias for webhook signature verification
+    /// (`X-Hub-Signature-256`).
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    pub whatsapp_app_secret: HashMap<String, Arc<str>>,
+    #[cfg(feature = "channel-linq")]
+    pub linq: HashMap<String, Arc<LinqChannel>>,
+    /// Linq webhook signing secrets per alias
+    #[cfg(feature = "channel-linq")]
+    pub linq_signing_secrets: HashMap<String, Arc<str>>,
+    /// Nextcloud Talk channel instances keyed by config alias.
+    #[cfg(feature = "channel-nextcloud")]
+    pub nextcloud_talk: HashMap<String, Arc<NextcloudTalkChannel>>,
+    /// Nextcloud Talk webhook secrets keyed by alias for signature verification.
+    #[cfg(feature = "channel-nextcloud")]
+    pub nextcloud_talk_webhook_secret: HashMap<String, Arc<str>>,
+    /// Gmail Pub/Sub push notification channel
+    #[cfg(feature = "channel-email")]
+    pub gmail_push: Option<Arc<GmailPushChannel>>,
+    /// Observability backend for metrics scraping
+    pub observer: Arc<dyn omnesagent_runtime::observability::Observer>,
+    /// Registered tool specs (for web dashboard tools page). This is the
+    /// default (no `?agent=`) listing, seeded from the deterministically
+    /// smallest enabled agent alias.
+    pub tools_registry: Arc<Vec<ToolSpec>>,
+    /// Per-agent tool-spec listings keyed by agent alias, powering the
+    /// agent-aware `GET /api/tools?agent=<alias>` view so the WebUI Tools
+    /// page can show each agent's scoped tool set. Falls back to
+    /// `tools_registry` for an unknown or omitted alias.
+    pub tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>>,
+    /// Cost tracker (optional, for web dashboard cost page)
+    pub cost_tracker: Option<Arc<CostTracker>>,
+    /// SSE broadcast channel for real-time events
+    pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Ring buffer of recent events for history replay
+    pub event_buffer: Arc<sse::EventBuffer>,
+    /// Shutdown signal sender for graceful shutdown
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Reload signal sender owned by the daemon. /admin/reload writes `true`
+    /// here; the daemon's wait loop reacts and re-instantiates every
+    /// subsystem in place. `None` when running standalone (`omnesagent gateway start`)
+    /// — reload then degrades to a 503 with a clear message.
+    pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Registry of dynamically connected nodes
+    pub node_registry: Arc<nodes::NodeRegistry>,
+    /// LAN-local peer hints discovered by multicast. These are informational
+    /// only; they never authorize or connect a peer.
+    pub mdns_peer_registry: nodes::mdns::MdnsPeerRegistry,
+    /// Path prefix for reverse-proxy deployments (empty string = no prefix)
+    pub path_prefix: String,
+    /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
+    pub web_dist_dir: Option<std::path::PathBuf>,
+    /// Session backend for persisting gateway WS chat sessions
+    pub session_backend: Option<Arc<dyn SessionBackend>>,
+    /// Per-session actor queue for serializing concurrent turns
+    pub session_queue: Arc<session_queue::SessionActorQueue>,
+    /// Device registry for paired device management
+    pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
+    /// Pending pairing request store
+    pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
+    /// Shared canvas store for Live Canvas (A2UI) system
+    pub canvas_store: CanvasStore,
+    /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
+    #[cfg(feature = "webauthn")]
+    pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
+    /// Per-session cancellation tokens for aborting in-flight agent responses.
+    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
+    /// current turn. Entries are inserted before each turn and removed after
+    /// completion (normal or cancelled).
+    pub cancel_tokens: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+    >,
+    pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
+    /// TUI session registry from the daemon (for /api/tuis endpoint).
+    /// `None` when the gateway runs standalone without a daemon.
+    pub tui_registry: Option<Arc<omnesagent_runtime::rpc::tui_identity::TuiRegistry>>,
+    /// Shared SOP engine from the daemon (for WS agent sessions).
+    /// `None` when the gateway runs standalone — sessions build their own.
+    pub sop_engine: Option<Arc<std::sync::Mutex<omnesagent_runtime::sop::SopEngine>>>,
+    /// Shared SOP audit logger from the daemon (for WS agent sessions).
+    pub sop_audit: Option<Arc<omnesagent_runtime::sop::SopAuditLogger>>,
+}
+
+/// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+#[allow(clippy::too_many_lines)]
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // Reload controls owned by the daemon for supervised runs. RPC reloads
+    // write to `shutdown_tx` before signalling daemon reload so the listener
+    // releases its socket before the replacement gateway binds. /admin/reload
+    // writes to both controls directly. Standalone gateway passes `None`.
+    reload_controls: Option<omnesagent_runtime::daemon::GatewayReloadControls>,
+    // TUI session registry from the daemon for the /api/tuis endpoint.
+    tui_registry: Option<Arc<omnesagent_runtime::rpc::tui_identity::TuiRegistry>>,
+    canvas_store: Option<CanvasStore>,
+    // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
+    sop_engine: Option<Arc<std::sync::Mutex<omnesagent_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<omnesagent_runtime::sop::SopAuditLogger>>,
+    readiness: Option<omnesagent_runtime::daemon::GatewayReadinessReporter>,
+) -> Result<()> {
+    // ── Security: warn on public bind without tunnel or explicit opt-in ──
+    if is_public_bind(host)
+        && config.tunnel.tunnel_provider == "none"
+        && !config.gateway.allow_public_bind
+    {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+            "⚠️  Binding to {host} — gateway will be exposed to all network interfaces.\n\
+             Suggestion: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             [gateway] allow_public_bind = true in config.toml to silence this warning.\n\n\
+             Docker/VM: if you are running inside a container or VM, this is expected."
+        );
+    }
+    let config_state = Arc::new(RwLock::new(config.clone()));
+
+    // ── Hooks ──────────────────────────────────────────────────────
+    let hooks: Option<std::sync::Arc<omnesagent_runtime::hooks::HookRunner>> = if config.hooks.enabled
+    {
+        Some(std::sync::Arc::new(
+            omnesagent_runtime::hooks::HookRunner::new(),
+        ))
+    } else {
+        None
+    };
+
+    let addr: SocketAddr = match omnesagent_infra::parse_gateway_bind_socket_addr(host, port) {
+        Ok(a) => a,
+        Err(e) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "host": host,
+                        "port": port,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: host:port did not parse as a SocketAddr; falling back to \
+                 127.0.0.1 so the gateway can still boot. Fix [gateway] host and \
+                 POST /admin/reload."
+            );
+            omnesagent_infra::fallback_gateway_bind_socket_addr(port)
+        }
+    };
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let actual_addr = listener.local_addr()?;
+    let actual_port = actual_addr.port();
+    let display_addr = format!("{host}:{actual_port}");
+
+    let (boot_family, boot_alias, boot_entry) = config
+        .providers
+        .models
+        .iter_entries()
+        .next()
+        .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
+        .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
+    let fallback = boot_entry;
+    let model_provider_name = boot_family.as_str();
+    let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
+        match omnesagent_providers::create_resilient_model_provider_from_ref(
+            &config,
+            model_provider_name,
+            fallback.and_then(|e| e.api_key.as_deref()),
+            fallback.and_then(|e| e.uri.as_deref()),
+            &config.reliability,
+            &omnesagent_providers::provider_runtime_options_for_alias(
+                &config,
+                &boot_family,
+                &boot_alias,
+            ),
+        ) {
+            Ok(p) => (Arc::from(p), false),
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note,)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": model_provider_name,
+                            "alias": boot_alias,
+                            "error": format!("{e}"),
+                        })),
+                    "Gateway: seed model_provider failed to construct; booting in \
+                     needs_quickstart mode so /quickstart and /admin/reload stay \
+                     reachable. Fix the [providers.models.<type>.<alias>] entry \
+                     and POST /admin/reload."
+                );
+                (
+                    Arc::new(UnconfiguredModelProvider) as Arc<dyn ModelProvider>,
+                    true,
+                )
+            }
+        };
+    let model = if boot_provider_failed {
+        String::new()
+    } else {
+        match fallback
+            .and_then(|e| e.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(m) => m.to_string(),
+            None => match config.resolve_default_model() {
+                Some(m) => {
+                    ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
+                     providers.models entry as default. Set \
+                     [providers.models.<type>.<alias>] model = \"...\" to silence \
+                     this warning.");
+                    m
+                }
+                None => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+                        &format!(
+                            "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                        )
+                    );
+                    String::new()
+                }
+            },
+        }
+    };
+    // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
+    // here would clobber the "let the provider decide" intent for models
+    // (e.g. claude-opus-4-7) that reject `temperature`.
+    let temperature: Option<f64> = fallback.and_then(|e| e.temperature);
+    let mem: Arc<dyn Memory> = if config.agents.is_empty() {
+        Arc::new(omnesagent_memory::NoneMemory::new("none"))
+    } else {
+        match omnesagent_memory::create_memory_from_config(
+            &config,
+            fallback.and_then(|e| e.api_key.as_deref()),
+        ) {
+            Ok(m) => Arc::from(m),
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note,)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "Gateway: memory backend failed to construct; falling back to \
+                     NoneMemory so the gateway can still boot. Fix [memory] and \
+                     POST /admin/reload."
+                );
+                Arc::new(omnesagent_memory::NoneMemory::new("none"))
+            }
+        }
+    };
+    let runtime: Arc<dyn platform::RuntimeAdapter> = match platform::create_runtime(&config.runtime)
+    {
+        Ok(r) => Arc::from(r),
+        Err(e) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note,)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "runtime_kind": config.runtime.kind,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: runtime adapter failed to construct; falling back to \
+                     NativeRuntime so the gateway can still boot. Fix [runtime] and \
+                     POST /admin/reload."
+            );
+            Arc::new(platform::NativeRuntime::new())
+        }
+    };
+    let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(DefaultMemoryStrategy::with_config(
+        mem.clone(),
+        config.memory.clone(),
+        config.data_dir.clone(),
+    ));
+    let canvas_store = canvas_store.unwrap_or_default();
+    let agent_alias_opt = default_agent_alias(&config);
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let agent_setup: Option<(
+        omnesagent_config::schema::RiskProfileConfig,
+        Arc<SecurityPolicy>,
+    )> = agent_alias_opt.as_ref().and_then(|agent_alias| {
+        let Some(risk_profile) = config.risk_profile_for_agent(agent_alias) else {
+            ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "agent_alias": agent_alias})), "Gateway: agents..risk_profile does not name a configured risk_profiles entry; booting with empty tools registry. Fix via /admin/reload or /quickstart.");
+            return None;
+        };
+        let risk_profile = risk_profile.clone();
+        let security = match SecurityPolicy::for_agent(&config, agent_alias) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "error": format!("{}", e), "agent_alias": agent_alias})), "Gateway: agent SecurityPolicy failed to build; booting with empty tools registry. Fix [agents.] via /admin/reload or /quickstart.");
+                return None;
+            }
+        };
+        Some((risk_profile, security))
+    });
+
+    let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
+        (Some(agent_alias), Some((risk_profile, security))) => {
+            let all_tools_result = tools::all_tools_with_runtime(
+                Arc::new(config.clone()),
+                &security,
+                &risk_profile,
+                agent_alias,
+                Arc::clone(&runtime),
+                Arc::clone(&mem),
+                composio_key,
+                composio_entity_id,
+                &config.browser,
+                &config.http_request,
+                &config.web_fetch,
+                &config.data_dir,
+                &config.agents,
+                config
+                    .model_provider_for_agent(agent_alias)
+                    .and_then(|e| e.api_key.as_deref()),
+                &config,
+                Some(canvas_store.clone()),
+                false,
+                None,
+                sop_engine.clone(),
+                sop_audit.clone(),
+                None,
+            );
+            let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+                config: &config,
+                agent_alias,
+                security: &security,
+                built: all_tools_result,
+                // The gateway registers no skills today; unifying the two
+                // skill loaders through this seam is the Epic F follow-up.
+                skills: &[],
+                runtime: Arc::clone(&runtime),
+                caller_allowed: None,
+                connect_mcp: true,
+                // Gateway tool-listing path: short-lived, no cross-turn reuse
+                // contract, so the per-call connect is correct.
+                mcp_registry: None,
+                // Listing-only registry: loading peripherals physically opens
+                // hardware (exclusive serial holds) that the live turn paths
+                // need. Never connect them for a registry no turn runs against.
+                connect_peripherals: false,
+                emit_assembly_logs: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: true,
+            })
+            .await;
+            let reaction_handle_gw_opt = Some(assembled.reaction_handle.clone());
+            let channel_names = omnesagent_channels::orchestrator::register_channels_for_tools(
+                &config,
+                &assembled.ask_user_handle,
+                &assembled.channel_room_handle,
+                &reaction_handle_gw_opt,
+                &assembled.poll_handle,
+                &assembled.escalate_handle,
+            );
+            if !channel_names.is_empty() {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"count": channel_names.len()})),
+                    &format!(
+                        "Registered {} channel(s) for dashboard agent",
+                        channel_names.len()
+                    ),
+                );
+            }
+            // Listing-only registry: no turn runs against it, so the
+            // deferred-MCP prompt section and activation handle returned by
+            // `assemble` have no consumer here (live gateway chat resolves
+            // its tools inside process_message).
+            (assembled.registry.into_inner(), assembled.delegate_handle)
+        }
+        (Some(_), None) => {
+            // Agent existed but its config failed to resolve. Warned
+            // above; fall through to the empty-registry shape.
+            (Vec::new(), None)
+        }
+        (None, _) => {
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+                &format!(
+                    "Gateway: no [agents.<alias>] configured — booting with empty tools registry. Visit http://{display_addr}/quickstart to add an agent."
+                )
+            );
+            (Vec::new(), None)
+        }
+    };
+
+    let tools_registry: Arc<Vec<ToolSpec>> =
+        Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
+
+    let mut tools_registry_by_agent: HashMap<String, Arc<Vec<ToolSpec>>> = HashMap::new();
+    if let Some(default_alias) = agent_alias_opt.as_ref() {
+        tools_registry_by_agent.insert(default_alias.clone(), Arc::clone(&tools_registry));
+    }
+    let mut other_aliases: Vec<String> = config
+        .agents
+        .iter()
+        .filter(|(alias, a)| a.enabled && Some(*alias) != agent_alias_opt.as_ref())
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    other_aliases.sort();
+    for alias in other_aliases {
+        let Some(risk_profile) = config.risk_profile_for_agent(&alias) else {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"agent_alias": alias})),
+                "Gateway: agent risk_profile does not resolve; skipping its /api/tools listing."
+            );
+            continue;
+        };
+        let risk_profile = risk_profile.clone();
+        let security = match SecurityPolicy::for_agent(&config, &alias) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"agent_alias": alias, "error": format!("{e}")})
+                        ),
+                    "Gateway: agent SecurityPolicy failed to build; skipping its /api/tools listing."
+                );
+                continue;
+            }
+        };
+        let agent_tools_result = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &risk_profile,
+            &alias,
+            Arc::clone(&runtime),
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.data_dir,
+            &config.agents,
+            config
+                .model_provider_for_agent(&alias)
+                .and_then(|e| e.api_key.as_deref()),
+            &config,
+            Some(canvas_store.clone()),
+            false,
+            None,
+            sop_engine.clone(),
+            sop_audit.clone(),
+            None,
+        );
+        // Same gated seam as the dashboard seed above, so this listing shows
+        // the agent's policy-filtered set (filter + MCP). The tools are only
+        // enumerated for their specs, never invoked, so the returned channel
+        // handles, deferred section, and activation handle are unused.
+        let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
+            config: &config,
+            agent_alias: &alias,
+            security: &security,
+            built: agent_tools_result,
+            // Same divergence note as the dashboard seed: no skills on the
+            // gateway until Epic F unifies the loaders.
+            skills: &[],
+            runtime: Arc::clone(&runtime),
+            caller_allowed: None,
+            connect_mcp: true,
+            // Gateway tool-listing path: short-lived, no cross-turn reuse
+            // contract, so the per-call connect is correct.
+            mcp_registry: None,
+            // Same as the seed: never open hardware for a listing (and
+            // `config.peripherals` is global - N per-agent opens of the same
+            // boards would fail against the first holder anyway).
+            connect_peripherals: false,
+            emit_assembly_logs: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: true,
+        })
+        .await;
+        let specs: Vec<ToolSpec> = assembled.registry.iter().map(|t| t.spec()).collect();
+        tools_registry_by_agent.insert(alias, Arc::new(specs));
+    }
+    let tools_registry_by_agent: Arc<HashMap<String, Arc<Vec<ToolSpec>>>> =
+        Arc::new(tools_registry_by_agent);
+
+    // Cost tracker — process-global singleton so channels share the same instance
+    let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
+
+    // Live model-pricing refresher (once per process; idempotent, no-op unless a
+    // provider sets `live_pricing = true`). Each call re-binds the refresher's
+    // config handle, so reloads that re-instantiate the config Arc are honored
+    // without a restart; shares the global price snapshot the cost path reads.
+    omnesagent_providers::pricing::spawn_refresher(config_state.clone());
+
+    // SSE broadcast channel for real-time events.
+    // Use an externally provided sender (e.g. from the daemon) so that other
+    // components (cron, heartbeat) can publish events to the same bus.
+    let event_tx = external_event_tx.unwrap_or_else(|| {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+        tx
+    });
+    let event_buffer = Arc::new(sse::EventBuffer::new(500));
+    // WhatsApp channel instances (one per cloud-configured alias), keyed by
+    // alias so `/whatsapp/{alias}` webhooks reach the matching instance
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    let whatsapp_channel: HashMap<String, Arc<WhatsAppChannel>> = config
+        .channels
+        .whatsapp
+        .iter()
+        .filter(|(_, wa)| wa.is_cloud_config())
+        .map(|(alias, wa)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
+            };
+            (
+                alias.clone(),
+                Arc::new(WhatsAppChannel::new(
+                    wa.access_token.clone().unwrap_or_default(),
+                    wa.phone_number_id.clone().unwrap_or_default(),
+                    wa.verify_token.clone().unwrap_or_default(),
+                    alias.clone(),
+                    peer_resolver,
+                )),
+            )
+        })
+        .collect();
+
+    // WhatsApp app secrets keyed by alias for webhook signature verification.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    let whatsapp_app_secret: HashMap<String, Arc<str>> = config
+        .channels
+        .whatsapp
+        .iter()
+        .filter_map(|(alias, wa)| {
+            let secret = wa
+                .app_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|secret| !secret.is_empty())
+                .map(ToOwned::to_owned)?;
+            Some((alias.clone(), Arc::from(secret)))
+        })
+        .collect();
+
+    // Linq channel instances (multi-tenant: one per alias)
+    #[cfg(feature = "channel-linq")]
+    let linq_channels: HashMap<String, Arc<LinqChannel>> = config
+        .channels
+        .linq
+        .iter()
+        .filter(|(_, lq)| lq.enabled)
+        .map(|(alias, lq)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("linq", &alias))
+            };
+            (
+                alias.clone(),
+                Arc::new(LinqChannel::new(
+                    lq.api_token.clone(),
+                    lq.from_phone.clone(),
+                    alias.clone(),
+                    peer_resolver,
+                )),
+            )
+        })
+        .collect();
+
+    // Linq signing secrets per alias.
+    #[cfg(feature = "channel-linq")]
+    let linq_signing_secrets: HashMap<String, Arc<str>> = config
+        .channels
+        .linq
+        .iter()
+        .filter_map(|(alias, lq)| {
+            let secret = lq
+                .signing_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)?;
+            Some((alias.clone(), Arc::from(secret)))
+        })
+        .collect();
+
+    // Nextcloud Talk channel instances keyed by alias.
+    #[cfg(feature = "channel-nextcloud")]
+    let nextcloud_talk_channel: HashMap<String, Arc<NextcloudTalkChannel>> = config
+        .channels
+        .nextcloud_talk
+        .iter()
+        .map(|(alias, nc)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channel_external_peers("nextcloud_talk", &alias)
+                })
+            };
+            (
+                alias.clone(),
+                Arc::new(NextcloudTalkChannel::new(
+                    nc.base_url.clone(),
+                    // Resolve the same installed-bot secret used by inbound
+                    // verification. `webhook_secret` is canonical and
+                    // `bot_token` is a deprecated alias for the same value.
+                    nc.resolve_bot_secret().unwrap_or_else(|e| {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                            &e.to_string()
+                        );
+                        None
+                    }),
+                    nc.bot_name.clone().unwrap_or_default(),
+                    alias.clone(),
+                    peer_resolver,
+                )),
+            )
+        })
+        .collect();
+
+    // Nextcloud Talk webhook secrets keyed by alias for signature verification.
+    #[cfg(feature = "channel-nextcloud")]
+    let nextcloud_talk_webhook_secret: HashMap<String, Arc<str>> = config
+        .channels
+        .nextcloud_talk
+        .iter()
+        .filter_map(|(alias, nc)| {
+            // Same resolver as the outbound signing path: Nextcloud installs one
+            // secret per bot, so inbound verification and outbound signing must
+            // agree. A conflict or an unresolved secret yields no entry, and the
+            // handler rejects rather than skipping verification.
+            let secret = match nc.resolve_bot_secret() {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                        &e.to_string()
+                    );
+                    return None;
+                }
+            };
+            Some((alias.clone(), Arc::from(secret)))
+        })
+        .collect();
+
+    // Gmail Push channel (if configured and referenced by an enabled agent)
+    #[cfg(feature = "channel-email")]
+    let gmail_push_channel: Option<Arc<GmailPushChannel>> = {
+        let active: std::collections::HashSet<String> = config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect();
+        config
+            .channels
+            .gmail_push
+            .iter()
+            .find(|(alias, _)| active.contains(&format!("gmail_push.{alias}")))
+            .map(|(alias, gp)| {
+                let alias = alias.clone();
+                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                    let cfg_arc = config_state.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || cfg_arc.read().channel_external_peers("gmail_push", &alias))
+                };
+                Arc::new(GmailPushChannel::new(gp.clone(), alias, peer_resolver))
+            })
+    };
+
+    let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
+        match omnesagent_infra::make_session_backend(
+            &config.data_dir,
+            &config.channels.session_backend,
+        ) {
+            Ok(backend) => {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                    &format!(
+                        "Gateway session persistence enabled (backend={})",
+                        config.channels.session_backend
+                    )
+                );
+                if config.gateway.session_ttl_hours > 0
+                    && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
+                    && cleaned > 0
+                {
+                    ::omnesagent_log::record!(
+                        INFO,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"cleaned": cleaned})),
+                        "Cleaned up stale gateway sessions"
+                    );
+                }
+                Some(backend)
+            }
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Session persistence disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Pairing guard ──────────────────────────────────────
+    let pairing = Arc::new(PairingGuard::new(
+        config.gateway.require_pairing,
+        &config.gateway.paired_tokens,
+    ));
+    let rate_limit_max_keys = normalize_max_keys(
+        config.gateway.rate_limit_max_keys,
+        RATE_LIMIT_MAX_KEYS_DEFAULT,
+    );
+    let rate_limiter = Arc::new(GatewayRateLimiter::new(
+        config.gateway.pair_rate_limit_per_minute,
+        config.gateway.webhook_rate_limit_per_minute,
+        rate_limit_max_keys,
+    ));
+    let idempotency_max_keys = normalize_max_keys(
+        config.gateway.idempotency_max_keys,
+        IDEMPOTENCY_MAX_KEYS_DEFAULT,
+    );
+    let idempotency_store = Arc::new(IdempotencyStore::new(
+        Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
+        idempotency_max_keys,
+    ));
+
+    // Resolve optional path prefix for reverse-proxy deployments.
+    let path_prefix: Option<&str> = config
+        .gateway
+        .path_prefix
+        .as_deref()
+        .filter(|p| !p.is_empty());
+
+    // ── Tunnel ────────────────────────────────────────────────
+    let tunnel = match omnesagent_runtime::tunnel::create_tunnel(&config.tunnel) {
+        Ok(t) => t,
+        Err(e) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tunnel_provider": config.tunnel.tunnel_provider,
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: tunnel adapter failed to construct; booting without a \
+                 tunnel. Fix [tunnel] and POST /admin/reload."
+            );
+            None
+        }
+    };
+    let mut tunnel_url: Option<String> = None;
+
+    if let Some(ref tun) = tunnel {
+        println!("🔗 Starting {} tunnel...", tun.name());
+        match tun.start(host, actual_port).await {
+            Ok(url) => {
+                println!("🌐 Tunnel active: {url}");
+                tunnel_url = Some(url);
+            }
+            Err(e) => {
+                println!("⚠️  Tunnel failed to start: {e}");
+                println!("   Falling back to local-only mode.");
+            }
+        }
+    }
+
+    let auto_detect_web_dist = || -> Option<std::path::PathBuf> {
+        let mut candidates = vec![
+            // Relative to CWD (development: running from repo root)
+            std::path::PathBuf::from("web/dist"),
+            // Relative to binary (installed alongside binary)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("web/dist")))
+                .unwrap_or_default(),
+            // Docker / packaged layout
+            std::path::PathBuf::from("/omnesagent-data/web/dist"),
+            // AUR / system package
+            std::path::PathBuf::from("/usr/share/omnesagentlabs/web/dist"),
+        ];
+        // XDG data home (prebuilt binary installer)
+        if let Some(data_dir) = dirs_data_local() {
+            candidates.push(data_dir.join("omnesagent/web/dist"));
+        }
+        candidates
+            .into_iter()
+            .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
+    };
+
+    let web_dist_dir: Option<std::path::PathBuf> = match config
+        .gateway
+        .web_dist_dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+    {
+        Some(explicit) if explicit.join("index.html").is_file() => Some(explicit),
+        Some(stale) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"configured": stale.display().to_string()})),
+                "gateway.web_dist_dir points at a path that doesn't contain index.html on \
+                 this machine; falling back to auto-detect. Update or remove the setting in \
+                 config.toml to silence this warning."
+            );
+            auto_detect_web_dist()
+        }
+        None => auto_detect_web_dist(),
+    };
+
+    if let Some(ref dir) = web_dist_dir {
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            &format!("Web dashboard: serving from {}", dir.display().to_string())
+        );
+    } else if config.gateway.web_dist_dir.is_some() {
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
+             this machine and no fallback location was found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
+        );
+    } else {
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            "Web dashboard: not available — no web/dist found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
+        );
+    }
+
+    let pfx = path_prefix.unwrap_or("");
+    println!("🦀 OmnesAgent Gateway listening on http://{display_addr}{pfx}");
+    if let Some(ref url) = tunnel_url {
+        println!("  🌐 Public URL: {url}");
+    }
+    if web_dist_dir.is_some() {
+        println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
+    } else {
+        println!(
+            "  ⚠️  Web Dashboard: not available — reinstall with the supported installer \
+             (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to build it"
+        );
+    }
+    if let Some(code) = pairing.pairing_code() {
+        println!();
+        println!("  🔐 PAIRING REQUIRED — use this one-time code:");
+        println!("     ┌──────────────┐");
+        println!("     │  {code}  │");
+        println!("     └──────────────┘");
+        println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
+    } else if pairing.require_pairing() {
+        for line in already_paired_pairing_notice(host, actual_port, pfx) {
+            println!("{line}");
+        }
+        println!();
+    } else {
+        println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
+        println!();
+    }
+    println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
+    println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    if !whatsapp_channel.is_empty() {
+        println!("  GET  {pfx}/whatsapp[/<alias>]  — Meta webhook verification");
+        println!("  POST {pfx}/whatsapp[/<alias>]  — WhatsApp message webhook");
+    }
+    #[cfg(feature = "channel-linq")]
+    if !linq_channels.is_empty() {
+        println!("  POST {pfx}/linq[/<alias>]      — Linq message webhook (iMessage/RCS/SMS)");
+    }
+    #[cfg(feature = "channel-nextcloud")]
+    if !nextcloud_talk_channel.is_empty() {
+        println!("  POST {pfx}/nextcloud-talk[/<alias>] — Nextcloud Talk bot webhook");
+    }
+    println!("  GET  {pfx}/api/*     — REST API (bearer token required)");
+    println!("  GET  {pfx}/ws/chat   — WebSocket agent chat");
+    if config.nodes.enabled {
+        println!("  GET  {pfx}/ws/nodes  — WebSocket node discovery");
+    }
+    println!("  GET  {pfx}/health    — health check");
+    println!("  GET  {pfx}/metrics   — Prometheus metrics");
+    println!("  Press Ctrl+C to stop.\n");
+
+    omnesagent_runtime::health::mark_component_ok("gateway");
+
+    // Fire gateway start hook
+    if let Some(ref hooks) = hooks {
+        hooks.fire_gateway_start(host, actual_port).await;
+    }
+
+    let broadcast_layer: Arc<dyn omnesagent_runtime::observability::Observer> = Arc::new(
+        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
+    );
+    let broadcast_hook_guard =
+        omnesagent_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
+
+    omnesagent_log::set_broadcast_hook(event_tx.clone());
+
+    // Bound into AppState. Not a broadcaster — the broadcaster is the
+    // `broadcast_layer` installed above as the global hook. This is the
+    // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
+    // which tees events into the hook on every record.
+    let state_observer: Arc<dyn omnesagent_runtime::observability::Observer> = Arc::from(
+        omnesagent_runtime::observability::create_observer(&config.observability),
+    );
+
+    let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, reload_tx) = reload_controls
+        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .unwrap_or((owned_shutdown_tx, None));
+    let mut shutdown_rx = shutdown_tx.subscribe();
+
+    // Node registry for dynamic node discovery
+    let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
+    let mdns_config_state = Arc::clone(&config_state);
+    let mdns_peer_registry =
+        nodes::mdns::MdnsPeerRegistry::new(move || mdns_config_state.read().nodes.mdns.max_peers);
+    let mdns_task = if config.nodes.mdns.enabled
+        && nodes::mdns::is_advertisable_gateway_addr(&actual_addr)
+    {
+        let mdns_config = config.nodes.mdns.clone();
+        let advertised_gateway = nodes::mdns::MdnsAdvertisedGateway::new(actual_port, path_prefix);
+        let mdns_registry = mdns_peer_registry.clone();
+        let mdns_shutdown_rx = shutdown_tx.subscribe();
+        Some(omnesagent_spawn::spawn!(async move {
+            if let Err(err) = nodes::mdns::run_peer_discovery(
+                mdns_config,
+                advertised_gateway,
+                mdns_registry,
+                mdns_shutdown_rx,
+            )
+            .await
+            {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                    "mDNS local peer discovery stopped"
+                );
+            }
+        }))
+    } else if config.nodes.mdns.enabled {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"bind_addr": actual_addr.to_string()})),
+            "mDNS local peer discovery skipped because the gateway is bound to a loopback-only host"
+        );
+        None
+    } else {
+        None
+    };
+
+    // Device registry and pairing store (only when pairing is required)
+    let device_registry = if config.gateway.require_pairing {
+        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        // Reconcile the registry against the canonical paired-token set so that
+        // tokens paired via the legacy `/pair` route (and any other historical
+        // orphans) become visible and revocable in the management UI. The token
+        // set itself stays owned by `PairingGuard`/`gateway.paired_tokens`.
+        match registry.reconcile_from_token_hashes(&pairing.tokens()) {
+            Ok(0) => {}
+            Ok(n) => ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({ "backfilled": n })),
+                "backfilled legacy paired token(s) into the device registry"
+            ),
+            Err(e) => ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
+                "device registry backfill from paired_tokens failed"
+            ),
+        }
+        Some(registry)
+    } else {
+        None
+    };
+    let pending_pairings = if config.gateway.require_pairing {
+        Some(Arc::new(api_pairing::PairingStore::new()))
+    } else {
+        None
+    };
+
+    let state = AppState {
+        config: config_state,
+        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        model_provider,
+        model,
+        temperature,
+        mem,
+        memory_strategy,
+        auto_save: config.memory.auto_save,
+        pairing,
+        trust_forwarded_headers: config.gateway.trust_forwarded_headers,
+        rate_limiter,
+        auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+        idempotency_store,
+        #[cfg(feature = "channel-whatsapp-cloud")]
+        whatsapp: whatsapp_channel,
+        #[cfg(feature = "channel-whatsapp-cloud")]
+        whatsapp_app_secret,
+        #[cfg(feature = "channel-linq")]
+        linq: linq_channels,
+        #[cfg(feature = "channel-linq")]
+        linq_signing_secrets,
+        #[cfg(feature = "channel-nextcloud")]
+        nextcloud_talk: nextcloud_talk_channel,
+        #[cfg(feature = "channel-nextcloud")]
+        nextcloud_talk_webhook_secret,
+        #[cfg(feature = "channel-email")]
+        gmail_push: gmail_push_channel,
+        observer: state_observer,
+        tools_registry,
+        tools_registry_by_agent,
+        cost_tracker,
+        event_tx,
+        event_buffer,
+        shutdown_tx,
+        reload_tx,
+        node_registry,
+        mdns_peer_registry,
+        session_backend,
+        session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
+        device_registry,
+        pending_pairings,
+        path_prefix: path_prefix.unwrap_or("").to_string(),
+        web_dist_dir,
+        canvas_store,
+        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        tui_registry,
+        sop_engine,
+        sop_audit,
+        #[cfg(feature = "webauthn")]
+        webauthn: if config.security.webauthn.enabled {
+            let secret_store = Arc::new(omnesagent_runtime::security::SecretStore::new(
+                &config.data_dir,
+                true,
+            ));
+            let wa_config = omnesagent_runtime::security::webauthn::WebAuthnConfig {
+                enabled: true,
+                rp_id: config.security.webauthn.rp_id.clone(),
+                rp_origin: config.security.webauthn.rp_origin.clone(),
+                rp_name: config.security.webauthn.rp_name.clone(),
+            };
+            Some(Arc::new(api_webauthn::WebAuthnState {
+                manager: omnesagent_runtime::security::webauthn::WebAuthnManager::new(
+                    wa_config,
+                    secret_store,
+                    &config.data_dir,
+                ),
+                pending_registrations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                pending_authentications: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            }))
+        } else {
+            None
+        },
+    };
+
+    // Build router with middleware
+    let inner = Router::new()
+        // ── Admin routes (for CLI management) ──
+        .route("/admin/shutdown", post(handle_admin_shutdown))
+        .route("/admin/reload", post(handle_admin_reload))
+        .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+        .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
+        .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
+        .route("/admin/paircode", get(handle_admin_paircode))
+        .route("/admin/paircode/new", post(handle_admin_paircode_new))
+        // ── Existing routes ──
+        .route("/health", get(handle_health))
+        .route("/metrics", get(handle_metrics))
+        .route("/pair", post(handle_pair))
+        .route("/pair/code", get(handle_pair_code))
+        .route("/webhook", post(handle_webhook))
+        .merge(sop_webhook_routes())
+        .merge(optional_channel_routes())
+        // ── Claude Code runner hooks ──
+        .route("/hooks/claude-code", post(api::handle_claude_code_hook))
+        // ── Web Dashboard API routes ──
+        .route("/api/status", get(api::handle_api_status))
+        .route("/api/version/check", get(version::handle_version_check))
+        .route("/api/version/upgrade", post(version::handle_version_upgrade))
+        .route(
+            "/api/version/upgrade/status",
+            get(version::handle_version_upgrade_status),
+        )
+        .route("/api/logs", get(api_logs::handle_api_logs))
+        .route(
+            "/api/config",
+            get(api_config::handle_config_get)
+                .patch(api_config::handle_patch)
+                .options(api_config::handle_options_config),
+        )
+        .route(
+            "/api/config/prop",
+            get(api_config::handle_prop_get)
+                .put(api_config::handle_prop_put)
+                .delete(api_config::handle_prop_delete)
+                .options(api_config::handle_options_prop),
+        )
+        .route("/api/config/list", get(api_config::handle_list))
+        .route(
+            "/api/sops",
+            get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
+        )
+        .route(
+            "/api/sops/{name}",
+            put(api_sop_author::handle_sop_save).delete(api_sop_author::handle_sop_delete),
+        )
+        .route(
+            "/api/sops/{name}/graph",
+            get(api_sop_author::handle_sop_graph),
+        )
+        .route(
+            "/api/sops/{name}/run",
+            post(api_sop_author::handle_sop_run),
+        )
+        .route("/api/sops/runs", get(api_sop_author::handle_sop_runs))
+        .route(
+            "/api/sops/{name}/full",
+            get(api_sop_author::handle_sop_full),
+        )
+        .route(
+            "/api/sops/wire-draft",
+            post(api_sop_author::handle_sop_wire_draft),
+        )
+        .route(
+            "/api/sops/graph-draft",
+            post(api_sop_author::handle_sop_graph_draft),
+        )
+        .route(
+            "/api/sops/trigger-sources",
+            get(api_sop_author::handle_sop_trigger_sources),
+        )
+        .route(
+            "/api/sops/graph-legend",
+            get(api_sop_author::handle_sop_graph_legend),
+        )
+        .route(
+            "/api/tools/param-options",
+            post(api_sop_author::handle_tools_param_options),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/overlay",
+            get(api_sop_author::handle_sop_run_overlay),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/decide",
+            post(api_sop_author::handle_sop_decide),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/cancel",
+            post(api_sop_author::handle_sop_cancel),
+        )
+        .route("/api/config/drift", get(api_config::handle_drift))
+        .route(
+            "/api/config/reload-status",
+            get(api_config::handle_reload_status),
+        )
+        .route("/api/config/templates", get(api_config::handle_templates))
+        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
+        .route(
+            "/api/config/map-key",
+            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
+        )
+        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
+        )
+        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
+        .route("/api/config/catalog", get(api_sections::handle_catalog))
+        .route(
+            "/api/config/catalog/models",
+            get(api_sections::handle_catalog_models),
+        )
+        .route("/api/config/status", get(api_sections::handle_section_status))
+        .route(
+            "/api/config/agent-options",
+            get(api_sections::handle_agent_options),
+        )
+        .route("/api/config/sections", get(api_sections::handle_sections))
+        .route(
+            "/api/config/sections/{section}",
+            get(api_sections::handle_section_picker),
+        )
+        .route(
+            "/api/config/sections/{section}/items/{key}",
+            post(api_sections::handle_section_select),
+        )
+        .route("/api/personality", get(api_personality::handle_index))
+        .route(
+            "/api/quickstart/state",
+            get(api_quickstart::handle_state),
+        )
+        .route(
+            "/api/quickstart/fields",
+            post(api_quickstart::handle_fields),
+        )
+        .route(
+            "/api/quickstart/validate",
+            post(api_quickstart::handle_validate),
+        )
+        .route(
+            "/api/quickstart/apply",
+            post(api_quickstart::handle_apply),
+        )
+        .route(
+            "/api/quickstart/dismiss",
+            post(api_quickstart::handle_dismiss),
+        )
+        .route(
+            "/api/personality/templates",
+            get(api_personality::handle_templates),
+        )
+        .route(
+            "/api/personality/{filename}",
+            get(api_personality::handle_get).put(api_personality::handle_put),
+        )
+        .route("/api/browse", get(api_browse::handle_browse))
+        .route("/api/browse/mkdir", post(api_browse::handle_browse_mkdir))
+        .route("/api/browse/rmdir", delete(api_browse::handle_browse_rmdir))
+        .route(
+            "/api/agents/{alias}/workspace/list",
+            get(api_browse::handle_agent_workspace_list),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/read",
+            get(api_browse::handle_agent_workspace_read),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/raw",
+            get(api_browse::handle_agent_workspace_raw),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/path",
+            delete(api_browse::handle_agent_workspace_delete),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/move",
+            post(api_browse::handle_agent_workspace_move),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/mkdir",
+            post(api_browse::handle_agent_workspace_mkdir),
+        )
+        .route(
+            "/api/agents/{alias}/workspace/write",
+            post(api_browse::handle_agent_workspace_write),
+        )
+        .route(
+            "/api/agents/{alias}/skills",
+            get(api_skills::handle_agent_skills),
+        )
+        .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
+        .route(
+            "/api/skills/slash-option-kinds",
+            get(api_skills::handle_slash_option_kinds),
+        )
+        .route(
+            "/api/skills/bundles/{alias}/skills",
+            get(api_skills::handle_list_skills).post(api_skills::handle_create_skill),
+        )
+        .route(
+            "/api/skills/bundles/{alias}/skills/{name}",
+            get(api_skills::handle_read_skill)
+                .put(api_skills::handle_write_skill)
+                .delete(api_skills::handle_delete_skill),
+        )
+        .route("/api/config/init", post(api_config::handle_init))
+        .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route("/api/openapi.json", get(openapi::handle_openapi_json))
+        .route("/api/docs", get(openapi::handle_docs))
+        .route("/api/tools", get(api::handle_api_tools))
+        .route("/api/cron", get(api::handle_api_cron_list))
+        .route("/api/cron", post(api::handle_api_cron_add))
+        .route(
+            "/api/cron/settings",
+            get(api::handle_api_cron_settings_get).patch(api::handle_api_cron_settings_patch),
+        )
+        .route(
+            "/api/cron/{id}",
+            delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
+        )
+        .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        // Note: `/api/cron/{id}/run` is registered on a separate router below
+        // with a longer TimeoutLayer — manual cron triggers run the job
+        // synchronously and routinely exceed the 30s gateway-wide default.
+        .route("/api/integrations", get(api::handle_api_integrations))
+        .route(
+            "/api/integrations/settings",
+            get(api::handle_api_integrations_settings),
+        )
+        .route(
+            "/api/doctor",
+            get(api::handle_api_doctor).post(api::handle_api_doctor),
+        )
+        .route("/api/memory", get(api::handle_api_memory_list))
+        .route("/api/memory", post(api::handle_api_memory_store))
+        .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/cost", get(api::handle_api_cost))
+        .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        .route("/api/channels", get(api::handle_api_channels))
+        .route(
+            "/api/channels/bind",
+            post(api_config::handle_api_channel_bind),
+        )
+        .route(
+            "/api/channels/{channel}/relink",
+            post(api::handle_api_channel_relink),
+        )
+        .route("/api/health", get(api::handle_api_health))
+        .route("/api/tuis", get(api::handle_api_tuis))
+        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions/running", get(api::handle_api_sessions_running))
+        .route(
+            "/api/sessions/{id}/messages",
+            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
+        )
+        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        // ── Pairing + Device management API ──
+        .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
+        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
+        .route("/api/devices", get(api_pairing::list_devices))
+        .route(
+            "/api/devices/me/capabilities",
+            post(api_pairing::update_my_capabilities),
+        )
+        .route("/api/devices/{id}", delete(api_pairing::revoke_device))
+        .route(
+            "/api/devices/{id}/token/rotate",
+            post(api_pairing::rotate_token),
+        )
+        // ── Live Canvas (A2UI) routes ──
+        .route("/api/canvas", get(canvas::handle_canvas_list))
+        .route(
+            "/api/canvas/{id}",
+            get(canvas::handle_canvas_get)
+                .post(canvas::handle_canvas_post)
+                .delete(canvas::handle_canvas_clear),
+        )
+        .route(
+            "/api/canvas/{id}/history",
+            get(canvas::handle_canvas_history),
+        );
+
+    #[cfg(feature = "a2a")]
+    let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
+        a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
+    )));
+
+    // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
+    #[cfg(feature = "webauthn")]
+    let inner = inner
+        .route(
+            "/api/webauthn/register/start",
+            post(api_webauthn::handle_register_start),
+        )
+        .route(
+            "/api/webauthn/register/finish",
+            post(api_webauthn::handle_register_finish),
+        )
+        .route(
+            "/api/webauthn/auth/start",
+            post(api_webauthn::handle_auth_start),
+        )
+        .route(
+            "/api/webauthn/auth/finish",
+            post(api_webauthn::handle_auth_finish),
+        )
+        .route(
+            "/api/webauthn/credentials",
+            get(api_webauthn::handle_list_credentials),
+        )
+        .route(
+            "/api/webauthn/credentials/{id}",
+            delete(api_webauthn::handle_delete_credential),
+        );
+
+    // ── Plugin management API (requires plugins-wasm feature) ──
+    #[cfg(feature = "plugins-wasm")]
+    let inner = inner.route(
+        "/api/plugins",
+        get(api_plugins::plugin_routes::list_plugins),
+    );
+
+    let inner = inner
+        // ── SSE event stream ──
+        .route("/api/events", get(sse::handle_sse_events))
+        .route("/api/events/history", get(sse::handle_events_history))
+        // ── ACP client bridge ──
+        .route("/acp", get(acp::handle_ws_acp))
+        // ── WebSocket agent chat ──
+        .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket SOP runs feed ──
+        .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
+        // ── WebSocket canvas updates ──
+        .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
+        // ── WebSocket node discovery ──
+        .route("/ws/nodes", get(nodes::handle_ws_nodes))
+        // ── Static assets (web dashboard) ──
+        .merge(static_file_routes())
+        // ── SPA fallback: non-API GET requests serve index.html ──
+        .fallback(get(static_files::handle_spa_fallback))
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
+        ));
+
+    // The dashboard image upload lives on its own sub-router so it can opt out
+    // of the 64 KB gateway-wide RequestBodyLimitLayer, which is sized for JSON
+    // control-plane bodies and would otherwise reject any real image before the
+    // route's own ceiling runs. The route keeps the extractor-level
+    // DefaultBodyLimit at the same ceiling; the per-request size check against
+    // live `multimodal.max_image_size_mb` happens inside the handler.
+    let upload_router: Router = Router::new()
+        .route(
+            "/api/upload",
+            post(api_upload::handle_upload).layer(axum::extract::DefaultBodyLimit::max(
+                api_upload::UPLOAD_BODY_CEILING_BYTES,
+            )),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(
+            api_upload::UPLOAD_BODY_CEILING_BYTES,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
+        ));
+    let inner = inner.merge(upload_router);
+
+    // Manual cron-trigger and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // synchronous agent turn inline. Layers attached here travel with the
+    // route through `merge`, so only these endpoints see the longer timeout.
+    let long_running_router: Router<AppState> =
+        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    #[cfg(feature = "a2a")]
+    let long_running_router = long_running_router.merge(a2a::a2a_task_route());
+    let long_running_router: Router = long_running_router
+        .with_state(state)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
+        ));
+
+    let inner = inner.merge(long_running_router);
+
+    // Nest under path prefix when configured (axum strips prefix before routing).
+    // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
+    // with a trailing slash, so we add a fallback redirect for that case.
+    let app = if let Some(prefix) = path_prefix {
+        let redirect_target = prefix.to_string();
+        Router::new().nest(prefix, inner).route(
+            &format!("{prefix}/"),
+            get(|| async move { axum::response::Redirect::permanent(&redirect_target) }),
+        )
+    } else {
+        inner
+    };
+
+    let tls_enabled = config
+        .gateway
+        .tls
+        .as_ref()
+        .is_some_and(|tls_cfg| tls_cfg.enabled);
+    let app = if tls_enabled {
+        app.layer(axum::middleware::from_fn(security_headers::apply_with_hsts))
+    } else {
+        app.layer(axum::middleware::from_fn(security_headers::apply))
+    };
+
+    // ── TLS / mTLS setup ───────────────────────────────────────────
+    let tls_acceptor = match &config.gateway.tls {
+        Some(tls_cfg) if tls_cfg.enabled => {
+            let has_mtls = tls_cfg.client_auth.as_ref().is_some_and(|ca| ca.enabled);
+            if has_mtls {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                    "TLS enabled with mutual TLS (mTLS) client verification"
+                );
+            } else {
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                    "TLS enabled (no client certificate requirement)"
+                );
+            }
+            Some(tls::build_tls_acceptor(tls_cfg)?)
+        }
+        _ => None,
+    };
+
+    if let Some(readiness) = readiness {
+        readiness.report_ready(actual_addr);
+    }
+
+    if let Some(tls_acceptor) = tls_acceptor {
+        // Manual TLS accept loop — serves each connection via hyper.
+        let app = app.into_make_service_with_connect_info::<SocketAddr>();
+        let mut app = app;
+
+        let mut shutdown_signal = shutdown_rx;
+        loop {
+            tokio::select! {
+                conn = listener.accept() => {
+                    let (tcp_stream, remote_addr) = match conn {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            if is_recoverable_accept_error(&e) {
+                                // Transient (e.g. EMFILE under fd pressure):
+                                // the listener is still valid. Back off
+                                // briefly to avoid hot-spinning, then keep
+                                // serving rather than killing the daemon
+                                ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "gateway accept() failed with a transient error; backing off and continuing");
+                                tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                                continue;
+                            }
+                            return Err(e.into());
+                        }
+                    };
+                    let tls_acceptor = tls_acceptor.clone();
+                    let svc = tower::MakeService::<
+                        SocketAddr,
+                        hyper::Request<hyper::body::Incoming>,
+                    >::make_service(&mut app, remote_addr)
+                    .await
+                    .expect("infallible make_service");
+
+                    omnesagent_spawn::spawn!(async move {
+                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                ::omnesagent_log::record!(DEBUG, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "TLS handshake failed from");
+                                return;
+                            }
+                        };
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                            let mut svc = svc.clone();
+                            async move {
+                                tower::Service::call(&mut svc, req).await
+                            }
+                        });
+                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(io, hyper_svc)
+                        .await
+                        {
+                            ::omnesagent_log::record!(DEBUG, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": remote_addr})), "connection error from");
+                        }
+                    });
+                }
+                _ = shutdown_signal.changed() => {
+                    ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note), "OmnesAgent Gateway shutting down");
+                    break;
+                }
+            }
+        }
+    } else {
+        // Plain TCP — use axum's built-in serve.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.changed().await;
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                "OmnesAgent Gateway shutting down"
+            );
+        })
+        .await?;
+    }
+
+    if let Some(task) = mdns_task {
+        let mut task = task;
+        tokio::select! {
+            result = &mut task => {
+                if let Err(err) = result {
+                    ::omnesagent_log::record!(
+                        DEBUG,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{err}")})),
+                        "LAN peer discovery task join failed"
+                    );
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                task.abort();
+            }
+        }
+    }
+
+    drop(broadcast_hook_guard);
+    Ok(())
+}
+
+fn static_file_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_app/", get(static_files::handle_static))
+        .route("/_app/{*path}", get(static_files::handle_static))
+}
+
+fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
+    format!("omnesagent gateway get-paircode --new --port {port}")
+}
+
+fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Vec<String> {
+    vec![
+        "  🔒 Pairing: ACTIVE — this gateway is already paired, so no new \
+         one-time code was generated on this start."
+            .to_string(),
+        format!(
+            "     To pair another device, run: {}",
+            format_paircode_recovery_command(host, port)
+        ),
+        format!(
+            "     Fallback (localhost only): {}",
+            format_paircode_recovery_curl(host, port, path_prefix)
+        ),
+    ]
+}
+
+fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
+    // Admin paircode routes are localhost-only, so the curl fallback must point
+    // at loopback. Bind-only hosts and non-loopback advertised hosts are
+    // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
+    let recovery_host = paircode_recovery_curl_host(host);
+    format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
+}
+
+fn paircode_recovery_curl_host(host: &str) -> &str {
+    match host {
+        "127.0.0.1" | "localhost" => host,
+        "::1" => "[::1]",
+        _ => "127.0.0.1",
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AXUM HANDLERS
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// GET /health — always public (no secrets leaked)
+async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+    let body = serde_json::json!({
+        "status": "ok",
+        "paired": state.pairing.is_paired(),
+        "require_pairing": state.pairing.require_pairing(),
+        "runtime": omnesagent_runtime::health::snapshot_json(),
+    });
+    Json(body)
+}
+
+/// Prometheus content type for text exposition format.
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+fn prometheus_disabled_hint() -> String {
+    String::from(
+        "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
+    )
+}
+
+#[cfg(feature = "observability-prometheus")]
+fn prometheus_observer_from_state(
+    observer: &dyn omnesagent_runtime::observability::Observer,
+) -> Option<&omnesagent_runtime::observability::PrometheusObserver> {
+    // `TeeObserver::as_any` returns the primary observer, so a single direct
+    // downcast finds the PrometheusObserver whether the state observer is the
+    // raw backend or wrapped by the factory tee.
+    observer
+        .as_any()
+        .downcast_ref::<omnesagent_runtime::observability::PrometheusObserver>()
+}
+
+/// GET /metrics — Prometheus text exposition format
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = {
+        #[cfg(feature = "observability-prometheus")]
+        {
+            if let Some(prom) = prometheus_observer_from_state(state.observer.as_ref()) {
+                prom.encode()
+            } else {
+                prometheus_disabled_hint()
+            }
+        }
+        #[cfg(not(feature = "observability-prometheus"))]
+        {
+            let _ = &state;
+            prometheus_disabled_hint()
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
+        body,
+    )
+}
+
+/// POST /pair — exchange one-time code for bearer token
+#[axum::debug_handler]
+async fn handle_pair(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_pair(&rate_key) {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+            "/pair rate limit exceeded"
+        );
+        let err = serde_json::json!({
+            "error": "Too many pairing requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    // ── Auth rate limiting (brute-force protection) ──
+    if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"rate_key": rate_key})),
+            "pairing auth rate limit exceeded"
+        );
+        let err = serde_json::json!({
+            "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+            "retry_after": e.retry_after_secs,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    let code = headers
+        .get("X-Pairing-Code")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    match state.pairing.try_pair(code, &rate_key).await {
+        Ok(Some(token)) => {
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                "new client paired successfully"
+            );
+            let token_hash = PairingGuard::token_hash(&token);
+            if let Some(ref registry) = state.device_registry {
+                if let Err(e) = registry.register(
+                    token_hash.clone(),
+                    api_pairing::DeviceInfo {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: chrono::Utc::now(),
+                        last_seen: chrono::Utc::now(),
+                        ip_address: Some(rate_key.clone()),
+                        capabilities: None,
+                    },
+                ) {
+                    ::omnesagent_log::record!(
+                        ERROR,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                        "device registry insert failed after successful legacy /pair; rolling back in-process token"
+                    );
+                    state.pairing.revoke_token_hash(&token_hash);
+                    let body = serde_json::json!({
+                        "paired": false,
+                        "persisted": false,
+                        "error": format!("Device registry error: {e}"),
+                        "message": "Pairing failed; the in-process token was not retained.",
+                    });
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
+                }
+            }
+            if let Err(err) = Box::pin(persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            ))
+            .await
+            {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "pairing token persistence failed; rolling back in-process token"
+                );
+                state.pairing.revoke_token_hash(&token_hash);
+                let body = serde_json::json!({
+                    "paired": false,
+                    "persisted": false,
+                    "error": format!("Token persistence error: {err}"),
+                    "message": "Pairing failed; the in-process token was not retained.",
+                });
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(body));
+            }
+
+            let body = serde_json::json!({
+                "paired": true,
+                "persisted": true,
+                "token": token,
+                "message": "Save this token — use it as Authorization: Bearer <token>"
+            });
+            (StatusCode::OK, Json(body))
+        }
+        Ok(None) => {
+            state.auth_limiter.record_attempt(&rate_key);
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                "pairing attempt with invalid code"
+            );
+            let err = serde_json::json!({"error": "Invalid pairing code"});
+            (StatusCode::FORBIDDEN, Json(err))
+        }
+        Err(lockout_secs) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"lockout_secs": lockout_secs})),
+                "pairing locked out; too many failed attempts"
+            );
+            let err = serde_json::json!({
+                "error": format!("Too many failed attempts. Try again in {lockout_secs}s."),
+                "retry_after": lockout_secs
+            });
+            (StatusCode::TOO_MANY_REQUESTS, Json(err))
+        }
+    }
+}
+
+pub(crate) async fn persist_pairing_tokens(
+    config: Arc<RwLock<Config>>,
+    pairing: &PairingGuard,
+    config_write_lock: Arc<tokio::sync::Mutex<()>>,
+) -> Result<()> {
+    // Self-contained: no caller pre-reads config for modify, so this
+    // acquires the witness itself rather than taking it as a param. Held
+    // across the whole read-modify-save-swap below.
+    let _guard = Arc::clone(&config_write_lock).lock_owned().await;
+    debug_assert!(
+        config_write_lock.try_lock().is_err(),
+        "persist_pairing_tokens must hold config_write_lock across its read-modify-save-swap"
+    );
+    let paired_tokens = pairing.tokens();
+    // This is needed because parking_lot's guard is not Send so we clone the inner
+    // this should be removed once async mutexes are used everywhere
+    let mut updated_cfg = { config.read().clone() };
+    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg.mark_dirty("gateway.paired_tokens");
+    updated_cfg
+        .save_dirty()
+        .await
+        .context("Failed to persist paired tokens to config.toml")?;
+
+    // Keep shared runtime config in sync with persisted tokens.
+    *config.write() = updated_cfg;
+    Ok(())
+}
+
+/// Result of a gateway chat turn.
+struct GatewayChatOutcome {
+    response: String,
+}
+
+struct UnconfiguredModelProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for UnconfiguredModelProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!(
+            "needs_quickstart: gateway booted without a working model_provider. \
+             Complete browser quickstart at /quickstart, or fix \
+             [providers.models.<type>.<alias>] and POST /admin/reload."
+        )
+    }
+}
+
+impl ::omnesagent_api::attribution::Attributable for UnconfiguredModelProvider {
+    fn role(&self) -> ::omnesagent_api::attribution::Role {
+        ::omnesagent_api::attribution::Role::Provider(
+            ::omnesagent_api::attribution::ProviderKind::Model(
+                ::omnesagent_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "unconfigured"
+    }
+}
+
+fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
+    if model.trim().is_empty() {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure),
+            "gateway dispatch refused: no model configured (browser quickstart incomplete)"
+        );
+        Some(anyhow::Error::msg(
+            "needs_quickstart: gateway has no model configured. Complete \
+             browser quickstart at /quickstart, or set [providers.models.<type>.<alias>] \
+             model = \"...\" before sending messages.",
+        ))
+    } else {
+        None
+    }
+}
+
+/// True when `e` carries the marker produced by `needs_quickstart_for`.
+/// Used by chat-dispatch error paths to map the marker to a 503
+/// `needs_quickstart` HTTP response or a more accurate channel-side
+/// reply, instead of the generic 500 / "sorry" catch-all.
+fn is_needs_quickstart_err(e: &anyhow::Error) -> bool {
+    e.to_string().contains("needs_quickstart")
+}
+
+fn needs_quickstart_channel_reply() -> String {
+    i18n::get_required_cli_string("channel-needs-quickstart-reply")
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayChatDispatchCapture {
+    message: String,
+    session_id: Option<String>,
+    agent_override: Option<String>,
+}
+
+#[cfg(test)]
+static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
+    std::sync::Mutex::new(Vec::new());
+
+// The four items below serialize and read the capture buffer, and only the
+// Linq webhook alias tests do either. Their gate has to name that feature as
+// well as `test`, or they are compiled and unused whenever it is off, which
+// `-D warnings` promotes to an error. The buffer itself, and the recording
+// function that fills it, stay on the plain `test` gate because the chat
+// dispatch path writes to them unconditionally.
+#[cfg(all(test, feature = "channel-linq"))]
+static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(all(test, feature = "channel-linq"))]
+async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
+}
+
+#[cfg(all(test, feature = "channel-linq"))]
+fn clear_gateway_chat_dispatch_captures_for_test() {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clear();
+}
+
+#[cfg(all(test, feature = "channel-linq"))]
+fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+fn record_gateway_chat_dispatch_for_test(
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+) {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .push(GatewayChatDispatchCapture {
+            message: message.to_string(),
+            session_id: session_id.map(ToString::to_string),
+            agent_override: agent_override.map(ToString::to_string),
+        });
+}
+
+pub(crate) async fn run_gateway_chat_with_tools(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+) -> anyhow::Result<GatewayChatOutcome> {
+    if let Some(err) = needs_quickstart_for(&state.model) {
+        return Err(err);
+    }
+
+    // Tests exercise webhook infrastructure (idempotency, auth, autosave)
+    // through handle_webhook, so dispatch to the mock model_provider directly
+    // instead of bootstrapping the full agent runtime. The mock path
+    // doesn't go through the cost-tracking scope.
+    #[cfg(test)]
+    {
+        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        let response = state
+            .model_provider
+            .chat_with_system(None, message, &state.model, state.temperature)
+            .await?;
+        Ok(GatewayChatOutcome { response })
+    }
+
+    #[cfg(not(test))]
+    {
+        let config = state.config.read().clone();
+        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+
+        // Scope the cost tracking context so per-LLM-call usage flows into
+        // the gateway's cost tracker and costs.jsonl. A separate
+        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals so
+        // the runtime-owned lifecycle guard can annotate its `AgentEnd`
+        // without racing concurrent requests sharing the same tracker.
+        // Pricing is built from the
+        // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
+        // wins over legacy per-alias pricing).
+        let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
+            let pricing = omnesagent_runtime::agent::cost::build_model_provider_pricing(&config);
+            omnesagent_runtime::agent::cost::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                std::sync::Arc::new(pricing),
+            )
+            .with_agent_alias(&agent_alias)
+        });
+        let turn_usage = state.cost_tracker.as_ref().map(|_| {
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                omnesagent_runtime::agent::cost::TurnUsage::default(),
+            ))
+        });
+        let response = Box::pin(omnesagent_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+            turn_usage.clone(),
+            omnesagent_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                cost_tracking_context,
+                omnesagent_runtime::agent::process_message(
+                    config,
+                    &agent_alias,
+                    message,
+                    session_id,
+                    omnesagent_api::ingress::TurnOrigin::Interactive,
+                ),
+            ),
+        ))
+        .await?;
+        Ok(GatewayChatOutcome { response })
+    }
+}
+
+fn resolve_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> Option<String> {
+    agent_override
+        .map(ToString::to_string)
+        .or_else(|| config.resolved_runtime_agent_alias().map(str::to_owned))
+}
+
+#[cfg(not(test))]
+fn require_gateway_chat_agent_alias(
+    config: &Config,
+    agent_override: Option<&str>,
+) -> anyhow::Result<String> {
+    resolve_gateway_chat_agent_alias(config, agent_override).ok_or_else(|| {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure),
+            "webhook chat rejected: no configured [agents.<alias>] entry"
+        );
+        anyhow::Error::msg("webhook chat requires at least one configured [agents.<alias>] entry")
+    })
+}
+
+fn optional_channel_routes() -> Router<AppState> {
+    let router: Router<AppState> = Router::new();
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    let router = router
+        .route("/whatsapp", get(handle_whatsapp_verify))
+        .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/whatsapp/{alias}", get(handle_whatsapp_verify_alias))
+        .route("/whatsapp/{alias}", post(handle_whatsapp_message_alias));
+    #[cfg(feature = "channel-linq")]
+    let router = router
+        .route("/linq", post(handle_linq_webhook))
+        .route("/linq/{alias}", post(handle_linq_webhook_alias));
+    #[cfg(feature = "channel-nextcloud")]
+    let router = router
+        .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
+        .route(
+            "/nextcloud-talk/{alias}",
+            post(handle_nextcloud_talk_webhook_alias),
+        );
+    #[cfg(feature = "channel-email")]
+    let router = router.route("/webhook/gmail", post(handle_gmail_push_webhook));
+    router
+}
+
+fn sop_webhook_routes() -> Router<AppState> {
+    Router::new().route("/sop/{*rest}", post(api_sop_webhook::handle_sop_webhook))
+}
+
+/// Webhook request body
+#[derive(serde::Deserialize)]
+pub struct WebhookBody {
+    pub message: String,
+}
+
+/// Webhook query parameters
+#[derive(Default, serde::Deserialize)]
+pub struct WebhookQuery {
+    /// Configured agent alias to dispatch to. Optional — when omitted, the
+    /// legacy pick applies (migration-synthesized "default" agent, else the
+    /// first enabled one). Aliases mirror `WsQuery` so `/ws/chat` callers
+    /// can reuse their query string verbatim.
+    #[serde(default, alias = "agentAlias", alias = "agent_alias")]
+    pub agent: Option<String>,
+}
+
+type WebhookJsonResponse = (StatusCode, Json<serde_json::Value>);
+
+/// Resolve the gateway webhook credential from its canonical live config.
+/// Channel webhook aliases own separate HMAC listeners and never participate
+/// in authorization for the gateway's `/webhook` or `/sop/*` routes.
+fn configured_gateway_webhook_secret_hash(state: &AppState) -> Option<String> {
+    state
+        .config
+        .read()
+        .gateway
+        .webhook_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(hash_webhook_secret)
+}
+
+/// Immutable snapshot of the credential policy applied to ONE request.
+///
+/// `AppState::config` is a live `Arc<RwLock<Config>>` that the config
+/// PUT/PATCH handlers and `POST /admin/reload` legitimately mutate while a
+/// request is in flight. Reading the policy twice therefore lets a single
+/// request straddle two security states: a headerless request can pass an
+/// "unconfigured" read and then satisfy a "configured" read after an operator
+/// inserts a secret, and a request bearing a revoked secret can pass a read
+/// against the old secret and then be admitted merely because a replacement is
+/// present.
+///
+/// This verdict is produced by exactly one policy read inside
+/// [`authorize_webhook_request`] and is then threaded through dispatch. No
+/// downstream code re-reads `state.config` for an authorization decision, so
+/// live rotation takes effect at *next*-request granularity instead of mixing
+/// two security states inside one request.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WebhookAuthVerdict {
+    /// `gateway.require_pairing` was on in this snapshot AND the bearer token verified.
+    pairing_verified: bool,
+    /// `gateway.webhook_secret` was set in this snapshot AND `X-Webhook-Secret` matched it.
+    secret_verified: bool,
+    /// At least one control was configured in this same snapshot.
+    any_control_configured: bool,
+}
+
+impl WebhookAuthVerdict {
+    /// The composition rule the docs state: at least one control must be
+    /// configured, and every configured control must have passed. A verdict is
+    /// only ever constructed after every configured control passed, so both
+    /// facts come from the SAME snapshot and insertion/rotation cannot straddle
+    /// them.
+    fn may_dispatch_sop(self) -> bool {
+        self.any_control_configured && (self.pairing_verified || self.secret_verified)
+    }
+}
+
+fn authorize_webhook_request(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<WebhookAuthVerdict, WebhookJsonResponse> {
+    let rate_key = client_key_from_request(Some(peer_addr), headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+            "/webhook rate limit exceeded"
+        );
+        let err = serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
+    }
+
+    // ── The single authorization policy read for this request ──
+    // Everything below decides from `snapshot_secret_hash` / `require_pairing`
+    // captured here; `state.config` is never consulted again for an
+    // authorization decision on this request.
+    let snapshot_secret_hash = configured_gateway_webhook_secret_hash(state);
+    let require_pairing = state.pairing.require_pairing();
+    let any_control_configured = require_pairing || snapshot_secret_hash.is_some();
+    let mut pairing_verified = false;
+    let mut secret_verified = false;
+
+    if require_pairing {
+        if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"rate_key": rate_key})),
+                "webhook: auth rate limit exceeded for"
+            );
+            let err = serde_json::json!({
+                "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+                "retry_after": e.retry_after_secs,
+            });
+            return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
+        }
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            state.auth_limiter.record_attempt(&rate_key);
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                "webhook: rejected — not paired / invalid bearer token"
+            );
+            let err = serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            });
+            return Err((StatusCode::UNAUTHORIZED, Json(err)));
+        }
+        pairing_verified = true;
+    }
+
+    if let Some(secret_hash) = snapshot_secret_hash.as_deref() {
+        let header_hash = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_webhook_secret);
+        match header_hash {
+            Some(val) if constant_time_eq(&val, secret_hash) => {
+                secret_verified = true;
+            }
+            _ => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                    "webhook: rejected request — invalid or missing X-Webhook-Secret"
+                );
+                let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
+                return Err((StatusCode::UNAUTHORIZED, Json(err)));
+            }
+        }
+    }
+
+    Ok(WebhookAuthVerdict {
+        pairing_verified,
+        secret_verified,
+        any_control_configured,
+    })
+}
+
+/// Build an injective storage key for the replay/idempotency store.
+///
+/// Both the namespace (derived from a caller-controlled SOP path) and the
+/// caller's `X-Idempotency-Key` are attacker-controlled strings, so a bare
+/// `"{namespace}:{key}"` join is ambiguous: `/sop/a` with key `b:c` produced
+/// the same string as `/sop/a:b` with key `c`, and a `/webhook` caller could
+/// forge the key `sop:/sop/deploy:k` to collide with `/sop/deploy` key `k`.
+/// An authenticated caller could therefore suppress a *different* attempt
+/// despite the documented per-path and per-endpoint isolation.
+///
+/// This encoding is injective because every component is length-prefixed:
+/// a reader consumes exactly the declared number of bytes, so no component
+/// boundary can be forged by embedding the separator inside a component. The
+/// endpoint domain tag is carried as its own component, so `/webhook` keys can
+/// never alias `/sop/*` keys.
+fn idempotency_storage_key(namespace: Option<&str>, idempotency_key: &str) -> String {
+    fn push_component(out: &mut String, value: &str) {
+        // `<byte-len>:<value>` — the length prefix makes the split point
+        // unambiguous regardless of what `value` contains.
+        out.push_str(&value.len().to_string());
+        out.push(':');
+        out.push_str(value);
+    }
+
+    let mut key = String::new();
+    match namespace {
+        Some(namespace) => {
+            push_component(&mut key, "ns");
+            push_component(&mut key, namespace);
+        }
+        None => push_component(&mut key, "global"),
+    }
+    push_component(&mut key, idempotency_key);
+    key
+}
+
+/// Emit duplicate telemetry without copying caller-controlled key material
+/// into the log pipeline. The key remains available to the replay store; only
+/// its presence is useful and safe at this observability boundary.
+fn record_duplicate_idempotency_log() {
+    ::omnesagent_log::record!(
+        INFO,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+            .with_attrs(::serde_json::json!({"idempotency_key_present": true})),
+        "webhook duplicate ignored"
+    );
+}
+
+fn check_webhook_idempotency(
+    state: &AppState,
+    headers: &HeaderMap,
+    namespace: Option<&str>,
+) -> Option<WebhookJsonResponse> {
+    let idempotency_key = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let storage_key = idempotency_storage_key(namespace, idempotency_key);
+    if state.idempotency_store.record_if_new(&storage_key) {
+        return None;
+    }
+
+    record_duplicate_idempotency_log();
+    Some((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "duplicate",
+            "idempotent": true,
+            "message": "A prior request already reserved this idempotency key; no new dispatch was started"
+        })),
+    ))
+}
+
+/// Fail closed before a SOP run starts. Starting a SOP run authorizes real
+/// side effects, so — unlike the chat-only `/webhook` fallback, which keeps
+/// its existing default-open policy — dispatch must not proceed when both
+/// `gateway.require_pairing` and the webhook secret are unset (the official
+/// container's default configuration). Repo policy is "new external surfaces
+/// default closed".
+///
+/// This is a PURE function over the request-scoped [`WebhookAuthVerdict`]
+/// produced by the single policy read in [`authorize_webhook_request`]. It
+/// deliberately takes no `&AppState`: re-reading the live config here is what
+/// let a request straddle two security states across a concurrent config
+/// mutation.
+fn require_sop_dispatch_credentials(
+    verdict: WebhookAuthVerdict,
+) -> Result<(), WebhookJsonResponse> {
+    if verdict.may_dispatch_sop() {
+        return Ok(());
+    }
+    ::omnesagent_log::record!(
+        WARN,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+            .with_outcome(::omnesagent_log::EventOutcome::Failure),
+        "sop webhook dispatch rejected — no credential configured"
+    );
+    let err = serde_json::json!({
+        "error": "SOP webhook dispatch requires a configured credential: set \
+                  `gateway.require_pairing = true` and authenticate with \
+                  `Authorization: Bearer <paired-token>` (pair first via POST /pair), or set \
+                  `gateway.webhook_secret` and send X-Webhook-Secret."
+    });
+    Err((StatusCode::UNAUTHORIZED, Json(err)))
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
+        Ok(verdict) => verdict,
+        Err(response) => return response,
+    };
+    let Json(webhook_body) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "webhook JSON parse error"
+            );
+            let err = serde_json::json!({
+                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    // ── SOP dispatch first ──
+    // A matching `/webhook` SOP trigger takes the request before any
+    // chat-only routing (query params, agent aliases) is even inspected —
+    // the advertised contract is SOP dispatch first, chat fallback second,
+    // so a chat-only param must never block a matching SOP.
+    let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
+    let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
+        Ok(matches) => matches,
+        Err(response) => return response,
+    };
+
+    if has_matching_sop {
+        if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
+            return response;
+        }
+        if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
+            return response;
+        }
+        if let api_sop_webhook::SopWebhookOutcome::Handled(response) =
+            api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
+        {
+            return response;
+        }
+        // The engine reported no match after all (e.g. a trigger was
+        // unloaded between the pre-check above and dispatch); fall through
+        // to chat. The idempotency key above is already consumed for this
+        // attempt.
+    }
+
+    // ── Per-request agent dispatch (optional `?agent=` query param) ──
+    // Chat-only routing: only reached when no SOP trigger matched
+    // `/webhook`, so a bogus `?agent=` can never block a matching SOP
+    // dispatch. Validated before idempotency / autosave so a typo'd alias
+    // doesn't consume the caller's idempotency key. Mirrors the `/ws/chat`
+    // unknown-agent rejection.
+    let agent_override = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(alias) = agent_override {
+        let cfg = state.config.read();
+        if cfg.agent(alias).is_none() {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"agent": alias})),
+                "webhook: rejected — unknown agent alias"
+            );
+            let err = serde_json::json!({
+                "error": format!(
+                    "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
+                )
+            });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    }
+
+    if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
+        return response;
+    }
+
+    let message = &webhook_body.message;
+    let session_id = webhook_session_id(&headers);
+
+    if state.auto_save && !omnesagent_memory::should_skip_autosave_content(message) {
+        let key = webhook_memory_key();
+        let _ = state
+            .mem
+            .store(
+                &key,
+                message,
+                MemoryCategory::Conversation,
+                session_id.as_deref(),
+            )
+            .await;
+    }
+
+    let model_label = {
+        let cfg = state.config.read();
+        let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
+        let resolved_provider = resolved_agent_alias
+            .as_deref()
+            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
+        resolved_provider
+            .and_then(|(_, _, entry)| {
+                entry
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(ToString::to_string)
+            })
+            .or_else(|| cfg.resolve_default_model())
+            .unwrap_or_else(|| "<unresolved>".to_string())
+    };
+    // HTTP transport owns request latency and response mapping. The production
+    // dispatch below enters `process_message`, whose runtime turn guard is the
+    // sole owner of lifecycle and LLM events. Emitting another bracket here
+    // gives one webhook prompt two unrelated turn IDs.
+    let started_at = Instant::now();
+
+    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    {
+        Ok(GatewayChatOutcome { response, .. }) => {
+            let duration = started_at.elapsed();
+            state.observer.record_metric(
+                &omnesagent_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+
+            let body = serde_json::json!({"response": response, "model": model_label});
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let duration = started_at.elapsed();
+            let sanitized = omnesagent_providers::sanitize_api_error(&e.to_string());
+            state.observer.record_metric(
+                &omnesagent_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&omnesagent_runtime::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            if is_needs_quickstart_err(&e) {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                    "Webhook chat refused: gateway has no model configured; \
+                     visit /quickstart"
+                );
+                let body = serde_json::json!({
+                    "error": "needs_quickstart",
+                    "url": "/quickstart"
+                });
+                (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+            } else {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": sanitized})),
+                    "webhook model_provider error"
+                );
+                let err = serde_json::json!({"error": "LLM request failed"});
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+            }
+        }
+    }
+}
+
+/// `WhatsApp` verification query params
+#[derive(serde::Deserialize)]
+pub struct WhatsAppVerifyQuery {
+    #[serde(rename = "hub.mode")]
+    pub mode: Option<String>,
+    #[serde(rename = "hub.verify_token")]
+    pub verify_token: Option<String>,
+    #[serde(rename = "hub.challenge")]
+    pub challenge: Option<String>,
+}
+
+/// GET /whatsapp — Meta webhook verification (bare path, deprecated fallback).
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_verify(
+    State(state): State<AppState>,
+    Query(params): Query<WhatsAppVerifyQuery>,
+) -> Response {
+    handle_whatsapp_verify_impl(state, None, params).await
+}
+
+/// GET /whatsapp/{alias} — Meta webhook verification for a specific instance.
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_verify_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    Query(params): Query<WhatsAppVerifyQuery>,
+) -> Response {
+    handle_whatsapp_verify_impl(state, Some(alias), params).await
+}
+
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_verify_impl(
+    state: AppState,
+    alias: Option<String>,
+    params: WhatsAppVerifyQuery,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.whatsapp, alias.as_deref());
+    let Some((_alias, wa)) = resolved.entry() else {
+        return api_webhook::not_found("whatsapp");
+    };
+
+    // Verify the token matches (constant-time comparison to prevent timing attacks)
+    let token_matches = params
+        .verify_token
+        .as_deref()
+        .is_some_and(|t| constant_time_eq(t, wa.verify_token()));
+    let resp = if params.mode.as_deref() == Some("subscribe") && token_matches {
+        if let Some(ch) = params.challenge {
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"channel": "whatsapp"})),
+                "webhook verified successfully"
+            );
+            (StatusCode::OK, ch).into_response()
+        } else {
+            (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string()).into_response()
+        }
+    } else {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"channel": "whatsapp"})),
+            "webhook verification failed — token mismatch"
+        );
+        (StatusCode::FORBIDDEN, "Forbidden".to_string()).into_response()
+    };
+    api_webhook::tag_deprecation(resp, resolved, "whatsapp")
+}
+
+/// Verify `WhatsApp` webhook signature (`X-Hub-Signature-256`).
+/// Returns true if the signature is valid, false otherwise.
+/// See: <https://developers.facebook.com/docs/graph-api/webhooks/getting-started#verification-requests>
+pub fn verify_whatsapp_signature(app_secret: &str, body: &[u8], signature_header: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    // Signature format: "sha256=<hex_signature>"
+    let Some(hex_sig) = signature_header.strip_prefix("sha256=") else {
+        return false;
+    };
+
+    // Decode hex signature
+    let Ok(expected) = hex::decode(hex_sig) else {
+        return false;
+    };
+
+    // Compute HMAC-SHA256
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(app_secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body);
+
+    // Constant-time comparison
+    mac.verify_slice(&expected).is_ok()
+}
+
+/// POST /whatsapp — incoming message webhook
+/// POST /whatsapp — incoming message webhook (bare path, deprecated fallback).
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_whatsapp_message_impl(state, None, headers, body).await
+}
+
+/// POST /whatsapp/{alias} — incoming message webhook for a specific instance.
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_message_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_whatsapp_message_impl(state, Some(alias), headers, body).await
+}
+
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn handle_whatsapp_message_impl(
+    state: AppState,
+    alias: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.whatsapp, alias.as_deref());
+    let Some((alias_key, wa)) = resolved.entry() else {
+        return api_webhook::not_found("whatsapp");
+    };
+    let app_secret = state.whatsapp_app_secret.get(alias_key).cloned();
+    let resp =
+        process_whatsapp_message(&state, alias_key, wa, app_secret.as_deref(), headers, body).await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "whatsapp")
+}
+
+/// Verify, parse, and dispatch a WhatsApp webhook payload for one resolved
+/// instance. `app_secret` is that instance's `X-Hub-Signature-256` secret.
+#[cfg(feature = "channel-whatsapp-cloud")]
+async fn process_whatsapp_message(
+    state: &AppState,
+    alias: &str,
+    wa: &Arc<WhatsAppChannel>,
+    app_secret: Option<&str>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let verified = match webhook_ingress::authenticate(
+        &webhook_ingress::WHATSAPP_WEBHOOK,
+        alias,
+        app_secret,
+        &headers,
+        body,
+        |secret, headers, body| {
+            let signature = headers
+                .get("X-Hub-Signature-256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            verify_whatsapp_signature(secret, body, signature)
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(&webhook_ingress::WHATSAPP_WEBHOOK),
+    };
+
+    let mut verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(wa.parse_webhook_payload(&payload))
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
+
+    // Route approval replies to pending approval requests before dispatching
+    // to the agent.
+    let mut approvals = wa.pending_approvals().lock().await;
+    verified.retain(|msg| {
+        let Some((token, response)) = omnesagent_channels::util::parse_approval_reply(&msg.content)
+        else {
+            return true;
+        };
+        let Some(sender) = approvals.remove(&token) else {
+            return true;
+        };
+        let _ = sender.send(response);
+        false
+    });
+    drop(approvals);
+
+    let channel: Arc<dyn Channel> = wa.clone();
+    webhook_ingress::dispatch_verified_webhook(
+        state,
+        verified,
+        webhook_ingress::WebhookDispatchContext {
+            channel,
+            memory_key: whatsapp_memory_key,
+            agent_override: None,
+            mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            #[cfg(test)]
+            suppress_reply_send: true,
+        },
+    )
+    .await
+}
+
+/// POST /linq — incoming message webhook (bare path, deprecated fallback).
+#[cfg(feature = "channel-linq")]
+async fn handle_linq_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_linq_webhook_impl(state, None, headers, body).await
+}
+
+/// POST /linq/{alias} — incoming message webhook for a specific instance.
+#[cfg(feature = "channel-linq")]
+async fn handle_linq_webhook_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_linq_webhook_impl(state, Some(alias), headers, body).await
+}
+
+#[cfg(feature = "channel-linq")]
+async fn handle_linq_webhook_impl(
+    state: AppState,
+    alias: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.linq, alias.as_deref());
+    let Some((alias_key, linq)) = resolved.entry() else {
+        return api_webhook::not_found("linq");
+    };
+    let signing_secret = state.linq_signing_secrets.get(alias_key).cloned();
+    let resp = process_linq_webhook(
+        &state,
+        alias_key,
+        linq,
+        signing_secret.as_deref(),
+        headers,
+        body,
+    )
+    .await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "linq")
+}
+
+/// Verify, parse, and dispatch a Linq webhook payload for one resolved instance.
+/// `signing_secret` is that instance's `X-Webhook-Signature` secret.
+#[cfg(feature = "channel-linq")]
+async fn process_linq_webhook(
+    state: &AppState,
+    alias: &str,
+    linq: &Arc<LinqChannel>,
+    signing_secret: Option<&str>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let verified = match webhook_ingress::authenticate(
+        &webhook_ingress::LINQ_WEBHOOK,
+        alias,
+        signing_secret,
+        &headers,
+        body,
+        |secret, headers, body| {
+            let body_str = String::from_utf8_lossy(body);
+            let timestamp = headers
+                .get("X-Webhook-Timestamp")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let signature = headers
+                .get("X-Webhook-Signature")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            omnesagent_channels::linq::verify_linq_signature(secret, &body_str, timestamp, signature)
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(&webhook_ingress::LINQ_WEBHOOK),
+    };
+
+    let verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(linq.parse_webhook_payload(&payload))
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
+
+    if verified.is_empty() {
+        // Acknowledge status/delivery events before ownership resolution.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    let channel_ref = linq_channel_ref(alias);
+    let (agent_override, has_channel_bindings) = {
+        let config = state.config.read();
+        (
+            config.agent_for_channel(&channel_ref).map(str::to_owned),
+            config
+                .agents
+                .values()
+                .any(|agent| !agent.channels.is_empty()),
+        )
+    };
+    if agent_override.is_none() && has_channel_bindings {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": "linq", "alias": alias})),
+            "Linq webhook ignored because no enabled agent owns the channel alias"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ignored", "reason": "no_agent_for_channel"})),
+        );
+    }
+
+    let channel: Arc<dyn Channel> = linq.clone();
+    webhook_ingress::dispatch_verified_webhook(
+        state,
+        verified,
+        webhook_ingress::WebhookDispatchContext {
+            channel,
+            memory_key: linq_memory_key,
+            agent_override,
+            mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            #[cfg(test)]
+            suppress_reply_send: true,
+        },
+    )
+    .await
+}
+
+/// POST /nextcloud-talk — incoming message webhook (bare path, deprecated).
+#[cfg(feature = "channel-nextcloud")]
+async fn handle_nextcloud_talk_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_nextcloud_talk_webhook_impl(state, None, headers, body).await
+}
+
+/// POST /nextcloud-talk/{alias} — incoming message webhook for one instance.
+#[cfg(feature = "channel-nextcloud")]
+async fn handle_nextcloud_talk_webhook_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_nextcloud_talk_webhook_impl(state, Some(alias), headers, body).await
+}
+
+#[cfg(feature = "channel-nextcloud")]
+async fn handle_nextcloud_talk_webhook_impl(
+    state: AppState,
+    alias: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.nextcloud_talk, alias.as_deref());
+    let Some((alias_key, nextcloud_talk)) = resolved.entry() else {
+        return api_webhook::not_found("nextcloud-talk");
+    };
+    let webhook_secret = state.nextcloud_talk_webhook_secret.get(alias_key).cloned();
+    let resp = process_nextcloud_talk_webhook(
+        &state,
+        alias_key,
+        nextcloud_talk,
+        webhook_secret.as_deref(),
+        headers,
+        body,
+    )
+    .await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "nextcloud-talk")
+}
+
+/// Verify, parse, and dispatch a Nextcloud Talk webhook payload for one resolved
+/// instance. `webhook_secret` is that instance's HMAC signing secret.
+#[cfg(feature = "channel-nextcloud")]
+async fn process_nextcloud_talk_webhook(
+    state: &AppState,
+    alias: &str,
+    nextcloud_talk: &Arc<NextcloudTalkChannel>,
+    webhook_secret: Option<&str>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let verified = match webhook_ingress::authenticate(
+        &webhook_ingress::NEXTCLOUD_TALK_WEBHOOK,
+        alias,
+        webhook_secret,
+        &headers,
+        body,
+        |secret, headers, body| {
+            let body_str = String::from_utf8_lossy(body);
+            let random = headers
+                .get("X-Nextcloud-Talk-Random")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let signature = headers
+                .get("X-Nextcloud-Talk-Signature")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            omnesagent_channels::nextcloud_talk::verify_nextcloud_talk_signature(
+                secret, random, &body_str, signature,
+            )
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(&webhook_ingress::NEXTCLOUD_TALK_WEBHOOK),
+    };
+
+    let verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+            nextcloud_talk.parse_webhook_payload(&payload),
+        )
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
+
+    // Fast-ack: Nextcloud Talk cancels webhook requests that don't complete
+    // within ~5s and slow local models routinely exceed that, so processing
+    // happens in background tasks and the 200 returns immediately.
+    let channel: Arc<dyn Channel> = nextcloud_talk.clone();
+    webhook_ingress::dispatch_verified_webhook(
+        state,
+        verified,
+        webhook_ingress::WebhookDispatchContext {
+            channel,
+            memory_key: nextcloud_talk_memory_key,
+            agent_override: None,
+            mode: webhook_ingress::WebhookDispatchMode::FastAck,
+            #[cfg(test)]
+            suppress_reply_send: true,
+        },
+    )
+    .await
+}
+
+/// Maximum request body size for the Gmail webhook endpoint (1 MB).
+/// Google Pub/Sub messages are typically under 10 KB.
+#[cfg(feature = "channel-email")]
+const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
+
+/// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
+#[cfg(feature = "channel-email")]
+async fn handle_gmail_push_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref gmail_push) = state.gmail_push else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Gmail push not configured"})),
+        );
+    };
+
+    // Enforce body size limit.
+    if body.len() > GMAIL_WEBHOOK_MAX_BODY {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Request body too large"})),
+        );
+    }
+
+    // Authenticate the webhook request using a shared secret.
+    let secret = gmail_push.config.webhook_secret.clone();
+    if !secret.is_empty() {
+        let provided = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|auth| auth.strip_prefix("Bearer "))
+            .unwrap_or("");
+
+        if provided != secret {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"channel": "gmail_push"})),
+                "webhook: unauthorized request"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            );
+        }
+    }
+
+    let body_str = String::from_utf8_lossy(&body);
+    let envelope: omnesagent_channels::gmail_push::PubSubEnvelope =
+        match serde_json::from_str(&body_str) {
+            Ok(e) => e,
+            Err(e) => {
+                ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"error": format!("{}", e), "channel": "gmail_push"})
+                    ),
+                "webhook: invalid payload"
+            );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid Pub/Sub envelope"})),
+                );
+            }
+        };
+
+    // Process the notification asynchronously (non-blocking for the webhook response)
+    let channel = Arc::clone(gmail_push);
+    omnesagent_spawn::spawn!(async move {
+        if let Err(e) = channel.handle_notification(&envelope).await {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"channel": "gmail_push", "error": format!("{}", e)})
+                    ),
+                "push notification processing failed"
+            );
+        }
+    });
+
+    // Acknowledge immediately — Google Pub/Sub requires a 2xx within ~10s
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ADMIN HANDLERS (for CLI management)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Response for admin endpoints
+#[derive(serde::Serialize)]
+struct AdminResponse {
+    success: bool,
+    message: String,
+}
+
+/// Reject requests that do not originate from a loopback address.
+fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if peer.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Admin endpoints are restricted to localhost"
+            })),
+        ))
+    }
+}
+
+/// POST /admin/shutdown — graceful shutdown from CLI (localhost only)
+async fn handle_admin_shutdown(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    ::omnesagent_log::record!(
+        INFO,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+        "admin shutdown request received; initiating graceful shutdown"
+    );
+
+    let body = AdminResponse {
+        success: true,
+        message: "Gateway shutdown initiated".to_string(),
+    };
+
+    let _ = state.shutdown_tx.send(true);
+
+    Ok((StatusCode::OK, Json(body)))
+}
+
+/// Authorization decision for `POST /admin/reload`, derived purely from the
+/// caller's loopback status, the `gateway.allow_remote_admin` flag, and
+/// whether pairing is enabled.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminReloadGate {
+    /// Loopback caller (the CLI) — allow without further checks.
+    Allow,
+    /// Non-loopback caller, opted in with pairing on — allow only if pairing
+    /// auth passes.
+    RequireAuth,
+    /// Non-loopback caller, not opted in — reject.
+    Forbidden,
+    /// Non-loopback caller opted in, but pairing is disabled — reject rather
+    /// than allow an unauthenticated remote reload. `require_auth` is a no-op
+    /// when pairing is off, so without this guard `allow_remote_admin` would
+    /// expose reload to anonymous remote callers.
+    ForbiddenNoPairing,
+}
+
+fn admin_reload_gate(
+    is_loopback: bool,
+    allow_remote_admin: bool,
+    require_pairing: bool,
+) -> AdminReloadGate {
+    if is_loopback {
+        AdminReloadGate::Allow
+    } else if !allow_remote_admin {
+        AdminReloadGate::Forbidden
+    } else if require_pairing {
+        AdminReloadGate::RequireAuth
+    } else {
+        AdminReloadGate::ForbiddenNoPairing
+    }
+}
+
+async fn handle_admin_reload(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Loopback (the CLI) is always allowed. A non-loopback caller is rejected
+    // unless the operator opted in via `gateway.allow_remote_admin`, and even
+    // then must pass pairing auth — which requires pairing to be enabled, so
+    // opting in without pairing is rejected rather than left unauthenticated.
+    let allow_remote = state.config.read().gateway.allow_remote_admin;
+    // Source pairing status from the guard `require_auth` consults, not the
+    // raw config field, so the gate's `RequireAuth` decision can never
+    // diverge from what `require_auth` will actually enforce.
+    let require_pairing = state.pairing.require_pairing();
+    match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
+        AdminReloadGate::Allow => {}
+        AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
+        AdminReloadGate::Forbidden => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload is disabled. Call from localhost, \
+                              or set gateway.allow_remote_admin = true (with pairing \
+                              enabled, then pair) to allow authenticated remote reloads."
+                })),
+            ));
+        }
+        AdminReloadGate::ForbiddenNoPairing => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Remote admin reload requires pairing. \
+                              gateway.allow_remote_admin is enabled but \
+                              gateway.require_pairing is off, so remote callers \
+                              cannot be authenticated. Enable require_pairing, or \
+                              call /admin/reload from localhost."
+                })),
+            ));
+        }
+    }
+
+    let Some(reload_tx) = state.reload_tx.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no daemon supervisor — running as standalone gateway. \
+                          Restart the process to pick up config changes."
+            })),
+        ));
+    };
+
+    ::omnesagent_log::record!(
+        INFO,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+        "admin reload request received"
+    );
+    // Clear the pending-reload flag before the daemon supervisor brings up
+    // the new gateway instance. The fresh instance starts with the flag
+    // already false, matching its "subsystems just-loaded, no pending
+    // changes" state.
+    state
+        .pending_reload
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let shutdown_tx = state.shutdown_tx.clone();
+    // Brief delay so the HTTP response flushes before tear-down begins.
+    omnesagent_spawn::spawn!(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Drain axum first so the listener releases.
+        let _ = shutdown_tx.send(true);
+        // Then signal the daemon to re-read disk and re-spawn subsystems.
+        let _ = reload_tx.send(true);
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(AdminResponse {
+            success: true,
+            message: "Daemon reload initiated".to_string(),
+        }),
+    ))
+}
+
+/// GET /admin/paircode — fetch current pairing code (localhost only)
+async fn handle_admin_paircode(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    let code = state.pairing.pairing_code();
+
+    let body = if let Some(c) = code {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": c,
+            "message": "Use this one-time code to pair"
+        })
+    } else {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": null,
+            "message": if state.pairing.require_pairing() {
+                "Pairing is active but no new code available (already paired or code expired)"
+            } else {
+                "Pairing is disabled for this gateway"
+            }
+        })
+    };
+
+    Ok((StatusCode::OK, Json(body)))
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct AdminPaircodeQuery {
+    #[serde(default)]
+    pub rotate: Option<String>,
+}
+
+async fn handle_admin_paircode_new(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(params): Query<AdminPaircodeQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+
+    if !state.pairing.require_pairing() {
+        let body = serde_json::json!({
+            "success": false,
+            "pairing_required": false,
+            "pairing_code": null,
+            "message": "Pairing is disabled for this gateway"
+        });
+        return Ok((StatusCode::BAD_REQUEST, Json(body)));
+    }
+
+    let rotate = params
+        .rotate
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let revocation_message = match rotate {
+        Some("all") => {
+            let revoked = state.pairing.revoke_all_tokens();
+            if let Some(registry) = state.device_registry.as_ref() {
+                if let Err(e) = registry.clear() {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                    });
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                }
+            }
+            if let Err(e) = persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
+            {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but config persist failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            }
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"revoked": revoked})),
+                "all paired tokens revoked via admin endpoint"
+            );
+            Some(format!(
+                "Revoked all {revoked} paired token(s) and cleared the device registry."
+            ))
+        }
+        Some(device_id) => {
+            let Some(registry) = state.device_registry.as_ref() else {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": "Device registry is disabled; cannot rotate a single device.",
+                });
+                return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
+            };
+            let token_hash = match registry.revoke(device_id) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Device '{device_id}' not found; nothing revoked."),
+                    });
+                    return Ok((StatusCode::NOT_FOUND, Json(body)));
+                }
+                Err(e) => {
+                    let body = serde_json::json!({
+                        "success": false,
+                        "pairing_required": true,
+                        "pairing_code": null,
+                        "message": format!("Device registry error: {e}"),
+                    });
+                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+                }
+            };
+            state.pairing.revoke_token_hash(&token_hash);
+            if let Err(e) = persist_pairing_tokens(
+                state.config.clone(),
+                &state.pairing,
+                state.config_write_lock.clone(),
+            )
+            .await
+            {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Token revoked in memory but config persist failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
+            }
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                "single device token revoked via admin endpoint"
+            );
+            Some(format!(
+                "Revoked the bearer token for device '{device_id}'."
+            ))
+        }
+        None => None,
+    };
+
+    let code = state
+        .pairing
+        .generate_new_pairing_code()
+        .expect("require_pairing checked above");
+    if rotate.is_none() {
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            "new pairing code generated via admin endpoint"
+        );
+    }
+
+    let message = match revocation_message {
+        Some(revoked) => {
+            format!("{revoked} Use this one-time code to re-pair.")
+        }
+        None => "New pairing code generated — use this one-time code to pair".to_string(),
+    };
+
+    let body = serde_json::json!({
+        "success": true,
+        "pairing_required": true,
+        "pairing_code": code,
+        "message": message,
+    });
+    Ok((StatusCode::OK, Json(body)))
+}
+
+async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
+    let require = state.pairing.require_pairing();
+    let is_paired = state.pairing.is_paired();
+
+    // Only expose the code during initial setup (before first pairing)
+    let code = if require && !is_paired {
+        state.pairing.pairing_code()
+    } else {
+        None
+    };
+
+    let body = serde_json::json!({
+        "success": true,
+        "pairing_required": require,
+        "pairing_code": code,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, Uri};
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use parking_lot::{Mutex, RwLock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    use omnesagent_api::channel::ChannelMessage;
+    use omnesagent_memory::{Memory, MemoryCategory, MemoryEntry};
+    use omnesagent_providers::ModelProvider;
+    use omnesagent_runtime::agent::loop_::{
+        mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+    };
+
+    #[test]
+    fn default_agent_alias_picks_smallest_enabled_and_is_deterministic() {
+        use omnesagent_config::schema::AliasedAgentConfig;
+
+        let enabled = || AliasedAgentConfig {
+            enabled: true,
+            ..AliasedAgentConfig::default()
+        };
+
+        // No agents -> no default.
+        let mut config = Config::default();
+        assert_eq!(default_agent_alias(&config), None);
+
+        // Insertion order is deliberately not alphabetical; `config.agents` is
+        // a HashMap whose iteration order is randomized per process. The pick
+        // must still be the lexicographically smallest ENABLED alias so the
+        // Tools page seeds the same agent on every restart.
+        config.agents.insert("zeta".to_string(), enabled());
+        config.agents.insert("alpha".to_string(), enabled());
+        config.agents.insert("mid".to_string(), enabled());
+        assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+
+        // A smaller-but-disabled alias is skipped (omission is not a grant).
+        config.agents.insert(
+            "aaa_disabled".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+    }
+
+    /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
+    fn generate_test_secret() -> String {
+        let bytes: [u8; 32] = rand::random();
+        hex::encode(bytes)
+    }
+
+    struct NamedMcpMockTool(&'static str);
+    omnesagent_api::mock_tool_attribution!(NamedMcpMockTool);
+    #[async_trait]
+    impl tools::Tool for NamedMcpMockTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "mcp mock"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<tools::ToolResult> {
+            Ok(tools::ToolResult {
+                success: true,
+                output: tools::ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn gateway_excluded_tools_drops_denied_mcp_tool() {
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["aa_mcp__find_items".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        let mcp_policy = mcp_tool_access_policy(&policy, None);
+        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
+        let denied: std::sync::Arc<dyn tools::Tool> =
+            std::sync::Arc::new(NamedMcpMockTool("aa_mcp__find_items"));
+        let allowed: std::sync::Arc<dyn tools::Tool> =
+            std::sync::Arc::new(NamedMcpMockTool("aa_mcp__find_npcs"));
+        let registered_denied =
+            register_eager_mcp_tool_if_allowed(denied, &mut gw_tools, None, mcp_policy.as_ref());
+        let registered_allowed =
+            register_eager_mcp_tool_if_allowed(allowed, &mut gw_tools, None, mcp_policy.as_ref());
+        assert!(
+            !registered_denied,
+            "gateway must not register an `excluded_tools`-denied MCP tool"
+        );
+        assert!(
+            registered_allowed,
+            "gateway must register a non-denied MCP tool (allowlist auto-admit)"
+        );
+        let names: Vec<&str> = gw_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"aa_mcp__find_items"),
+            "denied MCP tool leaked into the gateway registry; got {names:?}"
+        );
+        assert!(
+            names.contains(&"aa_mcp__find_npcs"),
+            "allowed MCP tool missing from the gateway registry; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn security_body_limit_is_64kb() {
+        assert_eq!(MAX_BODY_SIZE, 65_536);
+    }
+
+    #[test]
+    fn security_timeout_default_is_30_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn gateway_timeout_uses_typed_config_default() {
+        let cfg = omnesagent_config::schema::GatewayConfig::default();
+        assert_eq!(gateway_request_timeout_secs(&cfg), 30);
+    }
+
+    #[test]
+    fn paircode_recovery_command_includes_alternate_port() {
+        assert_eq!(
+            format_paircode_recovery_command("127.0.0.1", 42617),
+            "omnesagent gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_includes_specific_host_when_needed() {
+        // Admin paircode routes are localhost-only, so the recovery hint must
+        // not advertise a non-loopback `--host` (the admin guard would 403 it).
+        // The CLI is left to fall back to its loopback default.
+        assert_eq!(
+            format_paircode_recovery_command("192.168.1.20", 42617),
+            "omnesagent gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_uses_loopback_for_nonloopback_host() {
+        // a gateway bound to a non-loopback interface must
+        // not surface a recovery hint that the localhost-only admin guard rejects.
+        let cmd = format_paircode_recovery_command("192.168.1.20", 42617);
+        assert!(
+            !cmd.contains("192.168.1.20"),
+            "recovery command must not advertise the non-loopback bound host: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--host"),
+            "recovery command should omit --host so the CLI uses its loopback default: {cmd}"
+        );
+
+        let curl = format_paircode_recovery_curl("192.168.1.20", 42617, "");
+        assert_eq!(
+            curl, "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new",
+            "curl fallback must target loopback, not the non-loopback bound host"
+        );
+        assert!(
+            !curl.contains("192.168.1.20"),
+            "curl fallback must not advertise the non-loopback bound host: {curl}"
+        );
+
+        // Path prefix is still preserved while the host is normalized.
+        assert_eq!(
+            format_paircode_recovery_curl("192.168.1.20", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_targets_running_instance() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn already_paired_notice_states_no_code_was_generated() {
+        // the banner must say plainly that NO code exists
+        // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
+        // hits the dashboard's 6-digit prompt with no code printed anywhere.
+        let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("already paired"),
+            "notice must say the gateway is already paired: {joined}"
+        );
+        assert!(
+            joined.contains("no new") && joined.contains("code"),
+            "notice must state that no new code was generated: {joined}"
+        );
+    }
+
+    #[test]
+    fn already_paired_notice_includes_recovery_command_and_curl() {
+        // The notice is the single source of truth for the on-demand recovery
+        // commands; it must reuse the loopback-safe builders so the banner and
+        // any future surface never drift from's no-`--host` rule.
+        let lines = already_paired_pairing_notice("192.168.1.20", 3001, "/gw");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(&format_paircode_recovery_command("192.168.1.20", 3001)),
+            "notice must surface the get-paircode recovery command: {joined}"
+        );
+        assert!(
+            joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
+            "notice must surface the curl fallback (honoring the path prefix): {joined}"
+        );
+        // never advertise the non-loopback bound host in the hint.
+        assert!(
+            !joined.contains("192.168.1.20"),
+            "notice must not advertise the non-loopback bound host: {joined}"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("0.0.0.0", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_actual_loopback_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("localhost", 42617, ""),
+            "curl -s -X POST http://localhost:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::1", 42617, ""),
+            "curl -s -X POST http://[::1]:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_path_prefix() {
+        assert_eq!(
+            format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    /// Build an AppState wired with a real pairing guard, on-disk config path,
+    /// and an optional device registry so the admin paircode handler's
+    /// revoke + persist paths can be exercised end to end.
+    fn admin_paircode_state(
+        tmp: &tempfile::TempDir,
+        require_pairing: bool,
+        with_registry: bool,
+    ) -> AppState {
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider: Arc::new(MockModelProvider::default()),
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: registry,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    fn webhook_sop_state(
+        tmp: &tempfile::TempDir,
+        trigger_path: &str,
+    ) -> (AppState, Arc<MockModelProvider>) {
+        let mut state = admin_paircode_state(tmp, false, false);
+        let provider = Arc::new(MockModelProvider::default());
+        state.model_provider = provider.clone();
+
+        let sops_dir = tmp.path().join("sops");
+        let sop_dir = sops_dir.join("webhook-test");
+        std::fs::create_dir_all(&sop_dir).unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.toml"),
+            format!(
+                r#"[sop]
+name = "webhook-test"
+description = "Gateway webhook fan-in test"
+execution_mode = "auto"
+
+[[triggers]]
+type = "webhook"
+path = "{trigger_path}"
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.md"),
+            "## Steps\n\n1. **Handle webhook** — Process the webhook payload.\n",
+        )
+        .unwrap();
+
+        let mut sop_config = state.config.read().sop.clone();
+        sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        sop_config.persist_runs = false;
+        state.config.write().sop = sop_config.clone();
+        let data_dir = state.config.read().data_dir.clone();
+        let install_root = state.config.read().install_root_dir();
+        let (engine, audit) = omnesagent_runtime::sop::build_sop_engine(
+            sop_config,
+            &data_dir,
+            &install_root,
+            Arc::clone(&state.mem),
+            Default::default(),
+        );
+        state.sop_engine = Some(engine);
+        state.sop_audit = Some(audit);
+        (state, provider)
+    }
+
+    /// Same as [`webhook_sop_state`] but loads two SOPs, each with its own
+    /// distinct webhook trigger path — used to prove idempotency keys are
+    /// namespaced per SOP path rather than shared across all of `/sop/*`.
+    fn webhook_two_sop_state(
+        tmp: &tempfile::TempDir,
+        path_a: &str,
+        path_b: &str,
+    ) -> (AppState, Arc<MockModelProvider>) {
+        let mut state = admin_paircode_state(tmp, false, false);
+        let provider = Arc::new(MockModelProvider::default());
+        state.model_provider = provider.clone();
+
+        let sops_dir = tmp.path().join("sops");
+        for (name, trigger_path) in [("sop-a", path_a), ("sop-b", path_b)] {
+            let sop_dir = sops_dir.join(name);
+            std::fs::create_dir_all(&sop_dir).unwrap();
+            std::fs::write(
+                sop_dir.join("SOP.toml"),
+                format!(
+                    r#"[sop]
+name = "{name}"
+description = "Gateway webhook fan-in test"
+execution_mode = "auto"
+
+[[triggers]]
+type = "webhook"
+path = "{trigger_path}"
+"#,
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                sop_dir.join("SOP.md"),
+                "## Steps\n\n1. **Handle webhook** — Process the webhook payload.\n",
+            )
+            .unwrap();
+        }
+
+        let mut sop_config = state.config.read().sop.clone();
+        sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        sop_config.persist_runs = false;
+        state.config.write().sop = sop_config.clone();
+        let data_dir = state.config.read().data_dir.clone();
+        let install_root = state.config.read().install_root_dir();
+        let (engine, audit) = omnesagent_runtime::sop::build_sop_engine(
+            sop_config,
+            &data_dir,
+            &install_root,
+            Arc::clone(&state.mem),
+            Default::default(),
+        );
+        state.sop_engine = Some(engine);
+        state.sop_audit = Some(audit);
+        (state, provider)
+    }
+
+    /// Attach a webhook-secret credential to `state`; returns the plaintext
+    /// secret to send back as `X-Webhook-Secret`. Item 2's fail-closed SOP
+    /// dispatch policy requires a configured-and-verified credential before
+    /// a SOP run can start.
+    fn with_webhook_secret(state: AppState) -> (AppState, String) {
+        let secret = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret.clone());
+        (state, secret)
+    }
+
+    fn webhook_secret_header(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(secret).unwrap());
+        headers
+    }
+
+    fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
+        let dist_dir = tmp.path().join("web").join("dist");
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::write(
+            dist_dir.join("index.html"),
+            r#"<!DOCTYPE html><html><head></head><body>dashboard shell</body></html>"#,
+        )
+        .unwrap();
+
+        let mut state = admin_paircode_state(tmp, false, false);
+        state.web_dist_dir = Some(dist_dir);
+        state
+    }
+
+    async fn spa_fallback_response(
+        path: &'static str,
+        state: AppState,
+    ) -> axum::response::Response {
+        static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
+    }
+
+    async fn static_route_response(
+        path: &'static str,
+        prefix: Option<&str>,
+        state: AppState,
+    ) -> axum::response::Response {
+        let routes = static_file_routes();
+        let app = match prefix {
+            Some(prefix) => Router::new().nest(prefix, routes),
+            None => routes,
+        }
+        .with_state(state);
+
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Pair a device into both the pairing guard and the device registry,
+    /// returning the plaintext token so the test can assert it is revoked.
+    async fn pair_device(state: &AppState, device_id: &str) -> String {
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing enabled");
+        let token = state
+            .pairing
+            .try_pair(&code, device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .device_registry
+            .as_ref()
+            .unwrap()
+            .register(
+                PairingGuard::token_hash(&token),
+                api_pairing::DeviceInfo {
+                    id: device_id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: chrono::Utc::now(),
+                    last_seen: chrono::Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
+        token
+    }
+
+    async fn admin_paircode_response_json(
+        result: Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = result.into_response();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_without_rotate_keeps_existing_tokens() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "dev-a").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "add-another-client path must not revoke existing tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_all_revokes_everything() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token_a = pair_device(&state, "dev-a").await;
+        let token_b = pair_device(&state, "dev-b").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("all".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(!state.pairing.is_authenticated(&token_a));
+        assert!(!state.pairing.is_authenticated(&token_b));
+        assert!(
+            state.config.read().gateway.paired_tokens.is_empty(),
+            "rotate=all must persist an empty token set"
+        );
+        assert!(
+            state
+                .device_registry
+                .as_ref()
+                .unwrap()
+                .list()
+                .expect("test device registry list")
+                .is_empty(),
+            "rotate=all must clear the device registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_device_revokes_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token_a = pair_device(&state, "dev-a").await;
+        let token_b = pair_device(&state, "dev-b").await;
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("dev-a".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+        assert!(!state.pairing.is_authenticated(&token_a));
+        assert!(
+            state.pairing.is_authenticated(&token_b),
+            "targeted rotate must not touch other devices"
+        );
+        let old_hash = PairingGuard::token_hash(&token_a);
+        assert!(
+            !state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&old_hash)
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_rotate_unknown_device_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let token = pair_device(&state, "dev-a").await;
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("ghost".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "a not-found rotate must not revoke any token"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_pairing_disabled_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state),
+                test_connect_info(),
+                Query(AdminPaircodeQuery {
+                    rotate: Some("all".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["success"], false);
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_rejects_remote_peer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+
+        let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
+                .await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "minting a pairing code must be rejected for non-loopback peers"
+        );
+    }
+
+    #[test]
+    fn long_running_request_timeout_default_is_ten_minutes() {
+        assert_eq!(LONG_RUNNING_REQUEST_TIMEOUT_SECS, 600);
+    }
+
+    #[test]
+    fn long_running_request_timeout_uses_typed_config_default() {
+        let cfg = omnesagent_config::schema::GatewayConfig::default();
+        assert_eq!(gateway_long_running_request_timeout_secs(&cfg), 600);
+    }
+
+    #[test]
+    fn webhook_body_requires_message_field() {
+        let valid = r#"{"message": "hello"}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
+        assert!(parsed.is_ok());
+        assert_eq!(parsed.unwrap().message, "hello");
+
+        let missing = r#"{"other": "field"}"#;
+        let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn whatsapp_query_fields_are_optional() {
+        let q = WhatsAppVerifyQuery {
+            mode: None,
+            verify_token: None,
+            challenge: None,
+        };
+        assert!(q.mode.is_none());
+    }
+
+    #[test]
+    fn app_state_is_clone() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<AppState>();
+    }
+
+    #[tokio::test]
+    async fn static_routes_reject_malformed_paths_before_spa_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut prefixed_state = spa_fallback_state(&tmp);
+        prefixed_state.path_prefix = "/gw".to_string();
+
+        for (path, prefix, state) in [
+            ("/_app/", None, spa_fallback_state(&tmp)),
+            ("/_app//index.html", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/./app.js", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/../secret", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/app.js/", None, spa_fallback_state(&tmp)),
+            ("/gw/_app/", Some("/gw"), prefixed_state),
+        ] {
+            let response = static_route_response(path, prefix, state).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "route path should be rejected: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_routes_serve_valid_assets_with_and_without_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dist_dir = tmp.path().join("web").join("dist");
+        let assets = dist_dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("route-test.js"), b"route-ok").unwrap();
+
+        let mut state = spa_fallback_state(&tmp);
+        let unprefixed =
+            static_route_response("/_app/assets/route-test.js", None, state.clone()).await;
+        assert_eq!(unprefixed.status(), StatusCode::OK);
+        assert_eq!(
+            unprefixed.into_body().collect().await.unwrap().to_bytes(),
+            &b"route-ok"[..]
+        );
+
+        state.path_prefix = "/gw".to_string();
+        let prefixed =
+            static_route_response("/gw/_app/assets/route-test.js", Some("/gw"), state).await;
+        assert_eq!(prefixed.status(), StatusCode::OK);
+        assert_eq!(
+            prefixed.into_body().collect().await.unwrap().to_bytes(),
+            &b"route-ok"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_not_html_for_unknown_api_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json")),
+            "unknown API paths must not be served as HTML"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "not_found");
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_api_root_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/api", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_returns_json_for_path_prefixed_api_miss() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = spa_fallback_state(&tmp);
+        state.path_prefix = "/gw".to_string();
+
+        let response = spa_fallback_response("/gw/api/agents", state).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["path"], "/api/agents");
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_still_serves_dashboard_routes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/config", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "dashboard routes should still receive the SPA shell"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("dashboard shell"));
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_does_not_treat_api_like_spa_paths_as_api() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = spa_fallback_state(&tmp);
+
+        let response = spa_fallback_response("/apiary", state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html")),
+            "similarly named SPA routes should not be reserved as API paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gateway_starts_with_zero_agents() {
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.omnesagent/data
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..omnesagent_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        // Default Config has no [agents.*] entries — the exact shape
+        // a fresh install presents on first daemon boot.
+        assert!(
+            config.agents.is_empty(),
+            "regression assumes default Config has no agents",
+        );
+
+        let handle = omnesagent_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            &mut Box::pin(async {
+                // We cannot await `handle` directly because the gateway
+                // never returns under normal operation; instead, peek at
+                // whether it has finished by polling join with a tiny
+                // budget.
+                let _ = tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => panic!("test setup timed out before checking gateway state"),
+        }
+
+        // If the boot path errored, the task is finished and join
+        // returns the error. If it's still running, abort and accept
+        // boot reached the serving stage.
+        if handle.is_finished() {
+            let result = handle.await.expect("task did not panic");
+            panic!(
+                "gateway exited during boot with zero agents — must stay up for reload/quickstart: {:?}",
+                result
+            );
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
+        use omnesagent_config::schema::AliasedAgentConfig;
+
+        // Isolate data_dir so parallel nextest runs don't race on the
+        // real ~/.omnesagent/data
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = omnesagent_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..omnesagent_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        // Enabled agent whose `risk_profile` does not resolve. No
+        // matching [risk_profiles.<key>] entry exists.
+        let agent = AliasedAgentConfig {
+            enabled: true,
+            risk_profile: "definitely_not_configured".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("fake123".to_string(), agent);
+
+        let handle = omnesagent_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            &mut Box::pin(async {
+                let _ = tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => panic!("test setup timed out before checking gateway state"),
+        }
+
+        if handle.is_finished() {
+            let result = handle.await.expect("task did not panic");
+            panic!(
+                "gateway exited during boot when agent.risk_profile was unresolved \
+                 — must stay up so operator can fix via /admin/reload or /quickstart: {:?}",
+                result
+            );
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "default".to_string(),
+            omnesagent_config::schema::AnthropicModelProviderConfig {
+                base: omnesagent_config::schema::ModelProviderConfig {
+                    model: Some("anthropic/claude-sonnet-4-6".to_string()),
+                    api_key: Some("sk-test-openai-shaped-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let handle = omnesagent_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            &mut Box::pin(async {
+                let _ = tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => panic!("test setup timed out before checking gateway state"),
+        }
+
+        if handle.is_finished() {
+            let result = handle.await.expect("task did not panic");
+            panic!(
+                "gateway exited during boot when seed provider API key was \
+                 mismatched — must stay up so operator can fix via /admin/reload \
+                 or /quickstart: {:?}",
+                result
+            );
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = omnesagent_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..omnesagent_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = omnesagent_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = omnesagent_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+
+        let handle = omnesagent_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("gateway should report its successful bind");
+        let ready_addr = *ready_rx.borrow();
+        assert_eq!(ready_addr.unwrap().port(), port);
+
+        let addr = format!("127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway should accept connections before shutdown");
+
+        shutdown_tx
+            .send(true)
+            .expect("external daemon-owned shutdown sender should stay connected");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("gateway should return after external shutdown")
+            .expect("gateway task should not panic")
+            .expect("gateway shutdown should be graceful");
+
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("gateway should release the listener after external shutdown");
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = omnesagent_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..omnesagent_config::schema::Config::default()
+        };
+        config.gateway.tls = Some(omnesagent_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: tmp.path().join("missing-cert.pem").display().to_string(),
+            key_path: tmp.path().join("missing-key.pem").display().to_string(),
+            client_auth: None,
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = omnesagent_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let result = run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(readiness),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "invalid TLS files should fail gateway setup"
+        );
+        assert!(
+            ready_rx.borrow().is_none(),
+            "failed post-bind setup must not report gateway readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider: Arc::new(MockModelProvider::default()),
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(PROMETHEUS_CONTENT_TYPE)
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Prometheus backend not enabled"));
+    }
+
+    #[cfg(feature = "observability-prometheus")]
+    #[tokio::test]
+    async fn metrics_endpoint_renders_prometheus_output() {
+        let event_tx = tokio::sync::broadcast::channel(16).0;
+        let prom = omnesagent_runtime::observability::PrometheusObserver::new();
+        omnesagent_runtime::observability::Observer::record_event(
+            &prom,
+            &omnesagent_runtime::observability::ObserverEvent::HeartbeatTick,
+        );
+
+        let observer: Arc<dyn omnesagent_runtime::observability::Observer> = Arc::new(prom);
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider: Arc::new(MockModelProvider::default()),
+            model: "test-model".into(),
+            temperature: None,
+            mem: Arc::new(MockMemory),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer,
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = handle_metrics(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("omnesagent_heartbeat_ticks_total 1"));
+    }
+
+    #[test]
+    fn gateway_rate_limiter_blocks_after_limit() {
+        let limiter = GatewayRateLimiter::new(2, 2, 100);
+        assert!(limiter.allow_pair("127.0.0.1"));
+        assert!(limiter.allow_pair("127.0.0.1"));
+        assert!(!limiter.allow_pair("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_sweep_removes_stale_entries() {
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 100);
+        // Add entries for multiple IPs
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+
+        {
+            let guard = limiter.requests.lock();
+            assert_eq!(guard.0.len(), 3);
+        }
+
+        // Force a sweep by backdating last_sweep
+        {
+            let mut guard = limiter.requests.lock();
+            guard.1 = Instant::now()
+                .checked_sub(Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1))
+                .unwrap();
+            // Clear timestamps for ip-2 and ip-3 to simulate stale entries
+            guard.0.get_mut("ip-2").unwrap().clear();
+            guard.0.get_mut("ip-3").unwrap().clear();
+        }
+
+        // Next allow() call should trigger sweep and remove stale entries
+        assert!(limiter.allow("ip-1"));
+
+        {
+            let guard = limiter.requests.lock();
+            assert_eq!(guard.0.len(), 1, "Stale entries should have been swept");
+            assert!(guard.0.contains_key("ip-1"));
+        }
+    }
+
+    #[test]
+    fn rate_limiter_zero_limit_always_allows() {
+        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60), 10);
+        for _ in 0..100 {
+            assert!(limiter.allow("any-key"));
+        }
+    }
+
+    #[test]
+    fn idempotency_store_rejects_duplicate_key() {
+        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
+        assert!(store.record_if_new("req-1"));
+        assert!(!store.record_if_new("req-1"));
+        assert!(store.record_if_new("req-2"));
+    }
+
+    #[test]
+    fn rate_limiter_bounded_cardinality_evicts_oldest_key() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 2);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 2);
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(guard.0.contains_key("ip-3"));
+    }
+
+    #[test]
+    fn idempotency_store_bounded_cardinality_evicts_oldest_key() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 2);
+        assert!(store.record_if_new("k1"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("k2"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("k3"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 2);
+        assert!(!keys.contains_key("k1"));
+        assert!(keys.contains_key("k2"));
+        assert!(keys.contains_key("k3"));
+    }
+
+    #[test]
+    fn client_key_defaults_to_peer_addr_when_untrusted_proxy_mode() {
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, false);
+        assert_eq!(key, "10.0.0.5");
+    }
+
+    #[test]
+    fn client_key_uses_forwarded_ip_only_in_trusted_proxy_mode() {
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "198.51.100.10");
+    }
+
+    #[test]
+    fn client_key_falls_back_to_peer_when_forwarded_header_invalid() {
+        let peer = SocketAddr::from(([10, 0, 0, 5], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("garbage-value"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "10.0.0.5");
+    }
+
+    #[test]
+    fn normalize_max_keys_uses_fallback_for_zero() {
+        assert_eq!(normalize_max_keys(0, 10_000), 10_000);
+        assert_eq!(normalize_max_keys(0, 0), 1);
+    }
+
+    #[test]
+    fn normalize_max_keys_preserves_nonzero_values() {
+        assert_eq!(normalize_max_keys(2_048, 10_000), 2_048);
+        assert_eq!(normalize_max_keys(1, 10_000), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_pairing_tokens_writes_config_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let workspace_path = temp.path().join("workspace");
+
+        let config = Config {
+            config_path: config_path.clone(),
+            data_dir: workspace_path,
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        let shared_config = Arc::new(RwLock::new(config));
+        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+        Box::pin(persist_pairing_tokens(
+            shared_config.clone(),
+            &guard,
+            config_write_lock,
+        ))
+        .await
+        .unwrap();
+
+        // In-memory tokens should remain as plaintext 64-char hex hashes.
+        let plaintext = {
+            let in_memory = shared_config.read();
+            assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+            in_memory.gateway.paired_tokens[0].clone()
+        };
+        assert_eq!(plaintext.len(), 64);
+        assert!(plaintext.chars().all(|c: char| c.is_ascii_hexdigit()));
+
+        // On disk, the token should be encrypted (secrets.encrypt defaults to true).
+        let saved = tokio::fs::read_to_string(config_path).await.unwrap();
+        let raw_parsed: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(raw_parsed.gateway.paired_tokens.len(), 1);
+        let on_disk = &raw_parsed.gateway.paired_tokens[0];
+        assert!(
+            omnesagent_runtime::security::SecretStore::is_encrypted(on_disk),
+            "paired_token should be encrypted on disk"
+        );
+    }
+
+    /// Unlike the `persist_and_swap` callers (which pre-acquire the witness
+    /// before their own read-for-modify), `persist_pairing_tokens` acquires
+    /// `config_write_lock` internally since it is self-contained. This
+    /// proves that internal acquisition still serializes it against a
+    /// second, concurrent config mutation the same way. A single Pending
+    /// poll wouldn't distinguish "blocked on `config_write_lock`" from
+    /// "transiently Pending on unrelated I/O", so this polls repeatedly
+    /// with a no-op waker while the witness stays held and asserts the
+    /// future never completes -- proving it stays parked on the lock for as
+    /// long as it's held. Once the lock is released both changes land —
+    /// neither clobbers the other.
+    #[tokio::test]
+    async fn persist_pairing_tokens_serializes_against_concurrent_config_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("workspace"),
+            ..Default::default()
+        };
+        config.save().await.unwrap();
+
+        let guard = PairingGuard::new(true, &[]);
+        let code = guard.pairing_code().unwrap();
+        let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
+        assert!(guard.is_authenticated(&token));
+
+        let shared_config = Arc::new(RwLock::new(config));
+        let config_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Simulate another in-flight config mutation already holding the
+        // witness for its own read-mutate-save-swap section.
+        let held_guard = Arc::clone(&config_write_lock).lock_owned().await;
+
+        let mut persist_fut = Box::pin(persist_pairing_tokens(
+            shared_config.clone(),
+            &guard,
+            config_write_lock.clone(),
+        ));
+
+        // Bounded, sleep-free: `persist_pairing_tokens` acquires the witness
+        // as its very first action, so poll with a no-op waker 50 times
+        // while `held_guard` stays live and assert Pending every time,
+        // rather than resolving synchronously or racing ahead after a
+        // single yield.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        for _ in 0..50 {
+            assert!(
+                std::future::Future::poll(persist_fut.as_mut(), &mut cx).is_pending(),
+                "persist_pairing_tokens must stay parked on config_write_lock \
+                 acquisition for as long as another writer holds it"
+            );
+        }
+
+        // Land a distinct, concurrent write directly on live config while
+        // persist_pairing_tokens is parked waiting for the lock.
+        shared_config.write().gateway.port = 55555;
+
+        drop(held_guard);
+        persist_fut
+            .await
+            .expect("persist_pairing_tokens must still succeed once unblocked");
+
+        let live = shared_config.read();
+        assert_eq!(
+            live.gateway.port, 55555,
+            "the concurrent writer's change must survive — no lost update"
+        );
+        assert_eq!(
+            live.gateway.paired_tokens.len(),
+            1,
+            "persist_pairing_tokens' own token write must also land"
+        );
+    }
+
+    #[test]
+    fn webhook_memory_key_is_unique() {
+        let key1 = webhook_memory_key();
+        let key2 = webhook_memory_key();
+
+        assert!(key1.starts_with("webhook_msg_"));
+        assert!(key2.starts_with("webhook_msg_"));
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn webhook_session_id_accepts_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("abc-DEF_123.foo"));
+        assert_eq!(webhook_session_id(&headers), Some("abc-DEF_123.foo".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_trims_whitespace() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static("  my-session  "));
+        assert_eq!(webhook_session_id(&headers), Some("my-session".into()));
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_empty() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Id", HeaderValue::from_static(""));
+        assert_eq!(webhook_session_id(&headers), None);
+
+        headers.insert("X-Session-Id", HeaderValue::from_static("   "));
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(webhook_session_id(&headers), None);
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_oversized() {
+        let mut headers = HeaderMap::new();
+        let long = "a".repeat(129);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&long).unwrap());
+        assert_eq!(webhook_session_id(&headers), None);
+
+        let at_limit = "b".repeat(128);
+        headers.insert("X-Session-Id", HeaderValue::from_str(&at_limit).unwrap());
+        assert!(webhook_session_id(&headers).is_some());
+    }
+
+    #[test]
+    fn webhook_session_id_rejects_invalid_chars() {
+        let mut headers = HeaderMap::new();
+        for bad in &[
+            "has/slash",
+            "has:colon",
+            "has space",
+            "has@at",
+            "emoji\u{1f600}",
+        ] {
+            if let Ok(val) = HeaderValue::from_str(bad) {
+                headers.insert("X-Session-Id", val);
+                assert_eq!(webhook_session_id(&headers), None, "should reject: {bad}");
+            }
+        }
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_memory_key_includes_sender_and_message_id() {
+        let msg = ChannelMessage {
+            id: "wamid-123".into(),
+            sender: "+1234567890".into(),
+            reply_target: "+1234567890".into(),
+            content: "hello".into(),
+            channel: "whatsapp".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+
+        let key = whatsapp_memory_key(&msg);
+        assert_eq!(key, "whatsapp_+1234567890_wamid-123");
+    }
+
+    #[derive(Default)]
+    struct MockMemory;
+
+    #[async_trait]
+    impl Memory for MockMemory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+    impl ::omnesagent_api::attribution::Attributable for MockMemory {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Memory(
+                ::omnesagent_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockMemory"
+        }
+    }
+
+    #[derive(Default)]
+    struct MockModelProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for MockModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".into())
+        }
+    }
+    impl ::omnesagent_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Provider(
+                ::omnesagent_api::attribution::ProviderKind::Model(
+                    ::omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockModelProvider"
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingObserver {
+        events: Mutex<Vec<omnesagent_runtime::observability::ObserverEvent>>,
+    }
+
+    impl omnesagent_runtime::observability::Observer for CapturingObserver {
+        fn record_event(&self, event: &omnesagent_runtime::observability::ObserverEvent) {
+            self.events.lock().push(event.clone());
+        }
+
+        fn record_metric(&self, _metric: &omnesagent_runtime::observability::traits::ObserverMetric) {
+        }
+
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
+    struct TrackingMemory {
+        keys: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Memory for TrackingMemory {
+        fn name(&self) -> &str {
+            "tracking"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.keys.lock().push(key.to_string());
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            let size = self.keys.lock().len();
+            Ok(size)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.store(key, content, category, session_id).await
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+    impl ::omnesagent_api::attribution::Attributable for TrackingMemory {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Memory(
+                ::omnesagent_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "TrackingMemory"
+        }
+    }
+
+    fn test_connect_info() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_skips_duplicate_provider_calls() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
+
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+        }));
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers.clone(),
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+        }));
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body,
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let payload = second.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "duplicate");
+        assert_eq!(parsed["idempotent"], true);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_dispatches_matching_path_without_provider_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{"revision":"abc123"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(parsed["path"], "/sop/deploy");
+        assert_eq!(parsed["results"][0]["sop"], "webhook-test");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let run_id = parsed["results"][0]["run_id"].as_str().unwrap();
+        let engine = state.sop_engine.as_ref().unwrap().lock().unwrap();
+        let run = engine.get_run(run_id).unwrap();
+        assert_eq!(
+            run.trigger_event.source,
+            omnesagent_runtime::sop::SopTriggerSource::Webhook
+        );
+        assert_eq!(run.trigger_event.topic.as_deref(), Some("/sop/deploy"));
+        assert_eq!(
+            run.trigger_event.payload.as_deref(),
+            Some(r#"{"revision":"abc123"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_route_reaches_the_shared_dispatch_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post("/sop/deploy")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("X-Webhook-Secret", secret)
+            .body(axum::body::Body::from(r#"{"revision":"abc123"}"#))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn post_sop_route_without_credentials(
+        state: AppState,
+        path: &'static str,
+        body: &'static [u8],
+    ) -> (StatusCode, serde_json::Value) {
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&payload).unwrap())
+    }
+
+    #[tokio::test]
+    async fn sop_route_without_credentials_hides_body_and_engine_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (matching, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let unavailable_tmp = tempfile::tempdir().unwrap();
+        let unavailable = admin_paircode_state(&unavailable_tmp, false, false);
+
+        let cases = [
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/deploy",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/missing",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(matching, "/sop/deploy", b"not-json").await,
+            post_sop_route_without_credentials(unavailable, "/sop/deploy", br#"{}"#).await,
+        ];
+
+        let expected_error = cases[0].1["error"].clone();
+        for (status, payload) in cases {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                payload["error"], expected_error,
+                "credential failure must not reveal JSON validity, trigger matches, or engine availability"
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_rejects_unmatched_and_invalid_requests_without_chat_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+
+        let unmatched = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("missing".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+        let invalid = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(b"not-json"),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_requires_shared_engine_and_webhook_auth() {
+        let disabled_tmp = tempfile::tempdir().unwrap();
+        let disabled = admin_paircode_state(&disabled_tmp, false, false);
+        let (disabled, secret) = with_webhook_secret(disabled);
+        let unavailable = api_sop_webhook::handle_sop_webhook(
+            State(disabled),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let protected_tmp = tempfile::tempdir().unwrap();
+        let (protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
+        let secret = generate_test_secret();
+        protected.config.write().gateway.webhook_secret = Some(secret);
+        let unauthorized = api_sop_webhook::handle_sop_webhook(
+            State(protected),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_dispatches_sop_first_then_falls_back_to_chat_on_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+        let (state, secret) = with_webhook_secret(state);
+        let sop_response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            webhook_secret_header(&secret),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(sop_response.status(), StatusCode::OK);
+        let payload = sop_response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let no_match_tmp = tempfile::tempdir().unwrap();
+        let (no_match_state, fallback_provider) = webhook_sop_state(&no_match_tmp, "/sop/only");
+        let fallback_response = handle_webhook(
+            State(no_match_state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "chat instead".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(fallback_response.status(), StatusCode::OK);
+        assert_eq!(fallback_provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_and_chat_webhook_idempotency_namespaces_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("same-key"));
+
+        let sop_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(sop_response.status(), StatusCode::OK);
+
+        let chat_response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "chat".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_idempotency_namespaced_per_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_two_sop_state(&tmp, "/sop/deploy", "/sop/rollback");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("same-key"));
+
+        // Same key, two different SOP paths: both execute.
+        let deploy_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(deploy_response.status(), StatusCode::OK);
+        let deploy_payload = deploy_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let deploy_parsed: serde_json::Value = serde_json::from_slice(&deploy_payload).unwrap();
+        assert_eq!(deploy_parsed["status"], "accepted");
+
+        let rollback_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("rollback".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(rollback_response.status(), StatusCode::OK);
+        let rollback_payload = rollback_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let rollback_parsed: serde_json::Value = serde_json::from_slice(&rollback_payload).unwrap();
+        assert_eq!(rollback_parsed["status"], "accepted");
+
+        // Same key, same path again: the second call is suppressed as a duplicate.
+        let repeat_response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(repeat_response.status(), StatusCode::OK);
+        let repeat_payload = repeat_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let repeat_parsed: serde_json::Value = serde_json::from_slice(&repeat_payload).unwrap();
+        assert_eq!(repeat_parsed["status"], "duplicate");
+        assert_eq!(repeat_parsed["idempotent"], true);
+        assert!(
+            repeat_parsed["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no new dispatch was started"),
+            "duplicate response must describe reservation, not claim successful processing"
+        );
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Count SOP runs the engine has ever started (active + finished), so a
+    /// race test can prove *no run was started*, not merely that the HTTP
+    /// status was 401.
+    fn started_run_count(state: &AppState) -> usize {
+        let engine = state.sop_engine.as_ref().expect("engine").lock().unwrap();
+        engine.active_runs().len() + engine.run_summaries(None).len()
+    }
+
+    /// B1 insertion race: pairing disabled and no secret configured, so a
+    /// headerless request is authorized against an "unconfigured" snapshot.
+    /// An operator then writes `gateway.webhook_secret` into the live config
+    /// *after* authorization but before dispatch. The old two-read design would
+    /// see a configured control on the second read and admit a request that
+    /// presented nothing; the request-scoped verdict must reject it.
+    #[tokio::test]
+    async fn sop_dispatch_uses_authorization_snapshot_when_secret_added_midrequest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        // Read #1: no control configured at all.
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .expect("no configured control -> authorization itself passes");
+
+        // Concurrent operator action lands between authorization and dispatch.
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+
+        // The dispatch decision must come from the snapshot, not the new config.
+        let rejection = require_sop_dispatch_credentials(verdict)
+            .expect_err("a request that presented no credential must not dispatch a SOP");
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+
+        // And end-to-end through the route: the headerless caller now fails the
+        // (newly configured) secret check outright and still starts no run.
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            started_run_count(&state),
+            0,
+            "no SOP run may start for a request that presented no credential"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// B1 rotation race: secret A is configured and the caller presents A, so
+    /// read #1 verifies genuinely. The live config then rotates to secret B
+    /// before dispatch. The in-flight request is judged on its own snapshot
+    /// (accepted), while rotation takes effect at *next*-request granularity:
+    /// a subsequent A request is rejected and a B request is accepted.
+    #[tokio::test]
+    async fn sop_dispatch_uses_authorization_snapshot_during_secret_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let secret_a = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret_a.clone());
+
+        let verdict = authorize_webhook_request(
+            &state,
+            test_connect_info().0,
+            &webhook_secret_header(&secret_a),
+        )
+        .expect("the presented secret matches the live policy at read #1");
+
+        // Rotation lands between authorization and dispatch.
+        let secret_b = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret_b.clone());
+
+        assert!(
+            require_sop_dispatch_credentials(verdict).is_ok(),
+            "a request that genuinely verified its snapshot's secret keeps that verdict"
+        );
+
+        // Next-request granularity: the retired secret is now rejected...
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&secret_a),
+            )
+            .is_err(),
+            "a subsequent request bearing the retired secret must be rejected"
+        );
+        // ...and the replacement is accepted and may dispatch.
+        let rotated = authorize_webhook_request(
+            &state,
+            test_connect_info().0,
+            &webhook_secret_header(&secret_b),
+        )
+        .expect("the rotated secret authorizes the next request");
+        assert!(require_sop_dispatch_credentials(rotated).is_ok());
+    }
+
+    /// B1 on `/webhook`, where body parsing and trigger matching sit between
+    /// authorization and the dispatch credential check — the widest window.
+    /// A headerless request must not become dispatchable because a secret was
+    /// inserted while the body was being parsed.
+    #[tokio::test]
+    async fn webhook_path_snapshot_survives_body_parse_and_trigger_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .expect("no configured control -> authorization itself passes");
+
+        // Simulate the parse/match window: config mutates before dispatch.
+        assert!(
+            api_sop_webhook::has_matching_webhook_sop(&state, "/webhook").unwrap(),
+            "fixture must load a matching /webhook trigger"
+        );
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+
+        assert!(
+            require_sop_dispatch_credentials(verdict).is_err(),
+            "the /webhook SOP branch must judge the snapshot, not the mutated config"
+        );
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            started_run_count(&state),
+            0,
+            "no SOP run may start on the /webhook path either"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "and it must not silently fall back to the chat/model path"
+        );
+    }
+
+    /// B1 purity: the dispatch gate decides only from the request-scoped
+    /// verdict. Two verdict values with identical contents must produce
+    /// identical decisions regardless of what the live config says, which is
+    /// only possible because the function never touches `AppState`.
+    #[tokio::test]
+    async fn require_sop_dispatch_credentials_is_pure_over_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        let unconfigured =
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .expect("no control configured");
+        let before = require_sop_dispatch_credentials(unconfigured).is_ok();
+
+        // Flip the live config to the opposite policy in every way we can.
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        let after = require_sop_dispatch_credentials(unconfigured).is_ok();
+
+        assert_eq!(
+            before, after,
+            "the decision must depend only on the verdict, never on live state"
+        );
+        assert!(!before, "an unconfigured snapshot must fail closed");
+    }
+
+    /// B2: the replay-domain encoding must be injective. Every one of these
+    /// pairs collides under the old `format!("{namespace}:{key}")` join, which
+    /// let an authenticated caller suppress a *different* attempt.
+    #[test]
+    fn idempotency_storage_key_encoding_is_injective() {
+        // Adversarial cross-path: `/sop/a` + `b:c` vs `/sop/a:b` + `c`.
+        assert_ne!(
+            idempotency_storage_key(Some("sop:/sop/a"), "b:c"),
+            idempotency_storage_key(Some("sop:/sop/a:b"), "c"),
+            "a caller must not shift bytes across the namespace/key boundary"
+        );
+        // `/webhook` (global domain) vs `/sop/*`: a forged caller key must not
+        // alias a namespaced SOP key.
+        assert_ne!(
+            idempotency_storage_key(None, "sop:/sop/deploy:k"),
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            "/webhook keys must never collide with /sop/* keys"
+        );
+        // Empty-component edge cases stay distinct too.
+        assert_ne!(
+            idempotency_storage_key(Some(""), "x"),
+            idempotency_storage_key(Some("x"), ""),
+        );
+        // The encoding is still deterministic and path-discriminating.
+        assert_eq!(
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+        );
+        assert_ne!(
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            idempotency_storage_key(Some("sop:/sop/rollback"), "k"),
+            "distinct SOP paths must remain distinct",
+        );
+    }
+
+    /// B2 end-to-end: two different SOP paths whose `(path, key)` pairs collide
+    /// under the old join must both dispatch. `/sop/a` with `X-Idempotency-Key:
+    /// b:c` and `/sop/a:b` with key `c` are genuinely different requests.
+    #[tokio::test]
+    async fn sop_idempotency_resists_adversarial_cross_path_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_two_sop_state(&tmp, "/sop/a", "/sop/a:b");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("b:c"));
+        let mut second_headers = webhook_secret_header(&secret);
+        second_headers.insert("X-Idempotency-Key", HeaderValue::from_static("c"));
+
+        let first = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("a".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_parsed: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(first_parsed["status"], "accepted");
+
+        let second = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("a:b".to_string()),
+            second_headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_parsed: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            second_parsed["status"], "accepted",
+            "a colliding-by-concatenation key must not suppress a different SOP path"
+        );
+    }
+
+    /// B2 end-to-end across endpoints: a `/webhook` caller who forges the SOP
+    /// namespace prefix into their own key must not reserve the `/sop/deploy`
+    /// replay slot and suppress the real SOP request.
+    #[tokio::test]
+    async fn webhook_forged_namespace_key_cannot_suppress_sop_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_two_sop_state(&tmp, "/webhook", "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+
+        // `/webhook` caller forges the `/sop/deploy` storage key.
+        let mut forged = webhook_secret_header(&secret);
+        forged.insert(
+            "X-Idempotency-Key",
+            HeaderValue::from_static("sop:/sop/deploy:k"),
+        );
+        let chat = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            forged,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(chat.status(), StatusCode::OK);
+
+        // The genuine `/sop/deploy` request with key `k` must still dispatch.
+        let mut sop_headers = webhook_secret_header(&secret);
+        sop_headers.insert("X-Idempotency-Key", HeaderValue::from_static("k"));
+        let sop = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            sop_headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(sop.status(), StatusCode::OK);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&sop.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            parsed["status"], "accepted",
+            "a forged /webhook key must not reserve a /sop/* replay slot"
+        );
+    }
+
+    /// B2 property test: `idempotency_storage_key` must be injective over the
+    /// whole `(namespace, caller_key)` space, not just the two collisions the
+    /// reviewers happened to name. Exhaustively cross-products adversarial
+    /// components that are rich in the separator character and asserts distinct
+    /// inputs never share an encoding.
+    #[test]
+    fn idempotency_storage_key_is_injective_over_adversarial_inputs() {
+        let namespaces = [
+            None,
+            Some(""),
+            Some(":"),
+            Some("sop:/sop/a"),
+            Some("sop:/sop/a:b"),
+            Some("sop:/sop/a:b:c"),
+            Some("sop:/sop/deploy"),
+            Some("1:x"),
+            Some("global"),
+            Some("ns"),
+        ];
+        let caller_keys = ["", ":", "b:c", "c", "k", "sop:/sop/deploy:k", "1:x", "ns"];
+
+        let mut seen: std::collections::HashMap<String, (Option<&str>, &str)> =
+            std::collections::HashMap::new();
+        for namespace in namespaces {
+            for caller_key in caller_keys {
+                let encoded = idempotency_storage_key(namespace, caller_key);
+                if let Some(previous) = seen.insert(encoded.clone(), (namespace, caller_key)) {
+                    assert_eq!(
+                        previous,
+                        (namespace, caller_key),
+                        "encoding collision: {previous:?} and {:?} both map to {encoded}",
+                        (namespace, caller_key),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            namespaces.len() * caller_keys.len(),
+            "every distinct (namespace, caller_key) pair must have a distinct encoding"
+        );
+    }
+
+    /// B2 counterpart: injectivity must not have broken the *intended*
+    /// duplicate suppression — the same path with the same key is still a replay.
+    #[tokio::test]
+    async fn sop_idempotency_same_path_same_key_still_suppresses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("dup-key"));
+
+        let first = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_parsed: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(first_parsed["status"], "accepted");
+
+        let second = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_parsed: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            second_parsed["status"], "duplicate",
+            "the intended same-path same-key replay suppression must survive the new encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_dispatch_rejected_when_no_credentials_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("require_pairing"), "error was: {error}");
+        assert!(error.contains("X-Webhook-Secret"), "error was: {error}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sop_dispatch_rejected_when_no_credentials_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("require_pairing"), "error was: {error}");
+        assert!(error.contains("X-Webhook-Secret"), "error was: {error}");
+        // Rejected outright — a matching SOP with no configured credential
+        // must never silently fall back to the chat/model path.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_dispatch_succeeds_with_paired_bearer_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        // A plaintext (not pre-hashed) token: `PairingGuard::new` treats a
+        // bare 64-hex-char value as an already-hashed token, so a "zc_"
+        // prefix keeps this one unambiguously plaintext.
+        let token = format!("zc_{}", generate_test_secret());
+        state.pairing = Arc::new(PairingGuard::new(true, std::slice::from_ref(&token)));
+
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            bearer_headers(&token),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sop_first_ignores_bogus_chat_agent_query_param() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+        let (state, secret) = with_webhook_secret(state);
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("missing".into()),
+            }),
+            webhook_secret_header(&secret),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        // A matching SOP dispatches even though `?agent=missing` has no
+        // `[agents.missing]` entry — the chat-only param is never inspected.
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(parsed["source"], "webhook");
+        // The model provider is never touched.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_unknown_agent_rejected_before_dispatch() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        // An idempotency key on a rejected request must NOT be consumed.
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("ghost-key"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("ghost".into()),
+            }),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unknown agent `ghost`")
+        );
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+        // Key still fresh — a corrected retry with the same key proceeds.
+        assert!(state.idempotency_store.record_if_new("ghost-key"));
+    }
+
+    #[tokio::test]
+    async fn webhook_explicit_agent_reports_model_without_owning_lifecycle() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let observer_impl = Arc::new(CapturingObserver::default());
+        let observer: Arc<dyn omnesagent_runtime::observability::Observer> = observer_impl.clone();
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "default".into(),
+            omnesagent_config::schema::AnthropicModelProviderConfig {
+                base: omnesagent_config::schema::ModelProviderConfig {
+                    model: Some("agent-model".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let expected_provider = "anthropic.default".to_string();
+        config.agents.insert(
+            "nova".to_string(),
+            omnesagent_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: expected_provider.clone().into(),
+                ..Default::default()
+            },
+        );
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "startup-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer,
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("nova".into()),
+            }),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["model"], "agent-model");
+        let events = observer_impl.events.lock();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                omnesagent_runtime::observability::ObserverEvent::AgentStart { .. }
+                    | omnesagent_runtime::observability::ObserverEvent::AgentEnd { .. }
+                    | omnesagent_runtime::observability::ObserverEvent::LlmRequest { .. }
+                    | omnesagent_runtime::observability::ObserverEvent::LlmResponse { .. }
+            )),
+            "the HTTP handler must not create a second agent lifecycle; events were: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_autosave_stores_distinct_keys_per_request() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+
+        let tracking_impl = Arc::new(TrackingMemory::default());
+        let memory: Arc<dyn Memory> = tracking_impl.clone();
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: true,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let headers = HeaderMap::new();
+
+        let body1 = Ok(Json(WebhookBody {
+            message: "hello one".into(),
+        }));
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers.clone(),
+            body1,
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let body2 = Ok(Json(WebhookBody {
+            message: "hello two".into(),
+        }));
+        let second = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body2,
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let keys = tracking_impl.keys.lock().clone();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert!(keys[0].starts_with("webhook_msg_"));
+        assert!(keys[1].starts_with("webhook_msg_"));
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn webhook_secret_hash_is_deterministic_and_nonempty() {
+        let secret_a = generate_test_secret();
+        let secret_b = generate_test_secret();
+        let one = hash_webhook_secret(&secret_a);
+        let two = hash_webhook_secret(&secret_a);
+        let other = hash_webhook_secret(&secret_b);
+
+        assert_eq!(one, two);
+        assert_ne!(one, other);
+        assert_eq!(one.len(), 64);
+    }
+
+    #[test]
+    fn gateway_webhook_secret_uses_one_live_config_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        {
+            let mut config = state.config.write();
+            config.channels.webhook.insert(
+                "enabled-a".into(),
+                omnesagent_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-a".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "enabled-b".into(),
+                omnesagent_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-b".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "disabled".into(),
+                omnesagent_config::schema::WebhookConfig {
+                    enabled: false,
+                    secret: Some("disabled-channel-secret".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            configured_gateway_webhook_secret_hash(&state),
+            None,
+            "channel listener aliases must never become gateway credentials"
+        );
+        assert!(
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .map(require_sop_dispatch_credentials)
+                .is_ok_and(|dispatch| dispatch.is_err()),
+            "multiple channel aliases without a gateway credential must fail closed"
+        );
+
+        let startup_secret = "synthetic-startup-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(startup_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header("channel-secret-a"),
+            )
+            .is_err(),
+            "an enabled channel alias secret must not authorize the gateway"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_ok()
+        );
+
+        let rotated_secret = "synthetic-rotated-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(rotated_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_err(),
+            "authorization must not retain a startup snapshot after config replacement"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&rotated_secret),
+            )
+            .is_ok(),
+            "the live canonical gateway credential must take effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_secret_hash_rejects_missing_header() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_secret_hash_rejects_invalid_header() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let valid_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(valid_secret.clone());
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Secret",
+            HeaderValue::from_str(&wrong_secret).unwrap(),
+        );
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_secret_hash_accepts_valid_header() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "channel-nextcloud")]
+    fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let payload = format!("{random}{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[cfg(feature = "channel-nextcloud")]
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_not_found_when_not_configured() {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"type":"message"}"#),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-nextcloud")]
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_invalid_signature() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let alias = "nextcloud_talk_test_alias";
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            None,
+            String::new(),
+            alias,
+            peer_resolver,
+        ));
+
+        let secret = "nextcloud-test-secret";
+        let random = "seed-value";
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let _valid_signature = compute_nextcloud_signature_hex(secret, random, body);
+        let invalid_signature = "deadbeef";
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
+            nextcloud_talk_webhook_secret: HashMap::from([(alias.to_string(), Arc::from(secret))]),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(invalid_signature).unwrap(),
+        );
+
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Fail closed. An alias with no resolved bot secret cannot verify
+    /// anything, so the webhook is refused before parsing or dispatch.
+    #[cfg(feature = "channel-nextcloud")]
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_when_no_secret_is_configured() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let alias = "nextcloud_talk_test_alias";
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            None,
+            String::new(),
+            alias,
+            peer_resolver,
+        ));
+
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // handler must return 200 OK before the (potentially
+    // slow) LLM call completes, so Nextcloud Talk doesn't cancel the webhook
+    // request at its ~5s timeout.
+    #[cfg(feature = "channel-nextcloud")]
+    #[derive(Default)]
+    struct SlowProvider {
+        calls: AtomicUsize,
+        started_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[cfg(feature = "channel-nextcloud")]
+    #[async_trait]
+    impl ModelProvider for SlowProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self.started_tx.lock().take() {
+                let _ = tx.send(());
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok("slow ok".into())
+        }
+    }
+    #[cfg(feature = "channel-nextcloud")]
+    impl ::omnesagent_api::attribution::Attributable for SlowProvider {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Provider(
+                ::omnesagent_api::attribution::ProviderKind::Model(
+                    ::omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SlowProvider"
+        }
+    }
+
+    #[cfg(feature = "channel-nextcloud")]
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_returns_before_llm_call_completes() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let provider_impl = Arc::new(SlowProvider {
+            calls: AtomicUsize::new(0),
+            started_tx: Mutex::new(Some(started_tx)),
+        });
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        // Obviously-fake placeholder, never a real credential.
+        let secret = "fake-nextcloud-webhook-secret-not-real";
+        let random = "0123456789abcdef0123456789abcdef";
+
+        // The same secret governs both directions now, so the channel is built
+        // with that resolved secret as its bot token rather than the `None` this
+        // test used to pass.
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            Some(secret.to_string()),
+            String::new(),
+            "default",
+            Arc::new(|| vec!["*".to_string()]),
+        ));
+
+        let body = r#"{"type":"message","object":{"token":"room-token"},"actor":{"id":"user_a","name":"User A"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+        let signature = compute_nextcloud_signature_hex(secret, random, body);
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider: provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            nextcloud_talk: HashMap::from([("default".to_string(), channel)]),
+            // A resolved secret, not an empty map. Inbound verification is now
+            // mandatory and fail-closed, so an unsigned request is rejected with
+            // 401 before the handler ever spawns the LLM task — which would make
+            // this test pass for the wrong reason (no provider call because the
+            // request was refused, not because the ack raced ahead of a slow
+            // provider). Signing the request keeps it on the fast-ack path.
+            nextcloud_talk_webhook_secret: HashMap::from([(
+                "default".to_string(),
+                std::sync::Arc::<str>::from(secret),
+            )]),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Nextcloud-Talk-Random",
+            HeaderValue::from_str(random).unwrap(),
+        );
+        headers.insert(
+            "X-Nextcloud-Talk-Signature",
+            HeaderValue::from_str(&signature).unwrap(),
+        );
+
+        let start = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            Box::pin(handle_nextcloud_talk_webhook(
+                State(state),
+                headers,
+                Bytes::from(body),
+            )),
+        )
+        .await
+        .expect("webhook must return before 2s deadline (regression #6156)")
+        .into_response();
+
+        let elapsed = start.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handler returned after {elapsed:?}; expected fast return for #6156"
+        );
+
+        // Confirm the spawned task actually started the LLM call (i.e., the
+        // ack didn't just skip processing). The 30s sleep is still in flight.
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("spawned LLM call did not start within 2s")
+            .expect("started_tx sender was dropped");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // WhatsApp Signature Verification Tests (CWE-345 Prevention)
+    // ══════════════════════════════════════════════════════════
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn compute_whatsapp_signature_hex(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
+        format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_valid() {
+        let app_secret = generate_test_secret();
+        let body = b"test body content";
+
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
+
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_invalid_wrong_secret() {
+        let app_secret = generate_test_secret();
+        let wrong_secret = generate_test_secret();
+        let body = b"test body content";
+
+        let signature_header = compute_whatsapp_signature_header(&wrong_secret, body);
+
+        assert!(!verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_invalid_wrong_body() {
+        let app_secret = generate_test_secret();
+        let original_body = b"original body";
+        let tampered_body = b"tampered body";
+
+        let signature_header = compute_whatsapp_signature_header(&app_secret, original_body);
+
+        // Verify with tampered body should fail
+        assert!(!verify_whatsapp_signature(
+            &app_secret,
+            tampered_body,
+            &signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_missing_prefix() {
+        let app_secret = generate_test_secret();
+        let body = b"test body";
+
+        // Signature without "sha256=" prefix
+        let signature_header = "abc123def456";
+
+        assert!(!verify_whatsapp_signature(
+            &app_secret,
+            body,
+            signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_empty_header() {
+        let app_secret = generate_test_secret();
+        let body = b"test body";
+
+        assert!(!verify_whatsapp_signature(&app_secret, body, ""));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_invalid_hex() {
+        let app_secret = generate_test_secret();
+        let body = b"test body";
+
+        // Invalid hex characters
+        let signature_header = "sha256=not_valid_hex_zzz";
+
+        assert!(!verify_whatsapp_signature(
+            &app_secret,
+            body,
+            signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_empty_body() {
+        let app_secret = generate_test_secret();
+        let body = b"";
+
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
+
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_unicode_body() {
+        let app_secret = generate_test_secret();
+        let body = "Hello 🦀 World".as_bytes();
+
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
+
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_json_payload() {
+        let app_secret = generate_test_secret();
+        let body = br#"{"entry":[{"changes":[{"value":{"messages":[{"from":"1234567890","text":{"body":"Hello"}}]}}]}]}"#;
+
+        let signature_header = compute_whatsapp_signature_header(&app_secret, body);
+
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_case_sensitive_prefix() {
+        let app_secret = generate_test_secret();
+        let body = b"test body";
+
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
+
+        // Wrong case prefix should fail
+        let wrong_prefix = format!("SHA256={hex_sig}");
+        assert!(!verify_whatsapp_signature(&app_secret, body, &wrong_prefix));
+
+        // Correct prefix should pass
+        let correct_prefix = format!("sha256={hex_sig}");
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &correct_prefix
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_truncated_hex() {
+        let app_secret = generate_test_secret();
+        let body = b"test body";
+
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
+        let truncated = &hex_sig[..32]; // Only half the signature
+        let signature_header = format!("sha256={truncated}");
+
+        assert!(!verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[test]
+    fn whatsapp_signature_extra_bytes() {
+        let app_secret = generate_test_secret();
+        let body = b"test body";
+
+        let hex_sig = compute_whatsapp_signature_hex(&app_secret, body);
+        let extended = format!("{hex_sig}deadbeef");
+        let signature_header = format!("sha256={extended}");
+
+        assert!(!verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &signature_header
+        ));
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // IdempotencyStore Edge-Case Tests
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn idempotency_store_allows_different_keys() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
+        assert!(store.record_if_new("key-a"));
+        assert!(store.record_if_new("key-b"));
+        assert!(store.record_if_new("key-c"));
+        assert!(store.record_if_new("key-d"));
+    }
+
+    #[test]
+    fn idempotency_store_max_keys_clamped_to_one() {
+        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
+        assert!(store.record_if_new("only-key"));
+        assert!(!store.record_if_new("only-key"));
+    }
+
+    #[test]
+    fn idempotency_store_rapid_duplicate_rejected() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
+        assert!(store.record_if_new("rapid"));
+        assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn duplicate_idempotency_log_omits_caller_key() {
+        let _hook_guard = omnesagent_log::__private_test_hook_lock();
+        omnesagent_log::try_install_capture_subscriber();
+        let mut receiver = omnesagent_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let raw_key = "caller-sensitive-id";
+        record_duplicate_idempotency_log();
+
+        let event = loop {
+            match receiver.try_recv() {
+                Ok(value)
+                    if value.get("message").and_then(|message| message.as_str())
+                        == Some("webhook duplicate ignored") =>
+                {
+                    break value;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("duplicate log event was not broadcast: {error}"),
+            }
+        };
+        omnesagent_log::clear_broadcast_hook();
+
+        assert_eq!(
+            event["attributes"]["idempotency_key_present"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(event["attributes"].get("idempotency_key").is_none());
+        assert!(
+            !event.to_string().contains(raw_key),
+            "caller-controlled idempotency key must not enter structured logs"
+        );
+    }
+
+    #[test]
+    fn idempotency_store_accepts_after_ttl_expires() {
+        let store = IdempotencyStore::new(Duration::from_millis(1), 100);
+        assert!(store.record_if_new("ttl-key"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(store.record_if_new("ttl-key"));
+    }
+
+    #[test]
+    fn idempotency_store_eviction_preserves_newest() {
+        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
+        assert!(store.record_if_new("old-key"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(store.record_if_new("new-key"));
+
+        let keys = store.keys.lock();
+        assert_eq!(keys.len(), 1);
+        assert!(!keys.contains_key("old-key"));
+        assert!(keys.contains_key("new-key"));
+    }
+
+    #[test]
+    fn rate_limiter_allows_after_window_expires() {
+        let window = Duration::from_millis(50);
+        let limiter = SlidingWindowRateLimiter::new(2, window, 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // blocked
+
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_independent_keys_tracked_separately() {
+        let limiter = SlidingWindowRateLimiter::new(2, Duration::from_secs(60), 100);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-1"));
+        assert!(!limiter.allow("ip-1")); // ip-1 blocked
+
+        // ip-2 should still work
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-2"));
+        assert!(!limiter.allow("ip-2")); // ip-2 now blocked
+    }
+
+    #[test]
+    fn rate_limiter_exact_boundary_at_max_keys() {
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 3);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+        // At capacity now
+        assert!(limiter.allow("ip-4")); // should evict ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 3);
+        assert!(
+            !guard.0.contains_key("ip-1"),
+            "ip-1 should have been evicted"
+        );
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(guard.0.contains_key("ip-3"));
+        assert!(guard.0.contains_key("ip-4"));
+    }
+
+    #[test]
+    fn gateway_rate_limiter_pair_and_webhook_are_independent() {
+        let limiter = GatewayRateLimiter::new(2, 3, 100);
+
+        // Exhaust pair limit
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(limiter.allow_pair("ip-1"));
+        assert!(!limiter.allow_pair("ip-1")); // pair blocked
+
+        // Webhook should still work
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(limiter.allow_webhook("ip-1"));
+        assert!(!limiter.allow_webhook("ip-1")); // webhook now blocked
+    }
+
+    #[test]
+    fn rate_limiter_single_key_max_allows_one_request() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 1);
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2")); // evicts ip-1
+
+        let guard = limiter.requests.lock();
+        assert_eq!(guard.0.len(), 1);
+        assert!(guard.0.contains_key("ip-2"));
+        assert!(!guard.0.contains_key("ip-1"));
+    }
+
+    #[test]
+    fn rate_limiter_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let limiter = Arc::new(SlidingWindowRateLimiter::new(
+            1000,
+            Duration::from_secs(60),
+            1000,
+        ));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let limiter = limiter.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    limiter.allow(&format!("thread-{i}-req-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Should not panic or deadlock
+        let guard = limiter.requests.lock();
+        assert!(guard.0.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn idempotency_store_concurrent_access_safe() {
+        use std::sync::Arc;
+
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..100 {
+                    store.record_if_new(&format!("thread-{i}-key-{j}"));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let keys = store.keys.lock();
+        assert!(keys.len() <= 1000, "should respect max_keys");
+    }
+
+    #[test]
+    fn rate_limiter_rapid_burst_then_cooldown() {
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_millis(50), 100);
+
+        // Burst: use all 5 requests
+        for _ in 0..5 {
+            assert!(limiter.allow("burst-ip"));
+        }
+        assert!(!limiter.allow("burst-ip")); // 6th should fail
+
+        // Cooldown
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Should be allowed again
+        assert!(limiter.allow("burst-ip"));
+    }
+
+    #[test]
+    fn require_localhost_accepts_ipv4_loopback() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        assert!(require_localhost(&peer).is_ok());
+    }
+
+    #[test]
+    fn require_localhost_accepts_ipv6_loopback() {
+        let peer = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 12345));
+        assert!(require_localhost(&peer).is_ok());
+    }
+
+    #[test]
+    fn require_localhost_rejects_non_loopback_ipv4() {
+        let peer = SocketAddr::from(([192, 168, 1, 100], 12345));
+        let err = require_localhost(&peer).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn require_localhost_rejects_non_loopback_ipv6() {
+        let peer = SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            12345,
+        ));
+        let err = require_localhost(&peer).unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_reload_gate_loopback_always_allowed() {
+        // Loopback is allowed regardless of the opt-in or pairing flags.
+        assert_eq!(
+            admin_reload_gate(true, false, false),
+            AdminReloadGate::Allow
+        );
+        assert_eq!(admin_reload_gate(true, true, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, false, true), AdminReloadGate::Allow);
+        assert_eq!(admin_reload_gate(true, true, false), AdminReloadGate::Allow);
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_blocked_by_default() {
+        // Non-loopback caller with the flag off is rejected outright,
+        // regardless of pairing.
+        assert_eq!(
+            admin_reload_gate(false, false, true),
+            AdminReloadGate::Forbidden
+        );
+        assert_eq!(
+            admin_reload_gate(false, false, false),
+            AdminReloadGate::Forbidden
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_requires_auth() {
+        // Non-loopback caller with the flag on and pairing on must authenticate.
+        assert_eq!(
+            admin_reload_gate(false, true, true),
+            AdminReloadGate::RequireAuth
+        );
+    }
+
+    #[test]
+    fn admin_reload_gate_remote_opt_in_without_pairing_is_rejected() {
+        // Opting in with pairing off cannot authenticate the caller, so the
+        // request is rejected rather than allowed anonymously.
+        assert_eq!(
+            admin_reload_gate(false, true, false),
+            AdminReloadGate::ForbiddenNoPairing
+        );
+    }
+
+    #[test]
+    fn allow_remote_admin_defaults_off() {
+        // Security default: remote admin reload is disabled until opted in.
+        assert!(!omnesagent_config::schema::GatewayConfig::default().allow_remote_admin);
+    }
+
+    /// Build an `AppState` for `handle_admin_reload`: controls
+    /// `gateway.allow_remote_admin`, pairing (and its tokens), and wires a
+    /// live reload channel so the allowed path reaches `200` rather than the
+    /// `503` standalone-gateway branch.
+    fn admin_reload_state(
+        tmp: &tempfile::TempDir,
+        allow_remote_admin: bool,
+        require_pairing: bool,
+        tokens: &[String],
+    ) -> AppState {
+        let mut state = admin_paircode_state(tmp, require_pairing, false);
+        state.config.write().gateway.allow_remote_admin = allow_remote_admin;
+        state.pairing = Arc::new(PairingGuard::new(require_pairing, tokens));
+        state.reload_tx = Some(tokio::sync::watch::channel(false).0);
+        state
+    }
+
+    fn loopback_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 40000))
+    }
+
+    fn remote_peer() -> SocketAddr {
+        // RFC 5737 TEST-NET-3 documentation address — a stable non-loopback
+        // peer that is never a real host on anyone's network.
+        SocketAddr::from(([203, 0, 113, 50], 40000))
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn admin_reload_loopback_no_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let resp =
+            handle_admin_reload(State(state), ConnectInfo(loopback_peer()), HeaderMap::new())
+                .await
+                .unwrap()
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_default_off_is_forbidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_without_pairing_does_not_reload() {
+        // The fixed hole: allow_remote_admin = true + require_pairing = false
+        // must NOT permit an anonymous remote reload.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, false, &[]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_missing_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(State(state), ConnectInfo(remote_peer()), HeaderMap::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_invalid_token_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let err = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("not-the-token"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_remote_opt_in_valid_token_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, true, true, &["zc_test_token".to_string()]);
+        let resp = handle_admin_reload(
+            State(state),
+            ConnectInfo(remote_peer()),
+            bearer_headers("zc_test_token"),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn needs_quickstart_for_flags_empty_model() {
+        let err =
+            needs_quickstart_for("").expect("empty model must produce a needs_quickstart error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("needs_quickstart"),
+            "error must carry the needs_quickstart marker for callers to map to 503; got: {msg}"
+        );
+        assert!(
+            msg.contains("/quickstart"),
+            "error must point the user at /quickstart; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn needs_quickstart_for_flags_whitespace_only_model() {
+        assert!(
+            needs_quickstart_for("   ").is_some(),
+            "whitespace-only model must be treated as empty"
+        );
+        assert!(
+            needs_quickstart_for("\n\t ").is_some(),
+            "tabs and newlines count as empty too"
+        );
+    }
+
+    #[test]
+    fn needs_quickstart_for_passes_real_model() {
+        assert!(
+            needs_quickstart_for("anthropic/claude-sonnet-4").is_none(),
+            "a real model id must not be flagged"
+        );
+        assert!(
+            needs_quickstart_for("  gpt-4  ").is_none(),
+            "leading/trailing whitespace around a real model id must not be flagged"
+        );
+    }
+
+    #[test]
+    fn is_needs_quickstart_err_detects_marker_from_helper() {
+        let err = needs_quickstart_for("").expect("empty model produces marker");
+        assert!(
+            is_needs_quickstart_err(&err),
+            "the marker emitted by needs_quickstart_for must be detected"
+        );
+    }
+
+    #[test]
+    fn is_needs_quickstart_err_ignores_unrelated_errors() {
+        let err = anyhow::Error::msg("upstream timeout: provider returned 504");
+        assert!(
+            !is_needs_quickstart_err(&err),
+            "unrelated errors must not be misclassified as needs_quickstart"
+        );
+        let err = anyhow::Error::msg("invalid api key");
+        assert!(!is_needs_quickstart_err(&err));
+    }
+
+    #[test]
+    fn is_needs_quickstart_err_detects_via_substring() {
+        // Defends the contract that the substring marker is the
+        // detection key — not the exact string. Wrappers (e.g.
+        // anyhow::Error::context) must not break the check.
+        let err =
+            anyhow::Error::msg("provider call failed").context("needs_quickstart: empty model");
+        assert!(is_needs_quickstart_err(&err));
+    }
+
+    #[test]
+    fn needs_quickstart_channel_reply_resolves_via_fluent() {
+        let reply = needs_quickstart_channel_reply();
+        assert!(
+            !reply.starts_with('{') && !reply.ends_with('}'),
+            "fluent missing-key fallback leaked into channel reply: {reply:?}"
+        );
+        assert!(
+            reply.to_lowercase().contains("quickstart"),
+            "channel reply must mention Quickstart so users know what's missing: {reply:?}"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Linq Multi-Tenant Webhook Routing Tests
+    // ══════════════════════════════════════════════════════════
+
+    /// Helper: compute a valid Linq HMAC-SHA256 signature for the given
+    /// secret, timestamp, and body.  Mirrors the verification logic in
+    /// `omnesagent_channels::linq::verify_linq_signature`.
+    #[cfg(feature = "channel-linq")]
+    fn compute_linq_signature_hex(secret: &str, timestamp: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let message = format!("{timestamp}.{body}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(message.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Helper: build a minimal Linq webhook payload that `parse_webhook_payload`
+    /// recognises as a `message.received` event with one text part.
+    #[cfg(feature = "channel-linq")]
+    fn linq_webhook_body(sender: &str, text: &str) -> String {
+        serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat_id": "chat-789",
+                "from": sender,
+                "is_from_me": false,
+                "message": {
+                    "parts": [{ "type": "text", "value": text }]
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// Helper: build an `AppState` with one Linq channel registered under the
+    /// given alias, with an allow-any peer resolver and an optional signing
+    /// secret.
+    #[cfg(feature = "channel-linq")]
+    fn linq_test_state(alias: &str, signing_secret: Option<&str>) -> AppState {
+        linq_test_state_with_config(alias, signing_secret, Config::default())
+    }
+
+    #[cfg(feature = "channel-linq")]
+    fn linq_test_state_with_config(
+        alias: &str,
+        signing_secret: Option<&str>,
+        config: Config,
+    ) -> AppState {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let channel = Arc::new(LinqChannel::new(
+            "test-token".into(),
+            "+15550000000".into(),
+            alias,
+            peer_resolver,
+        ));
+        let mut linq = HashMap::new();
+        linq.insert(alias.to_string(), channel);
+
+        let mut linq_signing_secrets: HashMap<String, Arc<str>> = HashMap::new();
+        if let Some(secret) = signing_secret {
+            linq_signing_secrets.insert(alias.to_string(), Arc::from(secret));
+        }
+
+        AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq,
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets,
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_returns_not_found_for_unknown_alias() {
+        // No Linq channels configured at all.
+        let state = linq_test_state("production", None);
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("staging".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"event_type":"message.received"}"#),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_returns_not_found_when_no_channels_configured() {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(br#"{"event_type":"message.received"}"#),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_accepts_valid_message_for_known_alias() {
+        // This test proves alias routing, not signature handling, but inbound
+        // verification is mandatory, so it has to carry a real secret and a
+        // valid signature to reach the routing it is asserting on.
+        let secret = generate_test_secret();
+        let state = linq_test_state("default", Some(&secret));
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_rejects_when_no_signing_secret_is_configured() {
+        // Fail closed. An alias with no resolved signing secret cannot verify
+        // anything, so the webhook is refused rather than processed
+        // unverified.
+        let state = linq_test_state("default", None);
+        let body = linq_webhook_body("+15551234567", "hello from test");
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            HeaderMap::new(),
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_rejects_invalid_signature_for_alias() {
+        let secret = generate_test_secret();
+        let state = linq_test_state("secure-alias", Some(&secret));
+
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_static("sha256=deadbeef"),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_static("9999999999"),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("secure-alias".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_accepts_valid_signature_for_alias() {
+        let secret = generate_test_secret();
+        let state = linq_test_state("secure-alias", Some(&secret));
+
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("secure-alias".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Authenticated webhook ingress: shared dispatch lifecycle ────────
+
+    /// Memory double that records every autosave call so lifecycle tests
+    /// can assert on keys and session ids.
+    #[cfg(feature = "channel-linq")]
+    #[derive(Default)]
+    struct CapturingMemory {
+        stores: Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[async_trait]
+    impl Memory for CapturingMemory {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            _category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.stores.lock().push((
+                key.to_string(),
+                content.to_string(),
+                session_id.map(ToString::to_string),
+            ));
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.store(key, content, category, session_id).await
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    impl ::omnesagent_api::attribution::Attributable for CapturingMemory {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Memory(
+                ::omnesagent_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapturingMemory"
+        }
+    }
+
+    /// Channel double that records every outbound send so lifecycle tests
+    /// can assert on reply delivery without network I/O.
+    #[cfg(feature = "channel-linq")]
+    #[derive(Default)]
+    struct CapturingChannel {
+        sends: Mutex<Vec<(String, String)>>,
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[async_trait]
+    impl Channel for CapturingChannel {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        async fn send(&self, message: &omnesagent_api::channel::SendMessage) -> anyhow::Result<()> {
+            self.sends
+                .lock()
+                .push((message.content.clone(), message.recipient.clone()));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<omnesagent_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    impl ::omnesagent_api::attribution::Attributable for CapturingChannel {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Channel(
+                ::omnesagent_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapturingChannel"
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    fn test_channel_message(sender: &str, content: &str) -> omnesagent_api::channel::ChannelMessage {
+        omnesagent_api::channel::ChannelMessage {
+            id: "msg-1".into(),
+            sender: sender.into(),
+            reply_target: sender.into(),
+            content: content.into(),
+            channel: "linq".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+            subject: None,
+            internal_sop_event: None,
+            passive_context: false,
+            explicitly_addressed: false,
+            conversation_scope: Default::default(),
+            references: Vec::new(),
+        }
+    }
+
+    /// A verified request still flows through the full shared lifecycle:
+    /// autosave with the channel session key, agent dispatch, and reply
+    /// delivery through the channel implementation.
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn verified_webhook_dispatch_runs_the_full_lifecycle() {
+        let mut state = linq_test_state("default", Some("secret"));
+        let memory_impl = Arc::new(CapturingMemory::default());
+        let mem: Arc<dyn Memory> = memory_impl.clone();
+        state.mem = mem;
+        state.auto_save = true;
+
+        let verified = match webhook_ingress::authenticate(
+            &webhook_ingress::LINQ_WEBHOOK,
+            "default",
+            Some("secret"),
+            &HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+            |_, _, _| true,
+        ) {
+            Ok(verified) => verified,
+            Err(refusal) => panic!("stub verification must succeed, got {refusal:?}"),
+        };
+        let verified = verified
+            .parse_messages(|body| {
+                assert_eq!(body, b"{}", "the parser receives the verified request body");
+                Ok::<_, ()>(vec![test_channel_message(
+                    "+15551234567",
+                    "hello lifecycle",
+                )])
+            })
+            .expect("verified request should parse");
+
+        let channel_impl = Arc::new(CapturingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let (status, _body) = webhook_ingress::dispatch_verified_webhook(
+            &state,
+            verified,
+            webhook_ingress::WebhookDispatchContext {
+                channel,
+                memory_key: linq_memory_key,
+                agent_override: None,
+                mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+                suppress_reply_send: false,
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let stores = memory_impl.stores.lock().clone();
+        assert_eq!(stores.len(), 1, "one autosave per inbound message");
+        assert_eq!(stores[0].0, "linq_+15551234567_msg-1");
+        assert_eq!(stores[0].1, "hello lifecycle");
+        assert_eq!(stores[0].2.as_deref(), Some("linq_default__15551234567"));
+
+        let sends = channel_impl.sends.lock().clone();
+        assert_eq!(sends.len(), 1, "one reply per inbound message");
+        assert_eq!(sends[0].0, "ok", "the model reply is what gets delivered");
+        assert_eq!(sends[0].1, "+15551234567");
+    }
+
+    /// When the gateway has no model configured, a verified request still
+    /// gets the quickstart fallback reply through the channel instead of
+    /// silence.
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn verified_webhook_dispatch_sends_quickstart_fallback_when_unconfigured() {
+        let mut state = linq_test_state("default", Some("secret"));
+        state.model = String::new();
+
+        let verified = match webhook_ingress::authenticate(
+            &webhook_ingress::LINQ_WEBHOOK,
+            "default",
+            Some("secret"),
+            &HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+            |_, _, _| true,
+        ) {
+            Ok(verified) => verified,
+            Err(refusal) => panic!("stub verification must succeed, got {refusal:?}"),
+        };
+        let verified = verified
+            .parse_messages(|body| {
+                assert_eq!(body, b"{}", "the parser receives the verified request body");
+                Ok::<_, ()>(vec![test_channel_message("+15551234567", "anyone home?")])
+            })
+            .expect("verified request should parse");
+
+        let channel_impl = Arc::new(CapturingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let (status, _body) = webhook_ingress::dispatch_verified_webhook(
+            &state,
+            verified,
+            webhook_ingress::WebhookDispatchContext {
+                channel,
+                memory_key: linq_memory_key,
+                agent_override: None,
+                mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+                suppress_reply_send: false,
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let sends = channel_impl.sends.lock().clone();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            sends[0].0,
+            needs_quickstart_channel_reply(),
+            "unconfigured gateway sends the quickstart reply, not silence"
+        );
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_dispatches_to_configured_channel_agent() {
+        use omnesagent_config::providers::ChannelRef;
+        use omnesagent_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "hello from linq work alias";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == message)
+            .expect("Linq webhook should dispatch the inbound message");
+        assert_eq!(capture.agent_override.as_deref(), Some("beta"));
+        let session_id = capture
+            .session_id
+            .as_deref()
+            .expect("Linq dispatch should pass a session id");
+        assert_eq!(session_id, "linq_work__15551234567");
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_without_enabled_owner_does_not_use_default_agent() {
+        use omnesagent_config::providers::ChannelRef;
+        use omnesagent_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "do not route me to alpha";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captures = gateway_chat_dispatch_captures_for_test();
+        assert!(
+            captures.iter().all(|capture| capture.message != message),
+            "unowned Linq alias must not dispatch through the default agent: {captures:?}"
+        );
+    }
+
+    // ── Per-alias webhook routing───────────────────────────────────
+
+    /// Baseline `AppState` with no channels configured, for the per-alias
+    /// routing tests. Tests insert the WhatsApp instances they exercise.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn webhook_baseline_state() -> AppState {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let mem: Arc<dyn Memory> = Arc::new(MockMemory);
+        AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                omnesagent_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(omnesagent_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_instance(alias: &str, verify_token: &str) -> Arc<WhatsAppChannel> {
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            verify_token.into(),
+            alias.to_string(),
+            peer_resolver,
+        ))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_signature(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn verify_query(token: &str, challenge: &str) -> WhatsAppVerifyQuery {
+        WhatsAppVerifyQuery {
+            mode: Some("subscribe".to_string()),
+            verify_token: Some(token.to_string()),
+            challenge: Some(challenge.to_string()),
+        }
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_alias_routes_to_the_matching_instance() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([
+            ("work".to_string(), whatsapp_instance("work", "tok-work")),
+            (
+                "personal".to_string(),
+                whatsapp_instance("personal", "tok-personal"),
+            ),
+        ]);
+
+        let resp = handle_whatsapp_verify_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            Query(verify_query("tok-work", "challenge-work")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Explicit alias path carries no deprecation header.
+        assert!(
+            resp.headers()
+                .get(api_webhook::DEPRECATION_HEADER)
+                .is_none()
+        );
+
+        // The other instance's token must NOT verify against `work`.
+        let resp = handle_whatsapp_verify_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            Query(verify_query("tok-personal", "challenge")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = handle_whatsapp_verify_alias(
+            State(state),
+            Path("personal".to_string()),
+            Query(verify_query("tok-personal", "challenge-personal")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_unknown_alias_is_404_not_500() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+
+        let resp = handle_whatsapp_verify_alias(
+            State(state),
+            Path("nope".to_string()),
+            Query(verify_query("tok", "challenge")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_bare_path_is_back_compat_and_flags_deprecation() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp =
+            HashMap::from([("default".to_string(), whatsapp_instance("default", "tok"))]);
+
+        let resp = handle_whatsapp_verify(
+            State(state),
+            Query(verify_query("tok", "challenge-default")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(api_webhook::DEPRECATION_HEADER)
+                .is_some()
+        );
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn webhook_alias_path_preserves_signature_auth() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+        state.whatsapp_app_secret =
+            HashMap::from([("work".to_string(), Arc::<str>::from("app-secret"))]);
+
+        // Unknown alias → 404 before any processing.
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("nope".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Configured alias, missing/invalid signature → 401.
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Configured alias, valid signature over an empty payload → 200 ack.
+        let body = br#"{"object":"whatsapp_business_account","entry":[]}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature("app-secret", body)).unwrap(),
+        );
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Fail closed. A configured alias with no app secret cannot verify
+    /// `X-Hub-Signature-256`, so the webhook is refused rather than
+    /// dispatched to the agent unverified.
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_rejects_when_no_app_secret_is_configured() {
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+        state.whatsapp_app_secret = HashMap::new();
+
+        let body = br#"{"object":"whatsapp_business_account","entry":[]}"#;
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Build an `AppState` whose device registry points at a non-existent
+    /// path so every SQLite write fails. Mirrors `unwriteable_registry_state`
+    /// in `api_pairing::tests` so the regression set stays side-by-side.
+    fn unwriteable_registry_pair_state(tmp: &tempfile::TempDir) -> AppState {
+        let mut state = admin_paircode_state(tmp, true, false);
+        // No registry from `admin_paircode_state`; inject the broken one.
+        state.device_registry = Some(Arc::new(api_pairing::DeviceRegistry::with_db_path(
+            std::path::PathBuf::from("/this/path/does/not/exist/devices.db"),
+        )));
+        state
+    }
+
+    async fn legacy_pair_response_json(
+        result: impl IntoResponse,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = result.into_response();
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("legacy /pair response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn legacy_pair_rolls_back_in_process_token_when_registry_register_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = unwriteable_registry_pair_state(&tmp);
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pairing-Code", HeaderValue::from_str(&code).unwrap());
+
+        let (status, body) = legacy_pair_response_json(
+            handle_pair(State(state.clone()), test_connect_info(), headers).await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy /pair registry.register failure must surface as 500"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "legacy /pair 5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed /pair \
+             registry.register (compensating `revoke_token_hash`); instead have {:?}",
+            state.pairing.tokens()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_pair_rolls_back_in_process_token_when_persist_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let blocker = tmp.path().join("legacy-pair-blocker");
+        std::fs::write(&blocker, b"").expect("seed blocker file");
+        state.config.write().config_path = blocker.join("config.toml");
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("pairing code must be issuable when require_pairing=true");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Pairing-Code", HeaderValue::from_str(&code).unwrap());
+
+        let (status, body) = legacy_pair_response_json(
+            handle_pair(State(state.clone()), test_connect_info(), headers).await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "legacy /pair persistence failure MUST surface as 500 (legacy leaked 200 + token)"
+        );
+        assert_eq!(body["paired"], serde_json::Value::Bool(false));
+        assert!(
+            body.get("token").is_none(),
+            "legacy /pair 5xx body MUST NOT contain the plaintext bearer token; got: {body}"
+        );
+        assert!(
+            state.pairing.tokens().is_empty(),
+            "PairingGuard::paired_tokens must be empty after a failed /pair \
+             persist; have {:?}",
+            state.pairing.tokens()
+        );
+    }
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::is_recoverable_accept_error;
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_accept_errors_are_recoverable() {
+        // EMFILE/ENFILE must not terminate the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn transient_kinds_recover_but_fatal_propagates() {
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        // A non-transient error is not swallowed (loop will propagate it).
+        assert!(!is_recoverable_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
+    }
+}

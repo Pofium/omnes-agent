@@ -1,0 +1,198 @@
+pub mod platform;
+pub mod registry;
+
+use anyhow::Result;
+use omnesagent_config::schema::Config;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum IntegrationStatus {
+    /// Fully implemented and ready to use
+    Available,
+    /// Configured and active
+    Active,
+}
+
+/// Integration category
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum IntegrationCategory {
+    Chat,
+    AiModel,
+    ToolsAutomation,
+    Platform,
+}
+
+impl IntegrationCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat Providers",
+            Self::AiModel => "AI Models",
+            Self::ToolsAutomation => "Tools & Automation",
+            Self::Platform => "Platforms",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Chat,
+            Self::AiModel,
+            Self::ToolsAutomation,
+            Self::Platform,
+        ]
+    }
+}
+
+pub struct IntegrationEntry {
+    pub name: String,
+    pub description: String,
+    pub category: IntegrationCategory,
+    pub status: IntegrationStatus,
+}
+
+/// Handle the `integrations` CLI command
+pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
+    let entries = registry::all_integrations(config);
+    let name_lower = name.to_lowercase();
+
+    let Some(entry) = entries.iter().find(|e| e.name.to_lowercase() == name_lower) else {
+        anyhow::bail!(
+            "Unknown integration: {name}. Check README for supported integrations or run `omnesagent quickstart` to configure a model provider, then `omnesagent config set channels.<name>.<field>=<value>` for channels."
+        );
+    };
+
+    let (icon, label) = match entry.status {
+        IntegrationStatus::Active => ("✅", "Active"),
+        IntegrationStatus::Available => ("⚪", "Available"),
+    };
+
+    println!();
+    println!(
+        "  {} {} — {}",
+        icon,
+        console::style(&entry.name).white().bold(),
+        entry.description
+    );
+    println!("  Category: {}", entry.category.label());
+    println!("  Status:   {label}");
+    println!();
+
+    // Setup hints. Channel-specific steps that are not yet covered by a
+    // standalone book walkthrough stay here so `omnesagent integration info
+    // <name>` keeps producing actionable output. The Chat-category catch-all
+    // points operators at the per-channel config keys.
+    match entry.name.as_str() {
+        "Telegram" => {
+            println!("  Setup:");
+            println!("    1. Message @BotFather on Telegram");
+            println!("    2. Create a bot and copy the token");
+            println!("    3. Run: omnesagent config set channels.telegram.default.bot_token <token>");
+            println!("    4. Start: omnesagent channel start");
+        }
+        "Discord" => {
+            println!("  Setup:");
+            println!("    1. Go to https://discord.com/developers/applications");
+            println!("    2. Create app → Bot → Copy token");
+            println!("    3. Enable MESSAGE CONTENT intent");
+            println!("    4. Run: omnesagent config set channels.discord.default.bot-token <token>");
+        }
+        "Slack" => {
+            println!("  Setup:");
+            println!("    1. Go to https://api.slack.com/apps");
+            println!("    2. Create app → Bot Token Scopes → Install");
+            println!("    3. Run: omnesagent config set channels.slack.default.bot-token <token>");
+        }
+        "iMessage" => {
+            println!("  Setup (macOS only):");
+            println!("    Uses AppleScript bridge to send/receive iMessages.");
+            println!("    Requires Full Disk Access in System Settings → Privacy.");
+        }
+        "OpenRouter" => {
+            println!("  Setup:");
+            println!("    1. Get API key at https://openrouter.ai/keys");
+            println!("    2. Run: omnesagent quickstart --model-provider openrouter --api-key <key>");
+            println!("    Access 200+ models with one key.");
+        }
+        "Ollama" => {
+            println!("  Setup:");
+            println!("    1. Install: brew install ollama");
+            println!("    2. Pull a model: ollama pull llama3");
+            println!("    3. Set model_provider to 'ollama' in config.toml");
+        }
+        "Git" => {
+            println!("  Setup:");
+            println!("    1. Create a GitHub App (Settings → Developer settings → GitHub Apps)");
+            println!(
+                "       Permissions: Issues R/W, Pull requests R/W, Metadata R. Webhook: off."
+            );
+            println!("    2. Generate a private key (.pem) and install the app on your repos");
+            println!("    3. Run: omnesagent config set channels.git.default.provider github");
+            println!("       Run: omnesagent config set channels.git.default.app-id <id>");
+            println!(
+                "       Run: omnesagent config set channels.git.default.private-key-path <path>"
+            );
+            println!("       Run: omnesagent config set channels.git.default.enabled true");
+            println!("    4. Start: omnesagent channel start");
+        }
+        "Browser" => {
+            println!("  Built-in:");
+            println!("    OmnesAgent can control Chrome/Chromium for web tasks.");
+            println!("    Uses headless browser automation.");
+        }
+        "Cron" => {
+            println!("  Built-in:");
+            println!("    Schedule tasks in ~/.omnesagent/workspace/cron/");
+            println!("    Run: omnesagent cron list");
+        }
+        "Weather" => {
+            println!("  Built-in:");
+            println!("    Fetches live conditions from wttr.in, no API key required.");
+            println!("    Supports city names, IATA airport codes, GPS coordinates,");
+            println!("    postal/zip codes, and Unicode location names.");
+        }
+        _ if entry.category == IntegrationCategory::Chat => {
+            println!("  Setup:");
+            println!("    Run: omnesagent config set channels.<name>.<field>=<value>");
+            println!("    (see docs/book/src/channels/overview.md for the per-channel field list)");
+        }
+        _ => {}
+    }
+
+    println!();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integration_category_all_includes_every_variant_once() {
+        let all = IntegrationCategory::all();
+        assert_eq!(all.len(), 4);
+
+        let labels: Vec<&str> = all.iter().map(|cat| cat.label()).collect();
+        assert!(labels.contains(&"Chat Providers"));
+        assert!(labels.contains(&"AI Models"));
+        assert!(labels.contains(&"Tools & Automation"));
+        assert!(labels.contains(&"Platforms"));
+    }
+
+    #[test]
+    fn handle_command_info_is_case_insensitive_for_known_integrations() {
+        let config = Config::default();
+        let entries = registry::all_integrations(&config);
+        assert!(
+            !entries.is_empty(),
+            "registry should define at least one integration"
+        );
+
+        let upper_name = entries[0].name.to_uppercase();
+        assert!(show_integration_info(&config, &upper_name).is_ok());
+    }
+
+    #[test]
+    fn handle_command_info_returns_error_for_unknown_integration() {
+        let config = Config::default();
+        let err = show_integration_info(&config, "definitely-not-a-real-integration").unwrap_err();
+        assert!(err.to_string().contains("Unknown integration"));
+    }
+}

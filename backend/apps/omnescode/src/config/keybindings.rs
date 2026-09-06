@@ -1,0 +1,460 @@
+//! Local keybinding presets and override resolution.
+
+use std::collections::HashMap;
+
+use anyhow::{Result, bail};
+use crossterm::event::KeyCode;
+
+use crate::keymap::{
+    ChatTabAction, Chord, ConfigTabAction, DashboardTabAction, DoctorTabAction, FileExplorerAction,
+    GlobalAction, InputBarAction, LogsTabAction, QuickstartTabAction, RebindableActions,
+    overrides::OverrideTable,
+};
+
+/// Default preset name — the complete compile-time keymap.
+pub const DEFAULT_PRESET_NAME: &str = "default";
+
+/// A named keybinding preset. `build` returns the COMPLETE
+/// `action_key -> chords` map (every rebindable action present).
+#[derive(Clone, Copy)]
+pub struct KeyPreset {
+    pub build: fn() -> Vec<(String, Vec<Chord>)>,
+}
+
+/// The complete default keymap: every variant of every rebindable enum
+/// mapped to its compile-time default chords. The base every preset
+/// starts from so completeness is automatic.
+fn all_defaults() -> HashMap<String, Vec<Chord>> {
+    let mut map = HashMap::new();
+    fill_defaults::<GlobalAction>(&mut map);
+    fill_defaults::<ChatTabAction>(&mut map);
+    fill_defaults::<LogsTabAction>(&mut map);
+    fill_defaults::<DashboardTabAction>(&mut map);
+    fill_defaults::<ConfigTabAction>(&mut map);
+    fill_defaults::<DoctorTabAction>(&mut map);
+    fill_defaults::<QuickstartTabAction>(&mut map);
+    fill_defaults::<InputBarAction>(&mut map);
+    fill_defaults::<FileExplorerAction>(&mut map);
+    map
+}
+
+fn fill_defaults<A: RebindableActions>(map: &mut HashMap<String, Vec<Chord>>) {
+    for v in A::all() {
+        map.insert(v.key(), v.defaults());
+    }
+}
+
+/// Every rebindable action key — used by the completeness test and to
+/// size preset maps.
+fn all_action_keys() -> Vec<String> {
+    all_defaults().into_keys().collect()
+}
+
+/// Materialise a complete preset map: start from defaults, apply the
+/// caller's per-action reassignments. Each reassignment is the FULL
+/// chord set for that action (it replaces, within the complete map).
+fn from_defaults(changes: Vec<(String, Vec<Chord>)>) -> Vec<(String, Vec<Chord>)> {
+    let mut map = all_defaults();
+    for (key, chords) in changes {
+        map.insert(key, chords);
+    }
+    map.into_iter().collect()
+}
+
+fn default_rows() -> Vec<(String, Vec<Chord>)> {
+    all_defaults().into_iter().collect()
+}
+
+fn emacs_rows() -> Vec<(String, Vec<Chord>)> {
+    // Emacs motion ADDED alongside the kept defaults (arrows etc.).
+    let with = |action: &str, extra: Vec<Chord>| -> (String, Vec<Chord>) {
+        let mut chords = default_chords_for(action);
+        for c in extra {
+            // `same_key`, not `contains`: a preset that adds a chord the
+            // defaults already own under a different spelling would build a row
+            // the validator now rejects.
+            if !chords.iter().any(|owned| owned.same_key(&c)) {
+                chords.push(c);
+            }
+        }
+        (action.to_string(), chords)
+    };
+    from_defaults(vec![
+        with(
+            &DashboardTabAction::Up.action_key(),
+            vec![Chord::primary('p')],
+        ),
+        with(
+            &DashboardTabAction::Down.action_key(),
+            vec![Chord::ctrl('n')],
+        ),
+        with(&LogsTabAction::Up.action_key(), vec![Chord::primary('p')]),
+        with(&LogsTabAction::Down.action_key(), vec![Chord::ctrl('n')]),
+        with(
+            &FileExplorerAction::Up.action_key(),
+            vec![Chord::primary('p')],
+        ),
+        with(
+            &FileExplorerAction::Down.action_key(),
+            vec![Chord::ctrl('n')],
+        ),
+    ])
+}
+
+fn vim_rows() -> Vec<(String, Vec<Chord>)> {
+    // Vim motion ADDED alongside the kept defaults (arrows + Tab survive).
+    let with = |action: &str, extra: Vec<Chord>| -> (String, Vec<Chord>) {
+        let mut chords = default_chords_for(action);
+        for c in extra {
+            // `same_key`, not `contains`: a preset that adds a chord the
+            // defaults already own under a different spelling would build a row
+            // the validator now rejects.
+            if !chords.iter().any(|owned| owned.same_key(&c)) {
+                chords.push(c);
+            }
+        }
+        (action.to_string(), chords)
+    };
+    from_defaults(vec![
+        with(&DashboardTabAction::Up.action_key(), vec![Chord::char('k')]),
+        with(
+            &DashboardTabAction::Down.action_key(),
+            vec![Chord::char('j')],
+        ),
+        with(
+            &DashboardTabAction::PrevTab.action_key(),
+            vec![Chord::char('h')],
+        ),
+        with(
+            &DashboardTabAction::NextTab.action_key(),
+            vec![Chord::char('l')],
+        ),
+        with(
+            &DashboardTabAction::JumpStart.action_key(),
+            vec![Chord::char('g')],
+        ),
+        with(
+            &DashboardTabAction::JumpEnd.action_key(),
+            vec![Chord::char('G')],
+        ),
+        with(&LogsTabAction::Up.action_key(), vec![Chord::char('k')]),
+        with(&LogsTabAction::Down.action_key(), vec![Chord::char('j')]),
+        with(
+            &LogsTabAction::JumpStart.action_key(),
+            vec![Chord::char('g')],
+        ),
+        with(&LogsTabAction::JumpEnd.action_key(), vec![Chord::char('G')]),
+        with(&FileExplorerAction::Up.action_key(), vec![Chord::char('k')]),
+        with(
+            &FileExplorerAction::Down.action_key(),
+            vec![Chord::char('j')],
+        ),
+        with(
+            &FileExplorerAction::JumpStart.action_key(),
+            vec![Chord::char('g')],
+        ),
+        with(
+            &FileExplorerAction::JumpEnd.action_key(),
+            vec![Chord::char('G')],
+        ),
+    ])
+}
+
+fn arrows_only_rows() -> Vec<(String, Vec<Chord>)> {
+    // Arrows REPLACE vim letters on the motion actions (full set per row).
+    from_defaults(vec![
+        (
+            DashboardTabAction::Up.action_key(),
+            vec![Chord::key(KeyCode::Up)],
+        ),
+        (
+            DashboardTabAction::Down.action_key(),
+            vec![Chord::key(KeyCode::Down)],
+        ),
+        (
+            DashboardTabAction::NextTab.action_key(),
+            vec![Chord::key(KeyCode::Tab), Chord::key(KeyCode::Right)],
+        ),
+        (
+            DashboardTabAction::PrevTab.action_key(),
+            vec![Chord::key(KeyCode::BackTab), Chord::key(KeyCode::Left)],
+        ),
+        (
+            LogsTabAction::Up.action_key(),
+            vec![Chord::key(KeyCode::Up)],
+        ),
+        (
+            LogsTabAction::Down.action_key(),
+            vec![Chord::key(KeyCode::Down)],
+        ),
+        (
+            FileExplorerAction::Up.action_key(),
+            vec![Chord::key(KeyCode::Up)],
+        ),
+        (
+            FileExplorerAction::Down.action_key(),
+            vec![Chord::key(KeyCode::Down)],
+        ),
+    ])
+}
+
+/// The compile-time default chords for one action key.
+fn default_chords_for(action_key: &str) -> Vec<Chord> {
+    all_defaults().get(action_key).cloned().unwrap_or_default()
+}
+
+/// Registry of named presets. Walked by the zerocode tab's preset picker.
+pub const KEY_PRESETS: &[(&str, KeyPreset)] = &[
+    (
+        DEFAULT_PRESET_NAME,
+        KeyPreset {
+            build: default_rows,
+        },
+    ),
+    ("vim", KeyPreset { build: vim_rows }),
+    ("emacs", KeyPreset { build: emacs_rows }),
+    (
+        "arrows_only",
+        KeyPreset {
+            build: arrows_only_rows,
+        },
+    ),
+];
+
+pub fn preset_names() -> impl Iterator<Item = &'static str> {
+    KEY_PRESETS.iter().map(|(n, _)| *n)
+}
+
+pub fn preset_by_name(name: &str) -> Option<&'static KeyPreset> {
+    KEY_PRESETS
+        .iter()
+        .find_map(|(n, p)| (*n == name).then_some(p))
+}
+
+impl KeyPreset {
+    /// Resolve into a validated override table keyed `tag -> variant ->
+    /// chords`, running the full validation battery.
+    pub fn resolve(&self) -> Result<OverrideTable> {
+        let rows: HashMap<String, Vec<Chord>> = (self.build)().into_iter().collect();
+        build_override_table(rows)
+    }
+}
+
+pub fn build_override_table(rows: HashMap<String, Vec<Chord>>) -> Result<OverrideTable> {
+    let mut table: OverrideTable = HashMap::new();
+    // Keyed by tag, then a flat list because ownership is decided with
+    // `Chord::same_key`, not `Eq`/`Hash`: two chords that differ on the wire can
+    // still claim one key event, so a hash lookup would miss the collision the
+    // dispatcher goes on to resolve by declaration order.
+    let mut seen: HashMap<String, Vec<(Chord, String)>> = HashMap::new();
+
+    for (action_key, chords) in rows {
+        let (tag, variant) = action_key.split_once('.').ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "keybinding key '{action_key}' missing '.<variant>'"
+            ))
+        })?;
+
+        // Exact duplicates only. A pair that differs on the wire but not at
+        // dispatch is caught by the per-tag check below, which compares every
+        // chord against every chord already claimed under this tag, including
+        // the ones this same action just claimed.
+        for (i, a) in chords.iter().enumerate() {
+            if chords[i + 1..].contains(a) {
+                bail!("'{action_key}' lists '{}' twice", a.wire());
+            }
+        }
+        let tag_seen = seen.entry(tag.to_string()).or_default();
+        for c in &chords {
+            if let Some((owned, other)) = tag_seen.iter().find(|(k, _)| k.same_key(c)) {
+                if owned == c {
+                    bail!(
+                        "chord '{}' bound to both '{action_key}' and '{other}'",
+                        c.wire()
+                    );
+                }
+                bail!(
+                    "chord '{}' on '{action_key}' is the same key as '{}' on '{other}'",
+                    c.wire(),
+                    owned.wire()
+                );
+            }
+            tag_seen.push((c.clone(), action_key.clone()));
+        }
+
+        table
+            .entry(tag.to_string())
+            .or_default()
+            .insert(variant.to_string(), chords);
+    }
+    Ok(table)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_preset_is_complete() {
+        let t = preset_by_name(DEFAULT_PRESET_NAME)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn every_preset_covers_every_action() {
+        let expected: std::collections::BTreeSet<String> = all_action_keys().into_iter().collect();
+        for name in preset_names() {
+            let rows = (preset_by_name(name).unwrap().build)();
+            let got: std::collections::BTreeSet<String> =
+                rows.into_iter().map(|(k, _)| k).collect();
+            let missing: Vec<&String> = expected.difference(&got).collect();
+            let extra: Vec<&String> = got.difference(&expected).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "preset '{name}' incomplete — missing: {missing:?}, unknown: {extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_preset_resolves_and_is_clean() {
+        for name in preset_names() {
+            preset_by_name(name)
+                .unwrap()
+                .resolve()
+                .unwrap_or_else(|e| panic!("preset '{name}' invalid: {e}"));
+        }
+    }
+
+    #[test]
+    fn emacs_preset_preserves_primary_p_and_literal_control_n() {
+        let rows: HashMap<_, _> = emacs_rows().into_iter().collect();
+        for (up, down) in [
+            (
+                DashboardTabAction::Up.action_key(),
+                DashboardTabAction::Down.action_key(),
+            ),
+            (
+                LogsTabAction::Up.action_key(),
+                LogsTabAction::Down.action_key(),
+            ),
+            (
+                FileExplorerAction::Up.action_key(),
+                FileExplorerAction::Down.action_key(),
+            ),
+        ] {
+            assert!(rows[&up].contains(&Chord::primary('p')));
+            assert!(!rows[&up].contains(&Chord::ctrl('p')));
+            assert!(rows[&down].contains(&Chord::ctrl('n')));
+            assert!(!rows[&down].contains(&Chord::primary('n')));
+        }
+    }
+
+    #[test]
+    fn preset_names_are_snake_case() {
+        let ok = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && !s.starts_with('_')
+                && !s.ends_with('_')
+        };
+        for name in preset_names() {
+            assert!(ok(name), "preset name '{name}' is not snake_case");
+        }
+    }
+
+    #[test]
+    fn reserved_chord_allowed_in_table_guarded_at_capture() {
+        // The compile-time defaults legitimately use Enter/Esc, so table
+        // building must accept reserved chords; rejection is the capture
+        // modal's job (tested via keymap::reserved_reason).
+        let mut rows = HashMap::new();
+        rows.insert("chat.scroll_up".to_string(), vec![Chord::key(KeyCode::Esc)]);
+        assert!(build_override_table(rows).is_ok());
+        assert!(crate::keymap::reserved_reason(&Chord::key(KeyCode::Esc)).is_some());
+    }
+
+    #[test]
+    fn intra_tag_chord_clash_is_rejected() {
+        let mut rows = HashMap::new();
+        rows.insert("dashboard.up".to_string(), vec![Chord::char('z')]);
+        rows.insert("dashboard.down".to_string(), vec![Chord::char('z')]);
+        assert!(build_override_table(rows).is_err());
+    }
+
+    #[test]
+    fn intra_action_duplicate_is_rejected() {
+        let mut rows = HashMap::new();
+        rows.insert(
+            "dashboard.up".to_string(),
+            vec![Chord::char('z'), Chord::char('z')],
+        );
+        assert!(build_override_table(rows).is_err());
+    }
+
+    /// A config file is the third writer of chord ownership, after the resolver
+    /// and the binding editor, and it has to answer the question the same way.
+    /// `strip_redundant_shift` drops `SHIFT` from every character chord on every
+    /// platform, so these two spellings are one key at dispatch while `Eq` reads
+    /// them as two. Accepting both left `resolved_bindings` holding two explicit
+    /// owners, which nothing arbitrates: dispatch takes the earlier declaration
+    /// and Help advertises the chord for both actions.
+    #[test]
+    fn normalized_duplicate_across_actions_is_rejected() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut rows = HashMap::new();
+        rows.insert("dashboard.up".to_string(), vec![Chord::char('?')]);
+        rows.insert(
+            "dashboard.down".to_string(),
+            vec![Chord::with(KeyCode::Char('?'), KeyModifiers::SHIFT)],
+        );
+        let err = build_override_table(rows).expect_err("one key, two owners");
+        assert!(
+            err.to_string().contains("same key"),
+            "the error should say why two different spellings collide, got: {err}"
+        );
+    }
+
+    #[test]
+    fn normalized_duplicate_within_one_action_is_rejected() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut rows = HashMap::new();
+        rows.insert(
+            "dashboard.up".to_string(),
+            vec![
+                Chord::char('?'),
+                Chord::with(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            ],
+        );
+        assert!(build_override_table(rows).is_err());
+    }
+
+    /// The darwin arm of the same rule: platform-primary intent resolves to
+    /// `SUPER`, so it collides with a literal `super` spelling.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn primary_super_duplicate_is_rejected_on_darwin() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut rows = HashMap::new();
+        rows.insert("dashboard.up".to_string(), vec![Chord::primary('a')]);
+        rows.insert(
+            "dashboard.down".to_string(),
+            vec![Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER)],
+        );
+        assert!(build_override_table(rows).is_err());
+
+        // Literal Control remains distinct from literal Super for every key.
+        // The check must not over-reject the two explicit spellings.
+        let mut ok = HashMap::new();
+        ok.insert("dashboard.up".to_string(), vec![Chord::ctrl('a')]);
+        ok.insert(
+            "dashboard.down".to_string(),
+            vec![Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER)],
+        );
+        assert!(build_override_table(ok).is_ok());
+    }
+}

@@ -1,0 +1,53 @@
+# ==========================================
+# Rust (Backend)
+# ==========================================
+backend/target/
+**/Cargo.lock.orig
+**/*.rs.bk
+
+# ==========================================
+# Flutter / Dart (Frontend)
+# ==========================================
+frontend/.dart_tool/
+frontend/.flutter-plugins
+frontend/.flutter-plugins-dependencies
+frontend/.packages
+frontend/build/
+frontend/android/.gradle/
+frontend/android/local.properties
+frontend/android/app/release/
+frontend/ios/.symlinks/
+frontend/ios/Pods/
+frontend/ios/Podfile.lock
+frontend/windows/flutter/ephemeral/
+frontend/windows/build/
+
+# ==========================================
+# Database & Runtime Data
+# ==========================================
+data/*
+!data/.gitkeep
+logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ==========================================
+# Build Distributions & Outputs
+# ==========================================
+dist/
+*.apk
+
+# ==========================================
+# IDE & Agent Configs
+# ==========================================
+.codegraph/
+.gemini/
+.claude/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

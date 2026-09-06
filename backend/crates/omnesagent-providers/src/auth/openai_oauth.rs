@@ -1,0 +1,658 @@
+use crate::auth::oauth_common::{is_structured_callback_input, parse_query_params, url_encode};
+
+use crate::auth::profiles::TokenSet;
+use anyhow::{Context, Result};
+use base64::Engine;
+use chrono::Utc;
+use reqwest::Client;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+// Re-export for external use (used by main.rs)
+#[allow(unused_imports)]
+pub use crate::auth::oauth_common::{PkceState, generate_pkce_state};
+
+pub const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const OPENAI_OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const OPENAI_OAUTH_DEVICE_CODE_URL: &str = "https://auth.openai.com/oauth/device/code";
+pub const OPENAI_OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+
+#[derive(Debug, Clone)]
+pub struct DeviceCodeStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: u64,
+    pub interval: u64,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    expires_in: u64,
+    #[serde(default)]
+    interval: Option<u64>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthErrorResponse {
+    error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+pub fn build_authorize_url(pkce: &PkceState) -> String {
+    let mut params = BTreeMap::new();
+    params.insert("response_type", "code");
+    params.insert("client_id", OPENAI_OAUTH_CLIENT_ID);
+    params.insert("redirect_uri", OPENAI_OAUTH_REDIRECT_URI);
+    params.insert("scope", "openid profile email offline_access");
+    params.insert("code_challenge", pkce.code_challenge.as_str());
+    params.insert("code_challenge_method", "S256");
+    params.insert("state", pkce.state.as_str());
+    params.insert("codex_cli_simplified_flow", "true");
+    params.insert("id_token_add_organizations", "true");
+
+    let mut encoded: Vec<String> = Vec::with_capacity(params.len());
+    for (k, v) in params {
+        encoded.push(format!("{}={}", url_encode(k), url_encode(v)));
+    }
+
+    format!("{OPENAI_OAUTH_AUTHORIZE_URL}?{}", encoded.join("&"))
+}
+
+pub async fn exchange_code_for_tokens(
+    client: &Client,
+    code: &str,
+    pkce: &PkceState,
+) -> Result<TokenSet> {
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", OPENAI_OAUTH_CLIENT_ID),
+        ("redirect_uri", OPENAI_OAUTH_REDIRECT_URI),
+        ("code_verifier", pkce.code_verifier.as_str()),
+    ];
+
+    let response = client
+        .post(OPENAI_OAUTH_TOKEN_URL)
+        .form(&form)
+        .send()
+        .await
+        .context("Failed to exchange OpenAI OAuth authorization code")?;
+
+    parse_token_response(response).await
+}
+
+pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Result<TokenSet> {
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", OPENAI_OAUTH_CLIENT_ID),
+    ];
+
+    let response = client
+        .post(OPENAI_OAUTH_TOKEN_URL)
+        .form(&form)
+        .send()
+        .await
+        .context("Failed to refresh OpenAI OAuth token")?;
+
+    parse_token_response(response).await
+}
+
+pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> {
+    let form = [
+        ("client_id", OPENAI_OAUTH_CLIENT_ID),
+        ("scope", "openid profile email offline_access"),
+    ];
+
+    let response = client
+        .post(OPENAI_OAUTH_DEVICE_CODE_URL)
+        .form(&form)
+        .send()
+        .await
+        .context("Failed to start OpenAI OAuth device-code flow")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("OpenAI device-code start failed ({status}): {body}");
+    }
+
+    let parsed: DeviceCodeResponse = response
+        .json()
+        .await
+        .context("Failed to parse OpenAI device-code response")?;
+
+    Ok(DeviceCodeStart {
+        device_code: parsed.device_code,
+        user_code: parsed.user_code,
+        verification_uri: parsed.verification_uri,
+        verification_uri_complete: parsed.verification_uri_complete,
+        expires_in: parsed.expires_in,
+        interval: parsed.interval.unwrap_or(5).max(1),
+        message: parsed.message,
+    })
+}
+
+pub async fn poll_device_code_tokens(
+    client: &Client,
+    device: &DeviceCodeStart,
+) -> Result<TokenSet> {
+    let started = Instant::now();
+    let mut interval_secs = device.interval.max(1);
+
+    loop {
+        if started.elapsed() > Duration::from_secs(device.expires_in) {
+            anyhow::bail!("Device-code flow timed out before authorization completed");
+        }
+
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+
+        let form = [
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device.device_code.as_str()),
+            ("client_id", OPENAI_OAUTH_CLIENT_ID),
+        ];
+
+        let response = client
+            .post(OPENAI_OAUTH_TOKEN_URL)
+            .form(&form)
+            .send()
+            .await
+            .context("Failed polling OpenAI device-code token endpoint")?;
+
+        if response.status().is_success() {
+            return parse_token_response(response).await;
+        }
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+
+        if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&text) {
+            match err.error.as_str() {
+                "authorization_pending" => {
+                    continue;
+                }
+                "slow_down" => {
+                    interval_secs = interval_secs.saturating_add(5);
+                    continue;
+                }
+                "access_denied" => {
+                    anyhow::bail!("OpenAI device-code authorization was denied")
+                }
+                "expired_token" => {
+                    anyhow::bail!("OpenAI device-code expired")
+                }
+                _ => {
+                    anyhow::bail!(
+                        "OpenAI device-code polling failed ({status}): {}",
+                        err.error_description.unwrap_or(err.error)
+                    )
+                }
+            }
+        }
+
+        anyhow::bail!("OpenAI device-code polling failed ({status}): {text}");
+    }
+}
+
+pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
+    ::omnesagent_log::scope!(
+        model_provider_type: "openai",
+        model_provider_alias: "oauth",
+        => async move {
+            receive_loopback_code_inner(expected_state, timeout).await
+        }
+    )
+    .await
+}
+
+async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) -> Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:1455")
+        .await
+        .context("Failed to bind callback listener at 127.0.0.1:1455")?;
+
+    let accepted = tokio::time::timeout(timeout, listener.accept())
+        .await
+        .context("Timed out waiting for browser callback")?
+        .context("Failed to accept callback connection")?;
+
+    let (mut stream, _) = accepted;
+    let mut buffer = vec![0_u8; 8192];
+    let bytes_read = stream
+        .read(&mut buffer)
+        .await
+        .context("Failed to read callback request")?;
+
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let first_line = request.lines().next().ok_or_else(|| {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "openai"})),
+            "openai_oauth: malformed callback request"
+        );
+        anyhow::Error::msg("Malformed callback request")
+    })?;
+
+    let path = first_line.split_whitespace().nth(1).ok_or_else(|| {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "openai"})),
+            "openai_oauth: callback request missing path"
+        );
+        anyhow::Error::msg("Callback request missing path")
+    })?;
+
+    let code = parse_callback_code(path, expected_state)?;
+
+    let body =
+        "<html><body><h2>OmnesAgent login complete</h2><p>You can close this tab.</p></body></html>";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+
+    Ok(code)
+}
+
+pub(super) fn parse_manual_code_input(input: &str, expected_state: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("No OAuth code provided");
+    }
+
+    let query = if let Some((_, right)) = trimmed.split_once('?') {
+        right
+    } else {
+        trimmed
+    };
+
+    let params = parse_query_params(query);
+    if !is_structured_callback_input(trimmed, "/auth/callback") {
+        return Ok(trimmed.to_string());
+    }
+
+    parse_callback_params(&params, expected_state)
+}
+
+fn parse_callback_code(input: &str, expected_state: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("No OAuth code provided");
+    }
+
+    let query = trimmed.split_once('?').map_or(trimmed, |(_, query)| query);
+    let params = parse_query_params(query);
+
+    parse_callback_params(&params, expected_state)
+}
+
+fn parse_callback_params(
+    params: &std::collections::BTreeMap<String, String>,
+    expected_state: &str,
+) -> Result<String> {
+    let state = params
+        .get("state")
+        .ok_or_else(|| anyhow::Error::msg("Missing OAuth state in callback"))?;
+    if state != expected_state {
+        anyhow::bail!("OAuth state mismatch");
+    }
+
+    if let Some(err) = params.get("error") {
+        let desc = params
+            .get("error_description")
+            .cloned()
+            .unwrap_or_else(|| "OAuth authorization failed".to_string());
+        anyhow::bail!("OpenAI OAuth error: {err} ({desc})");
+    }
+
+    if let Some(code) = params.get("code")
+        && !code.trim().is_empty()
+    {
+        return Ok(code.trim().to_string());
+    }
+
+    anyhow::bail!("Missing OAuth code in callback")
+}
+
+pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
+    match expected_state {
+        Some(state) => parse_callback_code(input, state),
+        None => {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("No OAuth code provided");
+            }
+            if is_structured_callback_input(trimmed, "/auth/callback") {
+                anyhow::bail!("Expected OAuth state is required for callback input");
+            }
+            Ok(trimmed.to_string())
+        }
+    }
+}
+
+pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+
+    // Prefer the flat chatgpt_account_id claim when present.
+    if let Some(value) = claims.get("chatgpt_account_id").and_then(|v| v.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+
+    // Real OpenAI OAuth tokens namespace custom claims under
+    // https://api.openai.com/auth as a JSON object, not a flat dotted key.
+    if let Some(value) = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+
+    for key in [
+        "account_id",
+        "accountId",
+        "acct",
+        "https://api.openai.com/account_id",
+        "sub",
+    ] {
+        if let Some(value) = claims.get(key).and_then(|v| v.as_str())
+            && !value.trim().is_empty()
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    None
+}
+
+pub fn extract_expiry_from_jwt(token: &str) -> Option<chrono::DateTime<Utc>> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = claims.get("exp").and_then(|v| v.as_i64())?;
+    chrono::DateTime::<Utc>::from_timestamp(exp, 0)
+}
+
+async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("OpenAI OAuth token request failed ({status}): {body}");
+    }
+
+    let token: TokenResponse = response
+        .json()
+        .await
+        .context("Failed to parse OpenAI token response")?;
+
+    let expires_at = token.expires_in.and_then(|seconds| {
+        if seconds <= 0 {
+            None
+        } else {
+            Some(Utc::now() + chrono::Duration::seconds(seconds))
+        }
+    });
+
+    Ok(TokenSet {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        id_token: token.id_token,
+        expires_at,
+        token_type: token.token_type,
+        scope: token.scope,
+    })
+}
+
+/// Import an existing OpenAI Codex auth-profile JSON (the file
+/// `~/.codex/auth.json` produced by the upstream Codex CLI) into
+/// OmnesAgent's auth store. Replaces the `import_openai_codex_auth_profile`
+/// helper formerly in `src/main.rs`.
+pub async fn import_codex_auth_profile(
+    auth_service: &super::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    ::omnesagent_log::scope!(
+        model_provider_type: "openai",
+        model_provider_alias: profile,
+        => async move {
+            import_codex_auth_profile_inner(auth_service, profile, import_path).await
+        }
+    )
+    .await
+}
+
+async fn import_codex_auth_profile_inner(
+    auth_service: &super::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    #[derive(serde::Deserialize)]
+    struct CodexAuthTokens {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        id_token: Option<String>,
+        #[serde(default)]
+        account_id: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CodexAuthFile {
+        tokens: CodexAuthTokens,
+    }
+
+    let raw = std::fs::read_to_string(import_path).with_context(|| {
+        format!(
+            "Failed to read import file {}",
+            import_path.display().to_string()
+        )
+    })?;
+    let imported: CodexAuthFile = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse import file {}",
+            import_path.display().to_string()
+        )
+    })?;
+    let expires_at = extract_expiry_from_jwt(&imported.tokens.access_token);
+
+    let token_set = crate::auth::profiles::TokenSet {
+        access_token: imported.tokens.access_token,
+        refresh_token: imported.tokens.refresh_token,
+        id_token: imported.tokens.id_token,
+        expires_at,
+        token_type: Some("Bearer".to_string()),
+        scope: None,
+    };
+
+    let account_id = imported
+        .tokens
+        .account_id
+        .or_else(|| extract_account_id_from_jwt(&token_set.access_token));
+    if account_id.is_none() {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+            "Could not extract OpenAI account id from imported access token; \
+             requests may fail until re-authentication."
+        );
+    }
+
+    auth_service
+        .store_openai_tokens(profile, token_set, account_id, true)
+        .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkce_generation_is_valid() {
+        let pkce = generate_pkce_state();
+        assert!(pkce.code_verifier.len() >= 43);
+        assert!(!pkce.code_challenge.is_empty());
+        assert!(!pkce.state.is_empty());
+    }
+
+    #[test]
+    fn callback_redirect_requires_matching_state() {
+        let code = parse_callback_code(
+            "http://127.0.0.1:1455/auth/callback?code=abc123&state=xyz",
+            "xyz",
+        )
+        .unwrap();
+        assert_eq!(code, "abc123");
+
+        assert!(parse_callback_code("/auth/callback?code=abc123", "xyz").is_err());
+        assert!(parse_callback_code("abc123", "xyz").is_err());
+    }
+
+    #[test]
+    fn manual_code_input_accepts_raw_code() {
+        let code = parse_manual_code_input("raw-code", "xyz").unwrap();
+        assert_eq!(code, "raw-code");
+    }
+
+    #[test]
+    fn manual_callback_input_rejects_missing_or_mismatched_state() {
+        let missing = parse_manual_code_input("/auth/callback?code=x", "b").unwrap_err();
+        assert!(missing.to_string().contains("Missing OAuth state"));
+
+        for input in [
+            "/auth/callback?code=x&state=a",
+            "?code=x&state=a",
+            "https://example.test/other?code=x&state=a",
+        ] {
+            let err = parse_manual_code_input(input, "b").unwrap_err();
+            assert!(err.to_string().contains("state mismatch"), "{input}");
+        }
+    }
+
+    #[test]
+    fn manual_callback_input_rejects_url_or_path_without_query() {
+        for input in ["http://localhost:1455/auth/callback", "/auth/callback"] {
+            assert!(parse_manual_code_input(input, "xyz").is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn compatibility_parser_accepts_raw_code_only_without_state_expectation() {
+        assert_eq!(
+            parse_code_from_redirect("raw-code", None).unwrap(),
+            "raw-code"
+        );
+        assert!(parse_code_from_redirect("raw-code", Some("xyz")).is_err());
+    }
+
+    #[test]
+    fn parse_redirect_rejects_error_without_code() {
+        let err = parse_manual_code_input(
+            "/auth/callback?error=access_denied&error_description=user+cancelled&state=xyz",
+            "xyz",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("OpenAI OAuth error: access_denied")
+        );
+    }
+
+    #[test]
+    fn extract_account_id_from_jwt_payload() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("{\"account_id\":\"acct_123\"}");
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("acct_123"));
+    }
+
+    #[test]
+    fn extract_account_id_from_chatgpt_account_id_claim() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("{\"chatgpt_account_id\":\"chatgpt_acct_456\"}");
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("chatgpt_acct_456"));
+    }
+
+    #[test]
+    fn extract_account_id_from_nested_auth_object() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        // https://api.openai.com/auth is an object with a chatgpt_account_id field
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"nested_chatgpt_acct_789\"}}");
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("nested_chatgpt_acct_789"));
+    }
+
+    #[test]
+    fn extract_account_id_prefers_chatgpt_account_id_over_generic() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("{}");
+        // When both chatgpt_account_id and account_id are present, prefer chatgpt_account_id
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            "{\"chatgpt_account_id\":\"chatgpt_acct_first\",\"account_id\":\"generic_acct\"}",
+        );
+        let token = format!("{header}.{payload}.sig");
+
+        let account = extract_account_id_from_jwt(&token);
+        assert_eq!(account.as_deref(), Some("chatgpt_acct_first"));
+    }
+}

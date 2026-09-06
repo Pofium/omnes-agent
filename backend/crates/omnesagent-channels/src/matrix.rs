@@ -1,0 +1,10196 @@
+//! Matrix channel using matrix-rust-sdk 0.16.
+
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context as _, Result, bail};
+use async_trait::async_trait;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
+
+use matrix_sdk::{
+    Client,
+    ruma::{
+        OwnedEventId, OwnedRoomId, OwnedUserId,
+        api::client::{
+            membership::invite_user::v3::{
+                InvitationRecipient, InviteUserId, Request as InviteUserRequest,
+            },
+            room::{Visibility as MatrixVisibility, create_room::v3::Request as CreateRoomRequest},
+        },
+        events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent},
+    },
+};
+
+use omnesagent_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
+    DraftProgressKind, RoomCreationOptions, RoomVisibility, SendMessage,
+};
+use omnesagent_config::schema::{MatrixConfig, MatrixStreamMode};
+use omnesagent_runtime::agent::loop_::DRAFT_PLACEHOLDER;
+
+// ─── markers ───────────────────────────────────────────────────────────────
+mod markers {
+    //! Parse `[image:url]`, `[audio:url]`, `[video:url]`, `[file:url]`, `[voice:url]`
+    //! markers from outbound text. Strips them from the body and returns the kinds
+    //! + targets so the caller can upload the corresponding media.
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum MarkerKind {
+        Image,
+        Audio,
+        Video,
+        File,
+        Voice,
+    }
+
+    impl MarkerKind {
+        fn from_keyword(kw: &str) -> Option<Self> {
+            match kw.to_ascii_lowercase().as_str() {
+                "image" | "img" | "photo" => Some(Self::Image),
+                "audio" => Some(Self::Audio),
+                "video" => Some(Self::Video),
+                "file" | "document" | "doc" => Some(Self::File),
+                "voice" => Some(Self::Voice),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Marker {
+        pub kind: MarkerKind,
+        pub target: String,
+    }
+
+    /// Scan `text` for marker substrings. Returns the cleaned text and any markers.
+    /// Malformed/unknown markers are left in the text untouched.
+    pub(super) fn parse(text: &str) -> (String, Vec<Marker>) {
+        let mut out = String::with_capacity(text.len());
+        let mut markers = Vec::new();
+        let mut chars = text.char_indices().peekable();
+
+        while let Some((start, ch)) = chars.next() {
+            if ch != '[' {
+                out.push(ch);
+                continue;
+            }
+
+            let rest = &text[start + 1..];
+            let Some(close_rel) = rest.find(']') else {
+                out.push(ch);
+                continue;
+            };
+            if rest[..close_rel].contains('\n') {
+                out.push(ch);
+                continue;
+            }
+            let inner = &rest[..close_rel];
+            let Some(colon) = inner.find(':') else {
+                out.push(ch);
+                continue;
+            };
+            let kw = &inner[..colon];
+            let target = inner[colon + 1..].trim();
+
+            let Some(kind) = MarkerKind::from_keyword(kw) else {
+                out.push(ch);
+                continue;
+            };
+            if target.is_empty() {
+                out.push(ch);
+                continue;
+            }
+
+            markers.push(Marker {
+                kind,
+                target: target.to_string(),
+            });
+            let consume_until = start + 1 + close_rel + 1;
+            while let Some(&(idx, _)) = chars.peek() {
+                if idx >= consume_until {
+                    break;
+                }
+                chars.next();
+            }
+        }
+
+        // Tidy whitespace left behind by stripped markers.
+        let cleaned = out
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        (cleaned.trim().to_string(), markers)
+    }
+}
+
+// ─── mention ───────────────────────────────────────────────────────────────
+mod mention {
+    use matrix_sdk::ruma::UserId;
+
+    pub(super) fn is_mentioned(
+        bot_user_id: &UserId,
+        bot_display_name: Option<&str>,
+        m_mentions_user_ids: Option<&[String]>,
+        body: &str,
+    ) -> bool {
+        if let Some(ids) = m_mentions_user_ids {
+            for id in ids {
+                if id == bot_user_id.as_str() {
+                    return true;
+                }
+            }
+            // Honour the explicit list when set — older clients without
+            // `m.mentions` still hit the body-scan fallback below.
+            if !ids.is_empty() {
+                return false;
+            }
+        }
+
+        let body_lc = body.to_ascii_lowercase();
+        if body_lc.contains(&bot_user_id.as_str().to_ascii_lowercase()) {
+            return true;
+        }
+        let localpart = bot_user_id.localpart().to_ascii_lowercase();
+        if body_lc.contains(&format!("@{localpart}")) {
+            return true;
+        }
+        if let Some(name) = bot_display_name
+            && !name.is_empty()
+        {
+            let n = name.to_ascii_lowercase();
+            if body_lc.contains(&n) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Group `mention_only` admits either an explicit mention or a direct reply
+    /// to a bot message (Telegram parity: replies are unambiguous intent).
+    pub(super) fn admit_group_message(is_mentioned: bool, is_reply_to_bot: bool) -> bool {
+        is_mentioned || is_reply_to_bot
+    }
+
+    /// True when a Matrix event JSON `sender` equals `user_id`.
+    /// Production admission uses `TimelineEvent::sender()`; this helper remains
+    /// for focused unit coverage of the JSON sender comparison.
+    #[cfg(test)]
+    pub(super) fn sender_is_user(raw_json: &str, user_id: &UserId) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+            return false;
+        };
+        v.get("sender").and_then(|s| s.as_str()) == Some(user_id.as_str())
+    }
+}
+
+// ─── allowlist ─────────────────────────────────────────────────────────────
+mod allowlist {
+    pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
+        crate::allowlist::is_user_allowed(
+            allowed_users,
+            sender,
+            crate::allowlist::Match::CaseInsensitive,
+        )
+    }
+
+    pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
+        if allowed_rooms.is_empty() {
+            return true;
+        }
+        allowed_rooms
+            .iter()
+            .any(|r| r == room_id || r.eq_ignore_ascii_case(room_id))
+    }
+}
+
+// ─── approval ──────────────────────────────────────────────────────────────
+mod approval {
+    use rand::{Rng, RngExt};
+    use omnesagent_api::channel::ChannelApprovalResponse;
+
+    pub(super) const TOKEN_LEN: usize = 8;
+    const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+    pub(super) fn generate_token<R: Rng>(rng: &mut R) -> String {
+        (0..TOKEN_LEN)
+            .map(|_| TOKEN_ALPHABET[rng.random_range(0..TOKEN_ALPHABET.len())] as char)
+            .collect()
+    }
+
+    pub(super) fn generate_token_default() -> String {
+        let mut rng = rand::rng();
+        generate_token(&mut rng)
+    }
+
+    /// Try to parse an approval reply. Returns `Some((token, response))` if the
+    /// body matches `<TOKEN> (approve|deny|always|yes|no)` (case-insensitive).
+    pub(super) fn parse_reply(body: &str) -> Option<(String, ChannelApprovalResponse)> {
+        let trimmed = body.trim();
+        let mut parts = trimmed.split_whitespace();
+        let token = parts.next()?;
+        if token.len() != TOKEN_LEN {
+            return None;
+        }
+        if !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let verb = parts.next()?.to_ascii_lowercase();
+        if parts.next().is_some() {
+            return None;
+        }
+        let response = match verb.as_str() {
+            crate::util::APPROVAL_REPLY_APPROVE
+            | crate::util::APPROVAL_REPLY_YES
+            | crate::util::APPROVAL_REPLY_YES_SHORT => ChannelApprovalResponse::Approve,
+            crate::util::APPROVAL_REPLY_DENY
+            | crate::util::APPROVAL_REPLY_NO
+            | crate::util::APPROVAL_REPLY_NO_SHORT => ChannelApprovalResponse::Deny,
+            crate::util::APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
+            _ => return None,
+        };
+        Some((token.to_uppercase(), response))
+    }
+}
+
+// ─── room management ──────────────────────────────────────────────────────
+mod room_management {
+    use super::*;
+
+    pub(super) fn build_create_room_request(
+        options: &RoomCreationOptions,
+    ) -> Result<CreateRoomRequest> {
+        let mut request = CreateRoomRequest::new();
+        request.name = options.name.clone();
+        request.topic = options.topic.clone();
+        request.invite = options
+            .invites
+            .iter()
+            .map(|user_id| {
+                user_id
+                    .parse::<OwnedUserId>()
+                    .with_context(|| format!("matrix: invalid invite user id '{user_id}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(visibility) = options.visibility {
+            request.visibility = match visibility {
+                RoomVisibility::Private => MatrixVisibility::Private,
+                RoomVisibility::Public => MatrixVisibility::Public,
+            };
+        }
+        if options.encryption.unwrap_or(false) {
+            request.initial_state.push(
+                InitialStateEvent::with_empty_state_key(
+                    RoomEncryptionEventContent::with_recommended_defaults(),
+                )
+                .to_raw_any(),
+            );
+        }
+        Ok(request)
+    }
+
+    pub(super) fn build_invite_user_request(
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<InviteUserRequest> {
+        let room_id = room_id
+            .parse::<OwnedRoomId>()
+            .with_context(|| format!("matrix: invalid room id '{room_id}'"))?;
+        let user_id = user_id
+            .parse::<OwnedUserId>()
+            .with_context(|| format!("matrix: invalid user id '{user_id}'"))?;
+        Ok(InviteUserRequest::new(
+            room_id,
+            InvitationRecipient::from(InviteUserId::new(user_id)),
+        ))
+    }
+}
+
+// ─── context (thread-root preamble) ────────────────────────────────────────
+mod context {
+    //! Inject the thread root as a `[Thread root from @x]: ...` preamble on the
+    //! first inbound message we see in each thread. After a restart we re-inject
+    //! exactly once per active thread (in-memory tracking only).
+
+    use std::{collections::HashSet, sync::Arc};
+
+    use matrix_sdk::ruma::{OwnedEventId, events::room::message::MessageType};
+    use tokio::sync::RwLock;
+
+    pub(super) fn format_preamble(sender: &str, body: &str) -> String {
+        let body = body.trim();
+        if body.is_empty() {
+            format!("[Thread root from {sender}]\n\n")
+        } else {
+            format!("[Thread root from {sender}]: {body}\n\n")
+        }
+    }
+
+    /// Returns `true` iff this thread had not been seen before — caller should
+    /// fetch the root and inject the preamble. Also marks the thread seen.
+    pub(super) async fn claim_first_visit(
+        threads_seen: &Arc<RwLock<HashSet<OwnedEventId>>>,
+        thread_id: &OwnedEventId,
+    ) -> bool {
+        let mut guard = threads_seen.write().await;
+        guard.insert(thread_id.clone())
+    }
+
+    /// Pre-mark a thread — used when the bot starts the thread itself, so the
+    /// next inbound thread message doesn't get a preamble pointing at the bot.
+    pub(super) async fn mark_seen(
+        threads_seen: &Arc<RwLock<HashSet<OwnedEventId>>>,
+        thread_id: OwnedEventId,
+    ) {
+        threads_seen.write().await.insert(thread_id);
+    }
+
+    pub(super) fn body_for(msg: &MessageType) -> String {
+        match msg {
+            MessageType::Text(t) => t.body.clone(),
+            MessageType::Notice(n) => n.body.clone(),
+            MessageType::Emote(e) => e.body.clone(),
+            MessageType::Image(_) => "[image]".to_string(),
+            MessageType::File(_) => "[file]".to_string(),
+            MessageType::Audio(_) => "[audio]".to_string(),
+            MessageType::Video(_) => "[video]".to_string(),
+            MessageType::Location(_) => "[location]".to_string(),
+            other => other.body().to_string(),
+        }
+    }
+}
+
+// ─── streaming ─────────────────────────────────────────────────────────────
+mod streaming {
+    use std::{
+        collections::{HashMap, VecDeque},
+        time::{Duration, Instant},
+    };
+
+    use anyhow::{Result, bail};
+    use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
+    use omnesagent_runtime::agent::loop_::{
+        DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, is_thinking_status_text, thinking_status_round,
+    };
+
+    use super::{DraftProgress, DraftProgressKind, MatrixStreamMode, markers};
+
+    const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub(super) struct DraftKey {
+        room_id: OwnedRoomId,
+        draft_id: String,
+    }
+
+    pub(super) fn draft_key(room_id: OwnedRoomId, draft_id: &str) -> Result<DraftKey> {
+        let draft_id = draft_id.trim();
+        if draft_id.is_empty() {
+            bail!("matrix: draft message id is empty");
+        }
+        Ok(DraftKey {
+            room_id,
+            draft_id: draft_id.to_string(),
+        })
+    }
+
+    pub(super) fn new_multi_message_draft_id() -> String {
+        format!(
+            "{MULTI_MESSAGE_SYNTHETIC_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct PartialDraft {
+        pub event_id: OwnedEventId,
+        pub thread_anchor: Option<OwnedEventId>,
+        pub last_text: String,
+        pub last_edit: Instant,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum PartialFinalizeAction {
+        EditDraft,
+        RedactDraft,
+        EmptyError,
+    }
+
+    /// Matrix-only progress draft for `stream_mode = "single_message"`.
+    /// It owns only live Matrix event state; the canonical config values stay
+    /// on `MatrixConfig`. Lines are stored as a deque so enforcing
+    /// `stream_draft_lines` is an O(1) pop from the front instead of repeatedly
+    /// re-splitting the rendered draft.
+    #[derive(Debug, Clone)]
+    pub(super) struct SingleDraft {
+        pub event_id: OwnedEventId,
+        pub thread_anchor: Option<OwnedEventId>,
+        /// Source of truth for the current visible progress window.
+        pub lines: VecDeque<DraftProgress>,
+        /// Last body confirmed by a successful Matrix edit, used to decide
+        /// whether retained drafts need a final flush.
+        pub last_text: String,
+        /// Last edit attempt timestamp, used only for Matrix edit throttling.
+        pub last_edit: Instant,
+    }
+
+    /// MultiMessage streaming state. The runtime calls `update_draft` repeatedly
+    /// with the accumulated agent output; we send each `\n\n`-bounded paragraph
+    /// as its own room message, threaded under `thread_anchor` when present.
+    /// `sent_so_far` is a byte counter into the accumulated text — everything
+    /// before that index has already been emitted.
+    #[derive(Debug, Clone)]
+    pub(super) struct MultiDraft {
+        pub thread_anchor: Option<OwnedEventId>,
+        pub sent_so_far: usize,
+    }
+
+    /// Live draft storage for the Matrix stream mode selected at channel
+    /// construction. A channel handle has an immutable `MatrixConfig`, so
+    /// keeping only the active draft map prevents impossible cross-mode state
+    /// while preserving concurrent draft isolation within that mode.
+    #[derive(Default, Debug)]
+    pub(super) enum State {
+        #[default]
+        Off,
+        Partial(HashMap<DraftKey, PartialDraft>),
+        Single(HashMap<DraftKey, SingleDraft>),
+        Multi(HashMap<DraftKey, MultiDraft>),
+    }
+
+    impl State {
+        /// Create the draft store matching the immutable Matrix stream mode.
+        pub(super) fn for_stream_mode(mode: MatrixStreamMode) -> Self {
+            match mode {
+                MatrixStreamMode::Off => Self::Off,
+                MatrixStreamMode::Partial => Self::Partial(HashMap::new()),
+                MatrixStreamMode::SingleMessage => Self::Single(HashMap::new()),
+                MatrixStreamMode::MultiMessage => Self::Multi(HashMap::new()),
+            }
+        }
+    }
+
+    pub(super) fn insert_partial(
+        state: &mut State,
+        key: DraftKey,
+        draft: PartialDraft,
+    ) -> Result<()> {
+        let State::Partial(drafts) = state else {
+            bail!("matrix: partial draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
+    }
+
+    pub(super) fn partial_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut PartialDraft> {
+        match state {
+            State::Partial(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
+    }
+
+    pub(super) fn take_partial(state: &mut State, key: &DraftKey) -> Option<PartialDraft> {
+        match state {
+            State::Partial(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Partial(drafts) if drafts.contains_key(key))
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_len(state: &State) -> usize {
+        match state {
+            State::Partial(drafts) => drafts.len(),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn insert_single(
+        state: &mut State,
+        key: DraftKey,
+        draft: SingleDraft,
+    ) -> Result<()> {
+        let State::Single(drafts) = state else {
+            bail!("matrix: single-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
+    }
+
+    /// Return the editable `single_message` draft for this room+draft id, if it
+    /// is still active.
+    pub(super) fn single_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut SingleDraft> {
+        match state {
+            State::Single(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
+    }
+
+    /// Remove the `single_message` draft from live state at finalize/cancel so
+    /// a late progress update cannot keep editing a completed response.
+    pub(super) fn take_single(state: &mut State, key: &DraftKey) -> Option<SingleDraft> {
+        match state {
+            State::Single(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn single_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Single(drafts) if drafts.contains_key(key))
+    }
+
+    pub(super) fn insert_multi(state: &mut State, key: DraftKey, draft: MultiDraft) -> Result<()> {
+        let State::Multi(drafts) = state else {
+            bail!("matrix: multi-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
+    }
+
+    pub(super) fn multi_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut MultiDraft> {
+        match state {
+            State::Multi(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
+    }
+
+    pub(super) fn take_multi(state: &mut State, key: &DraftKey) -> Option<MultiDraft> {
+        match state {
+            State::Multi(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn multi_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Multi(drafts) if drafts.contains_key(key))
+    }
+
+    pub(super) fn partial_should_edit(
+        existing: &PartialDraft,
+        new_text: &str,
+        now: Instant,
+        min_interval: Duration,
+    ) -> bool {
+        if existing.last_text == new_text {
+            return false;
+        }
+        now.saturating_duration_since(existing.last_edit) >= min_interval
+    }
+
+    pub(super) fn partial_visible_text(text: &str) -> Option<String> {
+        let (cleaned, _) = markers::parse(text);
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.to_string())
+        }
+    }
+
+    /// Append one progress update to a single-message draft, dropping the
+    /// oldest entries once the configured window is full. A zero limit
+    /// intentionally means "unlimited".
+    pub(super) fn push_single_progress_line(draft: &mut SingleDraft, text: &str, max_lines: usize) {
+        push_single_progress(draft, legacy_single_progress(text), max_lines);
+    }
+
+    /// Classify callers of the legacy text-only API using the historical
+    /// display convention. Typed callers bypass this heuristic.
+    pub(super) fn legacy_single_progress(text: &str) -> DraftProgress {
+        let kind = if text.starts_with(REASONING_FULL_PREFIX) && !is_thinking_status_text(text) {
+            DraftProgressKind::Reasoning
+        } else {
+            DraftProgressKind::Status
+        };
+        DraftProgress {
+            kind,
+            text: text.to_string(),
+        }
+    }
+
+    /// Append progress while retaining the source kind supplied by the
+    /// orchestrator, including when reasoning renders like generated status.
+    pub(super) fn push_single_progress(
+        draft: &mut SingleDraft,
+        progress: DraftProgress,
+        max_lines: usize,
+    ) {
+        let progress = normalize_matrix_progress(progress);
+        if progress.text.is_empty() {
+            return;
+        }
+        if merge_single_progress_line(draft, &progress) {
+            trim_single_visible_lines(draft, max_lines);
+            return;
+        }
+        draft.lines.push_back(progress);
+        trim_single_visible_lines(draft, max_lines);
+    }
+
+    /// Reasoning arrives as provider stream fragments. Keep it as one Matrix
+    /// transcript entry and let `draft_update_interval_ms` decide how often
+    /// that growing text is edited into the room.
+    fn merge_single_progress_line(draft: &mut SingleDraft, progress: &DraftProgress) -> bool {
+        if let Some(incoming_round) = single_thinking_status_round(progress)
+            && let Some(existing) = draft.lines.back_mut()
+            && is_single_thinking_status(existing)
+        {
+            if incoming_round >= single_thinking_status_round(existing).unwrap_or(0) {
+                *existing = progress.clone();
+            }
+            return true;
+        }
+
+        if let Some(fragment) = progress.text.strip_prefix(REASONING_FULL_PREFIX)
+            && let Some(existing) = draft.lines.back_mut()
+            && is_single_reasoning_progress(existing)
+        {
+            existing.text.push_str(fragment);
+            return true;
+        }
+
+        false
+    }
+
+    fn single_thinking_status_round(progress: &DraftProgress) -> Option<usize> {
+        matches!(progress.kind, DraftProgressKind::Status)
+            .then(|| thinking_status_round(&progress.text))
+            .flatten()
+    }
+
+    fn is_single_thinking_status(progress: &DraftProgress) -> bool {
+        single_thinking_status_round(progress).is_some()
+    }
+
+    fn is_single_reasoning_progress(progress: &DraftProgress) -> bool {
+        matches!(progress.kind, DraftProgressKind::Reasoning)
+            && progress.text.starts_with(REASONING_FULL_PREFIX)
+    }
+
+    fn visible_line_count(progress: &DraftProgress) -> usize {
+        single_render_line(progress).split('\n').count().max(1)
+    }
+
+    fn trim_visible_lines_from_front(
+        progress: &DraftProgress,
+        remove_lines: usize,
+    ) -> DraftProgress {
+        if remove_lines == 0 {
+            return progress.clone();
+        }
+
+        let rendered = single_render_line(progress);
+        let total = visible_line_count(progress);
+        if remove_lines >= total {
+            let mut empty = progress.clone();
+            empty.text.clear();
+            return empty;
+        }
+
+        let retained = rendered
+            .split('\n')
+            .skip(remove_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if is_single_reasoning_progress(progress)
+            && !retained.starts_with(REASONING_FULL_PREFIX)
+        {
+            format!("{REASONING_FULL_PREFIX}{retained}")
+        } else {
+            retained
+        };
+        DraftProgress {
+            kind: progress.kind,
+            text,
+        }
+    }
+
+    fn trim_single_visible_lines(draft: &mut SingleDraft, max_lines: usize) {
+        if max_lines == 0 {
+            return;
+        }
+        let mut total_lines = draft.lines.iter().map(visible_line_count).sum::<usize>();
+        while total_lines > max_lines {
+            let remove_lines = total_lines - max_lines;
+            let Some(front) = draft.lines.front_mut() else {
+                break;
+            };
+            let front_lines = visible_line_count(front);
+            if remove_lines >= front_lines {
+                draft.lines.pop_front();
+                total_lines = total_lines.saturating_sub(front_lines);
+            } else {
+                *front = trim_visible_lines_from_front(front, remove_lines);
+                break;
+            }
+        }
+    }
+
+    /// Keep multiline reasoning readable while preventing progress content from
+    /// becoming Matrix Markdown or HTML formatting. This is deliberately an
+    /// output transport encoder: it is applied once at insertion, never while
+    /// re-rendering a retained draft.
+    /// Tool/status progress remains one logical line; only raw reasoning gets
+    /// real newlines.
+    #[cfg(test)]
+    pub(super) fn normalize_matrix_progress_line(text: &str) -> String {
+        let kind = if text.starts_with(REASONING_FULL_PREFIX) && !is_thinking_status_text(text) {
+            DraftProgressKind::Reasoning
+        } else {
+            DraftProgressKind::Status
+        };
+        normalize_matrix_progress(DraftProgress {
+            kind,
+            text: text.to_string(),
+        })
+        .text
+    }
+
+    fn normalize_matrix_progress(mut progress: DraftProgress) -> DraftProgress {
+        if is_single_thinking_status(&progress) {
+            return progress;
+        }
+
+        let preserve_newlines = is_single_reasoning_progress(&progress);
+        let text = progress.text;
+        let mut normalized = String::with_capacity(text.len().saturating_mul(2));
+        let mut chars = text.trim_end_matches(&['\r', '\n'][..]).chars().peekable();
+        let mut line_start = true;
+        let mut leading_spaces = 0usize;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\n' if preserve_newlines => {
+                    normalized.push('\n');
+                    line_start = true;
+                    leading_spaces = 0;
+                }
+                '\n' => normalized.push('␊'),
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    if preserve_newlines {
+                        normalized.push('\n');
+                        line_start = true;
+                        leading_spaces = 0;
+                    } else {
+                        normalized.push('␊');
+                    }
+                }
+                '\t' => normalized.push('␉'),
+                '\u{000b}' => normalized.push('␋'),
+                '\u{000c}' => normalized.push('␌'),
+                '\u{001b}' => normalized.push('␛'),
+                '\u{007f}' => normalized.push('␡'),
+                c if c.is_control() => normalized.push('�'),
+                ' ' if line_start => {
+                    leading_spaces += 1;
+                    if leading_spaces == 4 {
+                        // A non-breaking first indentation space keeps literal
+                        // progress out of CommonMark's indented-code mode.
+                        let start = normalized.len().saturating_sub(3);
+                        normalized.replace_range(start..start + 1, "\u{00a0}");
+                        normalized.push(' ');
+                    } else {
+                        normalized.push(' ');
+                    }
+                }
+                c if c.is_ascii_punctuation() => {
+                    normalized.push('\\');
+                    normalized.push(c);
+                }
+                c => normalized.push(c),
+            }
+            if !matches!(ch, ' ' | '\n' | '\r') {
+                line_start = false;
+            }
+        }
+        progress.text = normalized;
+        progress
+    }
+
+    fn single_render_line(progress: &DraftProgress) -> &str {
+        if is_single_thinking_status(progress) {
+            progress.text.trim_end_matches('\n')
+        } else {
+            &progress.text
+        }
+    }
+
+    #[derive(Clone)]
+    struct VisibleProgressUnit {
+        text: String,
+        reasoning: bool,
+    }
+
+    fn visible_progress_units(draft: &SingleDraft) -> Vec<VisibleProgressUnit> {
+        draft
+            .lines
+            .iter()
+            .flat_map(|progress| {
+                if let Some(reasoning) = progress.text.strip_prefix(REASONING_FULL_PREFIX)
+                    && is_single_reasoning_progress(progress)
+                {
+                    reasoning
+                        .split('\n')
+                        .map(|text| VisibleProgressUnit {
+                            text: text.to_string(),
+                            reasoning: true,
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![VisibleProgressUnit {
+                        text: single_render_line(progress).to_string(),
+                        reasoning: false,
+                    }]
+                }
+            })
+            .collect()
+    }
+
+    fn render_visible_progress_units(units: &[VisibleProgressUnit]) -> String {
+        let mut text = String::new();
+        let mut previous_reasoning = false;
+        for unit in units {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            if unit.reasoning && !previous_reasoning {
+                text.push_str(REASONING_FULL_PREFIX);
+            }
+            text.push_str(&unit.text);
+            previous_reasoning = unit.reasoning;
+        }
+        text
+    }
+
+    fn oversized_progress_alert(unit: &VisibleProgressUnit) -> String {
+        let alert = omnesagent_runtime::i18n::get_required_cli_string(
+            "channel-runtime-matrix-progress-item-too-large",
+        );
+        if unit.reasoning {
+            return format!("{REASONING_FULL_PREFIX}{alert}");
+        }
+        let text = unit.text.trim_end();
+        if let Some((marker, subject)) = text.split_once(' ')
+            && matches!(marker, "⏳" | "✅" | "❌")
+        {
+            let subject = subject
+                .split_once("\\:")
+                .map_or(subject, |(tool, _)| tool)
+                .trim();
+            return format!("{marker} {subject}: {alert}");
+        }
+        format!("⚠️ {alert}")
+    }
+
+    fn single_visible_text_with_fit<F>(draft: &SingleDraft, fits: F) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
+        let units = visible_progress_units(draft);
+        let mut start = units.len();
+        while start > 0 {
+            let candidate = render_visible_progress_units(&units[start - 1..]);
+            if !fits(&candidate) {
+                break;
+            }
+            start -= 1;
+        }
+        if start == units.len() {
+            return units
+                .last()
+                .map(oversized_progress_alert)
+                .filter(|alert| fits(alert))
+                .unwrap_or_default();
+        }
+        render_visible_progress_units(&units[start..])
+    }
+
+    /// Render the newest complete physical reasoning lines and atomic progress
+    /// entries that fit within a byte budget. A separately supplied exact
+    /// Matrix-event fitter is used in production; this source-byte version is
+    /// retained for local state tests.
+    #[cfg(test)]
+    pub(super) fn single_visible_text_with_budget(draft: &SingleDraft, max_bytes: usize) -> String {
+        if max_bytes == 0 {
+            return String::new();
+        }
+        single_visible_text_with_fit(draft, |text| text.len() <= max_bytes)
+    }
+
+    pub(super) fn single_visible_text_with_edit_budget(
+        draft: &SingleDraft,
+        max_bytes: usize,
+    ) -> String {
+        single_visible_text_with_fit(draft, |text| {
+            super::outbound::serialized_edit_content_len(text, &draft.event_id)
+                .is_some_and(|actual| actual <= max_bytes)
+        })
+    }
+
+    /// Check the Matrix edit-attempt interval before rendering the draft body.
+    /// Progress lines are still recorded first, so retained drafts can flush
+    /// the latest transcript during finalization without paying render cost on
+    /// every debounced tick.
+    pub(super) fn single_edit_interval_elapsed(
+        existing: &SingleDraft,
+        now: Instant,
+        min_interval: Duration,
+    ) -> bool {
+        now.saturating_duration_since(existing.last_edit) >= min_interval
+    }
+
+    /// Avoid duplicate Matrix edits after rendering confirms that the visible
+    /// transcript is unchanged.
+    pub(super) fn single_render_changed(existing: &SingleDraft, new_text: &str) -> bool {
+        existing.last_text != new_text
+    }
+
+    /// Mark a rendered single-message draft body as Matrix-visible only after
+    /// the edit request succeeds. Keeping `last_text` as a delivery checkpoint
+    /// lets retained drafts flush again during finalization after a failed edit.
+    pub(super) fn mark_single_edit_delivered(
+        existing: &mut SingleDraft,
+        event_id: &OwnedEventId,
+        visible_text: String,
+        delivered_at: Instant,
+    ) -> bool {
+        if existing.event_id.as_str() != event_id.as_str() {
+            return false;
+        }
+        existing.last_text = visible_text;
+        existing.last_edit = delivered_at;
+        true
+    }
+
+    /// Finalization sequence for Matrix `single_message` mode. Encoding the
+    /// delete/send ordering here keeps the user-visible timeline rule testable
+    /// without mocking Matrix network calls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum SingleFinalizePlan {
+        DeleteDraftThenSendFinal,
+        KeepDraftThenSendFinal,
+        SendFinalOnly,
+        Noop,
+    }
+
+    /// Cleanup needed for a retained single-message draft before the final
+    /// answer can be posted. Retention applies to durable progress transcripts,
+    /// not to the initial placeholder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum SingleRetainedDraftAction {
+        DeletePlaceholder,
+        Flush(String),
+        KeepCurrent,
+    }
+
+    impl SingleFinalizePlan {
+        pub(super) fn deletes_draft_first(self) -> bool {
+            matches!(self, Self::DeleteDraftThenSendFinal)
+        }
+
+        pub(super) fn keeps_draft(self) -> bool {
+            matches!(self, Self::KeepDraftThenSendFinal)
+        }
+
+        pub(super) fn sends_final(self) -> bool {
+            !matches!(self, Self::Noop)
+        }
+    }
+
+    /// Choose the single-message finalization sequence from durable state and
+    /// operator config. A missing draft only suppresses empty final text; when a
+    /// draft existed, final delivery is attempted even if the text is empty so
+    /// the normal Matrix send path reports any invalid final body.
+    pub(super) fn single_finalize_plan(
+        has_draft: bool,
+        delete_draft: bool,
+        final_has_text: bool,
+    ) -> SingleFinalizePlan {
+        match (has_draft, delete_draft, final_has_text) {
+            (true, true, _) => SingleFinalizePlan::DeleteDraftThenSendFinal,
+            (true, false, _) => SingleFinalizePlan::KeepDraftThenSendFinal,
+            (false, _, true) => SingleFinalizePlan::SendFinalOnly,
+            (false, _, false) => SingleFinalizePlan::Noop,
+        }
+    }
+
+    /// Decide how to make a retained draft coherent before the final answer is
+    /// sent. This bypasses edit debounce at finalize time so a kept progress
+    /// transcript cannot lag behind the in-memory sliding buffer.
+    pub(super) fn single_retained_draft_action(
+        draft: &SingleDraft,
+        max_bytes: usize,
+    ) -> SingleRetainedDraftAction {
+        if draft.lines.is_empty() {
+            return SingleRetainedDraftAction::DeletePlaceholder;
+        }
+        let visible_text = single_visible_text_with_edit_budget(draft, max_bytes);
+        if visible_text.is_empty() {
+            return if draft.last_text == DRAFT_PLACEHOLDER {
+                // The buffered lines are not Matrix-visible until an edit
+                // succeeds. Retention must not leave a placeholder behind
+                // when no visible progress body can be established.
+                SingleRetainedDraftAction::DeletePlaceholder
+            } else {
+                SingleRetainedDraftAction::KeepCurrent
+            };
+        }
+        if visible_text == draft.last_text {
+            SingleRetainedDraftAction::KeepCurrent
+        } else {
+            SingleRetainedDraftAction::Flush(visible_text)
+        }
+    }
+
+    /// Cancel removes drafts when the operator requested deletion or when
+    /// Matrix still only shows the initial placeholder. The line buffer may
+    /// contain undelivered progress after a failed edit, so the delivery
+    /// checkpoint is the correct source for the user-visible state.
+    pub(super) fn single_cancel_deletes_draft(draft: &SingleDraft, delete_draft: bool) -> bool {
+        delete_draft || draft.last_text == DRAFT_PLACEHOLDER
+    }
+
+    pub(super) fn decide_partial_finalize_action(
+        text_is_empty_after_delivery: bool,
+        any_attachment_landed: bool,
+    ) -> PartialFinalizeAction {
+        match (text_is_empty_after_delivery, any_attachment_landed) {
+            (false, _) => PartialFinalizeAction::EditDraft,
+            (true, true) => PartialFinalizeAction::RedactDraft,
+            (true, false) => PartialFinalizeAction::EmptyError,
+        }
+    }
+
+    /// Find the next paragraph break (`\n\n`) in `new_text`, ignoring any
+    /// breaks that fall inside an open ```fenced``` code block. Returns the
+    /// byte offset of the first `\n` of the break, or `None` if no break is
+    /// found yet (caller should buffer and retry on the next update).
+    pub(super) fn next_paragraph_break(new_text: &str) -> Option<usize> {
+        let bytes = new_text.as_bytes();
+        let mut in_fence = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            // Detect opening or closing ```code fence``` at line start.
+            if bytes[i] == b'`'
+                && i + 2 < bytes.len()
+                && bytes[i + 1] == b'`'
+                && bytes[i + 2] == b'`'
+                && (i == 0 || bytes[i - 1] == b'\n')
+            {
+                in_fence = !in_fence;
+                i += 3;
+                continue;
+            }
+            if !in_fence && bytes[i] == b'\n' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+// ─── session ───────────────────────────────────────────────────────────────
+mod session {
+    //! Persist the Matrix login session next to the SDK SQLite crypto store so
+    //! `restore_session()` can reattach without re-running the login flow.
+
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Serialize};
+
+    pub(super) const SESSION_FILE: &str = "session.json";
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub(super) struct SessionBlob {
+        pub user_id: String,
+        pub device_id: String,
+        pub access_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_token: Option<String>,
+    }
+
+    pub(super) fn path(state_dir: &Path) -> PathBuf {
+        state_dir.join(SESSION_FILE)
+    }
+
+    pub(super) fn load(state_dir: &Path) -> anyhow::Result<Option<SessionBlob>> {
+        let p = path(state_dir);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&p).map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": p.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to read session blob"
+            );
+            anyhow::Error::msg(format!("read matrix session blob {}: {e}", p.display()))
+        })?;
+        match serde_json::from_slice::<SessionBlob>(&bytes) {
+            Ok(blob) => Ok(Some(blob)),
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                    &format!(
+                        "matrix: session blob {} is corrupt JSON ({e}); treating as missing so auto-recovery can re-login",
+                        p.display()
+                    )
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    pub(super) fn save(state_dir: &Path, blob: &SessionBlob) -> anyhow::Result<()> {
+        std::fs::create_dir_all(state_dir).map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": state_dir.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to create state dir"
+            );
+            anyhow::Error::msg(format!(
+                "create matrix state dir {}: {e}",
+                state_dir.display()
+            ))
+        })?;
+        let p = path(state_dir);
+        let json = serde_json::to_vec_pretty(blob)?;
+        write_with_owner_only(&p, &json).map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": p.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to write session blob"
+            );
+            anyhow::Error::msg(format!("write matrix session blob {}: {e}", p.display()))
+        })?;
+        Ok(())
+    }
+
+    /// Write the session blob with `0o600` permissions on Unix so the
+    /// access token isn't world-readable under a permissive umask.
+    /// Windows falls back to default ACLs (the std-lib write).
+    #[cfg(unix)]
+    fn write_with_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)
+    }
+
+    #[cfg(not(unix))]
+    fn write_with_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        std::fs::write(path, contents)
+    }
+}
+
+// ─── client ────────────────────────────────────────────────────────────────
+mod client {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use anyhow::{Context as _, Result, bail};
+    use matrix_sdk::{
+        Client, SessionMeta, SessionTokens,
+        authentication::matrix::MatrixSession,
+        config::RequestConfig,
+        ruma::{OwnedRoomId, RoomAliasId},
+    };
+    use serde::Deserialize;
+    use tokio::sync::RwLock;
+
+    use super::session;
+    use omnesagent_config::schema::MatrixConfig;
+
+    const WHOAMI_ENDPOINT: &str = "_matrix/client/v3/account/whoami";
+
+    pub(super) const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+    const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
+    const WHOAMI_ERROR_BODY_PREVIEW_BYTES: usize = 4096;
+    const WHOAMI_ERROR_BODY_DISPLAY_CHARS: usize = 256;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct AccessTokenIdentity {
+        pub user_id: String,
+        pub device_id: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WhoamiResponse {
+        user_id: String,
+        #[serde(default)]
+        device_id: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct MatrixErrorResponse {
+        #[serde(default)]
+        errcode: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+
+    pub(super) fn store_dir(state_dir: &Path) -> PathBuf {
+        state_dir.join("store")
+    }
+
+    pub(super) async fn build(config: &MatrixConfig, state_dir: &Path) -> Result<Client> {
+        build_attempt(config, state_dir, 0).await
+    }
+
+    fn wipe_state(state_dir: &Path) -> Result<()> {
+        let session = session::path(state_dir);
+        if session.exists()
+            && let Err(e) = std::fs::remove_file(&session)
+        {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": session.display().to_string(),
+                        "phase": "corruption_recovery",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to remove session blob during corruption recovery"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
+                session.display()
+            )));
+        }
+        let store = store_dir(state_dir);
+        if store.exists()
+            && let Err(e) = std::fs::remove_dir_all(&store)
+        {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": store.display().to_string(),
+                        "phase": "corruption_recovery",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to remove store dir during corruption recovery"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
+                store.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn store_has_orphan_data(state_dir: &Path) -> bool {
+        let store = store_dir(state_dir);
+        let Ok(mut entries) = std::fs::read_dir(&store) else {
+            return false;
+        };
+        entries.any(|e| e.is_ok())
+    }
+
+    pub(super) fn can_password_relogin(config: &MatrixConfig) -> bool {
+        let has_password = config
+            .password
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let has_user_id = config
+            .user_id
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        has_password && has_user_id
+    }
+
+    pub(super) fn saved_session_is_foreign(
+        config: &MatrixConfig,
+        blob: &session::SessionBlob,
+    ) -> bool {
+        let Some(want) = config.user_id.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if !want.contains(':') {
+            return false;
+        }
+        want != blob.user_id.as_str()
+    }
+
+    async fn build_attempt(
+        config: &MatrixConfig,
+        state_dir: &Path,
+        recovery_attempts: u32,
+    ) -> Result<Client> {
+        // Hard recursion bound: at most one auto-wipe + relogin cycle per call.
+        if recovery_attempts > 1 {
+            bail!(
+                "matrix: corruption recovery looped — aborting to avoid an infinite restart cycle. \
+                 Wipe ~/.omnesagent/state/matrix/ manually and restart."
+            );
+        }
+
+        let saved = session::load(state_dir)?;
+
+        // A saved session that belongs to a different account would run this
+        // channel block as the wrong Matrix identity. Wipe and re-login fresh
+        // under the configured account instead of impersonating.
+        if let Some(blob) = saved.as_ref()
+            && saved_session_is_foreign(config, blob)
+        {
+            return recover_or_bail(
+                config,
+                state_dir,
+                recovery_attempts,
+                &format!(
+                    "saved session user_id ({}) does not match configured channels.matrix user_id ({}); store belongs to a different account.",
+                    blob.user_id,
+                    config.user_id.as_deref().unwrap_or_default()
+                ),
+            )
+            .await;
+        }
+
+        if let (Some(blob), Some(want)) = (
+            saved.as_ref(),
+            config.device_id.as_deref().filter(|s| !s.is_empty()),
+        ) && want != blob.device_id
+        {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
+                 Honoring the saved device_id (canonical, assigned by the homeserver). \
+                 Update channels.matrix.device-id to match (or clear it) to silence this warning, \
+                 or wipe {} entirely to register a different device.",
+                    blob.device_id,
+                    state_dir.display()
+                )
+            );
+        }
+
+        if saved.is_none() && store_has_orphan_data(state_dir) {
+            return recover_or_bail(
+                config,
+                state_dir,
+                recovery_attempts,
+                "found crypto store data without a saved session.json — orphan state from a prior install or interrupted run.",
+            )
+            .await;
+        }
+
+        let store = store_dir(state_dir);
+        std::fs::create_dir_all(&store)
+            .with_context(|| format!("create matrix store dir {}", store.display()))?;
+
+        let client = Client::builder()
+            .server_name_or_homeserver_url(&config.homeserver)
+            .sqlite_store(&store, None)
+            // Widen the per-request timeout past the sync long-poll window so
+            // an idle `/sync` never trips the SDK's default 30s request
+            // deadline before the homeserver's own long-poll returns.
+            .request_config(RequestConfig::new().timeout(CLIENT_REQUEST_TIMEOUT))
+            .build()
+            .await
+            .context("build matrix client")?;
+
+        // Step 1: restore an existing session, or fresh-login.
+        if let Some(blob) = saved {
+            let saved_device_id = blob.device_id.clone();
+            let session = MatrixSession {
+                meta: SessionMeta {
+                    user_id: blob.user_id.parse().context("parse stored user_id")?,
+                    device_id: blob.device_id.into(),
+                },
+                tokens: SessionTokens {
+                    access_token: blob.access_token,
+                    refresh_token: blob.refresh_token,
+                },
+            };
+            match client
+                .matrix_auth()
+                .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
+                .await
+            {
+                Ok(()) => ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                    "matrix: restored session from session.json"
+                ),
+                Err(e) => {
+                    // restore_session failed despite a matching device_id —
+                    // the access token is probably revoked, or the saved
+                    // session disagrees with the local crypto store.
+                    drop(client);
+                    return recover_or_bail(
+                        config,
+                        state_dir,
+                        recovery_attempts,
+                        &format!(
+                            "restore_session failed for device_id {saved_device_id}: {e}. \
+                             The access token is likely revoked or the local crypto store is inconsistent."
+                        ),
+                    )
+                    .await;
+                }
+            }
+
+            let otk_corruption_flagged = client
+                .state_store()
+                .get_kv_data(matrix_sdk::store::StateStoreDataKey::OneTimeKeyAlreadyUploaded)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if otk_corruption_flagged {
+                drop(client);
+                return recover_or_bail(
+                    config,
+                    state_dir,
+                    recovery_attempts,
+                    "matrix-sdk has flagged the local crypto store as out-of-sync with server-side one-time keys (StateStoreDataKey::OneTimeKeyAlreadyUploaded). The local store has lost track of OTKs that the server still records — fresh sends would fail to decrypt. The SDK has no in-place fix for this state.",
+                )
+                .await;
+            }
+        } else {
+            login_fresh(&client, config).await?;
+            if let Some(blob) = session_blob_from(&client)
+                && let Err(e) = session::save(state_dir, &blob)
+            {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "matrix: failed to persist session.json"
+                );
+            }
+        }
+
+        if let Some(key) = config.recovery_key.as_deref()
+            && !key.is_empty()
+        {
+            run_recovery(&client, key).await;
+        }
+
+        Ok(client)
+    }
+
+    /// Either auto-wipe + retry (when password + user_id are configured) or
+    /// bail with operator-actionable instructions.
+    async fn recover_or_bail(
+        config: &MatrixConfig,
+        state_dir: &Path,
+        recovery_attempts: u32,
+        reason: &str,
+    ) -> Result<Client> {
+        if can_password_relogin(config) {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
+                    state_dir.display()
+                )
+            );
+            wipe_state(state_dir)?;
+            return Box::pin(build_attempt(config, state_dir, recovery_attempts + 1)).await;
+        }
+        bail!(
+            "matrix: {reason}\n\
+             Cannot auto-recover because channels.matrix.password and channels.matrix.user-id are not both set.\n\
+             Either:\n  \
+             • configure channels.matrix.password (and user-id) so the next start can re-authenticate, or\n  \
+             • wipe the state directory manually:  rm -rf {}",
+            state_dir.display(),
+        );
+    }
+
+    async fn login_fresh(client: &Client, config: &MatrixConfig) -> Result<()> {
+        // Prefer password when set: it creates a server-side device matching
+        // `config.device_id`, so subsequent crypto operations don't fight with
+        // a token bound to a different device.
+        if let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty()) {
+            return password_login(client, config, pw).await;
+        }
+        if config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
+            return access_token_login(client, config).await;
+        }
+        bail!("matrix login requires either access_token or user_id+password")
+    }
+
+    async fn password_login(client: &Client, config: &MatrixConfig, password: &str) -> Result<()> {
+        let user_id = config
+            .user_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                    "matrix.user_id is required for password login"
+                );
+                anyhow::Error::msg("matrix.user_id is required for password login")
+            })?;
+        let mut login = client
+            .matrix_auth()
+            .login_username(&user_id, password)
+            .initial_device_display_name("OmnesAgent");
+        if let Some(d) = config.device_id.as_deref()
+            && !d.is_empty()
+        {
+            login = login.device_id(d);
+        }
+        login.send().await.context("password login failed")?;
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            "matrix: logged in via password"
+        );
+        Ok(())
+    }
+
+    async fn access_token_login(client: &Client, config: &MatrixConfig) -> Result<()> {
+        let identity = resolve_access_token_identity(config, &client.homeserver()).await?;
+        let user_id = identity.user_id.parse().context("parse matrix.user_id")?;
+        let device_id = identity.device_id.ok_or_else(|| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                "matrix: access-token login requires a Matrix device_id"
+            );
+            anyhow::Error::msg("matrix: access-token login requires a Matrix device_id")
+        })?;
+        let session = MatrixSession {
+            meta: SessionMeta {
+                user_id,
+                device_id: device_id.into(),
+            },
+            tokens: SessionTokens {
+                access_token: config.access_token.clone().ok_or_else(|| {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                        "matrix.access_token is required for token login"
+                    );
+                    anyhow::Error::msg("matrix.access_token is required for token login")
+                })?,
+                refresh_token: None,
+            },
+        };
+        client
+            .matrix_auth()
+            .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
+            .await
+            .context("attach matrix session via access_token")?;
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            "matrix: logged in via access_token"
+        );
+        Ok(())
+    }
+
+    fn non_empty_config_value(value: Option<&str>) -> Option<String> {
+        value
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    pub(super) async fn resolve_access_token_identity(
+        config: &MatrixConfig,
+        homeserver: &reqwest::Url,
+    ) -> Result<AccessTokenIdentity> {
+        let configured_user_id = non_empty_config_value(config.user_id.as_deref());
+        let configured_device_id = non_empty_config_value(config.device_id.as_deref());
+
+        if let (Some(user_id), Some(device_id)) =
+            (configured_user_id.as_ref(), configured_device_id.as_ref())
+        {
+            return Ok(AccessTokenIdentity {
+                user_id: user_id.clone(),
+                device_id: Some(device_id.clone()),
+            });
+        }
+
+        let whoami = fetch_access_token_whoami(config, homeserver).await?;
+
+        if let Some(ref configured) = configured_user_id
+            && configured != &whoami.user_id
+        {
+            bail!(
+                "matrix: configured channels.matrix.user-id ({configured}) does not match Matrix whoami user_id ({})",
+                whoami.user_id
+            );
+        }
+
+        if let (Some(configured), Some(actual)) = (&configured_device_id, &whoami.device_id)
+            && configured != actual
+        {
+            bail!(
+                "matrix: configured channels.matrix.device-id ({configured}) does not match Matrix whoami device_id ({actual})"
+            );
+        }
+
+        if configured_device_id.is_none() && whoami.device_id.is_none() {
+            bail!(
+                "matrix: whoami response did not include device_id; configure channels.matrix.device-id for access-token login"
+            );
+        }
+
+        Ok(AccessTokenIdentity {
+            user_id: configured_user_id.unwrap_or(whoami.user_id),
+            device_id: configured_device_id.or(whoami.device_id),
+        })
+    }
+
+    async fn fetch_access_token_whoami(
+        config: &MatrixConfig,
+        homeserver: &reqwest::Url,
+    ) -> Result<WhoamiResponse> {
+        let access_token = config
+            .access_token
+            .as_deref()
+            .context("matrix: whoami requires access_token")?;
+        let url = matrix_client_api_url(homeserver, WHOAMI_ENDPOINT);
+        let response = reqwest::Client::builder()
+            .timeout(WHOAMI_TIMEOUT)
+            .build()
+            .context("matrix: build whoami HTTP client")?
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context("matrix: whoami request failed")?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = read_whoami_error_body_preview(response).await;
+            bail!("matrix: whoami request failed with HTTP {status}: {body}");
+        }
+
+        let mut whoami = response
+            .json::<WhoamiResponse>()
+            .await
+            .context("matrix: failed to parse whoami response")?;
+        whoami.user_id = whoami.user_id.trim().to_string();
+        if whoami.user_id.is_empty() {
+            bail!("matrix: whoami response did not include user_id");
+        }
+        whoami.device_id = whoami
+            .device_id
+            .map(|device_id| device_id.trim().to_string())
+            .filter(|device_id| !device_id.is_empty());
+
+        Ok(whoami)
+    }
+
+    async fn read_whoami_error_body_preview(mut response: reqwest::Response) -> String {
+        let mut preview = Vec::new();
+        let mut truncated = false;
+
+        while preview.len() < WHOAMI_ERROR_BODY_PREVIEW_BYTES {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(err) => return format!("failed to read response body: {err}"),
+            };
+            let remaining = WHOAMI_ERROR_BODY_PREVIEW_BYTES - preview.len();
+            if chunk.len() > remaining {
+                preview.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            preview.extend_from_slice(&chunk);
+        }
+
+        if preview.len() == WHOAMI_ERROR_BODY_PREVIEW_BYTES {
+            truncated = true;
+        }
+
+        format_whoami_error_body_preview(&preview, truncated)
+    }
+
+    fn format_whoami_error_body_preview(preview: &[u8], truncated: bool) -> String {
+        if let Ok(error) = serde_json::from_slice::<MatrixErrorResponse>(preview) {
+            let errcode = error
+                .errcode
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let message = error
+                .error
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let formatted = match (errcode, message) {
+                (Some(errcode), Some(message)) => Some(format!("{errcode}: {message}")),
+                (Some(errcode), None) => Some(errcode.to_string()),
+                (None, Some(message)) => Some(message.to_string()),
+                (None, None) => None,
+            };
+            if let Some(formatted) = formatted {
+                return truncate_with_ellipsis(&formatted, WHOAMI_ERROR_BODY_DISPLAY_CHARS);
+            }
+        }
+
+        let body = String::from_utf8_lossy(preview).trim().to_string();
+        if body.is_empty() {
+            return "<empty response body>".to_string();
+        }
+        let mut body = truncate_with_ellipsis(&body, WHOAMI_ERROR_BODY_DISPLAY_CHARS);
+        if truncated {
+            body.push_str(" [truncated]");
+        }
+        body
+    }
+
+    fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+        let mut chars = value.chars();
+        let mut truncated: String = chars.by_ref().take(max_chars).collect();
+        if chars.next().is_some() {
+            truncated.push_str("...");
+        }
+        truncated
+    }
+
+    fn matrix_client_api_url(homeserver: &reqwest::Url, endpoint_path: &str) -> reqwest::Url {
+        let mut url = homeserver.clone();
+        let base_path = url.path().trim_end_matches('/');
+        let endpoint_path = endpoint_path.trim_start_matches('/');
+        let full_path = if base_path.is_empty() || base_path == "/" {
+            format!("/{endpoint_path}")
+        } else {
+            format!("{base_path}/{endpoint_path}")
+        };
+        url.set_path(&full_path);
+        url.set_query(None);
+        url.set_fragment(None);
+        url
+    }
+
+    fn session_blob_from(client: &Client) -> Option<session::SessionBlob> {
+        let session = client.matrix_auth().session()?;
+        Some(session::SessionBlob {
+            user_id: session.meta.user_id.to_string(),
+            device_id: session.meta.device_id.to_string(),
+            access_token: session.tokens.access_token,
+            refresh_token: session.tokens.refresh_token,
+        })
+    }
+
+    async fn run_recovery(client: &Client, key: &str) {
+        use matrix_sdk::encryption::recovery::RecoveryState;
+
+        let recovery = client.encryption().recovery();
+        if matches!(recovery.state(), RecoveryState::Enabled) {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                "matrix: recovery already enabled, skipping recover()"
+            );
+            return;
+        }
+
+        let stripped_len = key.chars().filter(|c| !c.is_whitespace()).count();
+        diagnose_secret_storage(client, stripped_len).await;
+
+        match recovery.recover_and_fix_backup(key).await {
+            Ok(()) => ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                "matrix: E2EE recovery completed (cross-signing + room keys imported; key backup repaired if inconsistent)"
+            ),
+            Err(e) => ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "matrix: E2EE recovery failed: ; full error chain = . If the input length above is unexpected (base58 keys are typically ~58 chars, passphrases vary), the wrong value may be in channels.matrix.recovery-key."
+            ),
+        }
+    }
+
+    async fn diagnose_secret_storage(client: &Client, input_len: usize) {
+        use matrix_sdk::ruma::events::secret_storage::{
+            default_key::SecretStorageDefaultKeyEventContent, key::SecretStorageKeyEventContent,
+        };
+        use matrix_sdk::ruma::events::{GlobalAccountDataEventType, StaticEventContent};
+
+        let account = client.account();
+        let default_key = match account
+            .fetch_account_data_static::<SecretStorageDefaultKeyEventContent>()
+            .await
+        {
+            Ok(Some(raw)) => match raw.deserialize() {
+                Ok(content) => Some(content),
+                Err(e) => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "matrix: cannot deserialize default secret-storage key event"
+                    );
+                    None
+                }
+            },
+            Ok(None) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"input_len": input_len})),
+                    "matrix: server has no m.secret_storage.default_key set; recovery cannot proceed (input_len=). Set up Secure Backup in Element first."
+                );
+                return;
+            }
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "matrix: failed to fetch default secret-storage key event"
+                );
+                return;
+            }
+        };
+        let Some(default_key) = default_key else {
+            return;
+        };
+        let key_id = default_key.key_id;
+
+        // Fetch the actual key event for the default key id so we can see
+        // whether it has passphrase info (affects which decode path the SDK
+        // tries first inside SecretStorageKey::from_account_data).
+        let event_type = GlobalAccountDataEventType::SecretStorageKey(key_id.clone());
+        match account.fetch_account_data(event_type).await {
+            Ok(Some(raw)) => {
+                let json = raw.json().get();
+                let has_passphrase =
+                    json.contains("\"passphrase\"") && json.contains("\"iterations\"");
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                    &format!(
+                        "matrix: secret-storage diagnostics: default_key_id={key_id}, \
+                     has_passphrase_info={has_passphrase}, input_len={input_len}. \
+                     {}",
+                        if has_passphrase {
+                            "SDK will try passphrase derivation first; if your input is a base58 key the passphrase MAC will fail and the error you see may be the passphrase error rather than the base58 fallback's error."
+                        } else {
+                            "SDK will use base58 decoding directly."
+                        }
+                    )
+                );
+                let _ = SecretStorageKeyEventContent::TYPE; // keep import live
+            }
+            Ok(None) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"key_id": key_id})),
+                    "matrix: default key id has no corresponding key event on the account — secret storage is in an inconsistent state. Re-running Secure Backup setup in Element will repair this."
+                );
+            }
+            Err(e) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "key_id": key_id})
+                        ),
+                    "matrix: failed to fetch key event for"
+                );
+            }
+        }
+    }
+
+    pub(super) fn normalize_recipient(id_or_alias: &str) -> (&str, bool) {
+        if !id_or_alias.contains("||") {
+            return (id_or_alias, false);
+        }
+        let chosen = id_or_alias
+            .split("||")
+            .map(str::trim)
+            .filter(|s| s.starts_with('!') || s.starts_with('#'))
+            .last()
+            .unwrap_or(id_or_alias);
+        (chosen, true)
+    }
+
+    pub(super) async fn resolve_room(
+        client: &Client,
+        cache: &Arc<RwLock<HashMap<String, OwnedRoomId>>>,
+        id_or_alias: &str,
+    ) -> Result<OwnedRoomId> {
+        let (id_or_alias, normalized) = normalize_recipient(id_or_alias);
+        if normalized {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"id_or_alias": id_or_alias})),
+                "matrix: recipient contains `||`; using as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
+            );
+        }
+        if id_or_alias.starts_with('!') {
+            return id_or_alias
+                .parse::<matrix_sdk::ruma::OwnedRoomId>()
+                .with_context(|| format!("parse room id {id_or_alias}"));
+        }
+        if !id_or_alias.starts_with('#') {
+            bail!("matrix: not a room id or alias: {id_or_alias}");
+        }
+        if let Some(id) = cache.read().await.get(id_or_alias) {
+            return Ok(id.clone());
+        }
+        let alias: &RoomAliasId = id_or_alias
+            .try_into()
+            .with_context(|| format!("parse room alias {id_or_alias}"))?;
+        let resp = client
+            .resolve_room_alias(alias)
+            .await
+            .with_context(|| format!("resolve room alias {id_or_alias}"))?;
+        cache
+            .write()
+            .await
+            .insert(id_or_alias.to_string(), resp.room_id.clone());
+        Ok(resp.room_id)
+    }
+}
+
+// ─── inbound ───────────────────────────────────────────────────────────────
+mod inbound {
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, SystemTime},
+    };
+
+    use matrix_sdk::{
+        Client, Room, RoomState,
+        config::SyncSettings,
+        event_handler::RawEvent,
+        ruma::{
+            OwnedEventId, OwnedUserId,
+            events::{
+                AnySyncTimelineEvent,
+                reaction::ReactionEventContent,
+                relation::Annotation,
+                room::{
+                    encrypted::OriginalSyncRoomEncryptedEvent,
+                    message::{MessageType, OriginalSyncRoomMessageEvent},
+                },
+            },
+            serde::Raw,
+        },
+    };
+    use serde_json::Value as JsonValue;
+    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+
+    use super::{allowlist, approval, context as ctx_mod, mention};
+    use omnesagent_api::{channel::ChannelMessage, media::MediaAttachment};
+    use omnesagent_config::schema::MatrixConfig;
+
+    pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[derive(Clone)]
+    pub(super) struct HandlerCtx {
+        pub config: Arc<MatrixConfig>,
+        /// OmnesAgent alias for `[channels.matrix.<alias>]` so session_key
+        /// construction can scope by bot instance.
+        pub alias: String,
+        /// Resolves inbound external peers from canonical state at message-time.
+        /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+        pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        pub transcription: Option<super::TranscriptionResolver>,
+        pub workspace_dir: Option<Arc<std::path::PathBuf>>,
+        pub tx: mpsc::Sender<ChannelMessage>,
+        pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+        pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
+        pub bot_user_id: OwnedUserId,
+        pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
+        pub initial_sync_done: Arc<AtomicBool>,
+        /// Event ids of inbound events that arrived as `m.room.encrypted` and
+        /// could not be decrypted. Tracked so the bot reacts ❓ exactly once
+        /// per event across sync catchup deliveries.
+        pub undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    }
+
+    /// Register the inbound event handlers on `client`. The returned guards
+    /// keep the handlers alive; drop them to deregister.
+    pub(super) fn register_event_handlers(
+        client: &Client,
+        ctx: &HandlerCtx,
+    ) -> (
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+    ) {
+        let handler_ctx = ctx.clone();
+        let message_handler = client.add_event_handler(
+            move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
+                let ctx = handler_ctx.clone();
+                async move {
+                    if let Err(e) = handle_message(ctx, ev, room, raw).await {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "matrix: handle_message failed"
+                        );
+                    }
+                }
+            },
+        );
+        let message_guard = client.event_handler_drop_guard(message_handler);
+
+        // Surface inbound events the SDK couldn't decrypt by reacting ❓ on
+        // the encrypted event so the operator notices a key gap in chat
+        // instead of silent dropping. Best-effort: prophylactic in normally-
+        // healthy rooms where decryption succeeds.
+        let encrypted_ctx = ctx.clone();
+        let encrypted_handler =
+            client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
+                let ctx = encrypted_ctx.clone();
+                async move {
+                    handle_undecryptable(ctx, ev, room).await;
+                }
+            });
+        let encrypted_guard = client.event_handler_drop_guard(encrypted_handler);
+
+        (message_guard, encrypted_guard)
+    }
+
+    pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+        let (_message_handler_guard, _encrypted_handler_guard) =
+            register_event_handlers(&client, &ctx);
+
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            "matrix: starting sync loop"
+        );
+        let sync_settings = SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT);
+        if let Err(e) = client.sync_once(sync_settings.clone()).await {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "initial_sync",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: initial sync failed"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "matrix initial sync failed: {e}"
+            )));
+        }
+        ctx.initial_sync_done.store(true, Ordering::SeqCst);
+        client.sync(sync_settings).await.map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "sync_loop",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: sync loop failed"
+            );
+            anyhow::Error::msg(format!("matrix sync loop failed: {e}"))
+        })
+    }
+
+    /// React ❓ on any inbound event the SDK delivered as still-encrypted
+    /// (decryption failed or no keys available). Skips the bot's own
+    /// events, non-Joined rooms, and any event already reacted to in this
+    /// process. Reaction send failures are warn-logged, not propagated.
+    async fn handle_undecryptable(ctx: HandlerCtx, ev: OriginalSyncRoomEncryptedEvent, room: Room) {
+        if room.state() != RoomState::Joined {
+            return;
+        }
+        if ev.sender == ctx.bot_user_id {
+            return;
+        }
+        let event_id = ev.event_id.clone();
+        let already = {
+            let mut seen = ctx.undecryptable_seen.lock().await;
+            !seen.insert(event_id.clone())
+        };
+        if already {
+            return;
+        }
+        ::omnesagent_log::record!(
+            DEBUG,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            &format!(
+                "matrix: reacting ❓ to undecryptable event {} from {}",
+                event_id, ev.sender
+            )
+        );
+        let content =
+            ReactionEventContent::new(Annotation::new(event_id.clone(), "❓".to_string()));
+        if let Err(e) = room.send(content).await {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"error": format!("{}", e), "event_id": event_id})
+                    ),
+                "matrix: failed to react ❓ on undecryptable event"
+            );
+        }
+    }
+
+    async fn handle_message(
+        ctx: HandlerCtx,
+        ev: OriginalSyncRoomMessageEvent,
+        room: Room,
+        raw: RawEvent,
+    ) -> anyhow::Result<()> {
+        if room.state() != RoomState::Joined {
+            return Ok(());
+        }
+        if ev.sender == ctx.bot_user_id {
+            return Ok(());
+        }
+
+        let body = ctx_mod::body_for(&ev.content.msgtype);
+        let sender = ev.sender.as_str();
+        let room_id = room.room_id().as_str();
+        let allowed_peers = (ctx.peer_resolver)();
+        let sender_allowed = allowlist::user_allowed(&allowed_peers, sender);
+        let room_allowed = allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id);
+
+        if let Some((token, response)) = approval::parse_reply(&body)
+            && crate::util::resolve_pending_approval(
+                &ctx.pending_approvals,
+                &token,
+                response,
+                sender_allowed && room_allowed,
+                room_id,
+            )
+            .await
+            .suppresses_message()
+        {
+            return Ok(());
+        }
+
+        if !sender_allowed {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": sender})),
+                "matrix: drop message from non-allowed sender"
+            );
+            return Ok(());
+        }
+        if !room_allowed {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"room_id": room_id})),
+                "matrix: drop message from non-allowed room"
+            );
+            return Ok(());
+        }
+
+        // Fetch the reply parent at most once for the mention_only gate and
+        // the parent-media path below (Room::event always hits the homeserver).
+        let reply_target = extract_in_reply_to(&raw);
+        let mut cached_reply_parent = None;
+
+        if ctx.config.mention_only && is_group_room(&room).await {
+            let display_name = ctx.bot_display_name.read().await.clone();
+            let mention_user_ids = extract_mentions_user_ids(&raw);
+            let mentioned = mention::is_mentioned(
+                &ctx.bot_user_id,
+                display_name.as_deref(),
+                mention_user_ids.as_deref(),
+                &body,
+            );
+            // Reply-to-bot bypasses the mention gate (Telegram parity). Fetch the
+            // parent only when the body/mention list alone would drop the turn.
+            let reply_to_bot = if mentioned {
+                false
+            } else if let Some(reply_id) = reply_target.as_ref() {
+                match room.event(reply_id, None).await {
+                    Ok(timeline_event) => {
+                        let is_bot = timeline_event
+                            .sender()
+                            .as_ref()
+                            .is_some_and(|sender| sender == &ctx.bot_user_id);
+                        cached_reply_parent = Some(timeline_event);
+                        is_bot
+                    }
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            DEBUG,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "reply_id": reply_id,
+                            })),
+                            "matrix: failed to fetch reply parent for mention_only gate"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !mention::admit_group_message(mentioned, reply_to_bot) {
+                ::omnesagent_log::record!(
+                    DEBUG,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": sender})),
+                    "matrix: drop unmentioned message from"
+                );
+                return Ok(());
+            }
+        }
+
+        let thread_id = extract_thread_id(&raw);
+        let mut content = body.clone();
+        if let Some(tid) = thread_id.as_ref()
+            && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
+        {
+            match room.event(tid, None).await {
+                Ok(timeline_event) => {
+                    if let Some((root_sender, root_body)) =
+                        extract_root_summary(timeline_event.into_raw())
+                    {
+                        content = format!(
+                            "{}{}",
+                            ctx_mod::format_preamble(&root_sender, &root_body),
+                            content
+                        );
+                    }
+                }
+                Err(e) => ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e), "tid": tid})),
+                    "matrix: failed to fetch thread root"
+                ),
+            }
+        }
+
+        let media_kind = match &ev.content.msgtype {
+            MessageType::Image(m) => Some(MediaInfo::new(
+                m.source.clone(),
+                m.body.clone(),
+                m.info.as_ref().and_then(|i| i.mimetype.clone()),
+                MediaCategory::Image,
+            )),
+            MessageType::File(m) => Some(MediaInfo::new(
+                m.source.clone(),
+                m.body.clone(),
+                m.info.as_ref().and_then(|i| i.mimetype.clone()),
+                MediaCategory::File,
+            )),
+            MessageType::Video(m) => Some(MediaInfo::new(
+                m.source.clone(),
+                m.body.clone(),
+                m.info.as_ref().and_then(|i| i.mimetype.clone()),
+                MediaCategory::Video,
+            )),
+            MessageType::Audio(m) => {
+                let kind = if is_voice_message(&raw) {
+                    MediaCategory::Voice
+                } else {
+                    MediaCategory::Audio
+                };
+                let mime = m.info.as_ref().and_then(|i| i.mimetype.clone());
+                let file_name = m
+                    .filename
+                    .as_deref()
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or(&m.body)
+                    .to_string();
+                Some(MediaInfo::new(m.source.clone(), file_name, mime, kind))
+            }
+            _ => None,
+        };
+
+        if let Some(info) = media_kind {
+            content = attach_media(
+                &room,
+                &info,
+                ctx.workspace_dir.as_deref(),
+                &body,
+                content,
+                ctx.transcription.as_ref(),
+            )
+            .await;
+        } else if let Some(reply_id) = reply_target.as_ref() {
+            let parent = if let Some(cached) = cached_reply_parent.take() {
+                Ok(cached)
+            } else {
+                room.event(reply_id, None).await
+            };
+            match parent {
+                Ok(timeline_event) => {
+                    if let Some(info) = parent_media_info(timeline_event.raw().clone()) {
+                        content = attach_media(
+                            &room,
+                            &info,
+                            ctx.workspace_dir.as_deref(),
+                            "",
+                            content,
+                            ctx.transcription.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    ::omnesagent_log::record!(DEBUG, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "reply_target": reply_id})), "matrix: could not fetch in_reply_to parent")
+                }
+            }
+        }
+        let attachments: Vec<MediaAttachment> = Vec::new();
+
+        let outbound_anchor =
+            resolve_outbound_anchor(thread_id.as_ref(), &ev.event_id, ctx.config.reply_in_thread);
+        // When the bot is the one starting the thread, mark its root seen
+        // so the next inbound that lands inside it does not re-fetch and
+        // re-inject a root preamble (the agent already saw the root in this
+        // same turn).
+        if thread_id.is_none() && ctx.config.reply_in_thread {
+            ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
+        }
+
+        let interruption_scope =
+            interruption_scope_from_anchor(outbound_anchor.as_deref(), &ev.event_id);
+
+        let msg = ChannelMessage {
+            id: ev.event_id.to_string(),
+            sender: sender.to_string(),
+            reply_target: room.room_id().to_string(),
+            content,
+            channel: "matrix".to_string(),
+            channel_alias: Some(ctx.alias.clone()),
+            timestamp: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: outbound_anchor.clone(),
+            interruption_scope_id: interruption_scope,
+            attachments,
+            subject: None,
+
+            ..Default::default()
+        };
+
+        if let Err(e) = ctx.tx.send(msg).await {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: failed to forward inbound message"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn handle_message_for_test(
+        ctx: HandlerCtx,
+        ev: OriginalSyncRoomMessageEvent,
+        room: Room,
+        raw: RawEvent,
+    ) -> anyhow::Result<()> {
+        handle_message(ctx, ev, room, raw).await
+    }
+
+    async fn is_group_room(room: &Room) -> bool {
+        !matches!(room.is_direct().await, Ok(true))
+    }
+
+    pub(super) fn extract_mentions_user_ids(raw: &RawEvent) -> Option<Vec<String>> {
+        let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
+        let mentions = v.get("content")?.get("m.mentions")?;
+        let arr = mentions.get("user_ids")?.as_array()?;
+        Some(
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect(),
+        )
+    }
+
+    pub(super) fn resolve_outbound_anchor(
+        thread_id: Option<&OwnedEventId>,
+        event_id: &OwnedEventId,
+        reply_in_thread: bool,
+    ) -> Option<String> {
+        thread_id.map(ToString::to_string).or_else(|| {
+            if reply_in_thread {
+                Some(event_id.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(super) fn interruption_scope_from_anchor(
+        outbound_anchor: Option<&str>,
+        event_id: &OwnedEventId,
+    ) -> Option<String> {
+        match outbound_anchor {
+            Some(anchor) if anchor == event_id.as_str() => None,
+            other => other.map(ToString::to_string),
+        }
+    }
+
+    pub(super) fn extract_thread_id(raw: &RawEvent) -> Option<OwnedEventId> {
+        let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
+        let relates = v.get("content")?.get("m.relates_to")?;
+        let rel_type = relates.get("rel_type")?.as_str()?;
+        if rel_type != "m.thread" {
+            return None;
+        }
+        let root = relates.get("event_id")?.as_str()?;
+        root.parse().ok()
+    }
+
+    pub(super) fn extract_in_reply_to(raw: &RawEvent) -> Option<OwnedEventId> {
+        let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
+        let relates = v.get("content")?.get("m.relates_to")?;
+        let in_reply_to = relates.get("m.in_reply_to")?;
+        let event_id = in_reply_to.get("event_id")?.as_str()?;
+        event_id.parse().ok()
+    }
+
+    pub(super) fn is_voice_message(raw: &RawEvent) -> bool {
+        let v: JsonValue = match serde_json::from_str(raw.get()) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        v.get("content")
+            .and_then(|c| c.get("org.matrix.msc3245.voice"))
+            .is_some()
+    }
+
+    fn extract_root_summary(raw: Raw<AnySyncTimelineEvent>) -> Option<(String, String)> {
+        let json: JsonValue = serde_json::from_str(raw.json().get()).ok()?;
+        let sender = json.get("sender")?.as_str()?.to_string();
+        let body = json
+            .get("content")
+            .and_then(|c| c.get("body"))
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string();
+        Some((sender, body))
+    }
+
+    pub(super) enum MediaCategory {
+        Image,
+        Video,
+        Audio,
+        Voice,
+        File,
+    }
+
+    /// Voice notes (MSC3245) are the only inbound media OmnesAgent transcribes.
+    /// Whether transcription is enabled at all is owned by the channel's
+    /// transcription resolver, which reads it from live config.
+    pub(super) fn should_transcribe(kind: &MediaCategory) -> bool {
+        matches!(kind, MediaCategory::Voice)
+    }
+
+    async fn attach_media(
+        room: &Room,
+        info: &MediaInfo,
+        workspace_dir: Option<&std::path::PathBuf>,
+        body_hint: &str,
+        content: String,
+        transcription: Option<&super::TranscriptionResolver>,
+    ) -> String {
+        let mut content = content;
+        match save_media_to_workspace(room, info, workspace_dir).await {
+            Ok(Some(path)) => {
+                let marker = format_media_marker(info, &path);
+                let placeholder = matches!(body_hint, "[image]" | "[file]" | "[audio]" | "[video]");
+                content = if body_hint.is_empty() {
+                    if content.is_empty() {
+                        marker
+                    } else {
+                        format!("{content}\n\n{marker}")
+                    }
+                } else if placeholder || body_hint == info.file_name || content == body_hint {
+                    marker
+                } else {
+                    format!("{content}\n\n{marker}")
+                };
+
+                if should_transcribe(&info.kind)
+                    && let Some(resolver) = transcription
+                {
+                    let transcribe_name =
+                        transcription_safe_filename(&info.file_name, info.mime.as_deref());
+                    match transcribe_from_disk(resolver, &path, &transcribe_name).await {
+                        Ok(Some(text)) if !text.trim().is_empty() => {
+                            content = format!("[voice transcript]: {text}\n\n{content}");
+                        }
+                        Ok(_) => {}
+                        Err(e) => ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "matrix: voice transcription failed"
+                        ),
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: media handling failed"
+            ),
+        }
+        content
+    }
+
+    /// Walk a fetched timeline event's raw JSON looking for a media-typed
+    /// `m.room.message` payload. Returns `None` if the event is not a
+    /// recognized media message.
+    pub(super) fn parent_media_info(
+        raw: matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnySyncTimelineEvent>,
+    ) -> Option<MediaInfo> {
+        let json: JsonValue = serde_json::from_str(raw.json().get()).ok()?;
+        let content = json.get("content")?;
+        let msgtype = content.get("msgtype")?.as_str()?;
+        let kind = match msgtype {
+            "m.image" => MediaCategory::Image,
+            "m.video" => MediaCategory::Video,
+            "m.audio" if content.get("org.matrix.msc3245.voice").is_some() => MediaCategory::Voice,
+            "m.audio" => MediaCategory::Audio,
+            "m.file" => MediaCategory::File,
+            _ => return None,
+        };
+        let body_str = content
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("attachment");
+        let filename_field = content.get("filename").and_then(|f| f.as_str());
+        let mime = content
+            .get("info")
+            .and_then(|i| i.get("mimetype"))
+            .and_then(|m| m.as_str());
+        let file_name = filename_field
+            .filter(|f| !f.is_empty())
+            .unwrap_or(body_str)
+            .to_string();
+        let mime = mime.map(String::from);
+        let source = if let Some(file) = content.get("file") {
+            // Encrypted media: rebuild MediaSource::Encrypted from JSON.
+            let encrypted: matrix_sdk::ruma::events::room::EncryptedFile =
+                serde_json::from_value(file.clone()).ok()?;
+            matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(encrypted))
+        } else {
+            let url = content.get("url").and_then(|u| u.as_str())?;
+            matrix_sdk::ruma::events::room::MediaSource::Plain(matrix_sdk::ruma::OwnedMxcUri::from(
+                url,
+            ))
+        };
+        Some(MediaInfo::new(source, file_name, mime, kind))
+    }
+
+    pub(super) struct MediaInfo {
+        pub source: matrix_sdk::ruma::events::room::MediaSource,
+        pub file_name: String,
+        pub mime: Option<String>,
+        pub kind: MediaCategory,
+    }
+
+    impl MediaInfo {
+        pub fn new(
+            source: matrix_sdk::ruma::events::room::MediaSource,
+            file_name: String,
+            mime: Option<String>,
+            kind: MediaCategory,
+        ) -> Self {
+            Self {
+                source,
+                file_name,
+                mime,
+                kind,
+            }
+        }
+    }
+
+    /// Download an inbound media file, persist it to `{workspace}/matrix_files/`,
+    /// and return the on-disk path. Returns `Ok(None)` when no `workspace_dir`
+    /// is configured (caller logs and falls back to the placeholder body).
+    async fn save_media_to_workspace(
+        room: &Room,
+        info: &MediaInfo,
+        workspace: Option<&std::path::PathBuf>,
+    ) -> anyhow::Result<Option<std::path::PathBuf>> {
+        let Some(workspace) = workspace else {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: cannot persist {} — channels.matrix workspace_dir not configured. Set OMNESAGENT_DIR or run via the orchestrator.",
+                    info.file_name
+                )
+            );
+            return Ok(None);
+        };
+        let dir = workspace.join("matrix_files");
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": dir.display().to_string(),
+                        "phase": "media_dir_create",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to create media dir"
+            );
+            anyhow::Error::msg(format!("create {}: {e}", dir.display()))
+        })?;
+        let request = matrix_sdk::media::MediaRequestParameters {
+            source: info.source.clone(),
+            format: matrix_sdk::media::MediaFormat::File,
+        };
+        let source_kind = match &info.source {
+            matrix_sdk::ruma::events::room::MediaSource::Plain(_) => "plain",
+            matrix_sdk::ruma::events::room::MediaSource::Encrypted(_) => "encrypted",
+        };
+        let bytes = room
+            .client()
+            .media()
+            .get_media_content(&request, true)
+            .await
+            .map_err(|e| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "get_media_content ()"
+                );
+                anyhow::Error::msg(format!("get_media_content ({source_kind}): {e}"))
+            })?;
+
+        let safe_name = sanitize_filename(&info.file_name, &info.kind, info.mime.as_deref());
+        // Disambiguate by uuid prefix to avoid collisions across messages.
+        let unique = format!("{}_{safe_name}", uuid::Uuid::new_v4().simple());
+        let path = dir.join(unique);
+        std::fs::write(&path, &bytes).map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "phase": "media_write",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to write media file"
+            );
+            anyhow::Error::msg(format!("write {}: {e}", path.display()))
+        })?;
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            &format!(
+                "matrix: saved {} bytes ({}) to {}",
+                bytes.len(),
+                source_kind,
+                path.display()
+            )
+        );
+        Ok(Some(path))
+    }
+
+    fn sanitize_filename(raw: &str, kind: &MediaCategory, mime: Option<&str>) -> String {
+        let trimmed = raw.trim();
+        let candidate = if trimmed.is_empty() || trimmed.starts_with('[') {
+            // Placeholder body or empty — synthesise a sensible name.
+            let ext = default_extension(kind, mime);
+            format!("matrix_media.{ext}")
+        } else {
+            trimmed.to_string()
+        };
+        candidate
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    fn default_extension(kind: &MediaCategory, mime: Option<&str>) -> &'static str {
+        if let Some(m) = mime {
+            // Audio MIMEs resolve through the canonical transcription-side
+            // mapping; non-audio types are display/on-disk naming only.
+            if let Some(ext) = crate::transcription::extension_for_audio_mime(m) {
+                return ext;
+            }
+            match m.split(';').next().unwrap_or(m).trim() {
+                "image/png" => return "png",
+                "image/jpeg" | "image/jpg" => return "jpg",
+                "image/gif" => return "gif",
+                "image/webp" => return "webp",
+                "video/mp4" => return "mp4",
+                "application/pdf" => return "pdf",
+                _ => {}
+            }
+        }
+        match kind {
+            MediaCategory::Image => "jpg",
+            MediaCategory::Video => "mp4",
+            MediaCategory::Audio | MediaCategory::Voice => "ogg",
+            MediaCategory::File => "bin",
+        }
+    }
+
+    /// Internal name for `transcribe()` only — never stored or shown.
+    /// Preserves a name whose extension the resolver accepts; substitutes a
+    /// MIME-derived stand-in only when the MIME maps to an accepted format;
+    /// otherwise passes the unsupported name through so the resolver rejects
+    /// it locally before any request is sent.
+    pub(super) fn transcription_safe_filename(file_name: &str, mime: Option<&str>) -> String {
+        let ext_accepted = file_name
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| crate::transcription::mime_for_audio(ext).is_some());
+        if ext_accepted {
+            return file_name.to_string();
+        }
+        match mime.and_then(crate::transcription::extension_for_audio_mime) {
+            Some(ext) => format!("attachment.{ext}"),
+            None => file_name.to_string(),
+        }
+    }
+
+    fn format_media_marker(info: &MediaInfo, path: &std::path::Path) -> String {
+        match info.kind {
+            MediaCategory::Image => format!("[IMAGE:{}]", path.display()),
+            _ => {
+                let display_name = if info.file_name.trim().is_empty() {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("attachment")
+                        .to_string()
+                } else {
+                    info.file_name.clone()
+                };
+                format!("[Document: {display_name}] {}", path.display())
+            }
+        }
+    }
+
+    /// Resolves the manager from live config before touching the filesystem.
+    /// `Ok(None)` means transcription is currently disabled.
+    async fn transcribe_from_disk(
+        resolver: &super::TranscriptionResolver,
+        path: &std::path::Path,
+        file_name: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(manager) = resolver() else {
+            return Ok(None);
+        };
+        let manager = manager?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "phase": "transcription_read",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to read media file for transcription"
+            );
+            anyhow::Error::msg(format!("read {}: {e}", path.display()))
+        })?;
+        manager.transcribe(&bytes, file_name).await.map(Some)
+    }
+}
+
+/// Registers every configured provider — legacy `[transcription]` and typed
+/// `[providers.transcription.<type>.<alias>]` alike — and binds
+/// `agent_provider`.
+///
+/// When the owning agent states no preference, a lone registered provider is
+/// bound so single-provider deployments keep working without an explicit
+/// `transcription_provider`.
+pub(crate) fn build_transcription_manager(
+    config: &omnesagent_config::schema::Config,
+    agent_provider: &str,
+) -> anyhow::Result<crate::transcription::TranscriptionManager> {
+    let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
+        config,
+        agent_provider.to_string(),
+    )?;
+    if !agent_provider.is_empty() {
+        return Ok(manager);
+    }
+    let sole_provider = match manager.available_providers().as_slice() {
+        [only] => Some((*only).to_string()),
+        _ => None,
+    };
+    Ok(match sole_provider {
+        Some(alias) => manager.with_agent_transcription_provider(alias),
+        None => manager,
+    })
+}
+
+/// Resolves transcription state from live config at message time. `None` means
+/// transcription is currently disabled; the inner `Result` carries provider
+/// registration failures.
+///
+/// Held as a closure rather than a config snapshot so reloadable provider
+/// policy is never copied into this long-lived channel handle
+/// (see AGENTS.md "Single Source Of Truth").
+pub(crate) type TranscriptionResolver = Arc<
+    dyn Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>> + Send + Sync,
+>;
+
+/// Resolver over a legacy `[transcription]` section alone. Typed
+/// `[providers.transcription.<type>.<alias>]` entries are unreachable this way,
+/// so production always goes through the channel runtime's live-config
+/// resolver; this exists to drive the inbound tests from a bare section.
+#[cfg(test)]
+pub(crate) fn legacy_transcription_resolver(
+    transcription: omnesagent_config::schema::TranscriptionConfig,
+) -> TranscriptionResolver {
+    let config = Arc::new(omnesagent_config::schema::Config {
+        transcription,
+        ..Default::default()
+    });
+    Arc::new(move || {
+        if !config.transcription.enabled {
+            return None;
+        }
+        Some(build_transcription_manager(&config, ""))
+    })
+}
+
+// ─── outbound ──────────────────────────────────────────────────────────────
+mod outbound {
+    use std::{collections::HashMap, sync::Arc};
+
+    use anyhow::{Context as _, Result, bail};
+    use futures_util::StreamExt;
+    use matrix_sdk::{
+        Client, Room, RoomState,
+        attachment::{
+            AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+            BaseVideoInfo,
+        },
+        room::{
+            edit::EditedContent,
+            reply::{EnforceThread, Reply},
+        },
+        ruma::{
+            OwnedEventId, OwnedRoomId, UInt,
+            events::{
+                reaction::ReactionEventContent,
+                relation::Annotation,
+                room::message::{
+                    AddMentions, MessageType, ReplacementMetadata, ReplyWithinThread,
+                    RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+                    TextMessageEventContent,
+                },
+            },
+        },
+    };
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
+
+    use super::{client, context as ctx_mod, markers};
+    use omnesagent_api::{channel::SendMessage, media::MediaAttachment};
+
+    pub(super) type ReactionKey = (OwnedRoomId, OwnedEventId, String);
+
+    pub(super) struct Outbox<'a> {
+        pub client: &'a Client,
+        pub alias_cache: &'a Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
+        pub threads_seen: &'a Arc<TokioRwLock<std::collections::HashSet<OwnedEventId>>>,
+        pub reaction_log: &'a Arc<TokioMutex<HashMap<ReactionKey, OwnedEventId>>>,
+        pub reply_in_thread: bool,
+        pub workspace_dir: Option<&'a Path>,
+        /// Resolved from the canonical Matrix channel config for this send.
+        /// Only single-message mode needs a final-response body budget.
+        pub message_max_bytes: Option<usize>,
+    }
+
+    /// What `outbound::send` should do once all attachment uploads are done
+    /// and the marker-stripped text is in hand. Extracted as a small enum so
+    /// the empty-text-with-attachments contract can be unit-tested without
+    /// the SDK in the loop.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum SendOutcome {
+        /// Text is non-empty (with or without prior attachments). Caller
+        /// proceeds to send the text message and returns its event_id.
+        SendText,
+        /// Text is empty but at least one attachment uploaded successfully.
+        /// Caller skips the text send and returns the carried event_id.
+        ReturnAttachment,
+        /// Text is empty AND no attachment landed. Caller surfaces an error
+        /// to the runtime so it can decide what to do.
+        EmptyError,
+    }
+
+    fn prefix_utf8_bytes(text: &str, max_bytes: usize) -> &str {
+        if text.len() <= max_bytes {
+            return text;
+        }
+        let mut end = max_bytes.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+
+    fn next_prefix_after_oversize(text: &str, actual: usize, max: usize) -> &str {
+        let first_scalar_len = text.chars().next().map_or(0, char::len_utf8);
+        let proportional = text.len().saturating_mul(max) / actual.max(1);
+        let target = proportional.clamp(first_scalar_len, text.len().saturating_sub(1));
+        prefix_utf8_bytes(text, target)
+    }
+
+    fn bounded_rendered_body<F>(text: &str, message_max_bytes: Option<usize>, render: F) -> String
+    where
+        F: Fn(&str) -> usize,
+    {
+        let Some(max_bytes) = message_max_bytes else {
+            return text.to_string();
+        };
+        let mut candidate = text;
+        loop {
+            let actual = render(candidate);
+            if actual <= max_bytes {
+                return candidate.to_string();
+            }
+            let next = next_prefix_after_oversize(candidate, actual, max_bytes);
+            // `MATRIX_MIN_MESSAGE_MAX_BYTES` guarantees a one-scalar Matrix
+            // event fits. This guard also prevents an accidental infinite loop
+            // if a future renderer violates that contract.
+            if next.len() == candidate.len() {
+                return candidate.to_string();
+            }
+            candidate = next;
+        }
+    }
+
+    /// Apply an explicitly selected Matrix response budget after markers and
+    /// attachments have been processed. The limit is checked against the
+    /// serialized Markdown event, not merely the Markdown source; a large
+    /// `formatted_body` must not escape the configured budget.
+    pub(super) fn bounded_body(text: &str, message_max_bytes: Option<usize>) -> String {
+        bounded_rendered_body(text, message_max_bytes, |candidate| {
+            serde_json::to_vec(&RoomMessageEventContent::text_markdown(candidate))
+                .map_or(usize::MAX, |serialized| serialized.len())
+        })
+    }
+
+    /// Apply the same serialized-content budget to Matrix edits. Replacement
+    /// events duplicate the rendered new content and add `m.relates_to`, so
+    /// their ceiling is checked independently from a plain send.
+    #[cfg(test)]
+    pub(super) fn bounded_edit_body(
+        text: &str,
+        event_id: &OwnedEventId,
+        message_max_bytes: Option<usize>,
+    ) -> String {
+        bounded_rendered_body(text, message_max_bytes, |candidate| {
+            serialized_edit_content_len(candidate, event_id).unwrap_or(usize::MAX)
+        })
+    }
+
+    pub(super) fn serialized_edit_content_len(
+        text: &str,
+        event_id: &OwnedEventId,
+    ) -> Option<usize> {
+        let new_content = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+            TextMessageEventContent::markdown(text),
+        ));
+        serde_json::to_vec(
+            &new_content.make_replacement(ReplacementMetadata::new(event_id.clone(), None)),
+        )
+        .ok()
+        .map(|serialized| serialized.len())
+    }
+
+    /// Decide what `outbound::send` should do given the post-marker-strip
+    /// text and whether at least one attachment landed. Pure function.
+    pub(super) fn decide_send_outcome(
+        text_is_empty_after_strip: bool,
+        any_attachment_landed: bool,
+    ) -> SendOutcome {
+        match (text_is_empty_after_strip, any_attachment_landed) {
+            (false, _) => SendOutcome::SendText,
+            (true, true) => SendOutcome::ReturnAttachment,
+            (true, false) => SendOutcome::EmptyError,
+        }
+    }
+
+    /// Why a marker upload didn't reach the room. Drives both the textual
+    /// "(note: I couldn't deliver…)" line and the emoji reactions on the
+    /// agent's outgoing message so a chatter sees a hard refusal at a glance.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MarkerFailure {
+        /// Trust-boundary refusal: `validate_marker_target` rejected the
+        /// target (path escapes workspace, disallowed scheme, etc.). The bot
+        /// deliberately did not attempt the fetch.
+        Refused,
+        /// Post-validation failure: fetch error, file not found, upload
+        /// rejected by the server, oversize body, timeout. The bot tried and
+        /// couldn't complete the delivery.
+        Failed,
+    }
+
+    pub(super) struct AttachmentDelivery {
+        pub text: String,
+        pub last_attachment_id: Option<OwnedEventId>,
+        pub failed_markers: Vec<(String, MarkerFailure)>,
+    }
+
+    impl AttachmentDelivery {
+        pub(super) fn failure_kinds(&self) -> Vec<MarkerFailure> {
+            self.failed_markers.iter().map(|(_, kind)| *kind).collect()
+        }
+    }
+
+    /// Pick the emoji reactions to apply to the agent's outgoing text/event
+    /// based on which kinds of marker failures occurred. 🚫 means the bot
+    /// refused for safety; ⚠️ means it tried and didn't make it. Both can
+    /// fire on the same message when a batch mixes refusals and failures.
+    pub(super) fn decide_reactions(failures: &[MarkerFailure]) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if failures.iter().any(|f| matches!(f, MarkerFailure::Refused)) {
+            out.push("🚫");
+        }
+        if failures.iter().any(|f| matches!(f, MarkerFailure::Failed)) {
+            out.push("⚠️");
+        }
+        out
+    }
+
+    /// 8 MiB cap on the body of an HTTP marker fetch. Matches WebFetchTool's
+    /// streaming-cap pattern in `crates/omnesagent-tools/src/web_fetch.rs`.
+    const MAX_MARKER_BYTES: usize = 8 * 1024 * 1024;
+    /// 30-second connect+request timeout for HTTP marker fetches. Bounds the
+    /// agent-driven fetch path so a hung target cannot stall the channel.
+    const MARKER_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Resolved marker fetch target after sandboxing. `Local` paths are
+    /// canonicalised and proven to live within the configured `workspace_dir`.
+    /// `Http` URLs have an explicit `http`/`https` scheme.
+    #[derive(Debug)]
+    pub(super) enum MarkerTarget {
+        Local(PathBuf),
+        Http(reqwest::Url),
+    }
+
+    #[derive(Debug)]
+    pub(super) enum ValidateError {
+        /// Trust-boundary refusal: disallowed scheme, no workspace
+        /// configured, or path resolved outside the workspace. The target
+        /// was a real, reachable resource that policy declined.
+        Refused(anyhow::Error),
+        /// The path didn't resolve to anything on disk (ENOENT or similar
+        /// during canonicalize). Treated as a delivery failure, not a
+        /// safety event.
+        NotFound(anyhow::Error),
+    }
+
+    impl std::fmt::Display for ValidateError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ValidateError::Refused(e) | ValidateError::NotFound(e) => write!(f, "{e}"),
+            }
+        }
+    }
+
+    impl ValidateError {
+        pub(super) fn as_marker_failure(&self) -> MarkerFailure {
+            match self {
+                ValidateError::Refused(_) => MarkerFailure::Refused,
+                ValidateError::NotFound(_) => MarkerFailure::Failed,
+            }
+        }
+    }
+
+    pub(super) fn validate_marker_target(
+        target: &str,
+        workspace_dir: Option<&Path>,
+    ) -> std::result::Result<MarkerTarget, ValidateError> {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            let url = reqwest::Url::parse(target)
+                .with_context(|| format!("parse marker URL {target}"))
+                .map_err(ValidateError::Refused)?;
+            let host_str = url.host_str().unwrap_or("");
+            if omnesagent_tools::helpers::domain_guard::is_private_or_local_host(host_str) {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target": target,
+                            "host": host_str,
+                            "reason": "ssrf_private_host",
+                        })),
+                    "matrix: marker target points to a private/local host"
+                );
+                return Err(ValidateError::Refused(anyhow::Error::msg(format!(
+                    "matrix: marker target {target} resolves to a private or local host ({host_str}); refusing for SSRF safety. \
+                     Use a public URL or attach the file from workspace_dir directly."
+                ))));
+            }
+            return Ok(MarkerTarget::Http(url));
+        }
+        if target.contains("://") {
+            let scheme = target.split("://").next().unwrap_or("?");
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "scheme": scheme,
+                        "target": target,
+                    })),
+                "matrix: marker target uses disallowed scheme"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(format!(
+                "matrix: marker target uses disallowed scheme {scheme:?}; only http/https and workspace-relative paths are accepted"
+            ))));
+        }
+        if target.starts_with("data:") || target.starts_with("file:") {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                    })),
+                "matrix: marker target uses disallowed data: or file: scheme"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(
+                "matrix: marker target uses disallowed scheme; only http/https and workspace-relative paths are accepted",
+            )));
+        }
+
+        let workspace = workspace_dir.ok_or_else(|| {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                        "reason": "no_workspace_dir",
+                    })),
+                "matrix: marker target is local path but channel has no workspace_dir"
+            );
+            ValidateError::Refused(anyhow::Error::msg(format!(
+                "matrix: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
+            )))
+        })?;
+        let workspace_canon = std::fs::canonicalize(workspace)
+            .with_context(|| format!("canonicalize workspace {}", workspace.display()))
+            .map_err(ValidateError::Refused)?;
+
+        let target_path = Path::new(target);
+        let absolute = if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            workspace_canon.join(target_path)
+        };
+        let target_canon = match std::fs::canonicalize(&absolute) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target": target,
+                            "reason": "not_found",
+                        })),
+                    "matrix: marker target not found on disk"
+                );
+                return Err(ValidateError::NotFound(anyhow::Error::msg(format!(
+                    "matrix: marker target {target} not found on disk"
+                ))));
+            }
+            Err(e) => {
+                return Err(ValidateError::Refused(
+                    anyhow::Error::from(e).context(format!("canonicalize marker target {target}")),
+                ));
+            }
+        };
+
+        if !target_canon.starts_with(&workspace_canon) {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                        "target_canon": target_canon.display().to_string(),
+                        "workspace_canon": workspace_canon.display().to_string(),
+                        "reason": "outside_workspace",
+                    })),
+                "matrix: marker target escapes workspace_dir"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(format!(
+                "matrix: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
+                target_canon.display(),
+                workspace_canon.display(),
+            ))));
+        }
+        Ok(MarkerTarget::Local(target_canon))
+    }
+
+    /// Maximum number of redirects to follow on a marker HTTP fetch. The
+    /// `Policy::custom` closure below rejects any redirect target whose host
+    /// is private/local, so the cap mainly bounds the worst-case public-→-public
+    /// chain an attacker can construct.
+    const MAX_MARKER_REDIRECTS: usize = 10;
+
+    fn marker_http_client() -> &'static reqwest::Client {
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        CLIENT.get_or_init(|| {
+            let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_MARKER_REDIRECTS {
+                    return attempt.error(std::io::Error::other(format!(
+                        "Too many marker redirects (max {MAX_MARKER_REDIRECTS})"
+                    )));
+                }
+                // `attempt.url()` borrows the attempt, so we copy out the
+                // bits we need into owned Strings before `attempt.error(...)`,
+                // which moves the attempt, can run.
+                let target_str = attempt.url().as_str().to_string();
+                let host = attempt.url().host_str().unwrap_or("").to_string();
+                if omnesagent_tools::helpers::domain_guard::is_private_or_local_host(&host) {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "target": target_str,
+                                "host": host,
+                                "reason": "ssrf_redirect_to_private_host",
+                            })),
+                        "matrix: marker redirect targets a private/local host"
+                    );
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Blocked marker redirect to private or local host ({host}); \
+                             refusing for SSRF safety. Use a public URL or attach the file \
+                             from workspace_dir directly."
+                        ),
+                    ));
+                }
+                attempt.follow()
+            });
+            reqwest::Client::builder()
+                .timeout(MARKER_HTTP_TIMEOUT)
+                .redirect(redirect_policy)
+                .user_agent("omnesagent-matrix/1.0")
+                .build()
+                .expect("default reqwest client config never fails to build")
+        })
+    }
+
+    pub(super) async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
+        let client = marker_http_client();
+        let resp = client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("fetch marker URL {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("matrix: marker URL {url} returned HTTP status {status}");
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("stream chunk from {url}"))?;
+            if buf.len().saturating_add(chunk.len()) > MAX_MARKER_BYTES {
+                bail!("matrix: marker URL {url} exceeded {MAX_MARKER_BYTES}-byte cap; refusing");
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    }
+
+    pub(super) fn thread_anchor_from_message(
+        outbox: &Outbox<'_>,
+        message: &SendMessage,
+    ) -> Option<OwnedEventId> {
+        if outbox.reply_in_thread {
+            message
+                .thread_ts
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse().ok())
+        } else {
+            None
+        }
+    }
+
+    pub(super) async fn deliver_attachments(
+        outbox: &Outbox<'_>,
+        room: &Room,
+        mut text: String,
+        markers: &[markers::Marker],
+        attachments: &[MediaAttachment],
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> Result<AttachmentDelivery> {
+        let mut last_attachment_id: Option<OwnedEventId> = None;
+        for att in attachments {
+            let id = upload_attachment(room, att, AttachmentKind::Auto, thread_anchor).await?;
+            last_attachment_id = Some(id);
+        }
+
+        // Track each failed marker with the reason: Refused (trust-boundary
+        // rejection by validate_marker_target) vs Failed (everything else —
+        // fetch error, upload rejection). Drives both the textual note and
+        // the emoji reactions fired below.
+        let mut failed_markers: Vec<(String, MarkerFailure)> = Vec::new();
+        for marker in markers {
+            let kind = match marker.kind {
+                markers::MarkerKind::Image => AttachmentKind::Image,
+                markers::MarkerKind::Audio => AttachmentKind::Audio,
+                markers::MarkerKind::Video => AttachmentKind::Video,
+                markers::MarkerKind::File => AttachmentKind::File,
+                markers::MarkerKind::Voice => AttachmentKind::Voice,
+            };
+            let resolved = match validate_marker_target(&marker.target, outbox.workspace_dir) {
+                Ok(t) => t,
+                Err(e) => {
+                    let kind = e.as_marker_failure();
+                    let label = match kind {
+                        MarkerFailure::Refused => "trust boundary",
+                        MarkerFailure::Failed => "not found",
+                    };
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} ({label}): {e}",
+                            marker.target
+                        )
+                    );
+                    failed_markers.push((marker.target.clone(), kind));
+                    continue;
+                }
+            };
+            let bytes = match resolved {
+                MarkerTarget::Local(path) => match tokio::fs::read(&path).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (read failed): {e}",
+                                marker.target
+                            )
+                        );
+                        failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
+                        continue;
+                    }
+                },
+                MarkerTarget::Http(url) => match fetch_http(url).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            )
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (http failed): {e}",
+                                marker.target
+                            )
+                        );
+                        failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
+                        continue;
+                    }
+                },
+            };
+            let file_name = derive_file_name(&marker.target);
+            let mime = mime_for(&file_name, &kind);
+            let att = MediaAttachment {
+                file_name,
+                data: bytes,
+                mime_type: Some(mime),
+                marker: None,
+            };
+            match upload_attachment(room, &att, kind, thread_anchor).await {
+                Ok(id) => last_attachment_id = Some(id),
+                Err(e) => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} (upload failed): {e}",
+                            marker.target
+                        )
+                    );
+                    failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
+                }
+            }
+        }
+
+        if !failed_markers.is_empty() {
+            let targets: Vec<&str> = failed_markers.iter().map(|(t, _)| t.as_str()).collect();
+            let note = if targets.len() == 1 {
+                format!("(note: I couldn't deliver the file at {}.)", targets[0])
+            } else {
+                let joined = targets.join(", ");
+                format!("(note: I couldn't deliver these files: {joined}.)")
+            };
+            text = if text.trim().is_empty() {
+                note
+            } else {
+                format!("{text}\n\n{note}")
+            };
+        }
+
+        Ok(AttachmentDelivery {
+            text,
+            last_attachment_id,
+            failed_markers,
+        })
+    }
+
+    pub(super) async fn send(outbox: &Outbox<'_>, message: &SendMessage) -> Result<OwnedEventId> {
+        let room =
+            resolve_joined_room(outbox.client, outbox.alias_cache, &message.recipient).await?;
+
+        let (text, ms) = markers::parse(&message.content);
+
+        // Build the thread anchor used by both attachment uploads and the
+        // text reply, so attachments live in the same thread instead of
+        // landing in the main timeline.
+        let thread_anchor = thread_anchor_from_message(outbox, message);
+
+        let delivery = deliver_attachments(
+            outbox,
+            &room,
+            text,
+            &ms,
+            &message.attachments,
+            thread_anchor.as_ref(),
+        )
+        .await?;
+
+        // Decide whether to send the text, return the last attachment's
+        // event_id, or surface an error. Marker-only messages used to error
+        // here even though their attachment had landed; the runtime would
+        // see Err and could retry, producing duplicate uploads.
+        match decide_send_outcome(
+            delivery.text.trim().is_empty(),
+            delivery.last_attachment_id.is_some(),
+        ) {
+            SendOutcome::SendText => {}
+            SendOutcome::ReturnAttachment => {
+                // Safe by construction: ReturnAttachment is only returned
+                // when last_attachment_id is Some.
+                let kinds = delivery.failure_kinds();
+                let attachment_id = delivery
+                    .last_attachment_id
+                    .expect("decide_send_outcome guarantees Some when ReturnAttachment");
+                emit_failure_reactions(&room, &attachment_id, &kinds).await;
+                return Ok(attachment_id);
+            }
+            SendOutcome::EmptyError => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"phase": "send"})),
+                    "matrix: empty message body and no successful attachment"
+                );
+                return Err(anyhow::Error::msg(
+                    "matrix: empty message body and no successful attachment",
+                ));
+            }
+        }
+
+        let event_id = if let (true, Some(anchor)) = (
+            outbox.reply_in_thread,
+            message.thread_ts.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            send_threaded_reply(
+                &room,
+                &delivery.text,
+                outbox.message_max_bytes,
+                anchor,
+                outbox.threads_seen,
+            )
+            .await?
+        } else {
+            let text = bounded_body(&delivery.text, outbox.message_max_bytes);
+            let content = RoomMessageEventContent::text_markdown(&text);
+            room.send(content).await?.response.event_id
+        };
+
+        let kinds = delivery.failure_kinds();
+        emit_failure_reactions(&room, &event_id, &kinds).await;
+
+        Ok(event_id)
+    }
+
+    /// Best-effort: apply 🚫 / ⚠️ reactions to the bot's just-sent message
+    /// based on which kinds of marker failures occurred. Reaction send
+    /// failures are logged but never propagated — the primary message
+    /// already landed.
+    pub(super) async fn emit_failure_reactions(
+        room: &Room,
+        event_id: &OwnedEventId,
+        failures: &[MarkerFailure],
+    ) {
+        for emoji in decide_reactions(failures) {
+            let content =
+                ReactionEventContent::new(Annotation::new(event_id.clone(), emoji.to_string()));
+            if let Err(e) = room.send(content).await {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "emoji": emoji})
+                        ),
+                    "matrix: failed to send reaction on outgoing message"
+                );
+            }
+        }
+    }
+
+    async fn send_threaded_reply(
+        room: &Room,
+        text: &str,
+        message_max_bytes: Option<usize>,
+        anchor_id: &str,
+        threads_seen: &Arc<TokioRwLock<std::collections::HashSet<OwnedEventId>>>,
+    ) -> Result<OwnedEventId> {
+        let anchor: OwnedEventId = anchor_id
+            .parse()
+            .with_context(|| format!("parse thread anchor {anchor_id}"))?;
+        let mut candidate = bounded_body(text, message_max_bytes);
+        let reply_event = loop {
+            let without_relation = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+                TextMessageEventContent::markdown(candidate.as_str()),
+            ));
+            let event = room
+                .make_reply_event(
+                    without_relation,
+                    Reply {
+                        event_id: anchor.clone(),
+                        enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                        add_mentions: AddMentions::No,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    ::omnesagent_log::record!(
+                        ERROR,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "make_reply_event failed"
+                    );
+                    anyhow::Error::msg(format!("make_reply_event failed: {e}"))
+                })?;
+            let Some(max_bytes) = message_max_bytes else {
+                break event;
+            };
+            let actual =
+                serde_json::to_vec(&event).map_or(usize::MAX, |serialized| serialized.len());
+            if actual <= max_bytes {
+                break event;
+            }
+            let next = next_prefix_after_oversize(&candidate, actual, max_bytes);
+            if next.len() == candidate.len() {
+                anyhow::bail!(
+                    "matrix: configured message_max_bytes cannot contain a threaded reply event"
+                );
+            }
+            candidate = next.to_string();
+        };
+        ctx_mod::mark_seen(threads_seen, anchor).await;
+        let resp = room.send(reply_event).await?;
+        Ok(resp.response.event_id)
+    }
+
+    pub(super) async fn edit(
+        client: &Client,
+        room_id: &str,
+        event_id: &OwnedEventId,
+        text: &str,
+        message_max_bytes: Option<usize>,
+    ) -> Result<String> {
+        let room = client
+            .get_room(&room_id.parse::<OwnedRoomId>()?)
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"room_id": room_id})),
+                    "matrix: room not joined"
+                );
+                anyhow::Error::msg(format!("matrix: room not joined: {room_id}"))
+            })?;
+        let candidate = text.to_string();
+        let edit_event = {
+            let new_content = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+                TextMessageEventContent::markdown(candidate.as_str()),
+            ));
+            let event = room
+                .make_edit_event(event_id, EditedContent::RoomMessage(new_content))
+                .await
+                .map_err(|e| {
+                    ::omnesagent_log::record!(
+                        ERROR,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "make_edit_event failed"
+                    );
+                    anyhow::Error::msg(format!("make_edit_event failed: {e}"))
+                })?;
+            if let Some(max_bytes) = message_max_bytes {
+                let actual =
+                    serde_json::to_vec(&event).map_or(usize::MAX, |serialized| serialized.len());
+                if actual > max_bytes {
+                    anyhow::bail!(
+                        "matrix: selected single-message progress edit exceeds configured message_max_bytes"
+                    );
+                }
+            }
+            event
+        };
+        room.send(edit_event).await?;
+        Ok(candidate)
+    }
+
+    pub(super) async fn redact(
+        client: &Client,
+        room_id: &str,
+        event_id: &OwnedEventId,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let room = client
+            .get_room(&room_id.parse::<OwnedRoomId>()?)
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"room_id": room_id})),
+                    "matrix: room not joined"
+                );
+                anyhow::Error::msg(format!("matrix: room not joined: {room_id}"))
+            })?;
+        room.redact(event_id, reason.as_deref(), None).await?;
+        Ok(())
+    }
+
+    pub(super) async fn react(
+        outbox: &Outbox<'_>,
+        room_id: &str,
+        event_id: &OwnedEventId,
+        emoji: &str,
+    ) -> Result<()> {
+        let room = resolve_joined_room(outbox.client, outbox.alias_cache, room_id).await?;
+        let content =
+            ReactionEventContent::new(Annotation::new(event_id.clone(), emoji.to_string()));
+        let resp = room.send(content).await?;
+        outbox.reaction_log.lock().await.insert(
+            (
+                room.room_id().to_owned(),
+                event_id.clone(),
+                emoji.to_string(),
+            ),
+            resp.response.event_id,
+        );
+        Ok(())
+    }
+
+    pub(super) async fn unreact(
+        outbox: &Outbox<'_>,
+        room_id: &str,
+        event_id: &OwnedEventId,
+        emoji: &str,
+    ) -> Result<()> {
+        let room = resolve_joined_room(outbox.client, outbox.alias_cache, room_id).await?;
+        let key = (
+            room.room_id().to_owned(),
+            event_id.clone(),
+            emoji.to_string(),
+        );
+        let reaction_event_id = outbox.reaction_log.lock().await.remove(&key);
+        if let Some(rid) = reaction_event_id {
+            room.redact(&rid, Some("removing reaction"), None).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn resolve_joined_room(
+        client: &Client,
+        cache: &Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
+        recipient: &str,
+    ) -> Result<Room> {
+        let id = client::resolve_room(client, cache, recipient).await?;
+        let room = client.get_room(&id).ok_or_else(|| {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"recipient": recipient})),
+                "matrix: bot is not in room"
+            );
+            anyhow::Error::msg(format!("matrix: bot is not in room {recipient}"))
+        })?;
+        if room.state() != RoomState::Joined {
+            bail!("matrix: room {recipient} is not in joined state");
+        }
+        Ok(room)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AttachmentKind {
+        Auto,
+        Image,
+        Audio,
+        Video,
+        File,
+        Voice,
+    }
+
+    async fn upload_attachment(
+        room: &Room,
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> Result<OwnedEventId> {
+        let mime = attachment_mime(att);
+        if matches!(kind, AttachmentKind::Voice) {
+            return upload_voice(room, att, &mime, thread_anchor).await;
+        }
+        let config = attachment_config_for(att, kind, &mime, thread_anchor);
+        let resp = room
+            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
+            .await
+            .map_err(|e| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "send_attachment failed"
+                );
+                anyhow::Error::msg(format!("send_attachment failed: {e}"))
+            })?;
+        Ok(resp.event_id)
+    }
+
+    pub(super) fn attachment_config_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> AttachmentConfig {
+        let mut config = AttachmentConfig::new().info(attachment_info_for(att, kind, mime));
+        if let Some(anchor) = thread_anchor {
+            config = config.reply(Some(Reply {
+                event_id: anchor.clone(),
+                enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                add_mentions: AddMentions::No,
+            }));
+        }
+        config
+    }
+
+    pub(super) fn attachment_mime(att: &MediaAttachment) -> mime_guess::Mime {
+        match att.mime_type.as_deref() {
+            Some(m) => m
+                .parse()
+                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
+            None => mime_guess::from_path(&att.file_name)
+                .first()
+                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
+        }
+    }
+
+    fn attachment_info_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+    ) -> AttachmentInfo {
+        let size = UInt::try_from(att.data.len()).ok();
+        match attachment_info_kind(kind, mime) {
+            AttachmentKind::Image => AttachmentInfo::Image(BaseImageInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Audio => AttachmentInfo::Audio(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Video => AttachmentInfo::Video(BaseVideoInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Voice => AttachmentInfo::Voice(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::File | AttachmentKind::Auto => {
+                AttachmentInfo::File(BaseFileInfo { size })
+            }
+        }
+    }
+
+    fn attachment_info_kind(kind: AttachmentKind, mime: &mime_guess::Mime) -> AttachmentKind {
+        if kind == AttachmentKind::Voice {
+            return AttachmentKind::Voice;
+        }
+        match mime.type_() {
+            mime_guess::mime::IMAGE => AttachmentKind::Image,
+            mime_guess::mime::AUDIO => AttachmentKind::Audio,
+            mime_guess::mime::VIDEO => AttachmentKind::Video,
+            _ => AttachmentKind::File,
+        }
+    }
+
+    /// Voice messages need the `org.matrix.msc3245.voice` flag, which the
+    /// stable matrix-sdk types don't carry. Send via raw JSON, attaching the
+    /// thread relation manually when the bot is replying inside one.
+    async fn upload_voice(
+        room: &Room,
+        att: &MediaAttachment,
+        mime: &mime_guess::Mime,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> Result<OwnedEventId> {
+        let mxc = room
+            .client()
+            .media()
+            .upload(mime, att.data.clone(), None)
+            .await
+            .map_err(|e| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "media upload failed"
+                );
+                anyhow::Error::msg(format!("media upload failed: {e}"))
+            })?;
+        let mut event = json!({
+            "msgtype": "m.audio",
+            "body": att.file_name,
+            "filename": att.file_name,
+            "url": mxc.content_uri.to_string(),
+            "info": {
+                "mimetype": mime.essence_str(),
+                "size": att.data.len(),
+            },
+            "org.matrix.msc3245.voice": {},
+            "org.matrix.msc1767.audio": {
+                "duration": 0u32,
+                "waveform": Vec::<u32>::new(),
+            },
+        });
+        if let Some(anchor) = thread_anchor
+            && let Some(obj) = event.as_object_mut()
+        {
+            obj.insert(
+                "m.relates_to".to_string(),
+                json!({
+                    "rel_type": "m.thread",
+                    "event_id": anchor.as_str(),
+                    "is_falling_back": true,
+                    "m.in_reply_to": { "event_id": anchor.as_str() },
+                }),
+            );
+        }
+        let resp = room.send_raw("m.room.message", event).await?;
+        Ok(resp.response.event_id)
+    }
+
+    fn derive_file_name(target: &str) -> String {
+        target
+            .rsplit_once('/')
+            .map(|(_, n)| n.to_string())
+            .unwrap_or_else(|| target.to_string())
+    }
+
+    fn mime_for(file_name: &str, kind: &AttachmentKind) -> String {
+        if let Some(m) = mime_guess::from_path(file_name).first() {
+            return m.essence_str().to_string();
+        }
+        match kind {
+            AttachmentKind::Image => "image/jpeg".to_string(),
+            AttachmentKind::Audio | AttachmentKind::Voice => "audio/ogg".to_string(),
+            AttachmentKind::Video => "video/mp4".to_string(),
+            AttachmentKind::File | AttachmentKind::Auto => "application/octet-stream".to_string(),
+        }
+    }
+}
+
+// ─── public type ───────────────────────────────────────────────────────────
+
+/// Matrix channel.
+pub struct MatrixChannel {
+    config: Arc<MatrixConfig>,
+    /// The alias key under `[channels.matrix.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    state_dir: PathBuf,
+    workspace_dir: Option<Arc<PathBuf>>,
+    transcription: Option<TranscriptionResolver>,
+    client: tokio::sync::OnceCell<Client>,
+    pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+    streaming_state: Arc<TokioRwLock<streaming::State>>,
+    threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
+    alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
+    reaction_log: Arc<TokioMutex<HashMap<outbound::ReactionKey, OwnedEventId>>>,
+    bot_display_name: Arc<TokioRwLock<Option<String>>>,
+    initial_sync_done: Arc<AtomicBool>,
+    undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    /// Resolved `ack_reactions` for this Matrix instance — the
+    /// per-channel `MatrixConfig.ack_reactions` override falls back to
+    /// `[channels].ack_reactions` here at construction time, so the
+    /// read site doesn't need to re-resolve on every reaction.
+    ack_reactions: bool,
+}
+
+impl MatrixChannel {
+    /// Validate config and prepare the channel. The SDK Client is built lazily
+    /// on first `listen()` or `send()` call.
+    pub fn new(
+        config: MatrixConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        state_dir: PathBuf,
+    ) -> Result<Self> {
+        if config.homeserver.trim().is_empty() {
+            bail!("matrix: `homeserver` is required");
+        }
+        let has_token = config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_password = config
+            .password
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if !has_token && !has_password {
+            bail!("matrix: configure either `access_token` or `password`");
+        }
+        let ack_reactions = config.ack_reactions.unwrap_or(true);
+        let streaming_state = streaming::State::for_stream_mode(config.stream_mode);
+        Ok(Self {
+            config: Arc::new(config),
+            alias: alias.into(),
+            peer_resolver,
+            state_dir,
+            workspace_dir: None,
+            transcription: None,
+            client: tokio::sync::OnceCell::new(),
+            pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+            streaming_state: Arc::new(TokioRwLock::new(streaming_state)),
+            threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+            alias_cache: Arc::new(TokioRwLock::new(HashMap::new())),
+            reaction_log: Arc::new(TokioMutex::new(HashMap::new())),
+            bot_display_name: Arc::new(TokioRwLock::new(None)),
+            initial_sync_done: Arc::new(AtomicBool::new(false)),
+            undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            ack_reactions,
+        })
+    }
+
+    /// Return the alias under `[channels.matrix.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    #[must_use]
+    pub fn with_ack_reactions(mut self, ack_reactions: bool) -> Self {
+        self.ack_reactions = ack_reactions;
+        self
+    }
+
+    /// Replace the compatibility resolver with the channel runtime's
+    /// live-config resolver, so typed provider entries and the owning agent's
+    /// `transcription_provider` are honoured.
+    pub(crate) fn with_transcription_manager_factory(
+        mut self,
+        factory: impl Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.transcription = Some(Arc::new(factory));
+        self
+    }
+
+    /// Configure the workspace directory used to persist downloaded media so
+    /// the agent's vision/document pipelines can read inbound files via
+    /// `[IMAGE:path]` / `[Document: name] path` markers.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(Arc::new(dir));
+        self
+    }
+
+    async fn ensure_client(&self) -> Result<&Client> {
+        use ::omnesagent_log::__private::tracing::Instrument;
+        self.client
+            .get_or_try_init(|| {
+                async {
+                    let c = client::build(&self.config, &self.state_dir).await?;
+                    if let Ok(Some(name)) = c.account().get_display_name().await {
+                        *self.bot_display_name.write().await = Some(name);
+                    }
+                    Ok::<_, anyhow::Error>(c)
+                }
+                .instrument(::omnesagent_log::attribution_span!(self))
+            })
+            .await
+    }
+
+    fn outbox<'a>(&'a self, client: &'a Client) -> outbound::Outbox<'a> {
+        outbound::Outbox {
+            client,
+            alias_cache: &self.alias_cache,
+            threads_seen: &self.threads_seen,
+            reaction_log: &self.reaction_log,
+            reply_in_thread: self.config.reply_in_thread,
+            workspace_dir: self.workspace_dir.as_deref().map(|p| p.as_path()),
+            message_max_bytes: None,
+        }
+    }
+
+    fn final_outbox<'a>(&'a self, client: &'a Client) -> outbound::Outbox<'a> {
+        let mut outbox = self.outbox(client);
+        outbox.message_max_bytes = (self.config.stream_mode == MatrixStreamMode::SingleMessage)
+            .then_some(self.config.effective_message_max_bytes());
+        outbox
+    }
+
+    /// Edit-in-place draft update. Rate-limited per the configured interval.
+    async fn partial_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let key = streaming_key(recipient, message_id)?;
+        let Some(visible_text) = streaming::partial_visible_text(text) else {
+            return Ok(());
+        };
+        let event_id = {
+            let mut state = self.streaming_state.write().await;
+            let Some(draft) = streaming::partial_for_update(&mut state, &key) else {
+                return Ok(());
+            };
+            let now = Instant::now();
+            let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
+            if !streaming::partial_should_edit(draft, &visible_text, now, interval) {
+                return Ok(());
+            }
+            let event_id = draft.event_id.clone();
+            draft.last_text = visible_text.clone();
+            draft.last_edit = now;
+            event_id
+        };
+        outbound::edit(client, recipient, &event_id, &visible_text, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Update the sliding progress transcript for `single_message` mode.
+    /// Unlike Partial mode, assistant answer text is intentionally ignored
+    /// elsewhere; this draft is only for durable status/progress entries.
+    async fn single_update_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let key = streaming_key(recipient, message_id)?;
+        let max_body_bytes = self.config.effective_message_max_bytes();
+        let update = {
+            let mut state = self.streaming_state.write().await;
+            let Some(draft) = streaming::single_for_update(&mut state, &key) else {
+                return Ok(());
+            };
+            streaming::push_single_progress_line(draft, text, self.config.stream_draft_lines);
+
+            let now = Instant::now();
+            let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
+            if !streaming::single_edit_interval_elapsed(draft, now, interval) {
+                return Ok(());
+            }
+
+            let visible_text =
+                streaming::single_visible_text_with_edit_budget(draft, max_body_bytes);
+            if visible_text.is_empty() || !streaming::single_render_changed(draft, &visible_text) {
+                return Ok(());
+            }
+            draft.last_edit = now;
+            (draft.event_id.clone(), visible_text)
+        };
+        let client = self.ensure_client().await?;
+        let delivered = outbound::edit(
+            client,
+            recipient,
+            &update.0,
+            &update.1,
+            Some(max_body_bytes),
+        )
+        .await?;
+        {
+            let mut state = self.streaming_state.write().await;
+            if let Some(draft) = streaming::single_for_update(&mut state, &key) {
+                streaming::mark_single_edit_delivered(draft, &update.0, delivered, Instant::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a burst of single-message progress entries and publish the
+    /// coalesced transcript with one Matrix edit. The caller owns pacing.
+    async fn single_update_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> Result<()> {
+        let progress = texts
+            .iter()
+            .map(|text| streaming::legacy_single_progress(text))
+            .collect::<Vec<_>>();
+        self.single_update_typed_progress_batch(recipient, message_id, &progress)
+            .await
+    }
+
+    /// Publish a coalesced Matrix progress batch while retaining each entry's
+    /// semantic source through the channel-local draft buffer.
+    async fn single_update_typed_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> Result<()> {
+        if progress.is_empty() {
+            return Ok(());
+        }
+        let key = streaming_key(recipient, message_id)?;
+        let max_body_bytes = self.config.effective_message_max_bytes();
+        let update = {
+            let mut state = self.streaming_state.write().await;
+            let Some(draft) = streaming::single_for_update(&mut state, &key) else {
+                return Ok(());
+            };
+            for entry in progress {
+                streaming::push_single_progress(
+                    draft,
+                    entry.clone(),
+                    self.config.stream_draft_lines,
+                );
+            }
+
+            let visible_text =
+                streaming::single_visible_text_with_edit_budget(draft, max_body_bytes);
+            if visible_text.is_empty() || !streaming::single_render_changed(draft, &visible_text) {
+                return Ok(());
+            }
+            draft.last_edit = Instant::now();
+            (draft.event_id.clone(), visible_text)
+        };
+        let client = self.ensure_client().await?;
+        let delivered = outbound::edit(
+            client,
+            recipient,
+            &update.0,
+            &update.1,
+            Some(max_body_bytes),
+        )
+        .await?;
+        {
+            let mut state = self.streaming_state.write().await;
+            if let Some(draft) = streaming::single_for_update(&mut state, &key) {
+                streaming::mark_single_edit_delivered(draft, &update.0, delivered, Instant::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// MultiMessage paragraph emitter. Loops emitting one paragraph per
+    /// `\n\n` boundary until the unsent buffer no longer contains a break,
+    /// then returns to wait for more accumulated text. Each paragraph posts
+    /// as an independent room message threaded under the captured anchor.
+    async fn multi_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let key = streaming_key(recipient, message_id)?;
+        let delay = Duration::from_millis(self.config.multi_message_delay_ms);
+        loop {
+            let (paragraph, thread_anchor) = {
+                let mut state = self.streaming_state.write().await;
+                let Some(multi) = streaming::multi_for_update(&mut state, &key) else {
+                    return Ok(());
+                };
+                // Detect a buffer reset (e.g. DraftEvent::Clear) and re-anchor
+                // to the new shorter text.
+                if text.len() < multi.sent_so_far {
+                    multi.sent_so_far = 0;
+                    return Ok(());
+                }
+                if text.len() == multi.sent_so_far {
+                    return Ok(());
+                }
+                let unsent = &text[multi.sent_so_far..];
+                let Some(break_at) = streaming::next_paragraph_break(unsent) else {
+                    return Ok(());
+                };
+                let paragraph = unsent[..break_at].trim().to_string();
+                multi.sent_so_far += break_at + 2; // +2 for the consumed "\n\n"
+                (paragraph, multi.thread_anchor.clone())
+            };
+            if !paragraph.is_empty() {
+                let mut msg = SendMessage::new(paragraph, recipient);
+                msg.thread_ts = thread_anchor.as_ref().map(|e| e.to_string());
+                if let Err(e) = outbound::send(&self.outbox(client), &msg).await {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "matrix: multi-message paragraph send failed"
+                    );
+                }
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    async fn redact_single_draft_before_final(
+        client: &Client,
+        recipient: &str,
+        event_id: &OwnedEventId,
+        reason: &str,
+    ) {
+        if let Err(err) =
+            outbound::redact(client, recipient, event_id, Some(reason.to_string())).await
+        {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                "matrix: single-message draft cleanup failed before final send; sending final response anyway"
+            );
+        }
+    }
+}
+
+impl ::omnesagent_api::attribution::Attributable for MatrixChannel {
+    fn role(&self) -> ::omnesagent_api::attribution::Role {
+        ::omnesagent_api::attribution::Role::Channel(::omnesagent_api::attribution::ChannelKind::Matrix)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[async_trait]
+impl Channel for MatrixChannel {
+    fn name(&self) -> &str {
+        "matrix"
+    }
+
+    fn self_handle(&self) -> Option<String> {
+        self.client
+            .get()
+            .and_then(|c| c.user_id().map(|u| u.to_string()))
+    }
+
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle()
+    }
+
+    async fn send(&self, message: &SendMessage) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let _ = outbound::send(&self.outbox(client), message).await?;
+        Ok(())
+    }
+
+    async fn send_final(&self, message: &SendMessage) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let _ = outbound::send(&self.final_outbox(client), message).await?;
+        Ok(())
+    }
+
+    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+        let client = self.ensure_client().await?.clone();
+        let user_id = client
+            .user_id()
+            .ok_or_else(|| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure),
+                    "matrix: client has no user_id after login"
+                );
+                anyhow::Error::msg("matrix: client has no user_id after login")
+            })?
+            .to_owned();
+        let ctx = inbound::HandlerCtx {
+            config: self.config.clone(),
+            alias: self.alias.clone(),
+            peer_resolver: self.peer_resolver.clone(),
+            transcription: self.transcription.clone(),
+            workspace_dir: self.workspace_dir.clone(),
+            tx,
+            pending_approvals: self.pending_approvals.clone(),
+            threads_seen: self.threads_seen.clone(),
+            bot_user_id: user_id,
+            bot_display_name: self.bot_display_name.clone(),
+            initial_sync_done: self.initial_sync_done.clone(),
+            undecryptable_seen: self.undecryptable_seen.clone(),
+        };
+        inbound::run_sync_loop(client, ctx).await
+    }
+
+    async fn health_check(&self) -> bool {
+        match self.client.get() {
+            Some(c) => c.matrix_auth().logged_in() && self.initial_sync_done.load(Ordering::SeqCst),
+            None => false,
+        }
+    }
+
+    async fn start_typing(&self, recipient: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let id = client::resolve_room(client, &self.alias_cache, recipient).await?;
+        if let Some(room) = client.get_room(&id) {
+            let _ = room.typing_notice(true).await;
+        }
+        Ok(())
+    }
+
+    async fn stop_typing(&self, recipient: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let id = client::resolve_room(client, &self.alias_cache, recipient).await?;
+        if let Some(room) = client.get_room(&id) {
+            let _ = room.typing_notice(false).await;
+        }
+        Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        // The orchestrator's streaming pipeline is gated on this returning
+        // true. Partial, SingleMessage, and MultiMessage all need streaming
+        // setup; the channel decides internally whether to edit answer text,
+        // edit progress only, or emit paragraphs.
+        !matches!(self.config.stream_mode, MatrixStreamMode::Off)
+    }
+
+    fn supports_multi_message_streaming(&self) -> bool {
+        matches!(self.config.stream_mode, MatrixStreamMode::MultiMessage)
+    }
+
+    fn multi_message_delay_ms(&self) -> u64 {
+        self.config.multi_message_delay_ms
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
+        let client = self.ensure_client().await?;
+        let room_id = streaming_room(&message.recipient)?;
+        match self.config.stream_mode {
+            MatrixStreamMode::Off => Ok(None),
+            MatrixStreamMode::Partial => {
+                // Send the placeholder draft now so subsequent update_draft
+                // calls have an event to edit.
+                let event_id = outbound::send(&self.outbox(client), message).await?;
+                let thread_anchor =
+                    outbound::thread_anchor_from_message(&self.outbox(client), message);
+                let key = streaming::draft_key(room_id, event_id.as_ref())?;
+                let mut state = self.streaming_state.write().await;
+                streaming::insert_partial(
+                    &mut state,
+                    key,
+                    streaming::PartialDraft {
+                        event_id: event_id.clone(),
+                        thread_anchor,
+                        last_text: message.content.clone(),
+                        last_edit: Instant::now(),
+                    },
+                )?;
+                Ok(Some(event_id.to_string()))
+            }
+            MatrixStreamMode::SingleMessage => {
+                // Single-message mode starts with one editable progress draft.
+                // Final answer text is never copied here; finalize_draft sends
+                // the answer as a separate Matrix message.
+                let event_id = outbound::send(&self.outbox(client), message).await?;
+                let thread_anchor =
+                    outbound::thread_anchor_from_message(&self.outbox(client), message);
+                let key = streaming::draft_key(room_id, event_id.as_ref())?;
+                let first_edit_ready = Instant::now();
+                let mut state = self.streaming_state.write().await;
+                streaming::insert_single(
+                    &mut state,
+                    key,
+                    streaming::SingleDraft {
+                        event_id: event_id.clone(),
+                        thread_anchor,
+                        lines: Default::default(),
+                        last_text: message.content.clone(),
+                        last_edit: first_edit_ready,
+                    },
+                )?;
+                Ok(Some(event_id.to_string()))
+            }
+            MatrixStreamMode::MultiMessage => {
+                // No initial message — paragraphs are emitted by update_draft
+                // as they appear. Capture the thread anchor up front so each
+                // paragraph lands in the same thread as the user's message.
+                let thread_anchor = message
+                    .thread_ts
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| s.parse::<OwnedEventId>().ok());
+                let draft_id = streaming::new_multi_message_draft_id();
+                let key = streaming::draft_key(room_id, &draft_id)?;
+                let mut state = self.streaming_state.write().await;
+                streaming::insert_multi(
+                    &mut state,
+                    key,
+                    streaming::MultiDraft {
+                        thread_anchor,
+                        sent_so_far: 0,
+                    },
+                )?;
+                Ok(Some(draft_id))
+            }
+        }
+    }
+
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
+        match self.config.stream_mode {
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => self.partial_update(recipient, message_id, text).await,
+            MatrixStreamMode::SingleMessage => Ok(()),
+            MatrixStreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
+        }
+    }
+
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        match self.config.stream_mode {
+            MatrixStreamMode::Partial => self.update_draft(recipient, message_id, text).await,
+            MatrixStreamMode::SingleMessage => {
+                self.single_update_progress(recipient, message_id, text)
+                    .await
+            }
+            // MultiMessage doesn't have an in-flight draft to update, and Off
+            // means the orchestrator should not have created one.
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+        }
+    }
+
+    async fn update_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> Result<()> {
+        match self.config.stream_mode {
+            MatrixStreamMode::SingleMessage => {
+                self.single_update_progress_batch(recipient, message_id, texts)
+                    .await
+            }
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+            MatrixStreamMode::Partial => {
+                for text in texts {
+                    self.update_draft_progress(recipient, message_id, text)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> Result<()> {
+        match self.config.stream_mode {
+            MatrixStreamMode::SingleMessage => {
+                self.single_update_typed_progress_batch(recipient, message_id, progress)
+                    .await
+            }
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+            MatrixStreamMode::Partial => {
+                for entry in progress {
+                    self.update_draft_progress(recipient, message_id, &entry.text)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        _suppress_voice: bool,
+    ) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let key = streaming_key(recipient, message_id)?;
+        match self.config.stream_mode {
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
+                if let Some(draft) = draft {
+                    let room =
+                        outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
+                    let (cleaned_text, markers) = markers::parse(text);
+                    let delivery = outbound::deliver_attachments(
+                        &self.outbox(client),
+                        &room,
+                        cleaned_text,
+                        &markers,
+                        &[],
+                        draft.thread_anchor.as_ref(),
+                    )
+                    .await?;
+
+                    match streaming::decide_partial_finalize_action(
+                        delivery.text.trim().is_empty(),
+                        delivery.last_attachment_id.is_some(),
+                    ) {
+                        streaming::PartialFinalizeAction::EditDraft => {
+                            let kinds = delivery.failure_kinds();
+                            let any_attachment_landed = delivery.last_attachment_id.is_some();
+                            if let Err(edit_err) = outbound::edit(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                &delivery.text,
+                                None,
+                            )
+                            .await
+                            {
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Note
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        ::serde_json::json!({"edit_err": edit_err.to_string()})
+                                    ),
+                                    "matrix: partial finalize edit failed: ; sending cleaned text fallback"
+                                );
+                                let mut fallback = SendMessage::new(&delivery.text, recipient);
+                                fallback.thread_ts =
+                                    draft.thread_anchor.as_ref().map(|e| e.to_string());
+                                match outbound::send(&self.outbox(client), &fallback).await {
+                                    Ok(fallback_id) => {
+                                        outbound::emit_failure_reactions(
+                                            &room,
+                                            &fallback_id,
+                                            &kinds,
+                                        )
+                                        .await;
+                                    }
+                                    Err(send_err) if any_attachment_landed => {
+                                        ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"send_err": send_err.to_string()})), "matrix: partial finalize cleaned text fallback failed after attachment upload: ; suppressing error to avoid duplicate attachment retry");
+                                    }
+                                    Err(send_err) => {
+                                        return Err(edit_err).with_context(|| {
+                                            format!(
+                                                "matrix: partial finalize cleaned text fallback failed: {send_err}"
+                                            )
+                                        });
+                                    }
+                                }
+                            } else {
+                                outbound::emit_failure_reactions(&room, &draft.event_id, &kinds)
+                                    .await;
+                            }
+                        }
+                        streaming::PartialFinalizeAction::RedactDraft => {
+                            if let Err(err) = outbound::redact(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                Some("attachment-only response delivered".to_string()),
+                            )
+                            .await
+                            {
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Note
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                                    "matrix: partial finalize redaction failed after attachment-only upload: ; leaving placeholder to avoid duplicate attachment retry"
+                                );
+                            }
+                        }
+                        streaming::PartialFinalizeAction::EmptyError => {
+                            ::omnesagent_log::record!(
+                                WARN,
+                                ::omnesagent_log::Event::new(
+                                    module_path!(),
+                                    ::omnesagent_log::Action::Reject
+                                )
+                                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"phase": "partial_finalize"})),
+                                "matrix: empty partial draft body and no successful attachment"
+                            );
+                            return Err(anyhow::Error::msg(
+                                "matrix: empty partial draft body and no successful attachment",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            MatrixStreamMode::SingleMessage => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_single(&mut state, &key)
+                };
+                let plan = streaming::single_finalize_plan(
+                    draft.is_some(),
+                    self.config.stream_draft_delete,
+                    !text.trim().is_empty(),
+                );
+
+                if plan.deletes_draft_first()
+                    && let Some(draft) = draft.as_ref()
+                {
+                    // Matrix implements message deletion through redaction.
+                    // Delete before the final send so the user's timeline
+                    // lands on the final answer rather than a trailing
+                    // "message deleted" event after it.
+                    Self::redact_single_draft_before_final(
+                        client,
+                        recipient,
+                        &draft.event_id,
+                        "streaming draft replaced by final response",
+                    )
+                    .await;
+                }
+
+                if plan.keeps_draft()
+                    && let Some(draft) = draft.as_ref()
+                {
+                    match streaming::single_retained_draft_action(
+                        draft,
+                        self.config.effective_message_max_bytes(),
+                    ) {
+                        streaming::SingleRetainedDraftAction::DeletePlaceholder => {
+                            Self::redact_single_draft_before_final(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                "empty streaming draft removed before final response",
+                            )
+                            .await;
+                        }
+                        streaming::SingleRetainedDraftAction::Flush(visible_text) => {
+                            if let Err(edit_err) = outbound::edit(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                &visible_text,
+                                Some(self.config.effective_message_max_bytes()),
+                            )
+                            .await
+                            {
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Note
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"err": edit_err.to_string()})),
+                                    "matrix: single-message retained draft flush failed before final send"
+                                );
+                                if draft.last_text == DRAFT_PLACEHOLDER {
+                                    // Buffered progress is not durable until
+                                    // an edit succeeds. Remove the still-
+                                    // visible placeholder before sending the
+                                    // final answer rather than retaining an
+                                    // empty progress event.
+                                    Self::redact_single_draft_before_final(
+                                        client,
+                                        recipient,
+                                        &draft.event_id,
+                                        "unpublished streaming draft removed before final response",
+                                    )
+                                    .await;
+                                }
+                                // Once a successful edit establishes a
+                                // durable transcript, retention is
+                                // best-effort. A stale retained draft is less
+                                // harmful than suppressing the separate final
+                                // Matrix answer, so final delivery proceeds.
+                            }
+                        }
+                        streaming::SingleRetainedDraftAction::KeepCurrent => {}
+                    }
+                }
+
+                if plan.sends_final() {
+                    let mut msg = SendMessage::new(text, recipient);
+                    msg.thread_ts = draft
+                        .as_ref()
+                        .and_then(|draft| draft.thread_anchor.as_ref())
+                        .map(|e| e.to_string());
+                    outbound::send(&self.final_outbox(client), &msg).await?;
+                }
+                Ok(())
+            }
+            MatrixStreamMode::MultiMessage => {
+                // Drain the trailing paragraph (or whatever's left after the
+                // last \n\n boundary) as one final message.
+                let multi = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_multi(&mut state, &key)
+                };
+                let Some(state) = multi else {
+                    return Ok(());
+                };
+                let remainder = if text.len() > state.sent_so_far {
+                    text[state.sent_so_far..].trim().to_string()
+                } else {
+                    String::new()
+                };
+                if !remainder.is_empty() {
+                    let mut msg = SendMessage::new(remainder, recipient);
+                    msg.thread_ts = state.thread_anchor.as_ref().map(|e| e.to_string());
+                    outbound::send(&self.outbox(client), &msg).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let key = streaming_key(recipient, message_id)?;
+        match self.config.stream_mode {
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
+                if let Some(d) = draft {
+                    let _ = outbound::redact(
+                        client,
+                        recipient,
+                        &d.event_id,
+                        Some("cancelled".to_string()),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            MatrixStreamMode::SingleMessage => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_single(&mut state, &key)
+                };
+                if let Some(draft) = draft
+                    && streaming::single_cancel_deletes_draft(
+                        &draft,
+                        self.config.stream_draft_delete,
+                    )
+                {
+                    let _ = outbound::redact(
+                        client,
+                        recipient,
+                        &draft.event_id,
+                        Some("cancelled".to_string()),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            MatrixStreamMode::MultiMessage => {
+                // Already-sent paragraphs are independent room messages and
+                // are not redacted on cancel — partial output is preferable
+                // to silent disappearance. Just drop our state.
+                let mut state = self.streaming_state.write().await;
+                streaming::take_multi(&mut state, &key);
+                Ok(())
+            }
+        }
+    }
+
+    async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        if !self.ack_reactions {
+            return Ok(());
+        }
+        let client = self.ensure_client().await?;
+        let event_id: OwnedEventId = message_id.parse()?;
+        outbound::react(&self.outbox(client), channel_id, &event_id, emoji).await
+    }
+
+    async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        if !self.ack_reactions {
+            return Ok(());
+        }
+        let client = self.ensure_client().await?;
+        let event_id: OwnedEventId = message_id.parse()?;
+        outbound::unreact(&self.outbox(client), channel_id, &event_id, emoji).await
+    }
+
+    async fn redact_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let event_id: OwnedEventId = message_id.parse()?;
+        outbound::redact(client, channel_id, &event_id, reason).await
+    }
+
+    async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+        let client = self.ensure_client().await?;
+        let request = room_management::build_create_room_request(options)?;
+        let room = client.create_room(request).await?;
+        Ok(room.room_id().to_string())
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let request = room_management::build_invite_user_request(room_id, user_id)?;
+        client.send(request).await?;
+        Ok(())
+    }
+
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<omnesagent_api::channel::AttributedApprovalResponse>> {
+        let client = self.ensure_client().await?;
+        let destination = client::resolve_room(client, &self.alias_cache, recipient)
+            .await?
+            .to_string();
+        let token = approval::generate_token_default();
+        let prompt = crate::util::build_approve_deny_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
+        );
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination,
+                tool_name: request.tool_name.clone(),
+            },
+        );
+
+        let send_msg = SendMessage::new(prompt, recipient);
+        if let Err(e) = self.send(&send_msg).await {
+            self.pending_approvals.lock().await.remove(&token);
+            return Err(e);
+        }
+
+        let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
+        let result = tokio::time::timeout(timeout, rx).await;
+        if result.is_err() {
+            self.pending_approvals.lock().await.remove(&token);
+        }
+        // Only the first arm is an operator decision; the other two are the
+        // runtime denying because nobody replied, and must say so.
+        match result {
+            Ok(Ok(resp)) => Ok(Some(
+                omnesagent_api::channel::AttributedApprovalResponse::operator(resp),
+            )),
+            Ok(Err(_)) => Ok(Some(
+                omnesagent_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    omnesagent_api::channel::ApprovalSource::Unreachable,
+                ),
+            )),
+            Err(_) => Ok(Some(
+                omnesagent_api::channel::AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    omnesagent_api::channel::ApprovalSource::TimedOut,
+                ),
+            )),
+        }
+    }
+}
+
+fn streaming_room(recipient: &str) -> Result<OwnedRoomId> {
+    recipient
+        .parse::<OwnedRoomId>()
+        .with_context(|| format!("parse recipient room id {recipient}"))
+}
+
+fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKey> {
+    streaming::draft_key(streaming_room(recipient)?, message_id)
+}
+
+// ─── tests ─────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    mod transcription_provider_resolution {
+        use super::super::build_transcription_manager;
+        use omnesagent_config::schema::{
+            AliasedAgentConfig, Config, LocalWhisperConfig,
+            LocalWhisperTranscriptionProviderConfig, TranscriptionConfig,
+        };
+
+        fn local_whisper_config(url: &str) -> LocalWhisperConfig {
+            LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        fn with_transcription(transcription: TranscriptionConfig) -> Config {
+            Config {
+                transcription,
+                ..Config::default()
+            }
+        }
+
+        /// A typed `[providers.transcription.local_whisper.stoa]` entry plus the
+        /// owning agent's `transcription_provider`, and no legacy provider.
+        fn typed_config() -> Config {
+            let mut config = with_transcription(TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            });
+            config.providers.transcription.local_whisper.insert(
+                "stoa".to_string(),
+                LocalWhisperTranscriptionProviderConfig {
+                    uri: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+                    ..LocalWhisperTranscriptionProviderConfig::default()
+                },
+            );
+            config.agents.insert(
+                "local".to_string(),
+                AliasedAgentConfig {
+                    transcription_provider: "local_whisper.stoa".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config
+        }
+
+        #[tokio::test]
+        async fn registers_typed_provider_and_binds_the_agent_alias() {
+            // Regression: the channel built its manager from the legacy
+            // `[transcription]` section alone, so typed entries never
+            // registered and the agent's provider was never read — voice
+            // ingest failed with "no transcription provider registered".
+            let config = typed_config();
+
+            let manager = build_transcription_manager(&config, "local_whisper.stoa").unwrap();
+
+            assert!(
+                manager
+                    .available_providers()
+                    .contains(&"local_whisper.stoa"),
+                "typed provider must register, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the bound alias, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn agent_alias_wins_over_the_sole_provider_heuristic() {
+            // Two providers register, so the sole-provider fallback cannot
+            // fire; only the agent's explicit alias can bind here.
+            let mut config = typed_config();
+            config.transcription.local_whisper =
+                Some(local_whisper_config("http://127.0.0.1:9998/v1/transcribe"));
+
+            let manager = build_transcription_manager(&config, "local_whisper.stoa").unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "the explicit agent alias must be bound, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn binds_alias_when_exactly_one_provider_is_configured() {
+            let config = with_transcription(TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            });
+
+            let manager = build_transcription_manager(&config, "").unwrap();
+            assert_eq!(
+                manager.available_providers(),
+                vec!["local_whisper"],
+                "fixture must register exactly one provider"
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn leaves_alias_unbound_when_multiple_providers_are_configured() {
+            let config = with_transcription(TranscriptionConfig {
+                enabled: true,
+                api_key: Some("test-groq-key".to_string()),
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            });
+
+            let manager = build_transcription_manager(&config, "").unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.ogg")
+                .await
+                .expect_err("an unbound alias must fail");
+            assert!(
+                err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected the empty-alias bail, got: {err}"
+            );
+        }
+    }
+
+    mod media_filename_resolution {
+        use super::super::build_transcription_manager;
+        use super::super::inbound::transcription_safe_filename;
+        use omnesagent_config::schema::TranscriptionConfig;
+
+        fn local_whisper_config(url: &str) -> omnesagent_config::schema::LocalWhisperConfig {
+            omnesagent_config::schema::LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        fn config_with(transcription: TranscriptionConfig) -> omnesagent_config::schema::Config {
+            omnesagent_config::schema::Config {
+                transcription,
+                ..omnesagent_config::schema::Config::default()
+            }
+        }
+
+        #[test]
+        fn unaccepted_extension_with_supported_mime_uses_mime_derived_name() {
+            let resolved = transcription_safe_filename("recording.bin", Some("audio/ogg"));
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_preserved_even_when_mime_differs() {
+            let resolved = transcription_safe_filename("recording.mp3", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn accepted_extension_matching_mime_is_passed_through_unchanged() {
+            let resolved = transcription_safe_filename("recording.ogg", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_matched_case_insensitively() {
+            let resolved = transcription_safe_filename("recording.OGG", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.OGG");
+        }
+
+        #[test]
+        fn oga_extension_is_accepted_and_preserved() {
+            let resolved = transcription_safe_filename("note.oga", Some("audio/ogg"));
+            assert_eq!(resolved, "note.oga");
+        }
+
+        #[test]
+        fn no_mime_with_an_accepted_extension_is_passed_through() {
+            let resolved = transcription_safe_filename("recording.mp3", None);
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn unaccepted_extension_with_no_mime_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("recording.bin", None);
+            assert_eq!(resolved, "recording.bin");
+        }
+
+        #[test]
+        fn no_mime_and_no_extension_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("Meeting recap", None);
+            assert_eq!(resolved, "Meeting recap");
+        }
+
+        #[test]
+        fn unsupported_mime_and_extension_are_preserved() {
+            let resolved = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(resolved, "recording.aac");
+        }
+
+        #[test]
+        fn synthesizes_extension_from_mime_when_no_extension_at_all() {
+            let resolved = transcription_safe_filename("Voice message", Some("audio/ogg"));
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[tokio::test]
+        async fn caption_only_body_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected a resolved .ogg filename to pass format validation, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn unaccepted_extension_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("recording.bin", Some("audio/ogg"));
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected the unaccepted .bin extension to be replaced with the MIME-derived .ogg, got: {err}"
+            );
+        }
+
+        // An unsupported format must be rejected locally by the resolver —
+        // the provider endpoint must see zero requests.
+        #[tokio::test]
+        async fn unsupported_mime_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(file_name, "recording.aac");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("unsupported format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn missing_mime_and_extension_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", None);
+            assert_eq!(file_name, "Voice message");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("missing format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
+        }
+
+        // attach_media only inserts non-empty transcripts.
+        #[tokio::test]
+        async fn caption_only_body_transcript_is_produced_for_insertion() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"text": "this is the transcribed voice message"}),
+                ))
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
+
+            let text = manager.transcribe(b"fake-audio", &file_name).await.unwrap();
+            assert_eq!(text, "this is the transcribed voice message");
+            assert!(!text.trim().is_empty());
+        }
+
+        #[test]
+        fn transcription_only_name_may_diverge_from_the_real_filename() {
+            let real_filename = "recording.bin";
+            let transcribe_name = transcription_safe_filename(real_filename, Some("audio/ogg"));
+            assert_ne!(transcribe_name, real_filename);
+            assert_eq!(transcribe_name, "attachment.ogg");
+        }
+    }
+
+    // Route-level hermetic coverage: a real (constructed) WAV file travels
+    // event parsing → media download/save → attach_media → transcript
+    // insertion, with only the homeserver and STT provider mocked at HTTP.
+    mod inbound_route {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{RoomId, room_id, user_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use matrix_sdk_test::JoinedRoomBuilder;
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        use omnesagent_api::channel::ChannelApprovalResponse;
+        use omnesagent_config::schema::{MatrixConfig, TranscriptionConfig};
+
+        use super::super::inbound::{HandlerCtx, register_event_handlers};
+
+        const TRANSCRIPT: &str = "route level transcript of the voice note";
+
+        fn test_room() -> &'static RoomId {
+            room_id!("!room:localhost")
+        }
+
+        fn timeline_raw(json: &serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+            Raw::new(json).expect("event json").cast_unchecked()
+        }
+
+        async fn recv_forwarded(
+            rx: &mut mpsc::Receiver<omnesagent_api::channel::ChannelMessage>,
+        ) -> omnesagent_api::channel::ChannelMessage {
+            tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .expect("inbound message must be forwarded before timeout")
+                .expect("channel must stay open")
+        }
+
+        // 0.1 s of a 440 Hz sine at 16 kHz mono 16-bit PCM: a genuinely
+        // valid, decodable WAV file, generated in-test.
+        fn build_wav() -> Vec<u8> {
+            let sample_rate: u32 = 16_000;
+            let samples: Vec<i16> = (0..(sample_rate / 10))
+                .map(|i| {
+                    let t = i as f32 / sample_rate as f32;
+                    ((t * 440.0 * std::f32::consts::TAU).sin() * f32::from(i16::MAX) * 0.5) as i16
+                })
+                .collect();
+            let data_len = (samples.len() * 2) as u32;
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for s in &samples {
+                wav.extend_from_slice(&s.to_le_bytes());
+            }
+            wav
+        }
+
+        fn handler_ctx(
+            stt_url: &str,
+            workspace: &std::path::Path,
+            tx: mpsc::Sender<omnesagent_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            HandlerCtx {
+                config: Arc::new(MatrixConfig::default()),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["*".to_string()]),
+                transcription: Some(super::super::legacy_transcription_resolver(
+                    TranscriptionConfig {
+                        enabled: true,
+                        local_whisper: Some(omnesagent_config::schema::LocalWhisperConfig {
+                            url: stt_url.to_string(),
+                            bearer_token: Some("test-token".to_string()),
+                            max_audio_bytes: 10 * 1024 * 1024,
+                            timeout_secs: 30,
+                        }),
+                        ..TranscriptionConfig::default()
+                    },
+                )),
+                workspace_dir: Some(Arc::new(workspace.to_path_buf())),
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        fn voice_event_json(event_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "url": "mxc://localhost/audioblob",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            })
+        }
+
+        async fn stt_server() -> wiremock::MockServer {
+            let stt = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": TRANSCRIPT })),
+                )
+                .expect(1)
+                .mount(&stt)
+                .await;
+            stt
+        }
+
+        async fn mount_media_download(matrix: &MatrixMockServer, wav: &[u8]) {
+            matrix
+                .mock_media_download()
+                .respond_with(ResponseTemplate::new(200).set_body_raw(wav.to_vec(), "audio/wav"))
+                .mount()
+                .await;
+            matrix
+                .mock_authed_media_download()
+                .ok_bytes(wav.to_vec())
+                .mount()
+                .await;
+        }
+
+        fn assert_stt_received_the_wav(reqs: &[wiremock::Request], wav: &[u8]) {
+            assert_eq!(reqs.len(), 1, "exactly one transcription request");
+            let body = &reqs[0].body;
+            assert!(
+                body.windows(wav.len()).any(|w| w == wav),
+                "request must carry the constructed WAV bytes verbatim"
+            );
+            let text = String::from_utf8_lossy(body);
+            assert!(
+                text.contains("filename=\"voice.wav\""),
+                "part filename: {text}"
+            );
+            assert!(text.contains("audio/wav"), "part content-type: {text}");
+            assert_eq!(&wav[..4], b"RIFF");
+            assert_eq!(&wav[8..12], b"WAVE");
+        }
+
+        #[tokio::test]
+        async fn direct_voice_note_inserts_transcript_and_keeps_real_filename() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            // The production handlers, registered exactly as `run_sync_loop`
+            // does; the event arrives through the real sync-dispatch pipeline.
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$audio1:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted into the inbound content: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            let saved_path = saved[0].path();
+            assert!(
+                saved_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .ends_with("voice.wav"),
+                "saved file keeps the real-name-derived filename: {saved_path:?}"
+            );
+            assert_eq!(std::fs::read(&saved_path).unwrap(), wav);
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        #[tokio::test]
+        async fn reply_to_voice_note_inserts_parent_transcript() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
+            // parent m.audio event verbatim.
+            let parent = voice_event_json("$parentaudio:localhost");
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .mount(matrix.server())
+                .await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$reply1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "what does this say?",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$parentaudio:localhost" }
+                    }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "parent transcript must be inserted: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the parent's real filename: {}",
+                msg.content
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        // Encrypted-media variant: the event carries an E2EE `file` source;
+        // the homeserver serves ciphertext and the client decrypts during
+        // download, so the saved copy and the STT request must contain the
+        // original plaintext WAV.
+        #[tokio::test]
+        async fn encrypted_voice_note_decrypts_and_inserts_transcript() {
+            use std::io::Read as _;
+
+            use matrix_sdk::ruma::OwnedMxcUri;
+            use matrix_sdk::ruma::events::room::EncryptedFile;
+            use matrix_sdk_base::crypto::AttachmentEncryptor;
+
+            let wav = build_wav();
+            let mut reader = wav.as_slice();
+            let mut encryptor = AttachmentEncryptor::new(&mut reader);
+            let mut ciphertext = Vec::new();
+            encryptor.read_to_end(&mut ciphertext).unwrap();
+            let keys = encryptor.finish();
+            let file = EncryptedFile::new(
+                OwnedMxcUri::from("mxc://localhost/encryptedaudioblob"),
+                keys.encryption_info,
+                keys.hashes,
+            );
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &ciphertext).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$encaudio1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "file": serde_json::to_value(&file).unwrap(),
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted for encrypted media: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            assert_eq!(
+                std::fs::read(saved[0].path()).unwrap(),
+                wav,
+                "saved copy must be the decrypted plaintext"
+            );
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        fn mention_only_handler_ctx(
+            tx: mpsc::Sender<omnesagent_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            let mut ctx = handler_ctx(
+                "http://127.0.0.1:9/v1/transcribe",
+                std::path::Path::new("/tmp"),
+                tx,
+            );
+            // Clone config Arc contents with mention_only enabled.
+            let mut config = (*ctx.config).clone();
+            config.mention_only = true;
+            ctx.config = Arc::new(config);
+            ctx.transcription = None;
+            ctx.workspace_dir = None;
+            ctx
+        }
+
+        fn text_parent_event(event_id: &str, sender: &str, body: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": sender,
+                "origin_server_ts": 1_000_000u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": body
+                }
+            })
+        }
+
+        fn plain_reply_event(event_id: &str, parent_id: &str, body: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": body,
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": parent_id }
+                    }
+                }
+            })
+        }
+
+        async fn mount_parent_event(
+            matrix: &MatrixMockServer,
+            parent: serde_json::Value,
+            expected_gets: u64,
+        ) {
+            let parent_id = parent["event_id"]
+                .as_str()
+                .expect("parent event_id")
+                .to_string();
+            // Event ids in these tests are `$name:localhost` — escape `$` for the regex.
+            let pattern = format!(
+                r"^/_matrix/client/v3/rooms/.*/event/{}$",
+                parent_id.replace('$', r"\$")
+            );
+            Mock::given(method("GET"))
+                .and(path_regex(pattern))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .expect(expected_gets)
+                .mount(matrix.server())
+                .await;
+        }
+
+        #[tokio::test]
+        async fn mention_only_forwards_unmentioned_reply_to_bot_with_one_parent_fetch() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let parent = text_parent_event("$botparent:localhost", "@bot:localhost", "bot said hi");
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = mention_only_handler_ctx(tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = plain_reply_event(
+                "$reply-bot:localhost",
+                "$botparent:localhost",
+                "thanks, continuing without an @mention",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert_eq!(
+                msg.content, "thanks, continuing without an @mention",
+                "unmentioned reply-to-bot must be forwarded under mention_only"
+            );
+        }
+
+        #[tokio::test]
+        async fn mention_only_drops_unmentioned_reply_to_non_bot_parent() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let parent = text_parent_event(
+                "$aliceparent:localhost",
+                "@carol:localhost",
+                "human chatter",
+            );
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = mention_only_handler_ctx(tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = plain_reply_event(
+                "$reply-human:localhost",
+                "$aliceparent:localhost",
+                "replying to carol, not the bot",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let timed_out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err();
+            assert!(
+                timed_out,
+                "unmentioned reply to a non-bot parent must be dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn mention_only_reply_to_bot_voice_reuses_single_parent_fetch() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent is a bot voice note: gate + parent-media must share one GET.
+            let mut parent = voice_event_json("$botvoice:localhost");
+            parent["sender"] = serde_json::json!("@bot:localhost");
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+            let mut config = (*ctx.config).clone();
+            config.mention_only = true;
+            ctx.config = Arc::new(config);
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = plain_reply_event(
+                "$reply-voice:localhost",
+                "$botvoice:localhost",
+                "what did you say?",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "admitted reply must still attach parent media once: {}",
+                msg.content
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+        #[tokio::test]
+        async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = HandlerCtx {
+                config: Arc::new(MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    ..MatrixConfig::default()
+                }),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["@operator:localhost".to_string()]),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            };
+            let (approved_tx, approved_rx) = oneshot::channel();
+            let (wrong_tx, _wrong_rx) = oneshot::channel();
+            let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+            {
+                let mut approvals = ctx.pending_approvals.lock().await;
+                approvals.insert(
+                    "AUTH0001".into(),
+                    crate::util::PendingApproval {
+                        sender: approved_tx,
+                        destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+                approvals.insert(
+                    "WRONG001".into(),
+                    crate::util::PendingApproval {
+                        sender: wrong_tx,
+                        destination: "!other:localhost".into(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+                approvals.insert(
+                    "OTHER001".into(),
+                    crate::util::PendingApproval {
+                        sender: unauthorized_tx,
+                        destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+            }
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let approved = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$approved:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": { "msgtype": "m.text", "body": "AUTH0001 approve" }
+            });
+            let wrong_destination = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$wrong-destination:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": { "msgtype": "m.text", "body": "WRONG001 deny" }
+            });
+            let unauthorized = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$unauthorized:localhost",
+                "sender": "@other:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": { "msgtype": "m.text", "body": "OTHER001 deny" }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room())
+                        .add_timeline_event(timeline_raw(&approved))
+                        .add_timeline_event(timeline_raw(&wrong_destination))
+                        .add_timeline_event(timeline_raw(&unauthorized)),
+                )
+                .await;
+
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), approved_rx)
+                    .await
+                    .expect("sync ingress should resolve the authorized approval")
+                    .expect("sync ingress should resolve the authorized approval"),
+                ChannelApprovalResponse::Approve
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "approval-shaped events must not reach agent dispatch"
+            );
+            let approvals = ctx.pending_approvals.lock().await;
+            assert!(approvals.contains_key("WRONG001"));
+            assert!(approvals.contains_key("OTHER001"));
+        }
+    }
+
+    mod markers {
+        use super::super::markers::{MarkerKind, parse};
+
+        #[test]
+        fn empty_text_yields_no_markers() {
+            let (text, ms) = parse("");
+            assert_eq!(text, "");
+            assert!(ms.is_empty());
+        }
+
+        #[test]
+        fn plain_text_passthrough() {
+            let (text, ms) = parse("hello world");
+            assert_eq!(text, "hello world");
+            assert!(ms.is_empty());
+        }
+
+        #[test]
+        fn single_image_marker_extracted() {
+            let (text, ms) = parse("[image:https://example.com/cat.jpg]");
+            assert_eq!(text, "");
+            assert_eq!(ms.len(), 1);
+            assert_eq!(ms[0].kind, MarkerKind::Image);
+            assert_eq!(ms[0].target, "https://example.com/cat.jpg");
+        }
+
+        #[test]
+        fn voice_marker_distinct_from_audio() {
+            let (_, ms) = parse("[voice:/tmp/note.ogg] [audio:/tmp/song.mp3]");
+            assert_eq!(ms.len(), 2);
+            assert_eq!(ms[0].kind, MarkerKind::Voice);
+            assert_eq!(ms[1].kind, MarkerKind::Audio);
+        }
+
+        #[test]
+        fn multiple_markers_with_text_in_between() {
+            let (text, ms) =
+                parse("before [image:https://x/y.jpg] middle [file:/tmp/doc.pdf] after");
+            assert_eq!(text, "before  middle  after");
+            assert_eq!(ms.len(), 2);
+            assert_eq!(ms[0].kind, MarkerKind::Image);
+            assert_eq!(ms[1].kind, MarkerKind::File);
+        }
+
+        #[test]
+        fn malformed_marker_left_in_text() {
+            let (text, ms) = parse("foo [image: bar");
+            assert_eq!(text, "foo [image: bar");
+            assert!(ms.is_empty());
+        }
+
+        #[test]
+        fn unknown_keyword_left_in_text() {
+            let (text, ms) = parse("[banana:fruit]");
+            assert_eq!(text, "[banana:fruit]");
+            assert!(ms.is_empty());
+        }
+
+        #[test]
+        fn empty_target_left_in_text() {
+            let (text, ms) = parse("[image:]");
+            assert_eq!(text, "[image:]");
+            assert!(ms.is_empty());
+        }
+
+        #[test]
+        fn marker_with_newline_inside_left_in_text() {
+            let (text, ms) = parse("[image:a\nb]");
+            assert!(text.contains("[image:a"));
+            assert!(ms.is_empty());
+        }
+    }
+
+    mod approval {
+        use super::super::approval::{
+            TOKEN_LEN, generate_token, generate_token_default, parse_reply,
+        };
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use std::collections::HashSet;
+        use omnesagent_api::channel::ChannelApprovalResponse;
+
+        #[tokio::test]
+        async fn pending_approval_requires_allowed_user_and_origin_room() {
+            let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVAL".to_string(),
+                crate::util::PendingApproval {
+                    sender: tx,
+                    destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+
+            for response in [
+                ChannelApprovalResponse::Approve,
+                ChannelApprovalResponse::Deny,
+                ChannelApprovalResponse::AlwaysApprove,
+            ] {
+                assert_eq!(
+                    crate::util::resolve_pending_approval(
+                        &pending,
+                        "APPROVAL",
+                        response,
+                        super::super::allowlist::user_allowed(
+                            &["@operator:example.invalid".to_string()],
+                            "@other:example.invalid",
+                        ),
+                        "!origin:example.invalid",
+                    )
+                    .await,
+                    crate::util::PendingApprovalResolution::Rejected,
+                );
+                assert!(pending.lock().await.contains_key("APPROVAL"));
+            }
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!other:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Rejected,
+            );
+            assert!(pending.lock().await.contains_key("APPROVAL"));
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::AlwaysApprove,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+
+            let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVE2".to_string(),
+                crate::util::PendingApproval {
+                    sender: approve_tx,
+                    destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVE2",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        }
+
+        #[test]
+        fn token_length_and_alphabet() {
+            let mut rng = StdRng::seed_from_u64(42);
+            let tok = generate_token(&mut rng);
+            assert_eq!(tok.len(), TOKEN_LEN);
+            assert!(tok.chars().all(|c| c.is_ascii_alphanumeric()));
+        }
+
+        #[test]
+        fn tokens_are_diverse() {
+            let mut rng = StdRng::seed_from_u64(7);
+            let mut seen = HashSet::new();
+            for _ in 0..1000 {
+                seen.insert(generate_token(&mut rng));
+            }
+            assert!(
+                seen.len() >= 998,
+                "too many collisions: {}",
+                1000 - seen.len()
+            );
+        }
+
+        #[test]
+        fn default_token_has_correct_length() {
+            assert_eq!(generate_token_default().len(), TOKEN_LEN);
+        }
+
+        #[test]
+        fn parse_approve() {
+            let (tok, resp) = parse_reply("ABCDEFGH approve").expect("parses");
+            assert_eq!(tok, "ABCDEFGH");
+            assert_eq!(resp, ChannelApprovalResponse::Approve);
+        }
+
+        #[test]
+        fn parse_deny_lowercase() {
+            let (_, resp) = parse_reply("abcdefgh deny").expect("parses");
+            assert_eq!(resp, ChannelApprovalResponse::Deny);
+        }
+
+        #[test]
+        fn parse_always() {
+            let (_, resp) = parse_reply("ABCDEFGH always").expect("parses");
+            assert_eq!(resp, ChannelApprovalResponse::AlwaysApprove);
+        }
+
+        #[test]
+        fn parse_yes_no_aliases() {
+            assert_eq!(
+                parse_reply("ABCDEFGH yes").map(|x| x.1),
+                Some(ChannelApprovalResponse::Approve)
+            );
+            assert_eq!(
+                parse_reply("ABCDEFGH no").map(|x| x.1),
+                Some(ChannelApprovalResponse::Deny)
+            );
+        }
+
+        #[test]
+        fn rejects_wrong_token_length() {
+            assert!(parse_reply("ABC approve").is_none());
+            assert!(parse_reply("ABCDEFGHIJ approve").is_none());
+        }
+
+        #[test]
+        fn rejects_unknown_verb() {
+            assert!(parse_reply("ABCDEFGH maybe").is_none());
+        }
+
+        #[test]
+        fn rejects_trailing_garbage() {
+            assert!(parse_reply("ABCDEFGH approve please").is_none());
+        }
+
+        #[test]
+        fn localized_request_approval_prompt_still_parses_via_matrix_own_parser() {
+            // Localization must not desync the (possibly translated) prompt
+            // prose from Matrix's own approve/deny/always parser: the
+            // keywords the prompt shows must remain the literal ASCII words
+            // `parse_reply` expects, whatever locale is active.
+            let token = generate_token_default();
+            let prompt = crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la");
+            assert!(
+                prompt.contains(&token),
+                "prompt should echo the token verbatim; got {prompt:?}"
+            );
+
+            for (word, expected) in [
+                ("approve", ChannelApprovalResponse::Approve),
+                ("deny", ChannelApprovalResponse::Deny),
+                ("always", ChannelApprovalResponse::AlwaysApprove),
+            ] {
+                let reply = format!("{token} {word}");
+                assert!(
+                    prompt.contains(&reply),
+                    "prompt should show the exact reply {reply:?}; got {prompt:?}"
+                );
+                let (parsed_token, response) =
+                    parse_reply(&reply).unwrap_or_else(|| panic!("{reply:?} should parse"));
+                assert_eq!(parsed_token, token);
+                assert_eq!(response, expected);
+            }
+        }
+    }
+
+    mod room_management {
+        use super::super::room_management::{build_create_room_request, build_invite_user_request};
+        use matrix_sdk::ruma::api::client::room::Visibility as MatrixVisibility;
+        use serde_json::json;
+        use omnesagent_api::channel::{RoomCreationOptions, RoomVisibility};
+
+        #[test]
+        fn create_room_request_maps_typed_options() {
+            let request = build_create_room_request(&RoomCreationOptions {
+                name: Some("Ops room".into()),
+                topic: Some("Operations".into()),
+                invites: vec!["@alice:example.org".into(), "@bob:example.org".into()],
+                visibility: Some(RoomVisibility::Public),
+                encryption: Some(true),
+            })
+            .expect("request builds");
+
+            assert_eq!(request.name.as_deref(), Some("Ops room"));
+            assert_eq!(request.topic.as_deref(), Some("Operations"));
+            assert_eq!(request.visibility, MatrixVisibility::Public);
+            assert_eq!(request.invite.len(), 2);
+            assert_eq!(request.invite[0].as_str(), "@alice:example.org");
+            assert_eq!(request.invite[1].as_str(), "@bob:example.org");
+            assert_eq!(request.initial_state.len(), 1);
+        }
+
+        #[test]
+        fn create_room_request_rejects_invalid_invite_user() {
+            let err = build_create_room_request(&RoomCreationOptions {
+                invites: vec!["not-a-mxid".into()],
+                ..RoomCreationOptions::default()
+            })
+            .unwrap_err();
+
+            assert!(err.to_string().contains("invalid invite user id"));
+        }
+
+        #[test]
+        fn invite_user_request_parses_room_and_user_ids() {
+            let request =
+                build_invite_user_request("!room:example.org", "@alice:example.org").unwrap();
+
+            assert_eq!(request.room_id.as_str(), "!room:example.org");
+            assert_eq!(
+                serde_json::to_value(&request.recipient).unwrap(),
+                json!({"user_id": "@alice:example.org"})
+            );
+        }
+
+        #[test]
+        fn invite_user_request_rejects_invalid_ids() {
+            let err = build_invite_user_request("not-a-room", "@alice:example.org").unwrap_err();
+            assert!(err.to_string().contains("invalid room id"));
+
+            let err = build_invite_user_request("!room:example.org", "not-a-user").unwrap_err();
+            assert!(err.to_string().contains("invalid user id"));
+        }
+    }
+
+    mod mention {
+        use super::super::mention::{admit_group_message, is_mentioned, sender_is_user};
+        use matrix_sdk::ruma::user_id;
+
+        #[test]
+        fn explicit_mention_in_user_ids_passes() {
+            let bot = user_id!("@bot:example.org");
+            assert!(is_mentioned(
+                bot,
+                None,
+                Some(&["@bot:example.org".to_string()]),
+                "hi",
+            ));
+        }
+
+        #[test]
+        fn explicit_mention_list_without_bot_rejects() {
+            let bot = user_id!("@bot:example.org");
+            assert!(!is_mentioned(
+                bot,
+                None,
+                Some(&["@alice:example.org".to_string()]),
+                "@bot:example.org help",
+            ));
+        }
+
+        #[test]
+        fn body_fallback_full_id() {
+            let bot = user_id!("@bot:example.org");
+            assert!(is_mentioned(bot, None, None, "@bot:example.org help"));
+        }
+
+        #[test]
+        fn body_fallback_localpart_only() {
+            let bot = user_id!("@bot:example.org");
+            assert!(is_mentioned(bot, None, None, "hey @bot please reply"));
+        }
+
+        #[test]
+        fn body_fallback_display_name() {
+            let bot = user_id!("@bot:example.org");
+            assert!(is_mentioned(bot, Some("OmnesAgent"), None, "hi omnesagent!"));
+        }
+
+        #[test]
+        fn no_mention_rejects() {
+            let bot = user_id!("@bot:example.org");
+            assert!(!is_mentioned(
+                bot,
+                Some("OmnesAgent"),
+                None,
+                "no mention here"
+            ));
+        }
+
+        #[test]
+        fn admit_group_message_allows_reply_to_bot_without_mention() {
+            assert!(admit_group_message(false, true));
+            assert!(admit_group_message(true, false));
+            assert!(admit_group_message(true, true));
+            assert!(!admit_group_message(false, false));
+        }
+
+        #[test]
+        fn sender_is_user_matches_bot_parent_event() {
+            let bot = user_id!("@bot:example.org");
+            let parent =
+                r#"{"sender":"@bot:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            let other = r#"{"sender":"@alice:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            assert!(sender_is_user(parent, bot));
+            assert!(!sender_is_user(other, bot));
+            assert!(!sender_is_user("not-json", bot));
+        }
+    }
+
+    mod allowlist {
+        use super::super::allowlist::{room_allowed_static, user_allowed};
+
+        #[test]
+        fn empty_user_list_denies_all() {
+            assert!(!user_allowed(&[], "@a:b"));
+        }
+
+        #[test]
+        fn star_user_list_allows_all() {
+            assert!(user_allowed(&["*".to_string()], "@a:b"));
+        }
+
+        #[test]
+        fn user_in_list_allowed() {
+            assert!(user_allowed(&["@a:b".to_string()], "@a:b"));
+        }
+
+        #[test]
+        fn user_not_in_list_denied() {
+            assert!(!user_allowed(&["@a:b".to_string()], "@c:d"));
+        }
+
+        #[test]
+        fn user_in_list_case_insensitive() {
+            // Operator-configured case shouldn't matter — Matrix MXIDs are
+            // spec-lowercase but tolerated in mixed case by some servers.
+            assert!(user_allowed(
+                &["@Bot:Example.org".to_string()],
+                "@bot:example.org"
+            ));
+            assert!(user_allowed(
+                &["@bot:example.org".to_string()],
+                "@Bot:EXAMPLE.org"
+            ));
+        }
+
+        #[test]
+        fn empty_room_list_allows_all() {
+            assert!(room_allowed_static(&[], "!any:server"));
+        }
+
+        #[test]
+        fn room_in_list_allowed() {
+            assert!(room_allowed_static(
+                &["!ok:server".to_string()],
+                "!ok:server"
+            ));
+        }
+
+        #[test]
+        fn room_not_in_list_denied() {
+            assert!(!room_allowed_static(
+                &["!ok:server".to_string()],
+                "!nope:server"
+            ));
+        }
+    }
+
+    mod ack_reactions {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use omnesagent_api::channel::Channel;
+        use omnesagent_config::schema::MatrixConfig;
+
+        use super::super::MatrixChannel;
+
+        #[tokio::test]
+        async fn matrix_remove_reaction_noops_before_parsing_when_ack_disabled() {
+            let config = MatrixConfig {
+                homeserver: "https://matrix.example.com".to_string(),
+                access_token: Some("token".to_string()),
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            channel
+                .remove_reaction("bad-room", "bad-event", "✅")
+                .await
+                .expect("ack-disabled reaction removal should be a no-op");
+        }
+    }
+
+    mod user_boundary {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use matrix_sdk::config::SyncSettings;
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{owned_room_id, owned_user_id};
+        use tempfile::TempDir;
+        use tokio::sync::mpsc;
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use omnesagent_api::channel::Channel;
+        use omnesagent_config::schema::{Config, MatrixConfig, MatrixStreamMode};
+
+        use super::super::{MatrixChannel, inbound};
+
+        async fn assert_matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
+            let server = MockServer::start().await;
+            let room_id = owned_room_id!("!room:server");
+            let bot_user_id = owned_user_id!("@bot:server");
+            let sender = "@alice:server";
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "OmnesAgent Test"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id.as_str(): {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": []
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/typing/.*$"))
+                .and(body_partial_json(serde_json::json!({ "typing": false })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({ "body": "..." })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$draft:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$redaction:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({ "body": "ok" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let matrix_config = MatrixConfig {
+                homeserver: server.uri(),
+                access_token: Some("secret-token".to_string()),
+                user_id: Some(bot_user_id.to_string()),
+                device_id: Some("DEVICE".to_string()),
+                allowed_rooms: vec![room_id.to_string()],
+                stream_mode: MatrixStreamMode::SingleMessage,
+                stream_draft_delete: true,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = Arc::new(
+                MatrixChannel::new(
+                    matrix_config.clone(),
+                    "single",
+                    Arc::new(move || vec![sender.to_string()]),
+                    state_dir.path().to_path_buf(),
+                )
+                .expect("matrix channel"),
+            );
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates joined room");
+            let room = client.get_room(&room_id).expect("joined room");
+
+            let event_json = serde_json::json!({
+                "type": "m.room.message",
+                "sender": sender,
+                "event_id": "$inbound:server",
+                "origin_server_ts": 1,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello"
+                }
+            });
+            let event: OriginalSyncRoomMessageEvent =
+                serde_json::from_value(event_json.clone()).expect("Matrix room-message event");
+            let raw: Raw<serde_json::Value> = Raw::new(&event_json).expect("raw Matrix event");
+            let (tx, mut rx) = mpsc::channel(1);
+            let handler_ctx = inbound::HandlerCtx {
+                config: Arc::clone(&channel.config),
+                alias: channel.alias.clone(),
+                peer_resolver: Arc::clone(&channel.peer_resolver),
+                transcription: channel.transcription.clone(),
+                workspace_dir: channel.workspace_dir.clone(),
+                tx,
+                pending_approvals: Arc::clone(&channel.pending_approvals),
+                threads_seen: Arc::clone(&channel.threads_seen),
+                bot_user_id: bot_user_id.clone(),
+                bot_display_name: Arc::clone(&channel.bot_display_name),
+                initial_sync_done: Arc::clone(&channel.initial_sync_done),
+                undecryptable_seen: Arc::clone(&channel.undecryptable_seen),
+            };
+            inbound::handle_message_for_test(handler_ctx, event, room, RawEvent(raw.into_json()))
+                .await
+                .expect("Matrix inbound adapter accepts event");
+            let message = rx.recv().await.expect("adapter forwards channel message");
+
+            assert_eq!(message.content, "hello");
+            assert_eq!(message.sender, sender);
+            assert_eq!(message.reply_target, room_id.as_str());
+            assert_eq!(message.channel_alias.as_deref(), Some("single"));
+
+            let mut config = Config::default();
+            config
+                .channels
+                .matrix
+                .insert("single".to_string(), matrix_config);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::orchestrator::tests::process_message_with_dummy_provider(
+                    channel as Arc<dyn Channel>,
+                    message,
+                    config,
+                ),
+            )
+            .await
+            .expect("Matrix inbound-to-outbound dispatch completes");
+        }
+
+        #[test]
+        fn matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
+            crate::orchestrator::tests::run_channel_dispatch_test(|| {
+                Box::pin(assert_matrix_single_message_crosses_inbound_and_outbound_user_boundary())
+            });
+        }
+    }
+
+    mod context {
+        use super::super::context::{claim_first_visit, format_preamble, mark_seen};
+        use matrix_sdk::ruma::{OwnedEventId, owned_event_id};
+        use std::{collections::HashSet, sync::Arc};
+        use tokio::sync::RwLock;
+
+        fn empty() -> Arc<RwLock<HashSet<OwnedEventId>>> {
+            Arc::new(RwLock::new(HashSet::new()))
+        }
+
+        #[test]
+        fn preamble_includes_sender_and_body() {
+            let p = format_preamble("@alice:server", "hello");
+            assert_eq!(p, "[Thread root from @alice:server]: hello\n\n");
+        }
+
+        #[test]
+        fn preamble_skips_body_when_empty() {
+            let p = format_preamble("@alice:server", "");
+            assert_eq!(p, "[Thread root from @alice:server]\n\n");
+        }
+
+        #[tokio::test]
+        async fn first_visit_returns_true_then_false() {
+            let set = empty();
+            let id = owned_event_id!("$abc:server");
+            assert!(claim_first_visit(&set, &id).await);
+            assert!(!claim_first_visit(&set, &id).await);
+        }
+
+        #[tokio::test]
+        async fn pre_marked_thread_returns_false() {
+            let set = empty();
+            let id = owned_event_id!("$abc:server");
+            mark_seen(&set, id.clone()).await;
+            assert!(!claim_first_visit(&set, &id).await);
+        }
+    }
+
+    mod streaming {
+        use super::super::MatrixChannel;
+        use super::super::outbound;
+        use super::super::streaming;
+        use super::super::streaming::{
+            MultiDraft, PartialDraft, PartialFinalizeAction, SingleDraft,
+            SingleRetainedDraftAction, State, decide_partial_finalize_action, insert_multi,
+            insert_partial, insert_single, mark_single_edit_delivered, multi_contains,
+            normalize_matrix_progress_line, partial_contains, partial_len, partial_should_edit,
+            partial_visible_text, push_single_progress, push_single_progress_line,
+            single_cancel_deletes_draft, single_contains, single_edit_interval_elapsed,
+            single_finalize_plan, single_render_changed, single_retained_draft_action,
+            single_visible_text_with_budget, single_visible_text_with_edit_budget,
+        };
+        use matrix_sdk::config::SyncSettings;
+        use matrix_sdk::ruma::{
+            OwnedEventId,
+            events::room::message::{
+                MessageType, ReplacementMetadata, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation, TextMessageEventContent,
+            },
+            owned_event_id, owned_room_id,
+        };
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tempfile::TempDir;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method, path_regex},
+        };
+        use omnesagent_api::channel::{Channel, DraftProgress, DraftProgressKind, SendMessage};
+        use omnesagent_config::schema::{MatrixConfig, MatrixStreamMode};
+        use omnesagent_runtime::agent::loop_::{
+            DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX, thinking_status_text,
+        };
+
+        fn draft(text: &str, last_edit: Instant) -> PartialDraft {
+            PartialDraft {
+                event_id: owned_event_id!("$1:server"),
+                thread_anchor: None,
+                last_text: text.to_string(),
+                last_edit,
+            }
+        }
+
+        fn partial_draft(event_id: OwnedEventId, text: &str) -> PartialDraft {
+            PartialDraft {
+                event_id,
+                thread_anchor: None,
+                last_text: text.to_string(),
+                last_edit: Instant::now(),
+            }
+        }
+
+        #[test]
+        fn single_message_final_budget_keeps_utf8_safe_rendered_prefix() {
+            let text = format!("{}NEWEST", "**x** ".repeat(8_000));
+            let budget = 48_000;
+            let bounded = outbound::bounded_body(&text, Some(budget));
+            let serialized = serde_json::to_vec(&RoomMessageEventContent::text_markdown(&bounded))
+                .expect("plain Matrix message serializes");
+
+            assert!(bounded.starts_with("**x** "));
+            assert!(!bounded.ends_with("NEWEST"));
+            assert!(serialized.len() <= budget);
+            assert!(
+                serialized.len() > bounded.len(),
+                "formatted_body expansion must be included in the budget"
+            );
+
+            let event_id = owned_event_id!("$draft:server");
+            let bounded_edit = outbound::bounded_edit_body(&text, &event_id, Some(budget));
+            let edited = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+                TextMessageEventContent::markdown(&bounded_edit),
+            ))
+            .make_replacement(ReplacementMetadata::new(event_id, None));
+            assert!(bounded_edit.starts_with("**x** "));
+            assert!(!bounded_edit.ends_with("NEWEST"));
+            assert!(
+                serde_json::to_vec(&edited)
+                    .expect("replacement Matrix message serializes")
+                    .len()
+                    <= budget
+            );
+
+            for message_max_bytes in [0, 511] {
+                let config = MatrixConfig {
+                    message_max_bytes,
+                    ..Default::default()
+                };
+                assert_eq!(config.effective_message_max_bytes(), 512);
+            }
+        }
+
+        fn single_draft(event_id: OwnedEventId) -> SingleDraft {
+            SingleDraft {
+                event_id,
+                thread_anchor: None,
+                lines: VecDeque::new(),
+                last_text: DRAFT_PLACEHOLDER.to_string(),
+                last_edit: Instant::now(),
+            }
+        }
+
+        #[test]
+        fn skip_when_text_unchanged() {
+            let now = Instant::now();
+            let d = draft("hello", now - Duration::from_secs(60));
+            assert!(!partial_should_edit(
+                &d,
+                "hello",
+                now,
+                Duration::from_millis(500)
+            ));
+        }
+
+        #[test]
+        fn skip_within_rate_limit() {
+            let now = Instant::now();
+            let d = draft("hello", now - Duration::from_millis(100));
+            assert!(!partial_should_edit(
+                &d,
+                "world",
+                now,
+                Duration::from_millis(500)
+            ));
+        }
+
+        #[test]
+        fn allow_after_rate_limit() {
+            let now = Instant::now();
+            let d = draft("hello", now - Duration::from_millis(600));
+            assert!(partial_should_edit(
+                &d,
+                "world",
+                now,
+                Duration::from_millis(500)
+            ));
+        }
+
+        #[test]
+        fn partial_visible_text_strips_attachment_markers() {
+            assert_eq!(
+                partial_visible_text("Report ready [DOCUMENT:report.pdf]").as_deref(),
+                Some("Report ready")
+            );
+        }
+
+        #[test]
+        fn partial_visible_text_skips_marker_only_updates() {
+            assert_eq!(partial_visible_text("[DOCUMENT:report.pdf]"), None);
+        }
+
+        #[test]
+        fn single_progress_slides_oldest_entries() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 2);
+            push_single_progress_line(&mut draft, "two", 2);
+            push_single_progress_line(&mut draft, "three", 2);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                "two\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_limit_counts_visible_lines_not_events() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+                2,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}two\nthree")
+            );
+
+            push_single_progress_line(&mut draft, "shell: printf 'a\\nb'\nnext\r\n", 2);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}three\nshell\\: printf \\'a\\\\nb\\'␊next")
+            );
+        }
+
+        #[test]
+        fn single_progress_window_keeps_the_newest_physical_reasoning_lines() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let reasoning = (1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}{reasoning}"),
+                5,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}line 16\nline 17\nline 18\nline 19\nline 20")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_progress_updates_existing_line() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}Thinking (round 2) through"),
+                10,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX} carefully"),
+                10,
+            );
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX} now"), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}Thinking \\(round 2\\) through carefully now")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_progress_keeps_complete_line_until_exact_event_fitting() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
+
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}abcd"), 10);
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}efgh"), 10);
+
+            let retained = draft.lines.front().expect("reasoning line retained");
+            assert_eq!(retained.text, format!("{REASONING_FULL_PREFIX}abcdefgh"));
+            assert!(retained.text.len() > max_bytes);
+        }
+
+        #[test]
+        fn single_reasoning_progress_does_not_merge_into_static_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{THINKING_STATUS_PREFIX}Thinking...\n"),
+                10,
+            );
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}The"), 10);
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX} answer"), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking...\n{REASONING_FULL_PREFIX}The answer")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_preserves_kind_when_text_matches_thinking_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let status = thinking_status_text(0);
+            let reasoning = format!("{REASONING_FULL_PREFIX}Thinking...\n");
+
+            // Preserve source identity even though the two raw strings match.
+            push_single_progress(&mut draft, DraftProgress::status(status.clone()), 10);
+            push_single_progress(&mut draft, DraftProgress::reasoning(reasoning.clone()), 10);
+
+            assert_eq!(
+                status, reasoning,
+                "the regression requires an exact collision"
+            );
+            assert_eq!(draft.lines.len(), 2);
+            assert_eq!(draft.lines[0].kind, DraftProgressKind::Status);
+            assert_eq!(draft.lines[1].kind, DraftProgressKind::Reasoning);
+        }
+
+        #[test]
+        fn single_reasoning_progress_starts_new_line_after_tool_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}The"), 10);
+            push_single_progress_line(&mut draft, "\u{2705} shell: command=true (0s)\n", 10);
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX} answer"), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!(
+                    "{REASONING_FULL_PREFIX}The\n✅ shell\\: command\\=true \\(0s\\)\n{REASONING_FULL_PREFIX} answer"
+                )
+            );
+        }
+
+        #[test]
+        fn single_status_progress_remains_one_static_line() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let status = thinking_status_text(0);
+            push_single_progress_line(&mut draft, &status, 10);
+            push_single_progress_line(&mut draft, &status, 10);
+            push_single_progress_line(&mut draft, &status, 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking...")
+            );
+        }
+
+        #[test]
+        fn single_status_progress_starts_new_line_after_tool_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &thinking_status_text(0), 10);
+            push_single_progress_line(&mut draft, "\u{2705} shell: command=true (0s)\n", 10);
+            push_single_progress_line(&mut draft, &thinking_status_text(1), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!(
+                    "{THINKING_STATUS_PREFIX}Thinking...\n✅ shell\\: command\\=true \\(0s\\)\n{THINKING_STATUS_PREFIX}Thinking (round 2)..."
+                )
+            );
+        }
+
+        #[test]
+        fn single_status_progress_does_not_downgrade_round_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &thinking_status_text(1), 10);
+            push_single_progress_line(&mut draft, &thinking_status_text(0), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking (round 2)...")
+            );
+        }
+
+        #[test]
+        fn single_progress_zero_limit_keeps_all_entries() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 0);
+            push_single_progress_line(&mut draft, "two", 0);
+            push_single_progress_line(&mut draft, "three", 0);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                "one\ntwo\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_byte_budget_drops_oldest_entries_after_line_limit() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 0);
+            push_single_progress_line(&mut draft, "two", 0);
+            push_single_progress_line(&mut draft, "three", 0);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, "two\nthree".len()),
+                "two\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_edit_budget_replaces_oversized_utf8_line_with_alert() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &"😀".repeat(300), 0);
+
+            let visible = single_visible_text_with_edit_budget(&draft, 512);
+
+            assert!(visible.contains("too large to fit"));
+            assert!(
+                outbound::serialized_edit_content_len(&visible, &draft.event_id)
+                    .is_some_and(|actual| actual <= 512)
+            );
+        }
+
+        #[test]
+        fn single_progress_edit_budget_preserves_tool_identity_in_oversized_alert() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &format!("✅ browser: {}", "😀".repeat(300)), 0);
+
+            let visible = single_visible_text_with_edit_budget(&draft, 512);
+
+            assert!(visible.starts_with("✅ browser: "));
+            assert!(visible.contains("too large to fit"));
+            assert!(
+                outbound::serialized_edit_content_len(&visible, &draft.event_id)
+                    .is_some_and(|actual| actual <= 512)
+            );
+        }
+
+        #[test]
+        fn single_progress_normalizes_vertical_whitespace_for_matrix_only() {
+            assert_eq!(
+                normalize_matrix_progress_line("shell: printf 'a\\nb'\nnext\r\n"),
+                "shell\\: printf \\'a\\\\nb\\'␊next"
+            );
+            assert_eq!(
+                normalize_matrix_progress_line("delegate: prompt=Check **service**\nthen _report_"),
+                "delegate\\: prompt\\=Check \\*\\*service\\*\\*␊then \\_report\\_"
+            );
+            assert_eq!(
+                normalize_matrix_progress_line(&format!(
+                    "{REASONING_FULL_PREFIX}Check **service**\nthen _report_"
+                )),
+                format!("{REASONING_FULL_PREFIX}Check \\*\\*service\\*\\*\nthen \\_report\\_")
+            );
+        }
+
+        #[test]
+        fn single_progress_uses_literal_matrix_markdown_transport_once() {
+            let raw = "    **bold** <div data-x=\"1\">&amp;</div> `code`\t\u{001b}[31m";
+            let encoded = normalize_matrix_progress_line(raw);
+
+            assert!(encoded.starts_with('\u{00a0}'));
+            assert!(
+                encoded.starts_with("\u{00a0}   "),
+                "indentation width is preserved"
+            );
+            assert!(encoded.contains("\\*\\*bold\\*\\*"));
+            assert!(encoded.contains("\\<div data\\-x\\=\\\"1\\\"\\>\\&amp\\;\\<\\/div\\>"));
+            assert!(encoded.contains('␉'));
+            assert!(encoded.contains('␛'));
+
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, raw, 0);
+            let first_render = single_visible_text_with_budget(&draft, usize::MAX);
+            let second_render = single_visible_text_with_budget(&draft, usize::MAX);
+            assert_eq!(first_render, encoded);
+            assert_eq!(
+                second_render, encoded,
+                "retained drafts must not double-escape"
+            );
+
+            let content = RoomMessageEventContent::text_markdown(&encoded);
+            let serialized = serde_json::to_value(content).expect("Matrix content serializes");
+            let formatted = serialized
+                .get("formatted_body")
+                .and_then(serde_json::Value::as_str)
+                .expect("Markdown content has formatted body");
+            assert!(formatted.contains("&lt;div"));
+            assert!(!formatted.contains("<div data-x"));
+            assert!(!formatted.contains("<strong>bold</strong>"));
+            assert!(!formatted.contains("<pre><code>"));
+        }
+
+        #[test]
+        fn single_edit_interval_can_skip_render_until_debounce_elapses() {
+            let now = Instant::now();
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_edit = now - Duration::from_millis(100);
+
+            assert!(!single_edit_interval_elapsed(
+                &draft,
+                now,
+                Duration::from_millis(500)
+            ));
+
+            draft.last_edit = now - Duration::from_millis(600);
+            assert!(single_edit_interval_elapsed(
+                &draft,
+                now,
+                Duration::from_millis(500)
+            ));
+        }
+
+        #[test]
+        fn single_render_changed_skips_duplicate_matrix_edits() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_text = "one\ntwo".to_string();
+
+            assert!(!single_render_changed(&draft, "one\ntwo"));
+            assert!(single_render_changed(&draft, "two\nthree"));
+        }
+
+        #[test]
+        fn failed_single_edit_leaves_retained_draft_flushable() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 10);
+
+            // Simulate a rendered edit body whose Matrix request fails: the
+            // line buffer advanced, but the delivery checkpoint must not.
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::Flush("one".to_string())
+            );
+
+            assert!(mark_single_edit_delivered(
+                &mut draft,
+                &owned_event_id!("$single:server"),
+                "one".to_string(),
+                Instant::now(),
+            ));
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::KeepCurrent
+            );
+        }
+
+        #[test]
+        fn single_edit_delivery_ignores_replaced_draft_event() {
+            let mut draft = single_draft(owned_event_id!("$current:server"));
+
+            assert!(!mark_single_edit_delivered(
+                &mut draft,
+                &owned_event_id!("$old:server"),
+                "old progress".to_string(),
+                Instant::now(),
+            ));
+            assert_eq!(draft.last_text, DRAFT_PLACEHOLDER);
+        }
+
+        #[test]
+        fn single_finalize_plan_deletes_draft_before_sending_final_when_enabled() {
+            assert_eq!(
+                single_finalize_plan(true, true, true),
+                streaming::SingleFinalizePlan::DeleteDraftThenSendFinal
+            );
+        }
+
+        #[test]
+        fn single_finalize_plan_keeps_draft_but_still_sends_final_when_disabled() {
+            assert_eq!(
+                single_finalize_plan(true, false, true),
+                streaming::SingleFinalizePlan::KeepDraftThenSendFinal
+            );
+            assert_eq!(
+                single_finalize_plan(false, true, true),
+                streaming::SingleFinalizePlan::SendFinalOnly
+            );
+            assert_eq!(
+                single_finalize_plan(false, true, false),
+                streaming::SingleFinalizePlan::Noop
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_flushes_latest_unflushed_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_text = "one".to_string();
+            push_single_progress_line(&mut draft, "one", 10);
+            push_single_progress_line(&mut draft, "two", 10);
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::Flush("one\ntwo".to_string())
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_uses_the_serialized_edit_budget() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "old", 0);
+            push_single_progress_line(&mut draft, &"😀".repeat(300), 0);
+
+            let action = single_retained_draft_action(&draft, 512);
+            let SingleRetainedDraftAction::Flush(visible) = action else {
+                panic!("unflushed progress must produce a Matrix edit");
+            };
+
+            assert!(visible.contains("too large to fit"));
+            assert!(
+                outbound::serialized_edit_content_len(&visible, &draft.event_id)
+                    .is_some_and(|actual| actual <= 512)
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_keeps_current_visible_text() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 10);
+            draft.last_text = "one".to_string();
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::KeepCurrent
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_deletes_placeholder_without_progress() {
+            let draft = single_draft(owned_event_id!("$single:server"));
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::DeletePlaceholder
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_deletes_placeholder_when_progress_cannot_fit() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "unpublished progress", 10);
+
+            assert_eq!(
+                single_retained_draft_action(&draft, 0),
+                SingleRetainedDraftAction::DeletePlaceholder
+            );
+        }
+
+        #[test]
+        fn single_cancel_deletes_placeholder_but_retains_durable_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            assert!(single_cancel_deletes_draft(&draft, false));
+
+            push_single_progress_line(&mut draft, "one", 10);
+            assert!(single_cancel_deletes_draft(&draft, false));
+
+            draft.last_text = "one".to_string();
+            assert!(!single_cancel_deletes_draft(&draft, false));
+            assert!(single_cancel_deletes_draft(&draft, true));
+        }
+
+        #[tokio::test]
+        async fn single_message_update_draft_ignores_answer_text() {
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: "https://matrix.invalid".to_string(),
+                    access_token: Some("test-token".to_string()),
+                    stream_mode: MatrixStreamMode::SingleMessage,
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+            let key =
+                super::super::streaming_key("!room:server", "$draft:server").expect("draft key");
+
+            {
+                let mut state = channel.streaming_state.write().await;
+                insert_single(
+                    &mut state,
+                    key.clone(),
+                    single_draft(owned_event_id!("$draft:server")),
+                )
+                .expect("single-message state accepts draft");
+            }
+
+            Channel::update_draft(&channel, "!room:server", "$draft:server", "final prose")
+                .await
+                .expect("single_message answer deltas are ignored without Matrix I/O");
+
+            let mut state = channel.streaming_state.write().await;
+            let draft =
+                streaming::single_for_update(&mut state, &key).expect("draft remains active");
+            assert!(draft.lines.is_empty());
+            assert_eq!(draft.last_text, DRAFT_PLACEHOLDER);
+        }
+
+        async fn assert_retained_single_draft_flush_failure(
+            last_text: &str,
+            expect_placeholder_cleanup: bool,
+        ) {
+            let server = MockServer::start().await;
+            let room_id = "!room:server";
+            let draft_id = owned_event_id!("$draft:server");
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "OmnesAgent Test"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id: {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": [{
+                                        "type": "m.room.message",
+                                        "sender": "@bot:server",
+                                        "event_id": draft_id.as_str(),
+                                        "origin_server_ts": 1,
+                                        "content": {
+                                            "msgtype": "m.text",
+                                            "body": last_text
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/event/.*$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "m.room.message",
+                    "sender": "@bot:server",
+                    "event_id": draft_id.as_str(),
+                    "origin_server_ts": 1,
+                    "room_id": room_id,
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": last_text
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            if expect_placeholder_cleanup {
+                Mock::given(method("PUT"))
+                    .and(path_regex(
+                        r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                    ))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "event_id": "$redaction:server"
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "m.relates_to": {
+                        "rel_type": "m.replace",
+                        "event_id": draft_id.as_str()
+                    }
+                })))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "errcode": "M_BAD_JSON",
+                    "error": "edit failed"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": "final answer"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: server.uri(),
+                    access_token: Some("secret-token".to_string()),
+                    user_id: Some("@bot:server".to_string()),
+                    device_id: Some("DEVICE".to_string()),
+                    allowed_rooms: vec![room_id.to_string()],
+                    stream_mode: MatrixStreamMode::SingleMessage,
+                    stream_draft_delete: false,
+                    reply_in_thread: false,
+                    ack_reactions: Some(false),
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            if let Err(err) = client.sync_once(SyncSettings::default()).await {
+                let paths = server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|request| request.url.path().to_string())
+                    .collect::<Vec<_>>();
+                panic!("mock sync populates joined room: {err}; received paths: {paths:?}");
+            }
+
+            let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
+            {
+                let mut draft = single_draft(draft_id.clone());
+                draft.last_text = last_text.to_string();
+                push_single_progress_line(&mut draft, "new progress", 10);
+                let mut state = channel.streaming_state.write().await;
+                insert_single(&mut state, key, draft).expect("single-message state accepts draft");
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                channel.finalize_draft(room_id, draft_id.as_str(), "final answer", false),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!(
+                        "retained draft flush failure must not block final send: {err}; received paths: {paths:?}"
+                    );
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("retained draft finalize timed out; received paths: {paths:?}");
+                }
+            }
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("requests captured by Matrix mock");
+            let redaction_index = requests
+                .iter()
+                .position(|request| request.url.path().contains("/redact/"));
+            assert_eq!(
+                redaction_index.is_some(),
+                expect_placeholder_cleanup,
+                "placeholder cleanup must match the Matrix delivery checkpoint"
+            );
+            if let Some(redaction_index) = redaction_index {
+                let final_index = requests
+                    .iter()
+                    .position(|request| {
+                        request.url.path().contains("/send/m.room.message/")
+                            && String::from_utf8_lossy(&request.body).contains("final answer")
+                    })
+                    .expect("final answer request captured");
+                assert!(
+                    redaction_index < final_index,
+                    "placeholder cleanup must be attempted before the final answer"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn retained_single_draft_flush_failure_still_sends_final() {
+            assert_retained_single_draft_flush_failure("old progress", false).await;
+        }
+
+        #[tokio::test]
+        async fn retained_placeholder_draft_flush_failure_redacts_before_final() {
+            assert_retained_single_draft_flush_failure(DRAFT_PLACEHOLDER, true).await;
+        }
+
+        async fn assert_single_redact_failure_still_sends_budgeted_final(
+            stream_draft_delete: bool,
+        ) {
+            let server = MockServer::start().await;
+            let room_id = "!room:server";
+            let draft_id = owned_event_id!("$draft:server");
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "OmnesAgent Test"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id: {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": [{
+                                        "type": "m.room.message",
+                                        "sender": "@bot:server",
+                                        "event_id": draft_id.as_str(),
+                                        "origin_server_ts": 1,
+                                        "content": {
+                                            "msgtype": "m.text",
+                                            "body": "old progress"
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errcode": "M_FORBIDDEN",
+                    "error": "redact forbidden"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": "😀😀"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let approval_prompt =
+                "Approval required: reply approve or deny with token approval-12345";
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": approval_prompt
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$approval:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: server.uri(),
+                    access_token: Some("secret-token".to_string()),
+                    user_id: Some("@bot:server".to_string()),
+                    device_id: Some("DEVICE".to_string()),
+                    allowed_rooms: vec![room_id.to_string()],
+                    stream_mode: MatrixStreamMode::SingleMessage,
+                    stream_draft_delete,
+                    message_max_bytes: 5,
+                    reply_in_thread: false,
+                    ack_reactions: Some(false),
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.sync_once(SyncSettings::default()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("mock sync populates joined room: {err}; received paths: {paths:?}");
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("mock sync timed out; received paths: {paths:?}");
+                }
+            }
+
+            channel
+                .send(&SendMessage::new(approval_prompt, room_id))
+                .await
+                .expect("ordinary approval-style send remains unbounded");
+            channel
+                .send_final(&SendMessage::new("😀😀", room_id))
+                .await
+                .expect("no-draft final uses the single-message budget");
+
+            let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
+            {
+                let draft = single_draft(draft_id.clone());
+                let mut state = channel.streaming_state.write().await;
+                insert_single(&mut state, key, draft).expect("single-message state accepts draft");
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                channel.finalize_draft(room_id, draft_id.as_str(), "😀😀", false),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!(
+                        "redaction failure must not block final send: {err}; received paths: {paths:?}"
+                    );
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("single-message finalize timed out; received paths: {paths:?}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn single_delete_redact_failure_still_sends_utf8_budgeted_final() {
+            assert_single_redact_failure_still_sends_budgeted_final(true).await;
+        }
+
+        #[tokio::test]
+        async fn retained_placeholder_redact_failure_still_sends_utf8_budgeted_final() {
+            assert_single_redact_failure_still_sends_budgeted_final(false).await;
+        }
+
+        #[test]
+        fn marker_only_partial_finalize_redacts_placeholder_after_upload() {
+            assert_eq!(
+                decide_partial_finalize_action(true, true),
+                PartialFinalizeAction::RedactDraft
+            );
+        }
+
+        #[test]
+        fn text_partial_finalize_keeps_editing_draft_after_upload() {
+            assert_eq!(
+                decide_partial_finalize_action(false, true),
+                PartialFinalizeAction::EditDraft
+            );
+        }
+
+        #[test]
+        fn text_only_partial_finalize_keeps_editing_draft() {
+            assert_eq!(
+                decide_partial_finalize_action(false, false),
+                PartialFinalizeAction::EditDraft
+            );
+        }
+
+        #[test]
+        fn empty_partial_finalize_without_upload_reports_empty_error() {
+            assert_eq!(
+                decide_partial_finalize_action(true, false),
+                PartialFinalizeAction::EmptyError
+            );
+        }
+
+        #[test]
+        fn draft_keys_include_message_id_for_same_room_concurrency() {
+            let room = owned_room_id!("!room:server");
+            let first = streaming::draft_key(room.clone(), "$draft-a:server").unwrap();
+            let second = streaming::draft_key(room.clone(), "$draft-b:server").unwrap();
+
+            assert_ne!(first, second);
+
+            let mut state = streaming::State::for_stream_mode(MatrixStreamMode::Partial);
+            insert_partial(
+                &mut state,
+                first.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-a:server"),
+                    thread_anchor: None,
+                    last_text: "first".to_string(),
+                    last_edit: Instant::now(),
+                },
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
+                second.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-b:server"),
+                    thread_anchor: None,
+                    last_text: "second".to_string(),
+                    last_edit: Instant::now(),
+                },
+            )
+            .expect("partial state accepts second draft");
+
+            assert_eq!(partial_len(&state), 2);
+            assert_eq!(
+                streaming::take_partial(&mut state, &second).map(|draft| draft.event_id),
+                Some(owned_event_id!("$draft-b:server"))
+            );
+            assert!(partial_contains(&state, &first));
+        }
+
+        #[test]
+        fn partial_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first = super::super::streaming_key(recipient, "$draft-a:server").unwrap();
+            let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
+            let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
+
+            let mut state = State::for_stream_mode(MatrixStreamMode::Partial);
+            insert_partial(
+                &mut state,
+                first.clone(),
+                partial_draft(owned_event_id!("$draft-a:server"), "first"),
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
+                second.clone(),
+                partial_draft(owned_event_id!("$draft-b:server"), "second"),
+            )
+            .expect("partial state accepts second draft");
+
+            streaming::partial_for_update(&mut state, &second)
+                .expect("second draft remains addressable")
+                .last_text = "second updated".to_string();
+
+            assert_eq!(
+                streaming::partial_for_update(&mut state, &first)
+                    .expect("first draft remains isolated")
+                    .last_text,
+                "first"
+            );
+
+            let finalized = streaming::take_partial(&mut state, &second)
+                .expect("finalize removes only the addressed draft");
+            assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &second));
+
+            insert_partial(
+                &mut state,
+                canceled.clone(),
+                partial_draft(owned_event_id!("$draft-c:server"), "cancel me"),
+            )
+            .expect("partial state accepts canceled draft");
+            let canceled_draft = streaming::take_partial(&mut state, &canceled)
+                .expect("cancel removes only the addressed draft");
+            assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &canceled));
+        }
+
+        #[test]
+        fn single_message_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first = super::super::streaming_key(recipient, "$draft-a:server").unwrap();
+            let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
+            let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
+
+            let mut state = State::for_stream_mode(MatrixStreamMode::SingleMessage);
+            insert_single(
+                &mut state,
+                first.clone(),
+                single_draft(owned_event_id!("$draft-a:server")),
+            )
+            .expect("single state accepts first draft");
+            insert_single(
+                &mut state,
+                second.clone(),
+                single_draft(owned_event_id!("$draft-b:server")),
+            )
+            .expect("single state accepts second draft");
+
+            push_single_progress_line(
+                streaming::single_for_update(&mut state, &second)
+                    .expect("second draft remains addressable"),
+                "second updated",
+                10,
+            );
+
+            assert_eq!(
+                streaming::single_for_update(&mut state, &first)
+                    .expect("first draft remains isolated")
+                    .lines
+                    .len(),
+                0
+            );
+
+            let finalized = streaming::take_single(&mut state, &second)
+                .expect("finalize removes only the addressed draft");
+            assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &second));
+
+            insert_single(
+                &mut state,
+                canceled.clone(),
+                single_draft(owned_event_id!("$draft-c:server")),
+            )
+            .expect("single state accepts canceled draft");
+            let canceled_draft = streaming::take_single(&mut state, &canceled)
+                .expect("cancel removes only the addressed draft");
+            assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &canceled));
+        }
+
+        #[test]
+        fn multi_message_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first =
+                super::super::streaming_key(recipient, "multi_message_synthetic:first").unwrap();
+            let second =
+                super::super::streaming_key(recipient, "multi_message_synthetic:second").unwrap();
+            let canceled =
+                super::super::streaming_key(recipient, "multi_message_synthetic:cancel").unwrap();
+
+            let mut state = State::for_stream_mode(MatrixStreamMode::MultiMessage);
+            insert_multi(
+                &mut state,
+                first.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 5,
+                },
+            )
+            .expect("multi state accepts first draft");
+            insert_multi(
+                &mut state,
+                second.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 0,
+                },
+            )
+            .expect("multi state accepts second draft");
+
+            streaming::multi_for_update(&mut state, &second)
+                .expect("second multi-message draft remains addressable")
+                .sent_so_far = 12;
+
+            assert_eq!(
+                streaming::multi_for_update(&mut state, &first)
+                    .expect("first multi-message draft remains isolated")
+                    .sent_so_far,
+                5
+            );
+
+            let finalized = streaming::take_multi(&mut state, &second)
+                .expect("finalize removes only the addressed multi-message draft");
+            assert_eq!(finalized.sent_so_far, 12);
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &second));
+
+            insert_multi(
+                &mut state,
+                canceled.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    sent_so_far: 3,
+                },
+            )
+            .expect("multi state accepts canceled draft");
+            let canceled_draft = streaming::take_multi(&mut state, &canceled)
+                .expect("cancel removes only the addressed multi-message draft");
+            assert_eq!(canceled_draft.sent_so_far, 3);
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &canceled));
+        }
+
+        #[test]
+        fn multi_message_synthetic_draft_ids_are_unique() {
+            let first = streaming::new_multi_message_draft_id();
+            let second = streaming::new_multi_message_draft_id();
+
+            assert_ne!(first, second);
+            assert!(first.starts_with("multi_message_synthetic:"));
+            assert!(second.starts_with("multi_message_synthetic:"));
+        }
+    }
+
+    mod live_smoke {
+        use std::{
+            env,
+            sync::Arc,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        };
+
+        use matrix_sdk::config::SyncSettings;
+        use tempfile::TempDir;
+        use omnesagent_api::channel::{Channel, SendMessage};
+        use omnesagent_config::schema::{MatrixConfig, MatrixStreamMode};
+
+        use super::super::{
+            MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming, streaming_key,
+        };
+
+        fn env_first(primary: &str, fallback: &str) -> String {
+            env::var(primary)
+                .or_else(|_| env::var(fallback))
+                .unwrap_or_else(|_| panic!("set {primary} or {fallback} to run Matrix live smoke"))
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable test room"]
+        async fn same_room_partial_draft_lifecycle_uses_real_draft_ids() {
+            let homeserver = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_HOMESERVER",
+                "OMNESAGENT_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("OMNESAGENT_MATRIX_SMOKE_ROOM_ID", "OMNESAGENT_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_ACCESS_TOKEN",
+                "OMNESAGENT_MATRIX_ACCESS_TOKEN",
+            );
+            let device_id = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_DEVICE_ID",
+                "OMNESAGENT_MATRIX_DEVICE_ID",
+            );
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_secs();
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                device_id: Some(device_id),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: MatrixStreamMode::Partial,
+                draft_update_interval_ms: 50,
+                multi_message_delay_ms: 0,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                approval_timeout_secs: 1,
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let first = channel
+                .send_draft(&SendMessage::new(
+                    format!("omnesagent draft lifecycle smoke {stamp} first"),
+                    &room_id,
+                ))
+                .await
+                .expect("send first draft")
+                .expect("partial mode returns first draft event id");
+            let second = channel
+                .send_draft(&SendMessage::new(
+                    format!("omnesagent draft lifecycle smoke {stamp} second"),
+                    &room_id,
+                ))
+                .await
+                .expect("send second draft")
+                .expect("partial mode returns second draft event id");
+            assert_ne!(first, second);
+
+            let first_key = streaming_key(&room_id, &first).expect("first draft key");
+            let second_key = streaming_key(&room_id, &second).expect("second draft key");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(streaming::partial_contains(&state, &second_key));
+            }
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let first_update = format!("omnesagent draft lifecycle smoke {stamp} first update");
+            channel
+                .update_draft(&room_id, &first, &first_update)
+                .await
+                .expect("update first draft by id");
+            {
+                let mut state = channel.streaming_state.write().await;
+                assert_eq!(
+                    streaming::partial_for_update(&mut state, &first_key)
+                        .map(|draft| draft.last_text.as_str()),
+                    Some(first_update.as_str())
+                );
+                assert!(streaming::partial_contains(&state, &second_key));
+            }
+
+            channel
+                .finalize_draft(
+                    &room_id,
+                    &second,
+                    &format!("omnesagent draft lifecycle smoke {stamp} second final"),
+                    false,
+                )
+                .await
+                .expect("finalize second draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(!streaming::partial_contains(&state, &second_key));
+            }
+
+            channel
+                .cancel_draft(&room_id, &first)
+                .await
+                .expect("cancel first draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert_eq!(streaming::partial_len(&state), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable test room"]
+        async fn same_room_single_message_draft_edits_one_real_event() {
+            let homeserver = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_HOMESERVER",
+                "OMNESAGENT_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("OMNESAGENT_MATRIX_SMOKE_ROOM_ID", "OMNESAGENT_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_ACCESS_TOKEN",
+                "OMNESAGENT_MATRIX_ACCESS_TOKEN",
+            );
+            let device_id = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_DEVICE_ID",
+                "OMNESAGENT_MATRIX_DEVICE_ID",
+            );
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_secs();
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                device_id: Some(device_id),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: MatrixStreamMode::SingleMessage,
+                draft_update_interval_ms: 50,
+                stream_draft_lines: 5,
+                message_max_bytes: 512,
+                stream_draft_delete: true,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                approval_timeout_secs: 1,
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let draft = channel
+                .send_draft(&SendMessage::new(
+                    format!("omnesagent single-message smoke {stamp} draft"),
+                    &room_id,
+                ))
+                .await
+                .expect("send single-message draft")
+                .expect("single-message mode returns a real draft event id");
+            let key = streaming_key(&room_id, &draft).expect("draft key");
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            channel
+                .update_draft_progress(
+                    &room_id,
+                    &draft,
+                    &format!("💭 omnesagent single-message smoke {stamp} **literal** <tag>"),
+                )
+                .await
+                .expect("edit the same single-message draft event");
+            {
+                let state = channel.streaming_state.read().await;
+                let active = streaming::single_contains(&state, &key);
+                assert!(active, "the edited draft remains one active event");
+            }
+
+            channel
+                .finalize_draft(
+                    &room_id,
+                    &draft,
+                    &format!("omnesagent single-message smoke {stamp} final"),
+                    false,
+                )
+                .await
+                .expect("finalize after editing the single-message draft");
+            let state = channel.streaming_state.read().await;
+            assert!(
+                !streaming::single_contains(&state, &key),
+                "finalization removes the local single-message draft state"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable idle test room"]
+        async fn idle_sync_does_not_error_at_30s_cadence() {
+            let homeserver = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_HOMESERVER",
+                "OMNESAGENT_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("OMNESAGENT_MATRIX_SMOKE_ROOM_ID", "OMNESAGENT_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_ACCESS_TOKEN",
+                "OMNESAGENT_MATRIX_ACCESS_TOKEN",
+            );
+            let device_id = env_first(
+                "OMNESAGENT_MATRIX_SMOKE_DEVICE_ID",
+                "OMNESAGENT_MATRIX_DEVICE_ID",
+            );
+
+            let idle_secs: u64 = env::var("OMNESAGENT_MATRIX_SMOKE_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(35);
+            assert!(
+                idle_secs > 30,
+                "idle soak must exceed 30s to exercise the pre-fix failure window; got {idle_secs}s"
+            );
+            let min_longpoll_ms: u64 = env::var("OMNESAGENT_MATRIX_SMOKE_MIN_LONGPOLL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000);
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                device_id: Some(device_id),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: MatrixStreamMode::Off,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            // Building the client exercises `CLIENT_REQUEST_TIMEOUT` on the
+            // underlying `RequestConfig`. If that constant ever regresses below
+            // `SYNC_LONGPOLL_TIMEOUT`, the very first long-poll below will
+            // error out at the HTTP deadline.
+            let client = channel.ensure_client().await.expect("matrix client");
+
+            // Prime the sync token with a single bounded sync_once so the
+            // subsequent loop measures true idle long-poll behavior rather
+            // than the initial state-fetch round-trip.
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let soak = Duration::from_secs(idle_secs);
+            let min_longpoll = Duration::from_millis(min_longpoll_ms);
+            let deadline = Instant::now() + soak;
+            let mut call_count: u32 = 0;
+            let mut short_longpoll_count: u32 = 0;
+            let mut max_call: Duration = Duration::from_millis(0);
+
+            while Instant::now() < deadline {
+                let started = Instant::now();
+                let result = client
+                    .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                    .await;
+                let elapsed = started.elapsed();
+
+                // Primary reviewer assertion: idle `/sync` must not error out.
+                // The pre-fix bug surfaced as a request-deadline error at ~30s
+                // when the HTTP timeout fired before the long-poll returned.
+                result.unwrap_or_else(|e| {
+                    panic!(
+                        "idle sync_once errored after {elapsed:?} (call #{call_count}); this is the 30s-cadence regression \
+                         the PR aims to fix: {e}"
+                    )
+                });
+
+                call_count += 1;
+                if elapsed > max_call {
+                    max_call = elapsed;
+                }
+                if elapsed < min_longpoll {
+                    short_longpoll_count += 1;
+                }
+            }
+
+            // Defense-in-depth against the other half of the pre-fix bug: a
+            // missing `?timeout=` made the homeserver reply instantly, so the
+            // SDK would busy-poll. With `SYNC_LONGPOLL_TIMEOUT` set, an idle
+            // room should produce only a handful of round-trips per 30s.
+            assert!(
+                call_count > 0,
+                "expected at least one sync_once call during the {idle_secs}s soak"
+            );
+            assert!(
+                max_call >= min_longpoll,
+                "every sync_once call returned in <{min_longpoll:?} (max observed: {max_call:?}); \
+                 homeserver appears to be replying without honoring `?timeout=` — likely the pre-fix \
+                 busy-poll regression. call_count={call_count}"
+            );
+            // Allow a couple of legitimate early returns (e.g. presence pings)
+            // but flag anything that smells like a tight busy-poll loop.
+            let busy_poll_budget = ((idle_secs / 5).max(2)) as u32;
+            assert!(
+                short_longpoll_count <= busy_poll_budget,
+                "{short_longpoll_count} of {call_count} sync_once calls returned in <{min_longpoll:?} \
+                 (budget for an idle room over {idle_secs}s is {busy_poll_budget}); this matches the \
+                 pre-fix busy-poll pattern"
+            );
+
+            // Mirror the validation-evidence shape requested on the PR: emit a
+            // concise note so a captured `cargo test -- --nocapture` run reads
+            // like the reviewer's "short Matrix smoke result" ask.
+            eprintln!(
+                "matrix idle-sync smoke: soak={idle_secs}s, sync_once_calls={call_count}, \
+                 max_call={max_call:?}, short_calls={short_longpoll_count}, no errors at 30s cadence"
+            );
+        }
+    }
+
+    mod session {
+        use super::super::session::{SessionBlob, load, save};
+        use tempfile::TempDir;
+
+        #[test]
+        fn round_trip() {
+            let dir = TempDir::new().unwrap();
+            let blob = SessionBlob {
+                user_id: "@bot:example.org".to_string(),
+                device_id: "DEV1".to_string(),
+                access_token: "secret".to_string(),
+                refresh_token: Some("refresh".to_string()),
+            };
+            save(dir.path(), &blob).unwrap();
+            let loaded = load(dir.path()).unwrap().unwrap();
+            assert_eq!(blob, loaded);
+        }
+
+        #[test]
+        fn missing_returns_none() {
+            let dir = TempDir::new().unwrap();
+            assert!(load(dir.path()).unwrap().is_none());
+        }
+
+        #[test]
+        fn corrupt_returns_none() {
+            let dir = TempDir::new().unwrap();
+            let p = dir.path().join("session.json");
+            std::fs::write(p, "{not valid json").unwrap();
+            assert!(load(dir.path()).unwrap().is_none());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn save_creates_owner_only_perms() {
+            // session.json holds the access token in plaintext. On Unix
+            // it must be 0o600 regardless of umask so other local users
+            // can't read it.
+            use std::os::unix::fs::PermissionsExt;
+            let dir = TempDir::new().unwrap();
+            let blob = SessionBlob {
+                user_id: "@bot:example.org".to_string(),
+                device_id: "DEV1".to_string(),
+                access_token: "secret".to_string(),
+                refresh_token: None,
+            };
+            save(dir.path(), &blob).unwrap();
+            let meta = std::fs::metadata(dir.path().join("session.json")).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "expected 0o600, got {mode:o}; session.json must be owner-only"
+            );
+        }
+    }
+
+    mod auth_gating {
+        //! Pure-logic tests for the auth-flow gating helpers — keeps
+        //! corruption-recovery decisions verifiable without touching the SDK.
+
+        use super::super::client::{
+            can_password_relogin, resolve_access_token_identity, saved_session_is_foreign,
+            store_has_orphan_data,
+        };
+        use tempfile::TempDir;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{header, method, path},
+        };
+        use omnesagent_config::schema::MatrixConfig;
+
+        const WHOAMI_PATH: &str = "/_matrix/client/v3/account/whoami";
+
+        fn cfg(password: Option<&str>, user_id: Option<&str>) -> MatrixConfig {
+            MatrixConfig {
+                enabled: true,
+                homeserver: "https://m.org".into(),
+                access_token: None,
+                user_id: user_id.map(String::from),
+                device_id: None,
+                allowed_rooms: vec![],
+                interrupt_on_new_message: false,
+                stream_mode: Default::default(),
+                stream_tool_arguments: vec![],
+                draft_update_interval_ms: 1500,
+                multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: omnesagent_config::schema::StreamReasoningMode::Status,
+                mention_only: false,
+                recovery_key: None,
+                password: password.map(String::from),
+                approval_timeout_secs: 300,
+                reply_in_thread: true,
+                ack_reactions: Some(true),
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
+            }
+        }
+
+        fn access_token_cfg(homeserver: String) -> MatrixConfig {
+            MatrixConfig {
+                homeserver,
+                access_token: Some("secret-token".into()),
+                ..cfg(None, None)
+            }
+        }
+
+        fn resolved_homeserver(url: &str) -> reqwest::Url {
+            reqwest::Url::parse(url).unwrap()
+        }
+
+        #[test]
+        fn relogin_requires_both_password_and_user_id() {
+            assert!(can_password_relogin(&cfg(Some("pw"), Some("@bot:m"))));
+            assert!(!can_password_relogin(&cfg(None, Some("@bot:m"))));
+            assert!(!can_password_relogin(&cfg(Some("pw"), None)));
+            assert!(!can_password_relogin(&cfg(None, None)));
+        }
+
+        #[test]
+        fn relogin_rejects_empty_strings() {
+            assert!(!can_password_relogin(&cfg(Some(""), Some("@bot:m"))));
+            assert!(!can_password_relogin(&cfg(Some("pw"), Some(""))));
+        }
+
+        fn blob_for(user_id: &str) -> super::super::session::SessionBlob {
+            super::super::session::SessionBlob {
+                user_id: user_id.to_string(),
+                device_id: "DEV1".to_string(),
+                access_token: "secret".to_string(),
+                refresh_token: None,
+            }
+        }
+
+        #[test]
+        fn foreign_session_detected_when_user_ids_differ() {
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let foreign = blob_for("@bender-bending-rodriguez-omnesagent:matrix.org");
+            assert!(saved_session_is_foreign(&cfg, &foreign));
+        }
+
+        #[test]
+        fn matching_session_not_foreign() {
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let own = blob_for("@clamps-bot:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg, &own));
+        }
+
+        #[test]
+        fn unset_or_bare_user_id_never_flags() {
+            // No configured user_id, or a bare localpart that cannot be
+            // compared against the canonical MXID, must not false-positive.
+            let any = blob_for("@whoever:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), None), &any));
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), Some("")), &any));
+            assert!(!saved_session_is_foreign(
+                &cfg(Some("pw"), Some("clamps-bot")),
+                &any
+            ));
+        }
+
+        #[test]
+        fn orphan_detection_no_state_dir() {
+            let dir = TempDir::new().unwrap();
+            // store/ does not exist
+            assert!(!store_has_orphan_data(dir.path()));
+        }
+
+        #[test]
+        fn orphan_detection_empty_store() {
+            let dir = TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join("store")).unwrap();
+            assert!(!store_has_orphan_data(dir.path()));
+        }
+
+        #[test]
+        fn orphan_detection_populated_store() {
+            let dir = TempDir::new().unwrap();
+            let store = dir.path().join("store");
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join("matrix-sdk-crypto.sqlite3"), b"x").unwrap();
+            assert!(store_has_orphan_data(dir.path()));
+        }
+
+        #[tokio::test]
+        async fn access_token_identity_fetches_missing_user_and_device_from_whoami() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .mount(&server)
+                .await;
+
+            let identity = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+        }
+
+        #[tokio::test]
+        async fn access_token_whoami_uses_discovered_delegated_homeserver() {
+            let root = MockServer::start().await;
+            let delegated = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/.well-known/matrix/client"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "m.homeserver": { "base_url": delegated.uri() }
+                })))
+                .expect(1)
+                .mount(&root)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.1"],
+                    "unstable_features": {}
+                })))
+                .mount(&delegated)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .expect(1)
+                .mount(&delegated)
+                .await;
+
+            let server_name =
+                matrix_sdk::ruma::ServerName::parse(root.address().to_string()).unwrap();
+            let client = matrix_sdk::Client::builder()
+                .insecure_server_name_no_tls(&server_name)
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(
+                client.homeserver().as_str().trim_end_matches('/'),
+                delegated.uri()
+            );
+
+            let identity = resolve_access_token_identity(
+                &access_token_cfg(server_name.to_string()),
+                &client.homeserver(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+            assert!(
+                root.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.url.path() != WHOAMI_PATH)
+            );
+        }
+
+        #[tokio::test]
+        async fn access_token_whoami_preserves_direct_homeserver_url_and_base_path() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/matrix/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.1"],
+                    "unstable_features": {}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/matrix{WHOAMI_PATH}")))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let homeserver = format!("{}/matrix", server.uri());
+            let client = matrix_sdk::Client::builder()
+                .server_name_or_homeserver_url(&homeserver)
+                .build()
+                .await
+                .unwrap();
+            let identity =
+                resolve_access_token_identity(&access_token_cfg(homeserver), &client.homeserver())
+                    .await
+                    .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+        }
+
+        #[tokio::test]
+        async fn access_token_identity_rejects_whoami_without_device_when_not_configured() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org"
+                })))
+                .mount(&server)
+                .await;
+
+            let err = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("whoami response did not include device_id"),
+                "{err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn access_token_identity_uses_complete_config_without_whoami() {
+            let mut config = access_token_cfg("http://127.0.0.1:9".into());
+            config.user_id = Some(" @bot:example.org ".into());
+            config.device_id = Some(" DEVICE42 ".into());
+
+            let identity =
+                resolve_access_token_identity(&config, &resolved_homeserver("http://127.0.0.1:9"))
+                    .await
+                    .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+        }
+
+        #[tokio::test]
+        async fn access_token_identity_rejects_configured_user_mismatch() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@actual:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .mount(&server)
+                .await;
+            let mut config = access_token_cfg(server.uri());
+            config.user_id = Some("@configured:example.org".into());
+
+            let err = resolve_access_token_identity(&config, &resolved_homeserver(&server.uri()))
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("does not match Matrix whoami user_id"),
+                "{err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn access_token_identity_reports_matrix_error_envelope_without_raw_body() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errcode": "M_FORBIDDEN",
+                    "error": "token rejected",
+                    "access_token": "secret-token"
+                })))
+                .mount(&server)
+                .await;
+
+            let err = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap_err();
+            let message = err.to_string();
+
+            assert!(message.contains("M_FORBIDDEN: token rejected"), "{message}");
+            assert!(!message.contains("access_token"), "{message}");
+            assert!(!message.contains("secret-token"), "{message}");
+        }
+
+        #[tokio::test]
+        async fn access_token_identity_rejects_configured_device_mismatch() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "ACTUAL_DEVICE"
+                })))
+                .mount(&server)
+                .await;
+            let mut config = access_token_cfg(server.uri());
+            config.device_id = Some("CONFIGURED_DEVICE".into());
+
+            let err = resolve_access_token_identity(&config, &resolved_homeserver(&server.uri()))
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("does not match Matrix whoami device_id"),
+                "{err}"
+            );
+        }
+    }
+
+    mod voice {
+        use super::super::inbound::is_voice_message;
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::serde::Raw;
+
+        fn raw(json: serde_json::Value) -> RawEvent {
+            let raw: Raw<serde_json::Value> = Raw::new(&json).expect("raw");
+            RawEvent(raw.into_json())
+        }
+
+        #[test]
+        fn audio_with_voice_flag_detected() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "voice.ogg",
+                    "org.matrix.msc3245.voice": {},
+                }
+            }));
+            assert!(is_voice_message(&r));
+        }
+
+        #[test]
+        fn plain_audio_not_voice() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "song.mp3",
+                }
+            }));
+            assert!(!is_voice_message(&r));
+        }
+    }
+
+    mod thread_extraction {
+        use super::super::inbound::{
+            extract_mentions_user_ids, extract_thread_id, interruption_scope_from_anchor,
+            resolve_outbound_anchor,
+        };
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::serde::Raw;
+
+        fn raw(json: serde_json::Value) -> RawEvent {
+            let raw: Raw<serde_json::Value> = Raw::new(&json).expect("raw");
+            RawEvent(raw.into_json())
+        }
+
+        #[test]
+        fn thread_relation_pulls_root_id() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "reply",
+                    "m.relates_to": {
+                        "rel_type": "m.thread",
+                        "event_id": "$root:server",
+                    }
+                }
+            }));
+            let id = extract_thread_id(&r).expect("some");
+            assert_eq!(id.as_str(), "$root:server");
+        }
+
+        #[test]
+        fn no_relation_returns_none() {
+            let r = raw(serde_json::json!({
+                "content": { "msgtype": "m.text", "body": "hi" }
+            }));
+            assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn non_thread_relation_returns_none() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hi",
+                    "m.relates_to": { "rel_type": "m.replace", "event_id": "$x:s" }
+                }
+            }));
+            assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn root_inbound_starts_new_thread_when_reply_in_thread_enabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(
+                resolve_outbound_anchor(None, &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn root_inbound_stays_root_when_reply_in_thread_disabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(resolve_outbound_anchor(None, &event_id, false), None);
+        }
+
+        #[test]
+        fn threaded_inbound_keeps_existing_thread_root() {
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread id");
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, false).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        // ── interruption_scope_from_anchor ──────────────────────────
+
+        #[test]
+        fn self_anchored_root_strips_interruption_scope() {
+            // when reply_in_thread anchors on the inbound event
+            // itself the anchor is a delivery detail, not a conversation
+            // boundary — interruption_scope_id should be None so
+            // cancellation keys match sender+room.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, true);
+            // thread_ts stays set to the event_id
+            assert_eq!(outbound.as_deref(), Some("$ev:server"));
+            // interruption_scope_id is stripped
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
+            );
+        }
+
+        #[test]
+        fn real_thread_reply_preserves_interruption_scope() {
+            // A reply inside an existing thread: outbound anchor is the
+            // thread root, not the inbound event itself.
+            // interruption_scope_id must stay set to the thread root.
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread root");
+            let outbound = resolve_outbound_anchor(Some(&thread_root), &event_id, true);
+            assert_eq!(outbound.as_deref(), Some("$root:server"));
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn no_anchor_yields_no_interruption_scope() {
+            // reply_in_thread disabled on a root event: no anchor at all.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, false);
+            assert_eq!(outbound, None);
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
+            );
+        }
+
+        #[test]
+        fn mentions_user_ids_extracted() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hi",
+                    "m.mentions": { "user_ids": ["@a:b", "@c:d"] }
+                }
+            }));
+            let ids = extract_mentions_user_ids(&r).expect("some");
+            assert_eq!(ids, vec!["@a:b", "@c:d"]);
+        }
+
+        #[test]
+        fn no_mentions_field_returns_none() {
+            let r = raw(serde_json::json!({
+                "content": { "msgtype": "m.text", "body": "hi" }
+            }));
+            assert!(extract_mentions_user_ids(&r).is_none());
+        }
+    }
+
+    mod multi_streaming {
+        //! `next_paragraph_break` is the heart of MultiMessage streaming —
+        //! getting the code-fence detection wrong means agent code blocks
+        //! get split mid-block. These cover the corner cases.
+
+        use super::super::streaming::next_paragraph_break;
+
+        #[test]
+        fn no_break_returns_none() {
+            assert_eq!(next_paragraph_break("hello world"), None);
+        }
+
+        #[test]
+        fn single_break_at_offset() {
+            assert_eq!(next_paragraph_break("first\n\nsecond"), Some(5));
+        }
+
+        #[test]
+        fn first_break_when_multiple_present() {
+            // Caller is expected to consume +2 past the break, so reporting
+            // the *first* break is the correct contract — the loop emits one
+            // paragraph per iteration.
+            assert_eq!(next_paragraph_break("a\n\nb\n\nc"), Some(1));
+        }
+
+        #[test]
+        fn break_inside_code_fence_ignored() {
+            // The `\n\n` after "let x = 1;" is inside ```rust ... ``` and
+            // must not be treated as a paragraph boundary.
+            let text = "before\n\n```rust\nlet x = 1;\n\nlet y = 2;\n```\n\nafter";
+            let break_at = next_paragraph_break(text).expect("first break");
+            // First real break is the one between "before" and the fence.
+            assert_eq!(&text[..break_at], "before");
+        }
+
+        #[test]
+        fn break_after_closed_fence_detected() {
+            // Once the fence closes, subsequent `\n\n` should be detected.
+            let text = "```\ncode\n```\n\nafter";
+            assert_eq!(next_paragraph_break(text), Some(12));
+        }
+
+        #[test]
+        fn fence_must_be_at_line_start() {
+            // ``` mid-line is not a fence open — paragraph break still applies.
+            let text = "inline ``` not a fence\n\nafter";
+            assert!(next_paragraph_break(text).is_some());
+        }
+
+        #[test]
+        fn unicode_safe() {
+            // Byte offset must be on a char boundary so the caller's
+            // `text[..break_at]` slice doesn't panic.
+            let text = "héllo\n\nwörld";
+            let break_at = next_paragraph_break(text).expect("break");
+            assert!(text.is_char_boundary(break_at));
+            assert_eq!(&text[..break_at], "héllo");
+        }
+    }
+
+    mod in_reply_to {
+        //! Coverage for the mention-only "@bot can you see this image?"
+        //! flow: the inbound text event has no media of its own but its
+        //! `m.relates_to.m.in_reply_to.event_id` points at an earlier
+        //! media-only event the bot ignored.
+
+        use super::super::inbound::{extract_in_reply_to, parent_media_info};
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::ruma::serde::Raw;
+
+        fn raw(json: serde_json::Value) -> RawEvent {
+            let r: Raw<serde_json::Value> = Raw::new(&json).expect("raw");
+            RawEvent(r.into_json())
+        }
+
+        fn parent_raw(json: serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+            Raw::new(&json).expect("parent raw").cast_unchecked()
+        }
+
+        #[test]
+        fn in_reply_to_extracted_from_plain_reply() {
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "@bot can you see this?",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$parent:server" }
+                    }
+                }
+            }));
+            let id = extract_in_reply_to(&r).expect("some");
+            assert_eq!(id.as_str(), "$parent:server");
+        }
+
+        #[test]
+        fn in_reply_to_extracted_from_threaded_reply() {
+            // Modern threaded replies nest m.in_reply_to *inside* the
+            // m.thread relation — extract_in_reply_to should handle both.
+            let r = raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "...",
+                    "m.relates_to": {
+                        "rel_type": "m.thread",
+                        "event_id": "$root:server",
+                        "m.in_reply_to": { "event_id": "$parent:server" }
+                    }
+                }
+            }));
+            let id = extract_in_reply_to(&r).expect("some");
+            assert_eq!(id.as_str(), "$parent:server");
+        }
+
+        #[test]
+        fn no_relation_returns_none() {
+            let r = raw(serde_json::json!({
+                "content": { "msgtype": "m.text", "body": "hi" }
+            }));
+            assert!(extract_in_reply_to(&r).is_none());
+        }
+
+        #[test]
+        fn parent_image_plain_url() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "cat.jpg",
+                    "url": "mxc://example.org/abc",
+                    "info": { "mimetype": "image/jpeg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Image
+            ));
+            assert_eq!(info.file_name, "cat.jpg");
+            assert_eq!(info.mime.as_deref(), Some("image/jpeg"));
+        }
+
+        #[test]
+        fn parent_voice_distinguished_from_audio() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "voice.ogg",
+                    "url": "mxc://example.org/v",
+                    "org.matrix.msc3245.voice": {}
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Voice
+            ));
+        }
+
+        #[test]
+        fn parent_audio_without_voice_flag_is_audio() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "song.mp3",
+                    "url": "mxc://example.org/m"
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Audio
+            ));
+        }
+
+        #[test]
+        fn parent_audio_real_filename_survives_even_with_unrecognized_extension() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Meeting recap.",
+                    "filename": "recording.bin",
+                    "url": "mxc://example.org/m",
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "recording.bin");
+        }
+
+        #[test]
+        fn parent_voice_filename_preferred_over_caption_body() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.ogg",
+                    "url": "mxc://example.org/v",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "voice.ogg");
+        }
+
+        #[test]
+        fn parent_encrypted_file_decoded() {
+            // The `file` key (instead of `url`) signals encrypted media —
+            // parent_media_info must decode it as MediaSource::Encrypted.
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.image",
+                    "body": "secret.jpg",
+                    "info": { "mimetype": "image/jpeg" },
+                    "file": {
+                        "url": "mxc://example.org/enc",
+                        "v": "v2",
+                        "key": {
+                            "kty": "oct",
+                            "alg": "A256CTR",
+                            "ext": true,
+                            "k": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+                            "key_ops": ["encrypt", "decrypt"]
+                        },
+                        "iv": "AAAAAAAAAAAAAAAAAAAAAA",
+                        "hashes": { "sha256": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8" }
+                    }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert!(matches!(
+                info.kind,
+                super::super::inbound::MediaCategory::Image
+            ));
+            assert!(matches!(
+                info.source,
+                matrix_sdk::ruma::events::room::MediaSource::Encrypted(_)
+            ));
+        }
+
+        #[test]
+        fn parent_text_event_returns_none() {
+            let p = parent_raw(serde_json::json!({
+                "content": { "msgtype": "m.text", "body": "hi" }
+            }));
+            assert!(parent_media_info(p).is_none());
+        }
+    }
+
+    mod cron_recipient {
+        //! Cron operators sometimes write `delivery.to` as `<sender>||<room>`.
+        //! `client::normalize_recipient` extracts the last `!`/`#`-prefixed
+        //! segment and signals whether it changed anything.
+
+        use super::super::client::normalize_recipient;
+
+        #[test]
+        fn plain_room_id_unchanged() {
+            let (out, normalized) = normalize_recipient("!abc:server");
+            assert_eq!(out, "!abc:server");
+            assert!(!normalized);
+        }
+
+        #[test]
+        fn plain_alias_unchanged() {
+            let (out, normalized) = normalize_recipient("#room:server");
+            assert_eq!(out, "#room:server");
+            assert!(!normalized);
+        }
+
+        #[test]
+        fn sender_pipe_room_extracts_room() {
+            let (out, normalized) = normalize_recipient("@bot:server||!abc:server");
+            assert_eq!(out, "!abc:server");
+            assert!(normalized);
+        }
+
+        #[test]
+        fn whitespace_around_pipes_trimmed() {
+            let (out, _) = normalize_recipient("@bot:server || !abc:server ");
+            assert_eq!(out, "!abc:server");
+        }
+
+        #[test]
+        fn no_room_segment_falls_through_to_input() {
+            // If nothing in the split looks like a room, return the original
+            // so resolve_room's downstream parser produces a clear error.
+            let (out, normalized) = normalize_recipient("alice||bob");
+            assert_eq!(out, "alice||bob");
+            assert!(normalized);
+        }
+
+        #[test]
+        fn last_room_segment_wins() {
+            let (out, _) = normalize_recipient("!old:s||!new:s");
+            assert_eq!(out, "!new:s");
+        }
+    }
+
+    mod outbound_sandbox {
+        //! Trust-boundary tests for `outbound::validate_marker_target`. The
+        //! marker target string comes from agent text and is therefore
+        //! untrusted; the sandbox must keep local reads inside `workspace_dir`
+        //! and refuse non-http(s) schemes outright.
+
+        use super::super::outbound::{MarkerTarget, validate_marker_target};
+        use tempfile::TempDir;
+
+        #[test]
+        fn accepts_workspace_path() {
+            let workspace = TempDir::new().unwrap();
+            let inside = workspace.path().join("photo.jpg");
+            std::fs::write(&inside, b"x").unwrap();
+            let result = validate_marker_target(inside.to_str().unwrap(), Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Local(p) => {
+                    assert!(p.starts_with(std::fs::canonicalize(workspace.path()).unwrap()));
+                }
+                _ => panic!("expected Local"),
+            }
+        }
+
+        #[test]
+        fn accepts_relative_workspace_path() {
+            let workspace = TempDir::new().unwrap();
+            let inside = workspace.path().join("photo.jpg");
+            std::fs::write(&inside, b"x").unwrap();
+            // Relative-to-workspace target — no `./` prefix; mimics the form
+            // an agent emits when it knows the workspace as cwd.
+            let result = validate_marker_target("photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Local(_) => {}
+                _ => panic!("expected Local"),
+            }
+        }
+
+        #[test]
+        fn rejects_absolute_outside_workspace() {
+            let workspace = TempDir::new().unwrap();
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            let result =
+                validate_marker_target(outside.path().to_str().unwrap(), Some(workspace.path()));
+            assert!(result.is_err(), "expected Err for outside target");
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("outside workspace_dir"),
+                "expected 'outside workspace_dir' in error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_dotdot_traversal() {
+            let workspace = TempDir::new().unwrap();
+            let parent = workspace.path().parent().unwrap();
+            let outside_dir = parent.join("omnesagent-test-outside");
+            let _ = std::fs::create_dir(&outside_dir);
+            let outside_file = outside_dir.join("secret");
+            std::fs::write(&outside_file, b"x").unwrap();
+            let traversal = format!(
+                "../{}/secret",
+                outside_dir.file_name().unwrap().to_str().unwrap()
+            );
+            let result = validate_marker_target(&traversal, Some(workspace.path()));
+            let _ = std::fs::remove_file(&outside_file);
+            let _ = std::fs::remove_dir(&outside_dir);
+            assert!(
+                result.is_err(),
+                "expected Err for `..` traversal escaping workspace"
+            );
+        }
+
+        #[test]
+        fn rejects_file_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target("file:///etc/hostname", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_data_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_marker_target("data:text/plain;base64,aGk=", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_scheme() {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target("ftp://example.com/x", Some(workspace.path()));
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("disallowed scheme"),
+                "expected scheme rejection, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn accepts_http_url() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_marker_target("http://example.com/photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Http(u) => assert_eq!(u.scheme(), "http"),
+                _ => panic!("expected Http"),
+            }
+        }
+
+        #[test]
+        fn accepts_https_url() {
+            let workspace = TempDir::new().unwrap();
+            let result =
+                validate_marker_target("https://example.com/photo.jpg", Some(workspace.path()));
+            match result.expect("validate") {
+                MarkerTarget::Http(u) => assert_eq!(u.scheme(), "https"),
+                _ => panic!("expected Http"),
+            }
+        }
+
+        #[test]
+        fn local_path_without_workspace_is_refused() {
+            // Operator forgot to wire `with_workspace_dir`. Local marker
+            // cannot be safely resolved — refuse rather than fall back to
+            // process cwd (which would be the daemon working dir, not the
+            // workspace).
+            let result = validate_marker_target("photo.jpg", None);
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("without a workspace_dir"),
+                "expected workspace_dir-not-configured error, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn http_url_works_without_workspace() {
+            // HTTP URLs don't depend on a workspace — they should succeed
+            // even when workspace_dir is None.
+            let result = validate_marker_target("https://example.com/x.jpg", None);
+            assert!(matches!(result, Ok(MarkerTarget::Http(_))));
+        }
+
+        fn assert_ssr_refused(target: &str) {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target(target, Some(workspace.path()));
+            let msg = result
+                .expect_err(&format!("expected SSRF refusal for {target}"))
+                .to_string();
+            assert!(
+                msg.contains("private or local host"),
+                "expected SSRF refusal message for {target}, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v4() {
+            assert_ssr_refused("http://127.0.0.1/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_trailing_dot_local_hosts() {
+            for target in [
+                "http://localhost./admin",
+                "http://printer.local./admin",
+                "http://192.168.1.1../admin",
+            ] {
+                assert_ssr_refused(target);
+            }
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v6() {
+            assert_ssr_refused("http://[::1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_rfc1918_v4() {
+            for h in ["10.0.0.5", "172.16.0.1", "192.168.1.1"] {
+                assert_ssr_refused(&format!("http://{h}/internal"));
+            }
+        }
+
+        #[test]
+        fn ssrf_refuses_link_local_v4() {
+            // AWS / GCP / Azure cloud-metadata endpoint.
+            assert_ssr_refused("http://169.254.169.254/latest/meta-data/");
+        }
+
+        #[test]
+        fn ssrf_refuses_cgnat_v4() {
+            // RFC 6598 shared address space (100.64.0.0/10).
+            assert_ssr_refused("http://100.64.0.1/api");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv4_mapped_loopback() {
+            // ::ffff:127.0.0.1 — IPv4-mapped loopback, often missed by
+            // naive IP-literal checks.
+            assert_ssr_refused("http://[::ffff:127.0.0.1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_localhost_name() {
+            assert_ssr_refused("http://localhost/admin");
+            assert_ssr_refused("http://foo.localhost/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_local_suffix_name() {
+            assert_ssr_refused("http://printer.local/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_unique_local() {
+            // fc00::/7 — RFC 4193 unique local addresses.
+            assert_ssr_refused("http://[fd00::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_link_local() {
+            // fe80::/10 — link-local.
+            assert_ssr_refused("http://[fe80::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_https_same_as_http() {
+            // The guard is scheme-agnostic; the same private host is
+            // refused over https:// too.
+            assert_ssr_refused("https://10.0.0.5/secret");
+            assert_ssr_refused("https://[::1]/secret");
+        }
+
+        #[test]
+        fn ssrf_refuses_with_userinfo_attempt() {
+            // An attacker who controls the host string might smuggle a
+            // private host through userinfo syntax; the SSRF guard fires
+            // on the host portion regardless.
+            assert_ssr_refused("http://attacker@127.0.0.1/");
+        }
+
+        #[test]
+        fn accepts_public_host() {
+            // Sanity: a normal public-looking host must still pass through.
+            for h in ["example.com", "cdn.example.com", "1.1.1.1", "8.8.8.8"] {
+                let workspace = TempDir::new().unwrap();
+                let result = validate_marker_target(
+                    &format!("https://{h}/photo.jpg"),
+                    Some(workspace.path()),
+                );
+                assert!(
+                    matches!(result, Ok(MarkerTarget::Http(_))),
+                    "public host {h} must be accepted, got: {result:?}"
+                );
+            }
+        }
+    }
+
+    mod outbound_redirect_ssrf {
+
+        use super::super::outbound::fetch_http;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn private_redirect_body(location: &str) -> ResponseTemplate {
+            ResponseTemplate::new(302).insert_header("Location", location)
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_cloud_metadata_ip() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body(
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to cloud-metadata IP must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_loopback() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body("http://127.0.0.1:9200/_cat/indices"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to loopback must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_trailing_dot_localhost() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body("http://localhost./secret"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to trailing-dot localhost must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn follows_public_redirect_target() {
+            assert!(
+                !omnesagent_tools::helpers::domain_guard::is_private_or_local_host("example.com"),
+                "public hostnames must not be classified as private by the per-hop guard"
+            );
+            assert!(
+                !omnesagent_tools::helpers::domain_guard::is_private_or_local_host("cdn.example.com"),
+                "public subdomains must not be classified as private"
+            );
+        }
+    }
+
+    mod transcription_gate {
+
+        use super::super::inbound::{MediaCategory, should_transcribe};
+        use super::super::legacy_transcription_resolver;
+        use omnesagent_config::schema::TranscriptionConfig;
+
+        fn enabled_cfg() -> TranscriptionConfig {
+            // Construct via Default + struct update so we stay robust to
+            // future field additions on TranscriptionConfig.
+            TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            }
+        }
+
+        fn disabled_cfg() -> TranscriptionConfig {
+            TranscriptionConfig::default()
+        }
+
+        #[test]
+        fn voice_transcribes() {
+            assert!(should_transcribe(&MediaCategory::Voice));
+        }
+
+        #[test]
+        fn audio_does_not_transcribe() {
+            // Plain m.audio (no MSC3245 voice flag) is left as a regular
+            // audio file — only voice notes get transcribed.
+            assert!(!should_transcribe(&MediaCategory::Audio));
+        }
+
+        #[test]
+        fn image_does_not_transcribe() {
+            assert!(!should_transcribe(&MediaCategory::Image));
+        }
+
+        #[test]
+        fn resolver_yields_nothing_when_disabled() {
+            // The enabled gate moved from `should_transcribe` onto the
+            // resolver, which reads it from live config on every message.
+            let resolver = legacy_transcription_resolver(disabled_cfg());
+            assert!(resolver().is_none());
+        }
+
+        #[test]
+        fn resolver_yields_a_manager_when_enabled() {
+            let resolver = legacy_transcription_resolver(TranscriptionConfig {
+                local_whisper: Some(omnesagent_config::schema::LocalWhisperConfig {
+                    url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+                    bearer_token: None,
+                    max_audio_bytes: 10 * 1024 * 1024,
+                    timeout_secs: 30,
+                }),
+                ..enabled_cfg()
+            });
+            assert!(resolver().is_some_and(|manager| manager.is_ok()));
+        }
+    }
+
+    mod outbound_send_outcome {
+        //! Decision logic for what `outbound::send` does after attachment
+        //! uploads complete. Marker-only messages used to error even though
+        //! the attachment had landed; this captures the new contract.
+
+        use super::super::outbound::{SendOutcome, decide_send_outcome};
+
+        #[test]
+        fn non_empty_text_with_attachment_sends_text() {
+            assert_eq!(decide_send_outcome(false, true), SendOutcome::SendText);
+        }
+
+        #[test]
+        fn non_empty_text_without_attachment_sends_text() {
+            assert_eq!(decide_send_outcome(false, false), SendOutcome::SendText);
+        }
+
+        #[test]
+        fn empty_text_with_attachment_returns_attachment() {
+            // The bug fix: marker-only sends must surface the attachment's
+            // event_id, not an error.
+            assert_eq!(
+                decide_send_outcome(true, true),
+                SendOutcome::ReturnAttachment
+            );
+        }
+
+        #[test]
+        fn empty_text_without_attachment_is_error() {
+            // True empty-message case: nothing to deliver, surface the error.
+            assert_eq!(decide_send_outcome(true, false), SendOutcome::EmptyError);
+        }
+    }
+
+    mod outbound_attachment_info {
+        use super::super::outbound::{AttachmentKind, attachment_config_for};
+        use matrix_sdk::{attachment::AttachmentInfo, ruma::UInt};
+        use omnesagent_api::media::MediaAttachment;
+
+        fn attachment(file_name: &str, mime_type: &str, len: usize) -> MediaAttachment {
+            MediaAttachment {
+                file_name: file_name.to_string(),
+                data: vec![0; len],
+                mime_type: Some(mime_type.to_string()),
+                marker: None,
+            }
+        }
+
+        fn info_size(info: AttachmentInfo) -> Option<UInt> {
+            match info {
+                AttachmentInfo::Image(info) => info.size,
+                AttachmentInfo::Video(info) => info.size,
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.size,
+                AttachmentInfo::File(info) => info.size,
+            }
+        }
+
+        #[test]
+        fn structured_file_attachment_carries_matrix_size_info() {
+            let att = attachment("report.pdf", "application/pdf", 4096);
+
+            let mime = super::super::outbound::attachment_mime(&att);
+            let config = attachment_config_for(&att, AttachmentKind::Auto, &mime, None);
+
+            let info = config.info.expect("attachment info is populated");
+            assert!(matches!(info, AttachmentInfo::File(_)));
+            assert_eq!(info_size(info), UInt::try_from(4096usize).ok());
+        }
+
+        #[test]
+        fn media_markers_use_type_specific_matrix_info_with_size() {
+            let cases = [
+                (
+                    AttachmentKind::Image,
+                    attachment("photo.png", "image/png", 17),
+                    "image",
+                ),
+                (
+                    AttachmentKind::Audio,
+                    attachment("clip.ogg", "audio/ogg", 23),
+                    "audio",
+                ),
+                (
+                    AttachmentKind::Video,
+                    attachment("movie.mp4", "video/mp4", 31),
+                    "video",
+                ),
+            ];
+
+            for (kind, att, expected_kind) in cases {
+                let mime = super::super::outbound::attachment_mime(&att);
+                let config = attachment_config_for(&att, kind, &mime, None);
+                let info = config.info.expect("attachment info is populated");
+                match (&info, expected_kind) {
+                    (AttachmentInfo::Image(_), "image") => {}
+                    (AttachmentInfo::Audio(_), "audio") => {}
+                    (AttachmentInfo::Video(_), "video") => {}
+                    _ => panic!("unexpected attachment info kind {info:?}"),
+                }
+                assert_eq!(info_size(info), UInt::try_from(att.data.len()).ok());
+            }
+        }
+
+        #[test]
+        fn attachment_info_kind_matches_final_mime_type() {
+            let image_named_as_file = attachment("photo.png", "image/png", 47);
+            let mime = super::super::outbound::attachment_mime(&image_named_as_file);
+            let config =
+                attachment_config_for(&image_named_as_file, AttachmentKind::File, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::Image(_)),
+                "info must match the MIME-selected Matrix event type"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_named_as_file.data.len()).ok()
+            );
+
+            let image_marker_with_file_mime = attachment("report.pdf", "application/pdf", 53);
+            let mime = super::super::outbound::attachment_mime(&image_marker_with_file_mime);
+            let config = attachment_config_for(
+                &image_marker_with_file_mime,
+                AttachmentKind::Image,
+                &mime,
+                None,
+            );
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::File(_)),
+                "file MIME should use file info so SDK preserves size"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
+        }
+    }
+}

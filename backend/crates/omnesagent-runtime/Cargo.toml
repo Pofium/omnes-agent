@@ -1,0 +1,158 @@
+[package]
+name = "omnesagent-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Miscellaneous OmnesAgent subsystems: security, observability, gateway, cron, SOP, skills, hardware, TUI, and more."
+publish = false
+
+[dependencies]
+omnesagent-api.workspace = true
+omnesagent-spawn.workspace = true
+omnesagent-infra.workspace = true
+omnesagent-config.workspace = true
+omnesagent-tls.workspace = true
+omnesagent-relay-proto.workspace = true
+omnesagent-commands.workspace = true
+omnesagent-log.workspace = true
+omnesagent-providers.workspace = true
+omnesagent-memory.workspace = true
+omnesagent-kag.workspace = true
+omnesagent-tools.workspace = true
+omnesagent-sop-graph.workspace = true
+omnesagent-plugins = { workspace = true, optional = true }
+omnesagent-tool-call-parser.workspace = true
+fluent = "0.16"
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+cap-std = "4"
+cap-fs-ext = "4"
+chacha20poly1305 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono-tz = "0.10"
+console = "0.16"
+cron = "0.15"
+# Raw-mode terminal secret input (cli_input::SecretInput). Blocking
+# `event::read()` only — no EventStream, so default features suffice.
+crossterm = "0.29"
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+directories = "6.0"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+glob = "0.3"
+hex = "0.4"
+hmac = "0.12"
+hostname = "0.4.2"
+lru = "0.18.2"
+mime_guess = "2"
+nanohtml2text = "0.2"
+parking_lot = "0.12"
+portable-atomic = "1"
+rand = "0.10"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
+ring = "0.17"
+rusqlite = { version = "0.37", features = ["bundled"] }
+schemars = { version = "1.2", optional = true }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+strum = "0.28"
+strum_macros = "0.28"
+sha2 = "0.10"
+shellexpand = "3.1"
+sys-locale.workspace = true
+# Pinned to 0.36 because 0.37+ requires rustc 1.88; workspace MSRV is 1.87.
+# Used only by `process_stats.rs` to sample this process's RSS/CPU% across
+# Linux, macOS, Windows, and FreeBSD. `default-features = false` drops the
+# multi-threaded refresh path (we sample a single pid).
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
+tar = "0.4"
+tempfile = "3.26"
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", default-features = false }
+toml = "1.0"
+tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
+tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
+urlencoding = "2.1"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+webpki-roots = "1.0.6"
+which = "8.0"
+zeroize = { version = "1.8", features = ["alloc"] }
+omnesagent-macros.workspace = true
+
+# Optional deps
+prometheus = { version = "0.14", default-features = false, optional = true }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
+# Optional deps for specific features
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { version = "0.4", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_Globalization"] }
+encoding_rs = "0.8"
+
+[features]
+default = ["observability-prometheus", "schema-export"]
+observability-prometheus = ["dep:prometheus"]
+observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+sandbox-landlock = ["dep:landlock"]
+schema-export = ["dep:schemars", "omnesagent-config/schema-export", "omnesagent-sop-graph/schema-export"]
+
+
+browser-native = []
+plugins-wasm = ["dep:omnesagent-plugins", "omnesagent-plugins/plugins-wasmtime"]
+# Adds the Cranelift JIT to the plugin host so a `.wasm` component can be
+# compiled on the host instead of requiring a precompiled `.cwasm`. Production
+# builds get this through the root crate's feature of the same name; the runtime
+# crate declares it so the live-Agent plugin regression can be compiled and run
+# against a real component (`WasmTool::from_wasm` refuses to register a tool it
+# cannot load, so a runtime-only backend has no plugin tool to execute).
+plugins-wasm-cranelift = ["plugins-wasm", "omnesagent-plugins/plugins-wasm-cranelift"]
+webauthn = []
+sandbox-bubblewrap = []
+# Exposes the test-only `ScopedToolRegistry::from_raw_for_test` constructor to
+# OTHER crates' test builds (e.g. omnesagent-channels dev-tests, which must mint a
+# sealed registry for `ChannelRuntimeContext` fixtures). Off by default and never
+# enabled by any production dependency edge, so the assemble()-only seal on
+# `ScopedToolRegistry` remains intact in shipped builds.
+test-util = []
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+encoding_rs = "0.8"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Enable the shared cert/CSR test fixtures for the enrollment + relay tests.
+omnesagent-tls = { workspace = true, features = ["testing"] }
+omnesrelay = { workspace = true }
+futures-util = "0.3"
+tempfile = "3.26"
+# `test-util` enables tokio's paused-clock test runtime, which is what the relay
+# bridge's setup-deadline and keepalive-liveness regressions need to reach a
+# minute-scale budget without waiting a minute.
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "test-util"] }
+scopeguard = "1.2"
+filetime = "0.2"
+wiremock = "0.6"
+# Test-only registry constructor used by the daemon heartbeat MCP
+# retry-regression tests. Not in default deps so
+# the helper is unreachable from production builds.
+omnesagent-tools = { workspace = true, features = ["test-helpers"] }
+# Test-only config fault injection for the config/set post-rename sync
+# regression. Same pattern as omnesagent-tools above.
+omnesagent-config = { workspace = true, features = ["test-helpers"] }
+
+# Channel features (forwarded to omnesagent-channels)
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(omnesagent_root_crate)'] }

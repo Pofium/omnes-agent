@@ -1,0 +1,405 @@
+use super::ModelProvider;
+use super::dispatch::{
+    ProviderDispatch, mark_current_dispatch_composite, stream_as_dispatch_composite,
+};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+};
+use async_trait::async_trait;
+use futures_util::stream::BoxStream;
+
+pub struct ModelPinnedProvider {
+    alias: String,
+    pinned_model: String,
+    inner: Box<dyn ModelProvider>,
+}
+
+/// Typed builder for [`ModelPinnedProvider`].
+///
+/// `alias` is the only positional argument. Both `pinned_model` and
+/// `inner` are semantically required at `build()` time; they moved off
+/// `new(...)` because two adjacent `&str` positional args (`alias` and
+/// `pinned_model`) had a real swap-risk surface — silently pinning the
+/// wrong provider to the wrong model.
+#[must_use]
+pub struct ModelPinnedProviderBuilder {
+    alias: String,
+    pinned_model: Option<String>,
+    inner: Option<Box<dyn ModelProvider>>,
+}
+
+impl ModelPinnedProviderBuilder {
+    /// The model ID every request to this provider is rewritten to.
+    /// Required.
+    pub fn pinned_model(mut self, model: &str) -> Self {
+        self.pinned_model = Some(model.to_string());
+        self
+    }
+
+    /// The inner provider whose model this pin overrides. Required.
+    pub fn inner(mut self, inner: Box<dyn ModelProvider>) -> Self {
+        self.inner = Some(inner);
+        self
+    }
+
+    /// # Panics
+    /// Panics if [`Self::pinned_model`] or [`Self::inner`] was not
+    /// called — neither has a sensible default.
+    pub fn build(self) -> ModelPinnedProvider {
+        ModelPinnedProvider {
+            alias: self.alias,
+            pinned_model: self
+                .pinned_model
+                .expect("ModelPinnedProviderBuilder: pinned_model() is required"),
+            inner: self
+                .inner
+                .expect("ModelPinnedProviderBuilder: inner() is required"),
+        }
+    }
+}
+
+impl ModelPinnedProvider {
+    /// Entry point. Only `alias` is taken positionally; the required
+    /// `pinned_model` and `inner` provider both go through labelled
+    /// chain methods so call sites cannot silently swap them.
+    pub fn builder(alias: &str) -> ModelPinnedProviderBuilder {
+        ModelPinnedProviderBuilder {
+            alias: alias.to_string(),
+            pinned_model: None,
+            inner: None,
+        }
+    }
+
+    pub(crate) fn pinned_model(&self) -> &str {
+        &self.pinned_model
+    }
+}
+
+#[async_trait]
+impl ModelProvider for ModelPinnedProvider {
+    fn has_stable_request_identity(&self, model: &str) -> bool {
+        model == self.pinned_model && self.inner.has_stable_request_identity(&self.pinned_model)
+    }
+
+    fn capabilities(&self) -> super::traits::ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn capabilities_for_model(&self, _model: &str) -> super::traits::ProviderCapabilities {
+        self.inner.capabilities_for_model(&self.pinned_model)
+    }
+
+    fn vision_limited_by(&self, _model: &str) -> Option<String> {
+        self.inner.vision_limited_by(&self.pinned_model)
+    }
+
+    fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
+        self.inner
+            .has_mixed_native_tool_support_for_model(&self.pinned_model)
+    }
+
+    fn default_temperature(&self) -> f64 {
+        self.inner.default_temperature()
+    }
+
+    fn default_max_tokens(&self) -> u32 {
+        self.inner.default_max_tokens()
+    }
+
+    fn default_timeout_secs(&self) -> u64 {
+        self.inner.default_timeout_secs()
+    }
+
+    fn default_base_url(&self) -> Option<&str> {
+        self.inner.default_base_url()
+    }
+
+    fn default_wire_api(&self) -> &str {
+        self.inner.default_wire_api()
+    }
+
+    fn convert_tools(&self, tools: &[omnesagent_api::tool::ToolSpec]) -> super::traits::ToolsPayload {
+        self.inner.convert_tools(tools)
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        self.inner.supports_native_tools()
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.inner.supports_vision()
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        self.inner.supports_streaming_tool_events()
+    }
+
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        ProviderDispatch::from_ref(&*self.inner).list_models().await
+    }
+
+    async fn warmup(&self) -> anyhow::Result<()> {
+        ProviderDispatch::from_ref(&*self.inner).warmup().await
+    }
+
+    async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        _model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
+        ProviderDispatch::from_ref(&*self.inner)
+            .chat_with_system(system_prompt, message, &self.pinned_model, temperature)
+            .await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
+        ProviderDispatch::from_ref(&*self.inner)
+            .chat_with_history(messages, &self.pinned_model, temperature)
+            .await
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
+        ProviderDispatch::from_ref(&*self.inner)
+            .chat(request, &self.pinned_model, temperature)
+            .await
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        _model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
+        ProviderDispatch::from_ref(&*self.inner)
+            .chat_with_tools(messages, tools, &self.pinned_model, temperature)
+            .await
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        _model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system(
+                system_prompt,
+                message,
+                &self.pinned_model,
+                temperature,
+                options,
+            ),
+        )
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        _model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history(
+                messages,
+                &self.pinned_model,
+                temperature,
+                options,
+            ),
+        )
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
+            request,
+            &self.pinned_model,
+            temperature,
+            options,
+        ))
+    }
+}
+
+impl omnesagent_api::attribution::Attributable for ModelPinnedProvider {
+    fn role(&self) -> omnesagent_api::attribution::Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::ProviderCapabilities;
+
+    struct ModelAwareCapabilityProvider;
+
+    impl omnesagent_api::attribution::Attributable for ModelAwareCapabilityProvider {
+        fn role(&self) -> omnesagent_api::attribution::Role {
+            omnesagent_api::attribution::Role::Provider(
+                omnesagent_api::attribution::ProviderKind::Model(
+                    omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "model_aware_capability"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ModelAwareCapabilityProvider {
+        fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: model == "pinned-model",
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn vision_limited_by(&self, model: &str) -> Option<String> {
+            (model == "pinned-model").then(|| "fallback.alias".to_string())
+        }
+
+        fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+            model == "pinned-model"
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn capability_queries_use_the_pinned_model() {
+        let provider = ModelPinnedProvider::builder("pinned")
+            .pinned_model("pinned-model")
+            .inner(Box::new(ModelAwareCapabilityProvider))
+            .build();
+
+        assert!(
+            provider
+                .capabilities_for_model("ignored-request-model")
+                .native_tool_calling,
+            "model-aware capabilities must be queried with the pinned model"
+        );
+        assert!(
+            provider.has_mixed_native_tool_support_for_model("ignored-request-model"),
+            "mixed-chain detection must be queried with the pinned model"
+        );
+        assert_eq!(
+            provider
+                .vision_limited_by("ignored-request-model")
+                .as_deref(),
+            Some("fallback.alias"),
+            "vision attribution must be queried with the pinned model"
+        );
+    }
+
+    struct AccountedLeaf;
+
+    impl omnesagent_api::attribution::Attributable for AccountedLeaf {
+        fn role(&self) -> omnesagent_api::attribution::Role {
+            omnesagent_api::attribution::Role::Provider(
+                omnesagent_api::attribution::ProviderKind::Model(
+                    omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "configured.inner"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for AccountedLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn accounting_through_model_pin_keeps_inner_identity_and_pinned_model() {
+        let pinned = ModelPinnedProvider::builder("pin-wrapper")
+            .pinned_model("served-model")
+            .inner(Box::new(AccountedLeaf))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&pinned)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-model",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("configured.inner", "served-model")
+        );
+    }
+}

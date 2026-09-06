@@ -1,0 +1,863 @@
+use std::fmt::Write as _;
+
+use serde_json::{Map, Value};
+
+pub fn channel_streaming_matrix(root: &Value) -> String {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let root = resolve(root, defs);
+    let Some(channels) = root
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("channels"))
+        .map(|c| resolve(c, defs))
+    else {
+        return String::new();
+    };
+    let Some(props) = channels.get("properties").and_then(Value::as_object) else {
+        return String::new();
+    };
+
+    let mut rows: Vec<(String, &'static str, &'static str)> = Vec::new();
+    for (key, schema) in props {
+        let mut node = resolve(schema, defs);
+        // Descend a map (HashMap) to the per-alias struct.
+        if let Some(add) = node.get("additionalProperties")
+            && add.is_object()
+        {
+            node = resolve(add, defs);
+        }
+        let Some(fields) = node.get("properties").and_then(Value::as_object) else {
+            continue;
+        };
+        let has = |f: &str| fields.contains_key(f);
+        let (draft, multi) = if has("stream_mode") {
+            ("yes", "yes")
+        } else if has("stream_drafts") {
+            ("yes", "no")
+        } else {
+            continue; // no streaming -> omit from the table
+        };
+        rows.push((key.clone(), draft, multi));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    out.push_str("| Channel | Draft updates | Multi-message |\n|---|:---:|:---:|\n");
+    for (ch, draft, multi) in rows {
+        let cell = |v: &str| if v == "yes" { "✓" } else { "" };
+        let _ = writeln!(out, "| `{ch}` | {} | {} |", cell(draft), cell(multi));
+    }
+    out
+}
+
+pub fn field_table_for_path(
+    root: &Value,
+    path: &str,
+    include_enabled: bool,
+    defaults: Option<&Value>,
+) -> Result<String, String> {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let mut node = resolve(root, defs);
+    let mut display_segments: Vec<String> = Vec::new();
+
+    for seg in path.split('.') {
+        // Descend a map (HashMap) before matching the next key: the segment
+        // names a concrete entry, and crossing the map adds an `<alias>` level.
+        let props = node.get("properties").and_then(Value::as_object);
+        let next = props.and_then(|p| p.get(seg)).map(|s| resolve(s, defs));
+        let Some(next) = next else {
+            return Err(format!(
+                "config-fields: path segment `{seg}` not found in `{path}`"
+            ));
+        };
+        display_segments.push(seg.to_string());
+        node = next;
+        // If this node is a map, step into its value type and record `<alias>`.
+        if let Some(add) = node.get("additionalProperties")
+            && add.is_object()
+        {
+            node = resolve(add, defs);
+            display_segments.push("<alias>".to_string());
+        }
+        // If this node is an array (Vec<T> -> schemars `items`), step into the
+        // element type so a list section (e.g. `mcp.servers`) renders its
+        // entry struct's fields. List entries have no named key; the prefix is
+        // left at the section name (TOML `[[section]]` blocks).
+        else if let Some(items) = node.get("items")
+            && items.is_object()
+        {
+            node = resolve(items, defs);
+        }
+    }
+
+    if node.get("properties").and_then(Value::as_object).is_none() {
+        return Err(format!("config-fields: `{path}` has no fields to render"));
+    }
+
+    let prefix = display_segments.join(".");
+    Ok(field_table(node, include_enabled, Some(&prefix), defaults))
+}
+
+pub fn section_field_names(root: &Value, path: &str) -> std::collections::BTreeSet<String> {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let mut node = resolve(root, defs);
+    for seg in path.split('.') {
+        let Some(next) = node
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get(seg))
+            .map(|s| resolve(s, defs))
+        else {
+            return Default::default();
+        };
+        node = next;
+        if let Some(add) = node.get("additionalProperties")
+            && add.is_object()
+        {
+            node = resolve(add, defs);
+        } else if let Some(items) = node.get("items")
+            && items.is_object()
+        {
+            node = resolve(items, defs);
+        }
+    }
+    node.get("properties")
+        .and_then(Value::as_object)
+        .map(|p| p.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub fn field_table_for_path_excluding(
+    root: &Value,
+    path: &str,
+    include_enabled: bool,
+    defaults: Option<&Value>,
+    exclude: &std::collections::BTreeSet<String>,
+) -> Result<String, String> {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let mut node = resolve(root, defs).clone();
+    let mut display_segments: Vec<String> = Vec::new();
+    {
+        let mut cur = &node as &Value;
+        for seg in path.split('.') {
+            let Some(next) = cur
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|p| p.get(seg))
+                .map(|s| resolve(s, defs).clone())
+            else {
+                return Err(format!(
+                    "model-provider-fields: path segment `{seg}` not found in `{path}`"
+                ));
+            };
+            display_segments.push(seg.to_string());
+            node = next;
+            if let Some(add) = node.get("additionalProperties").cloned()
+                && add.is_object()
+            {
+                node = resolve(&add, defs).clone();
+                display_segments.push("<alias>".to_string());
+            } else if let Some(items) = node.get("items").cloned()
+                && items.is_object()
+            {
+                node = resolve(&items, defs).clone();
+            }
+            cur = &node;
+        }
+    }
+
+    // Strip excluded fields from the resolved node's properties.
+    if let Some(props) = node.get_mut("properties").and_then(Value::as_object_mut) {
+        props.retain(|k, _| !exclude.contains(k));
+        if props.is_empty() {
+            return Ok(String::new());
+        }
+    } else {
+        return Ok(String::new());
+    }
+
+    // Carry `$defs` into the detached node so `$ref` field types still resolve.
+    if let (Some(node_obj), Some(defs_val)) = (node.as_object_mut(), root.get("$defs")) {
+        node_obj.insert("$defs".to_string(), defs_val.clone());
+    }
+
+    let prefix = display_segments.join(".");
+    Ok(field_table(&node, include_enabled, Some(&prefix), defaults))
+}
+
+pub fn field_table(
+    root: &Value,
+    include_enabled: bool,
+    prefix: Option<&str>,
+    defaults: Option<&Value>,
+) -> String {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    let Some(props) = root.get("properties").and_then(Value::as_object) else {
+        return String::new();
+    };
+    let required: Vec<&str> = root
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    let Some(prefix) = prefix else {
+        return plain_field_table(props, &required, defs, include_enabled);
+    };
+    let section_owned = {
+        let segs: Vec<&str> = prefix.split('.').collect();
+        if let Some(alias_idx) = segs.iter().position(|s| *s == "<alias>") {
+            let type_idx = alias_idx.saturating_sub(1);
+            let head = segs[..type_idx].join(".");
+            if head.is_empty() {
+                segs[type_idx].to_string()
+            } else {
+                format!("{head}/{}", segs[type_idx])
+            }
+        } else {
+            prefix.to_string()
+        }
+    };
+    let section = section_owned.as_str();
+
+    let mut rows = String::new();
+    for (key, prop_schema) in props {
+        if key == "enabled" && !include_enabled {
+            continue;
+        }
+        let resolved = resolve(prop_schema, defs);
+        let is_secret = resolved.get("x-secret").and_then(Value::as_bool) == Some(true);
+        let ty = if is_secret {
+            "secret".to_owned()
+        } else {
+            type_label(resolved, defs)
+        };
+        let fallback = defaults.and_then(|d| d.get(key));
+        let default = fmt_default_for(resolved, fallback);
+        let req = if required.contains(&key.as_str()) {
+            "*"
+        } else {
+            ""
+        };
+        let secret_mark = if is_secret { " 🔑" } else { "" };
+        let full_path = format!("{prefix}.{key}");
+        let set_cmd = if is_secret {
+            format!("omnesagent config set {full_path}    # masked input, stored encrypted")
+        } else {
+            format!("omnesagent config set {full_path} <value>")
+        };
+        // Env-var override form: `OMNESAGENT_` + dotted path with `.` -> `__`,
+        // lowercase tail (config-tree override). Mirrors the runtime resolver in
+        // `crate::env_overrides`, so the rendered example and the value the
+        // runtime accepts cannot disagree.
+        let env_var = format!("OMNESAGENT_{}", full_path.replace('.', "__"));
+        let full_desc = resolved
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let _ = write!(
+            rows,
+            concat!(
+                "<details class=\"cfg-field\">\n",
+                "<summary><code>{key}</code>{req}{secret_mark} ",
+                "<span class=\"cfg-field-meta\"><code>{ty}</code> · default {default}</span>",
+                "</summary>\n\n",
+                "{full_desc}\n\n",
+                "**Set it on any surface:**\n\n",
+                "<div class=\"os-tabs-src\">\n\n",
+                "#### Gateway dashboard\n\n",
+                "Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{full_path}` field.\n\n",
+                "#### zerocode\n\n",
+                "In the **Config** pane, set the `{full_path}` field.\n\n",
+                "#### omnesagent config\n\n",
+                "```sh\n{set_cmd}\n```\n\n",
+                "#### Environment variable\n\n",
+                "Export the override (POSIX shells; drop into `~/.bashrc`, `~/.zshrc`, `.env`, or a Dockerfile). Replace `<alias>` with the literal alias:\n\n",
+                "```sh\nexport {env_var}=\n```\n\n",
+                "</div>\n",
+                "</details>\n\n",
+            ),
+            key = html_escape(key),
+            req = req,
+            secret_mark = secret_mark,
+            ty = html_escape(&ty),
+            default = inline_code_html(&default),
+            section = section,
+            full_path = full_path,
+            set_cmd = set_cmd,
+            env_var = env_var,
+            full_desc = markdown_prose(full_desc),
+        );
+    }
+
+    format!("<div class=\"cfg-fields\">\n\n{rows}</div>\n")
+}
+
+/// Plain Markdown field table (no accordion), used when no config prefix is
+/// supplied.
+fn plain_field_table(
+    props: &Map<String, Value>,
+    required: &[&str],
+    defs: &Map<String, Value>,
+    include_enabled: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str("| field | type | default | meaning |\n");
+    out.push_str("|---|---|---|---|\n");
+    for (key, prop_schema) in props {
+        if key == "enabled" && !include_enabled {
+            continue;
+        }
+        let resolved = resolve(prop_schema, defs);
+        let is_secret = resolved.get("x-secret").and_then(Value::as_bool) == Some(true);
+        let ty = if is_secret {
+            "secret".to_owned()
+        } else {
+            type_label(resolved, defs)
+        };
+        let default = fmt_default(resolved);
+        let desc =
+            first_line(resolved.get("description").and_then(Value::as_str)).replace('|', "\\|");
+        let req = if required.contains(&key.as_str()) {
+            "\\*"
+        } else {
+            ""
+        };
+        let secret = if is_secret { " 🔑" } else { "" };
+        let _ = writeln!(out, "| `{key}`{req}{secret} | {ty} | {default} | {desc} |");
+    }
+    out
+}
+
+/// Escape text for inclusion in HTML body content.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Collapse a multi-line schema doc-comment into a single Markdown paragraph,
+/// preserving inline `` `code` `` spans verbatim. The result is emitted as
+/// Markdown (not HTML), so mdbook-i18n-helpers extracts the prose for
+/// translation while leaving the code spans untouched.
+fn markdown_prose(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Render a `fmt_default`-style value (which may be wrapped in backticks) as
+/// inline-code HTML, escaping the inner text.
+fn inline_code_html(s: &str) -> String {
+    let trimmed = s.trim();
+    if let Some(inner) = trimmed.strip_prefix('`').and_then(|t| t.strip_suffix('`')) {
+        format!("<code>{}</code>", html_escape(inner))
+    } else {
+        html_escape(trimmed)
+    }
+}
+
+/// Generates a markdown config reference by walking the schemars JSON Schema value in memory.
+/// No intermediate JSON file, no external tools.
+pub fn generate(root: &Value) -> String {
+    let empty = Map::new();
+    let defs = root
+        .get("$defs")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let mut out = String::new();
+    out.push_str("# Config Reference\n\n");
+    out.push_str(
+        "OmnesAgent is configured via a TOML file. All fields are optional unless noted.\n\n",
+    );
+
+    let Some(props) = root.get("properties").and_then(Value::as_object) else {
+        return out;
+    };
+
+    // Index table. Each section name links to its detail heading below; the
+    // mdBook anchor for a `## `<key>`` heading is the key verbatim (keys are
+    // lowercase ASCII with underscores, which slugify to themselves), so a
+    // `#<key>` fragment resolves without computing the slug.
+    out.push_str("| Section | Description |\n");
+    out.push_str("|---------|-------------|\n");
+    for (key, schema) in props {
+        let resolved = resolve(schema, defs);
+        let desc = first_line(resolved.get("description").and_then(Value::as_str));
+        let _ = writeln!(out, "| [`{key}`](#{key}) | {desc} |");
+    }
+    out.push('\n');
+
+    // Per-section details
+    for (key, schema) in props {
+        let resolved = resolve(schema, defs);
+        write_section(&mut out, &[key.as_str()], resolved, defs);
+    }
+
+    out
+}
+
+fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<String, Value>) {
+    let hashes = "#".repeat(path.len() + 1);
+    let path_str = path.join(".");
+    let _ = writeln!(out, "{hashes} `{path_str}`\n");
+
+    if let Some(desc) = schema.get("description").and_then(Value::as_str) {
+        out.push_str(desc);
+        out.push_str("\n\n");
+    }
+
+    let empty = Map::new();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    // For HashMap sections (e.g. `cron`, `risk_profiles`), there are no
+    // `properties` — the value type lives under `additionalProperties`.
+    // Descend into it and render the per-alias fields.
+    if props.is_empty() {
+        if let Some(add) = schema.get("additionalProperties")
+            && add.is_object()
+        {
+            let value_schema = resolve(add, defs);
+            if value_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some()
+            {
+                // Insert `<alias>` into the displayed path so the table header
+                // reads `[cron.<alias>]`, `[risk_profiles.<alias>]`, etc.
+                let mut map_path: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
+                map_path.push("<alias>".to_string());
+                let map_path_str = map_path.join(".");
+                let _ = writeln!(out, "## `{map_path_str}`\n");
+                if let Some(desc) = value_schema.get("description").and_then(Value::as_str) {
+                    out.push_str(desc);
+                    out.push_str("\n\n");
+                }
+                let map_path_refs: Vec<&str> = map_path.iter().map(String::as_str).collect();
+                write_section_fields(out, value_schema, defs, &map_path_str, &map_path_refs);
+                return;
+            }
+        }
+        return;
+    }
+
+    let all_maps = !props.is_empty()
+        && props.values().all(|v| {
+            resolve(v, defs)
+                .get("additionalProperties")
+                .map(Value::is_object)
+                .unwrap_or(false)
+        });
+    if all_maps {
+        let slots: Vec<String> = props.keys().map(|k| format!("`{k}`")).collect();
+        let _ = writeln!(
+            out,
+            "One slot per family ({}). Each slot is a `[{path_str}.<slot>.<alias>]` map; \
+             see the dedicated section page for the per-field reference.\n",
+            slots.join(", ")
+        );
+        return;
+    }
+
+    write_section_fields(out, schema, defs, &path_str, path);
+}
+
+/// Render a struct's fields as a markdown table and recurse into sub-sections.
+/// Shared by `write_section` and the HashMap-value-type path for sections like
+/// `cron` where the schema has `additionalProperties` instead of `properties`.
+fn write_section_fields(
+    out: &mut String,
+    schema: &Value,
+    defs: &Map<String, Value>,
+    _path_str: &str,
+    path: &[&str],
+) {
+    let empty = Map::new();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    out.push_str("| Key | Type | Default | Description |\n");
+    out.push_str("|-----|------|---------|-------------|\n");
+
+    let mut recurse: Vec<(Vec<String>, Value)> = Vec::new();
+
+    for (key, prop_schema) in props {
+        let resolved = resolve(prop_schema, defs);
+        let ty = type_label(resolved, defs);
+        let default = fmt_default(resolved);
+        let desc =
+            first_line(resolved.get("description").and_then(Value::as_str)).replace('|', "\\|");
+        let req = if required.contains(&key.as_str()) {
+            "\\*"
+        } else {
+            ""
+        };
+        let secret = if resolved.get("x-secret").and_then(Value::as_bool) == Some(true) {
+            " 🔑"
+        } else {
+            ""
+        };
+
+        let has_sub = resolved
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+
+        let _ = writeln!(out, "| `{key}`{req}{secret} | {ty} | {default} | {desc} |");
+
+        // Only recurse up to depth 3 (e.g. agent.auto_classify.something)
+        if has_sub && path.len() < 3 {
+            let mut sub_path: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
+            sub_path.push(key.clone());
+            recurse.push((sub_path, resolved.clone()));
+        }
+    }
+    out.push('\n');
+
+    for (sub_path_owned, sub_schema) in &recurse {
+        let refs: Vec<&str> = sub_path_owned.iter().map(String::as_str).collect();
+        write_section(out, &refs, sub_schema, defs);
+    }
+}
+
+/// Resolves a `$ref` to its definition. Also unwraps single-type `anyOf` (Option<T>).
+fn resolve<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
+    if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
+        let name = ref_str
+            .trim_start_matches("#/$defs/")
+            .trim_start_matches("#/definitions/");
+        if let Some(def) = defs.get(name) {
+            return resolve(def, defs);
+        }
+    }
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        let non_null: Vec<&Value> = any_of
+            .iter()
+            .filter(|s| s.get("type").and_then(Value::as_str) != Some("null"))
+            .collect();
+        if non_null.len() == 1 {
+            return resolve(non_null[0], defs);
+        }
+    }
+    schema
+}
+
+fn type_label(schema: &Value, defs: &Map<String, Value>) -> String {
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        let non_null: Vec<&Value> = any_of
+            .iter()
+            .filter(|s| s.get("type").and_then(Value::as_str) != Some("null"))
+            .collect();
+        if non_null.len() == 1 {
+            return format!("{}?", type_label(non_null[0], defs));
+        }
+        return non_null
+            .iter()
+            .map(|s| type_label(s, defs))
+            .collect::<Vec<_>>()
+            .join(" \\| ");
+    }
+
+    // schemars 1.x renders `Option<T>` as `{"type": ["T", "null"]}`. Unwrap the
+    // nullable wrapper to `T?` so the table shows the real underlying type
+    // instead of falling through to `any`.
+    if let Some(types) = schema.get("type").and_then(Value::as_array) {
+        let non_null: Vec<&str> = types
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|t| *t != "null")
+            .collect();
+        if non_null.len() == 1 {
+            let mut inner = schema.clone();
+            inner["type"] = Value::String(non_null[0].to_owned());
+            return format!("{}?", type_label(&inner, defs));
+        }
+    }
+
+    if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
+        let name = ref_str
+            .trim_start_matches("#/$defs/")
+            .trim_start_matches("#/definitions/");
+        if let Some(def) = defs.get(name) {
+            return type_label(def, defs);
+        }
+        return name.to_owned();
+    }
+
+    if schema.get("oneOf").is_some() || schema.get("enum").is_some() {
+        if let Some(title) = schema.get("title").and_then(Value::as_str) {
+            return title.to_owned();
+        }
+        if let Some(vals) = schema.get("enum").and_then(Value::as_array) {
+            let s: Vec<String> = vals
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|v| format!("`{v}`"))
+                .collect();
+            if !s.is_empty() {
+                return s.join(" \\| ");
+            }
+        }
+    }
+
+    match schema.get("type").and_then(Value::as_str) {
+        Some("boolean") => "bool".to_owned(),
+        Some("string") => "string".to_owned(),
+        Some("integer") => "integer".to_owned(),
+        Some("number") => "number".to_owned(),
+        Some("array") => {
+            let item_type = schema
+                .get("items")
+                .map(|i| type_label(i, defs))
+                .unwrap_or_else(|| "any".to_owned());
+            format!("{item_type}[]")
+        }
+        Some("object") => {
+            if schema.get("additionalProperties").is_some() {
+                "map".to_owned()
+            } else {
+                "object".to_owned()
+            }
+        }
+        _ => {
+            if schema.get("properties").is_some() {
+                "object".to_owned()
+            } else {
+                // A field with no `type`/`properties` is a free-form
+                // `serde_json::Value` (TOML inline table), e.g. `provider_extra`
+                // or `chat_template_kwargs`. Prefer the explicit title if the
+                // schema carries one, else label it `table` rather than `any`.
+                schema
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("table")
+                    .to_owned()
+            }
+        }
+    }
+}
+
+/// Format a default value for the table. Prefers the schema's own `default`
+/// key; when absent (schemars omits it for `skip_serializing_if` fields), falls
+/// back to the field's value in the struct's `Default::default()` instance, so
+/// `false`, `[]`, `{}`, and `null` defaults still surface instead of `—`.
+fn fmt_default_for(schema: &Value, fallback: Option<&Value>) -> String {
+    let value = schema.get("default").or(fallback);
+    fmt_value(value)
+}
+
+fn fmt_default(schema: &Value) -> String {
+    fmt_value(schema.get("default"))
+}
+
+fn fmt_value(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Bool(b)) => format!("`{b}`"),
+        Some(Value::String(s)) if s.is_empty() => "`\"\"`".to_owned(),
+        Some(Value::String(s)) => format!("`\"{s}\"`"),
+        Some(Value::Number(n)) => format!("`{n}`"),
+        Some(Value::Null) => "`null`".to_owned(),
+        Some(Value::Array(a)) if a.is_empty() => "`[]`".to_owned(),
+        Some(Value::Object(o)) if o.is_empty() => "`{}`".to_owned(),
+        Some(v) => format!("`{v}`"),
+        None => "`—`".to_owned(),
+    }
+}
+
+fn first_line(s: Option<&str>) -> String {
+    s.and_then(|d| d.lines().next()).unwrap_or("").to_owned()
+}
+
+#[cfg(all(test, feature = "schema-export"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_links_each_section_to_its_anchor() {
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+
+        // Every section in the index table must be a link to the detail
+        // heading below. mdBook slugs a `## `<key>`` heading to the bare key,
+        // so the index cell links `[`<key>`](#<key>)`. A plain `` `<key>` ``
+        // cell (no link) is the regression this guards against.
+        let mut linked = 0usize;
+        for line in md.lines() {
+            // Index rows look like: | [`acp`](#acp) | ... |
+            if let Some(rest) = line.strip_prefix("| [`") {
+                let key = rest.split('`').next().unwrap_or("");
+                assert!(
+                    line.contains(&format!("](#{key})")),
+                    "index row for `{key}` is not linked to its anchor: {line}"
+                );
+                // The matching detail heading must exist verbatim.
+                assert!(
+                    md.contains(&format!("# `{key}`")),
+                    "no detail heading for indexed section `{key}`"
+                );
+                linked += 1;
+            }
+        }
+        assert!(linked > 10, "expected many linked sections, got {linked}");
+    }
+
+    #[test]
+    fn config_fields_descends_array_section_to_entry_struct() {
+        // `mcp.servers` is a Vec<McpServerConfig> (schemars `items`), not a map.
+        // The path walker must step into the element struct so a `[[mcp.servers]]`
+        // list section renders its entry fields instead of erroring with
+        // "no fields to render".
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let table = field_table_for_path(&schema.to_value(), "mcp.servers", false, None)
+            .expect("mcp.servers should resolve to its entry struct fields");
+        for field in [
+            "transport",
+            "command",
+            "url",
+            "headers",
+            "tool_timeout_secs",
+        ] {
+            assert!(
+                table.contains(&format!("<code>{field}</code>")),
+                "mcp.servers field table missing `{field}`"
+            );
+        }
+    }
+
+    #[test]
+    fn html_escape_replaces_all_markup_characters() {
+        assert_eq!(html_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(html_escape("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(html_escape("plain text"), "plain text");
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn html_escape_encodes_ampersand_first_to_avoid_double_escaping() {
+        // The `&` replacement must run before the others, otherwise the `&`
+        // introduced by `&lt;` / `&gt;` / `&quot;` would itself be re-escaped.
+        assert_eq!(html_escape("<&>"), "&lt;&amp;&gt;");
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
+    fn markdown_prose_collapses_whitespace_to_single_spaces() {
+        assert_eq!(markdown_prose("  a\n  b\t c  "), "a b c");
+        assert_eq!(markdown_prose("single"), "single");
+        assert_eq!(markdown_prose("   "), "");
+        assert_eq!(markdown_prose(""), "");
+        // Inline code spans are just whitespace-delimited tokens here.
+        assert_eq!(markdown_prose("use `foo`  now"), "use `foo` now");
+    }
+
+    #[test]
+    fn inline_code_html_wraps_backticked_values_and_escapes_inner_text() {
+        assert_eq!(inline_code_html("`true`"), "<code>true</code>");
+        assert_eq!(inline_code_html("  `42`  "), "<code>42</code>");
+        // Inner markup is HTML-escaped inside the <code> wrapper.
+        assert_eq!(inline_code_html("`<x>`"), "<code>&lt;x&gt;</code>");
+    }
+
+    #[test]
+    fn inline_code_html_escapes_unwrapped_or_unbalanced_input() {
+        assert_eq!(inline_code_html("plain"), "plain");
+        assert_eq!(inline_code_html("a<b>"), "a&lt;b&gt;");
+        // A single leading backtick is not a balanced wrap, so it is escaped as-is.
+        assert_eq!(inline_code_html("`open"), "`open");
+        assert_eq!(inline_code_html("`"), "`");
+    }
+
+    #[test]
+    fn first_line_returns_first_line_or_empty() {
+        assert_eq!(first_line(Some("first\nsecond")), "first");
+        assert_eq!(first_line(Some("only")), "only");
+        assert_eq!(first_line(Some("first\r\nsecond")), "first");
+        assert_eq!(first_line(Some("")), "");
+        assert_eq!(first_line(None), "");
+    }
+
+    #[test]
+    fn docker_workspace_root_contract_appears_in_generated_reference() {
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+        let row = md
+            .lines()
+            .find(|line| line.contains("`allowed_workspace_roots`"))
+            .expect("generated config reference should include Docker workspace roots");
+
+        assert!(row.contains("fail-closed"));
+        assert!(row.contains("workspace must exist and canonicalize"));
+        assert!(row.contains("every configured root must also exist and canonicalize"));
+        assert!(row.contains("one invalid entry rejects the command"));
+        assert!(row.contains("empty list permits any canonical workspace"));
+    }
+
+    #[test]
+    fn cron_section_exposes_uses_memory_field() {
+        // Regression test: the generated config reference must expose
+        // per-cron-job fields (including `uses_memory`) instead of only the
+        // top-level `[cron]` summary. `cron` is a `HashMap<String, CronJobDecl>`
+        // — the generator must descend into `additionalProperties` to render
+        // the CronJobDecl fields.
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+
+        // The cron section heading with <alias> must exist.
+        assert!(
+            md.contains("## `cron.<alias>`"),
+            "cron section should have a `cron.<alias>` subheading"
+        );
+
+        // `uses_memory` must appear as a field in the cron section.
+        assert!(
+            md.contains("uses_memory"),
+            "cron section should expose the `uses_memory` field"
+        );
+
+        // Other CronJobDecl fields should also be present.
+        for field in [
+            "name", "job_type", "schedule", "enabled", "prompt", "command",
+        ] {
+            assert!(
+                md.contains(field),
+                "cron section should expose the `{field}` field"
+            );
+        }
+    }
+}

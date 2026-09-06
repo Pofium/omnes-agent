@@ -1,0 +1,1118 @@
+#![warn(clippy::all, clippy::pedantic)]
+#![allow(
+    clippy::assigning_clones,
+    clippy::bool_to_int_with_if,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::cast_possible_wrap,
+    clippy::doc_markdown,
+    clippy::field_reassign_with_default,
+    clippy::float_cmp,
+    clippy::implicit_clone,
+    clippy::items_after_statements,
+    clippy::map_unwrap_or,
+    clippy::manual_let_else,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::new_without_default,
+    clippy::needless_pass_by_value,
+    clippy::needless_raw_string_hashes,
+    clippy::redundant_closure_for_method_calls,
+    clippy::return_self_not_must_use,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::struct_field_names,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_literal_bound,
+    clippy::unnecessary_map_or,
+    clippy::unused_self,
+    clippy::cast_precision_loss,
+    clippy::unnecessary_wraps
+)]
+
+use clap::{Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "agent-runtime")]
+pub mod agent;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod approval;
+#[cfg(feature = "agent-runtime")]
+pub mod auth;
+#[cfg(feature = "agent-runtime")]
+pub mod channels;
+pub mod commands;
+pub mod config;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod cost;
+#[cfg(feature = "agent-runtime")]
+pub mod cron;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod daemon;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod doctor;
+#[cfg(feature = "gateway")]
+pub mod gateway;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod hardware;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod health;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod heartbeat;
+#[cfg(feature = "agent-runtime")]
+pub mod hooks;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod integrations;
+pub mod memory;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod multimodal;
+#[cfg(feature = "agent-runtime")]
+pub mod observability;
+#[cfg(feature = "agent-runtime")]
+pub mod peripherals;
+#[cfg(feature = "agent-runtime")]
+pub mod platform;
+pub mod providers;
+#[cfg(feature = "agent-runtime")]
+pub mod rag;
+#[cfg(feature = "agent-runtime")]
+pub mod routines;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod security;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod service;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod skills;
+#[cfg(feature = "agent-runtime")]
+pub mod sop;
+#[cfg(feature = "agent-runtime")]
+pub mod tools;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod trust;
+#[cfg(feature = "agent-runtime")]
+pub(crate) mod tunnel;
+#[cfg(feature = "agent-runtime")]
+pub mod verifiable_intent;
+
+#[cfg(feature = "plugins-wasm")]
+pub mod plugins;
+
+pub use config::Config;
+
+/// Gateway management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GatewayCommands {
+    /// Start the gateway server (default if no subcommand specified)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Start the gateway server (webhooks, websockets).
+
+Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
+and WebSocket connections. Bind address defaults to the values in \
+your config file (gateway.host / gateway.port).
+
+Examples:
+  omnesagent gateway start              # use config defaults
+  omnesagent gateway start -p 8080      # listen on port 8080
+  omnesagent gateway start --host 0.0.0.0   # requires [gateway].allow_public_bind=true or a tunnel
+  omnesagent gateway start -p 0         # random available port")]
+    Start {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
+    },
+    /// Restart the gateway server
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Restart the gateway server.
+
+Stops the running gateway if present, then starts a new instance \
+with the current configuration.
+
+Examples:
+  omnesagent gateway restart            # restart with config defaults
+  omnesagent gateway restart -p 8080    # restart on port 8080")]
+    Restart {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Boot even when security-critical config sections were dropped to
+        /// their defaults during load (weakened posture). Off by default.
+        #[arg(long)]
+        allow_degraded_security: bool,
+    },
+    /// Show or generate the pairing code without restarting
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Show or generate the gateway pairing code.
+
+Displays the pairing code for connecting new clients without \
+restarting the gateway. Requires the gateway to be running.
+
+With --new, generates a fresh pairing code even if the gateway \
+was previously paired (useful for adding additional clients). This \
+does NOT revoke existing tokens.
+
+With --rotate, revokes ALL paired bearer tokens, clears the device \
+registry, and issues a fresh code. Use this after a suspected token \
+leak when you do not know which token was compromised; every client \
+must re-pair.
+
+With --rotate-device ID, revokes just that device's bearer token \
+and issues a fresh code for re-pairing that one device.
+
+Examples:
+  omnesagent gateway get-paircode               # show current pairing code
+  omnesagent gateway get-paircode --new         # add another client (no revocation)
+  omnesagent gateway get-paircode --rotate      # revoke ALL tokens, then issue a code
+  omnesagent gateway get-paircode --rotate-device dash-1  # revoke one device's token
+  omnesagent gateway get-paircode --new --port 3001 # target alternate-port gateway")]
+    GetPaircode {
+        /// Generate a new pairing code for adding a client (does not revoke existing tokens)
+        #[arg(long)]
+        new: bool,
+
+        /// Revoke ALL paired tokens and clear the device registry, then issue a new code
+        #[arg(long, conflicts_with_all = ["new", "rotate_device"])]
+        rotate: bool,
+
+        /// Revoke a single device's bearer token by id, then issue a new code
+        #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
+        rotate_device: Option<String>,
+
+        /// Port of the running gateway to query; defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host of the running gateway to query; defaults to config gateway.host
+        #[arg(long)]
+        host: Option<String>,
+    },
+}
+
+/// Service management subcommands
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceLogStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServiceCommands {
+    /// Internal launchd runner that owns bounded daemon output capture
+    #[command(hide = true)]
+    RunLaunchdDaemon,
+    /// Internal OpenRC logger that drains one daemon stream into bounded storage
+    #[command(hide = true)]
+    RunOpenrcLogWriter {
+        #[arg(value_enum)]
+        stream: ServiceLogStream,
+    },
+    /// Install daemon service unit for auto-start and restart
+    Install,
+    /// Start daemon service
+    Start,
+    /// Stop daemon service
+    Stop,
+    /// Restart daemon service to apply latest config
+    Restart,
+    /// Check daemon service status
+    Status,
+    /// Uninstall daemon service unit
+    Uninstall,
+    /// Tail daemon service logs
+    Logs {
+        /// Number of lines to show (default: 50)
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
+}
+
+/// Channel management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChannelCommands {
+    /// List all configured channels
+    List,
+    /// Start all configured channels (handled in main.rs for async)
+    Start,
+    /// Run health checks for configured channels (handled in main.rs for async)
+    Doctor,
+    /// Add a new channel configuration
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Add a new channel configuration.
+
+Provide the channel type and a JSON object with the required \
+configuration keys for that channel type.
+
+Supported types: telegram, discord, slack, whatsapp, matrix, imessage, email.
+
+Examples:
+  omnesagent channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
+  omnesagent channel add discord '{\"bot_token\":\"...\",\"name\":\"my-discord\"}'")]
+    Add {
+        /// Channel type (telegram, discord, slack, whatsapp, matrix, imessage, email)
+        channel_type: String,
+        /// Optional configuration as JSON
+        config: String,
+    },
+    /// Remove a channel configuration
+    Remove {
+        /// Channel name to remove
+        name: String,
+    },
+    /// Bind a Telegram identity (username or numeric user ID) into allowlist
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Bind a Telegram identity into the allowlist.
+
+Adds a Telegram username (without the '@' prefix) or numeric user \
+ID to the channel allowlist so the agent will respond to messages \
+from that identity.
+
+Use --alias to target a non-default Telegram channel — it must match \
+the alias in the channels.telegram.<alias> section the agent uses. \
+Without it the identity is bound to the `default` alias and a \
+non-default agent will keep asking for approval.
+
+Examples:
+  omnesagent channel bind-telegram omnesagent_user
+  omnesagent channel bind-telegram 123456789
+  omnesagent channel bind-telegram 123456789 --alias alerts")]
+    BindTelegram {
+        /// Telegram identity to allow (username without '@' or numeric user ID)
+        identity: String,
+        /// Telegram channel alias to bind to (the `<alias>` in
+        /// `channels.telegram.<alias>`). Defaults to `default`.
+        #[arg(long, default_value = "default")]
+        alias: String,
+    },
+    /// Send a message to a configured channel
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Send a one-off message to a configured channel.
+
+Sends a text message through the specified channel without starting \
+the full agent loop. Useful for scripted notifications, hardware \
+sensor alerts, and automation pipelines.
+
+The --channel-id selects the channel by its config section name \
+(e.g. 'telegram', 'discord', 'slack'). The --recipient is the \
+platform-specific destination (e.g. a Telegram chat ID).
+
+Examples:
+  omnesagent channel send 'Someone is near your device.' --channel-id telegram --recipient 123456789
+  omnesagent channel send 'Build succeeded!' --channel-id discord --recipient 987654321")]
+    Send {
+        /// Message text to send
+        message: String,
+        /// Channel config name (e.g. telegram, discord, slack)
+        #[arg(long)]
+        channel_id: String,
+        /// Recipient identifier (platform-specific, e.g. Telegram chat ID)
+        #[arg(long)]
+        recipient: String,
+    },
+}
+
+/// Alias CRUD for agents (`[agents.<alias>]`). Distinct from the `agent`
+/// run command. Rename/delete cascade config references; for agents they also
+/// re-point owned state (memory / cron / acp / session) and move the workspace.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentsCommands {
+    /// List configured agent aliases
+    List,
+    /// Create a new agent alias with default config
+    Create {
+        /// New agent alias (lowercase alphanumeric + single underscore)
+        alias: String,
+    },
+    /// Rename an agent alias, rewriting every reference to it
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
+    },
+    /// Delete an agent alias, scrubbing references and cascading owned state
+    Delete {
+        /// Alias to delete
+        alias: String,
+        /// Show the impact (references that would be scrubbed) without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for providers (`[providers.<category>.<family>.<alias>]`).
+/// `category` is one of `models`, `tts`, `transcription`.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProvidersCommands {
+    /// List provider aliases (optionally filtered by category)
+    List {
+        /// Category: models | tts | transcription
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Create a new provider alias with default config
+    Create {
+        /// Category: models | tts | transcription
+        category: String,
+        /// Provider family (e.g. anthropic, openai, elevenlabs)
+        family: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a provider alias, rewriting every reference
+    Rename {
+        category: String,
+        family: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a provider alias, scrubbing references
+    Delete {
+        category: String,
+        family: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for channels (`[channels.<type>.<alias>]`).
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChannelsCommands {
+    /// List channel aliases (optionally filtered by type)
+    List {
+        /// Channel type, e.g. discord, telegram
+        #[arg(long)]
+        channel_type: Option<String>,
+    },
+    /// Create a new channel alias with default config
+    Create {
+        /// Channel type (discord, telegram, slack, …)
+        channel_type: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a channel alias, rewriting every reference
+    Rename {
+        channel_type: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a channel alias, scrubbing references
+    Delete {
+        channel_type: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Skills management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillCommands {
+    /// List all installed skills
+    List {
+        /// Show exactly what this agent loads at runtime (its workspace +
+        /// open-skills + plugins + assigned bundles). --bundle takes precedence
+        /// when both are passed.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Restrict to a single bundle. Omit to list across all bundles.
+        #[arg(long)]
+        bundle: Option<String>,
+    },
+    /// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Scaffold a new skill under a skill bundle. Writes `<bundle.directory>`/`<name>`/SKILL.md \
+plus the canonical optional subdirs (scripts/, references/, assets/). \
+Name must be lowercase + hyphens; description is required (prompted on TTY if omitted).
+
+Examples:
+  omnesagent skills add code-review --bundle official --description \"Review PRs.\"
+  omnesagent skills add ops-runbook --description \"Triage prod incidents.\" --edit")]
+    Add {
+        /// Skill name (lowercase + hyphens only)
+        name: String,
+        /// Target bundle alias. Optional when exactly one bundle is configured.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// What the skill does and when to use it (frontmatter `description`).
+        /// Required; prompted on TTY when missing.
+        #[arg(long)]
+        description: Option<String>,
+        /// SPDX license identifier (e.g. MIT).
+        #[arg(long)]
+        license: Option<String>,
+        /// Skill author handle.
+        #[arg(long)]
+        author: Option<String>,
+        /// SemVer version (defaults to 0.1.0).
+        #[arg(long)]
+        version: Option<String>,
+        /// Skill category for registry grouping.
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip scaffolding scripts/, references/, assets/.
+        #[arg(long)]
+        no_scaffold: bool,
+        /// Open SKILL.md in $EDITOR after scaffold.
+        #[arg(long)]
+        edit: bool,
+    },
+    /// Open a skill's SKILL.md (or a sibling file) in $EDITOR
+    Edit {
+        /// Skill name
+        name: String,
+        /// Target bundle alias. Optional when name is unique across bundles.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// Edit a sibling file instead of SKILL.md (e.g. scripts/runner.sh).
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Manage skill bundles (the named directories skills live in)
+    Bundle {
+        #[command(subcommand)]
+        bundle_command: SkillBundleCommands,
+    },
+    /// Audit a skill source directory or installed skill name
+    Audit {
+        /// Skill path or installed skill name
+        source: String,
+    },
+    /// Install a new skill from a URL or local path
+    Install {
+        /// Source URL or local path
+        source: String,
+        /// Install into this agent's assigned bundle (defaults to the active
+        /// agent). When the agent has no bundle, falls back to the global dir.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Install into this bundle directly. Takes precedence over --agent.
+        #[arg(long)]
+        bundle: Option<String>,
+        /// Suppress only the install-time tier banner; other install
+        /// progress output (resolving, installed, audited) is unaffected.
+        #[arg(long)]
+        no_tier_banner: bool,
+        /// Install a single named skill from a git catalog repo (its `skills/<name>/` directory).
+        #[arg(long)]
+        skill: Option<String>,
+    },
+    /// Remove an installed skill
+    Remove {
+        /// Skill name to remove
+        name: String,
+        /// Limit the search to this agent's assigned bundles.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Remove from this bundle directly (disambiguates duplicates).
+        #[arg(long)]
+        bundle: Option<String>,
+    },
+    /// Run TEST.sh validation for a skill (or all skills)
+    Test {
+        /// Skill name to test; omit for all skills
+        name: Option<String>,
+        /// Show verbose output
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
+/// Skill bundle subcommands (`omnesagent skills bundle <op>`)
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillBundleCommands {
+    /// List configured skill bundles and their resolved directories
+    List,
+    /// Add a new skill bundle. Directory defaults to shared/skills/`<alias>`/.
+    Add {
+        /// Bundle alias (lowercase + hyphens; same convention as agents/channels)
+        alias: String,
+        /// Override directory (relative to install root or absolute).
+        /// Must resolve inside `<install>/shared/`.
+        #[arg(long)]
+        directory: Option<String>,
+    },
+    /// Remove a configured skill bundle (archives its directory + strips it
+    /// from every agent's `skill_bundles` list)
+    Remove {
+        /// Bundle alias
+        alias: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rename a skill bundle (moves its directory + rewrites agent references)
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
+    },
+    /// Show metadata + skill list for a bundle
+    Show {
+        /// Bundle alias
+        alias: String,
+    },
+}
+
+/// Migration subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MigrateCommands {
+    /// Import memory from an `OpenClaw` workspace into this `OmnesAgent` workspace
+    Openclaw {
+        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
+        #[arg(long)]
+        source: Option<std::path::PathBuf>,
+
+        /// Validate and preview migration without writing any data
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Rebuild backend indexes after importing entries
+        #[arg(long)]
+        reindex: bool,
+    },
+}
+
+/// Reject a `--to` value that is shaped like a flag.
+///
+/// `--to` opts into `allow_hyphen_values` so hyphen-led recipients parse, which
+/// otherwise lets a forgotten value consume the next flag: `--to --thread t-1`
+/// would take `--thread` as the recipient and then fail on the positional
+/// argument. Rejecting a `--` prefix keeps that mistake legible while leaving
+/// every real recipient shape (`-100…`, `-100…:42`) accepted.
+///
+/// The rejection is unconditional. A value parser runs on the parsed value
+/// whichever syntax supplied it, so `--to=--thread` is rejected identically and
+/// the message must not offer that as a workaround. No supported channel has a
+/// recipient beginning with `--`.
+fn parse_delivery_recipient(raw: &str) -> Result<String, String> {
+    if raw.starts_with("--") {
+        return Err(format!(
+            "`{raw}` looks like a flag, not a recipient; \
+             recipient values beginning with `--` are not supported"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+/// Shared delivery flags for the cron creation and update subcommands.
+///
+/// Flattened into `add`, `add-at`, `add-every`, `once`, and `update` so a job's
+/// output can be routed to a channel. When none of these are set the job keeps
+/// delivery mode `"none"` (output is computed but not announced anywhere).
+///
+/// On `update` these are a patch: only the fields given are changed, and the
+/// rest are carried over from the job's stored delivery config.
+#[derive(clap::Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CronDeliveryArgs {
+    /// Announce job output to this channel (e.g. telegram, discord, slack).
+    #[arg(long = "channel")]
+    pub delivery_channel: Option<String>,
+    /// Target chat/recipient id for the channel (e.g. a Telegram chat id).
+    ///
+    /// `allow_hyphen_values` is required because supported recipients start with
+    /// a hyphen: Telegram group and channel ids are negative (`-100…`), and a
+    /// forum topic target is `chat:thread` (`-100…:42`), which is hyphen-led but
+    /// not a number. Without it clap treats the value as a flag and exits before
+    /// any delivery validation runs, leaving only the undocumented `--to=<value>`
+    /// form working.
+    ///
+    /// `allow_negative_numbers` is not enough: it accepts `-100…` but still
+    /// rejects the `chat:thread` form. The broader setting alone would let a
+    /// forgotten value swallow the following flag, so `parse_delivery_recipient`
+    /// rejects `--`-prefixed values and names the offending token.
+    #[arg(long = "to", allow_hyphen_values = true, value_parser = parse_delivery_recipient)]
+    pub delivery_to: Option<String>,
+    /// Optional thread/conversation id, for channels that route on it (webhook).
+    #[arg(long = "thread")]
+    pub delivery_thread: Option<String>,
+    /// Fail the job if delivery fails (default: delivery errors are non-fatal).
+    #[arg(long = "no-best-effort", conflicts_with = "best_effort")]
+    pub no_best_effort: bool,
+    /// Keep the job succeeding when delivery fails. Restores the default after
+    /// a previous `--no-best-effort`.
+    #[arg(long = "best-effort")]
+    pub best_effort: bool,
+}
+
+impl CronDeliveryArgs {
+    /// The requested best-effort setting, or `None` when neither flag is given.
+    ///
+    /// The two flags are mutually exclusive at the clap layer, so at most one
+    /// is ever set.
+    #[must_use]
+    pub fn best_effort_override(&self) -> Option<bool> {
+        if self.no_best_effort {
+            Some(false)
+        } else if self.best_effort {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the user supplied any delivery flag.
+    ///
+    /// This drives the `update` no-field guard and decides whether the stored
+    /// job has to be loaded for a merge, so it must count the boolean flags
+    /// too: `--no-best-effort` on its own is a real request, not an absence.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        self.delivery_channel.is_some()
+            || self.delivery_to.is_some()
+            || self.delivery_thread.is_some()
+            || self.best_effort_override().is_some()
+    }
+}
+
+/// Cron subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CronCommands {
+    /// List all scheduled tasks
+    List,
+    /// Add a new scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Add a new recurring scheduled task.
+
+Uses standard 5-field cron syntax: 'min hour day month weekday'. \
+When --tz is omitted, cron schedules use the runtime local timezone. \
+For user-facing schedules, pass --tz with an explicit IANA timezone.
+
+Examples:
+  omnesagent cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  omnesagent cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  omnesagent cron add '*/5 * * * *' 'echo ok' --agent sentinel")]
+    Add {
+        /// Cron expression
+        expression: String,
+        /// Configured agent alias the cron job runs as. Required —
+        /// there is no default agent.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Optional IANA timezone (e.g. America/Los_Angeles)
+        #[arg(long)]
+        tz: Option<String>,
+        /// Treat the argument as an agent prompt instead of a shell command.
+        #[arg(long)]
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        /// Set to false for stateless digest/report jobs that should not accumulate or consume memory.
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
+        /// Command (shell) or prompt (when --prompt) to run
+        command: String,
+    },
+    /// Add a one-shot scheduled task at an RFC3339 timestamp with explicit Z or offset
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Add a one-shot task that fires at a specific RFC3339 timestamp with explicit Z or offset.
+
+The timestamp must include an explicit Z or numeric offset \
+(e.g. 2099-01-15T14:00:00Z or 2099-01-15T09:00:00-05:00).
+
+Examples:
+  omnesagent cron add-at --agent morning-shift --prompt 2099-01-15T14:00:00Z 'Send reminder'
+  omnesagent cron add-at --agent morning-shift --prompt 2099-12-31T23:59:00Z 'Happy New Year!'")]
+    AddAt {
+        /// One-shot RFC3339 timestamp with explicit Z or offset
+        at: String,
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
+        #[arg(long)]
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
+        /// Command (shell) or prompt (when --prompt) to run
+        command: String,
+    },
+    /// Add a fixed-interval scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Add a task that repeats at a fixed interval.
+
+Interval is specified in milliseconds. For example, 60000 = 1 minute.
+
+Examples:
+  omnesagent cron add-every --agent triage --prompt 60000 'Ping heartbeat'
+  omnesagent cron add-every --agent triage --prompt 3600000 'Hourly report'")]
+    AddEvery {
+        /// Interval in milliseconds
+        every_ms: u64,
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
+        #[arg(long)]
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
+        /// Command (shell) or prompt (when --prompt) to run
+        command: String,
+    },
+    /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Add a one-shot task that fires after a delay from now.
+
+Accepts human-readable durations: s (seconds), m (minutes), \
+h (hours), d (days).
+
+Examples:
+  omnesagent cron once --agent ops-bot --prompt 30m 'Run backup in 30 minutes'
+  omnesagent cron once --agent researcher --prompt 2h 'Follow up on deployment'")]
+    Once {
+        /// Delay duration
+        delay: String,
+        /// Configured agent alias the cron job runs as.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// Treat the argument as an agent prompt instead of a shell command.
+        #[arg(long)]
+        prompt: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, prompt-only).
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
+        /// Command (shell) or prompt (when --prompt) to run
+        command: String,
+    },
+    /// Remove a scheduled task
+    Remove {
+        /// Task ID
+        id: String,
+    },
+    /// Update a scheduled task
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Update one or more fields of an existing scheduled task.
+
+Only the fields you specify are changed; others remain unchanged.
+
+Examples:
+  omnesagent cron update TASK_ID --expression '0 8 * * *'
+  omnesagent cron update TASK_ID --tz Europe/London --name 'Morning check'
+  omnesagent cron update TASK_ID --command 'Updated message'")]
+    Update {
+        /// Task ID
+        id: String,
+        /// Configured agent alias. Required. The alias risk profile
+        /// gates shell commands for shell jobs.
+        #[arg(short = 'a', long = "agent")]
+        agent_alias: String,
+        /// New cron expression
+        #[arg(long)]
+        expression: Option<String>,
+        /// New IANA timezone
+        #[arg(long)]
+        tz: Option<String>,
+        /// New shell command, or new agent prompt when the job is an agent job
+        #[arg(long)]
+        command: Option<String>,
+        /// New job name
+        #[arg(long)]
+        name: Option<String>,
+        /// Replace the agent job allowlist with the specified tool names (repeatable)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// If false, disable memory recall for this agent cron job (default: true).
+        #[arg(long)]
+        uses_memory: Option<bool>,
+        /// Delivery of the job's output to a channel (see `--channel` / `--to`).
+        #[command(flatten)]
+        #[serde(default)]
+        delivery: CronDeliveryArgs,
+    },
+    /// Pause a scheduled task
+    Pause {
+        /// Task ID
+        id: String,
+    },
+    /// Resume a paused task
+    Resume {
+        /// Task ID
+        id: String,
+    },
+}
+
+/// Memory management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MemoryCommands {
+    /// List memory entries with optional filters
+    List {
+        /// Filter by category (core, daily, conversation, or custom name)
+        #[arg(long)]
+        category: Option<String>,
+        /// Filter by session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum number of entries to display
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Number of entries to skip (for pagination)
+        #[arg(long, default_value = "0")]
+        offset: usize,
+    },
+    /// Get a specific memory entry by key
+    Get {
+        /// Memory key to look up
+        key: String,
+    },
+    /// Show memory backend statistics and health
+    Stats,
+    /// Clear memories by category, by key, or clear all
+    Clear {
+        /// Delete a single entry by key (supports prefix match)
+        #[arg(long)]
+        key: Option<String>,
+        /// Only clear entries in this category
+        #[arg(long)]
+        category: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rebuild backend indexes: FTS tables + any missing embedding vectors.
+    ///
+    /// Run after `omnesagent migrate openclaw` or other bulk writes that
+    /// land rows with `embedding = NULL`. Safe to re-run; only touches
+    /// entries whose vector is missing. No-op for backends without a
+    /// vector index.
+    Reindex,
+}
+
+/// Integration subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IntegrationCommands {
+    /// Show details about a specific integration
+    Info {
+        /// Integration name
+        name: String,
+    },
+}
+
+/// Hardware discovery subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HardwareCommands {
+    /// Enumerate USB devices (VID/PID) and show known boards
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Enumerate USB devices and show known boards.
+
+Scans connected USB devices by VID/PID and matches them against \
+known development boards (STM32 Nucleo, Arduino, ESP32).
+
+Examples:
+  omnesagent hardware discover")]
+    Discover,
+    /// Introspect a device by path (e.g. /dev/ttyACM0)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Introspect a device by its serial or device path.
+
+Opens the specified device path and queries for board information, \
+firmware version, and supported capabilities.
+
+Examples:
+  omnesagent hardware introspect /dev/ttyACM0
+  omnesagent hardware introspect COM3")]
+    Introspect {
+        /// Serial or device path
+        path: String,
+    },
+    /// Get chip info via USB (probe-rs over ST-Link). No firmware needed on target.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Get chip info via USB using probe-rs over ST-Link.
+
+Queries the target MCU directly through the debug probe without \
+requiring any firmware on the target board.
+
+Examples:
+  omnesagent hardware info
+  omnesagent hardware info --chip STM32F401RETx")]
+    Info {
+        /// Chip name (e.g. STM32F401RETx). Default: STM32F401RETx for Nucleo-F401RE
+        #[arg(long, default_value = "STM32F401RETx")]
+        chip: String,
+    },
+}
+
+/// Peripheral (hardware) management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PeripheralCommands {
+    /// List configured peripherals
+    List,
+    /// Add a peripheral (board path, e.g. nucleo-f401re /dev/ttyACM0)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Add a peripheral by board type and transport path.
+
+Registers a hardware board so the agent can use its tools (GPIO, \
+sensors, actuators). Use 'native' as path for local GPIO on \
+single-board computers like Raspberry Pi.
+
+Supported boards: nucleo-f401re, rpi-gpio, esp32, arduino-uno.
+
+Examples:
+  omnesagent peripheral add nucleo-f401re /dev/ttyACM0
+  omnesagent peripheral add rpi-gpio native
+  omnesagent peripheral add esp32 /dev/ttyUSB0")]
+    Add {
+        /// Board type (nucleo-f401re, rpi-gpio, esp32)
+        board: String,
+        /// Path for serial transport (/dev/ttyACM0) or "native" for local GPIO
+        path: String,
+    },
+    /// Flash OmnesAgent firmware to Arduino (creates .ino, installs arduino-cli if needed, uploads)
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Flash OmnesAgent firmware to an Arduino board.
+
+Generates the .ino sketch, installs arduino-cli if it is not \
+already available, compiles, and uploads the firmware.
+
+Examples:
+  omnesagent peripheral flash
+  omnesagent peripheral flash --port /dev/cu.usbmodem12345
+  omnesagent peripheral flash -p COM3")]
+    Flash {
+        /// Serial port (e.g. /dev/cu.usbmodem12345). If omitted, uses first arduino-uno from config.
+        #[arg(short, long)]
+        port: Option<String>,
+    },
+    /// Setup Arduino Uno Q Bridge app (deploy GPIO bridge for agent control)
+    SetupUnoQ {
+        /// Uno Q IP (e.g. 192.168.0.48). If omitted, assumes running ON the Uno Q.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Flash OmnesAgent firmware to Nucleo-F401RE (builds + probe-rs run)
+    FlashNucleo,
+}
+
+/// SOP management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SopCommands {
+    /// List loaded SOPs
+    List,
+    /// Validate SOP definitions
+    Validate {
+        /// SOP name to validate (all if omitted)
+        name: Option<String>,
+    },
+    /// Show details of an SOP
+    Show {
+        /// Name of the SOP to show
+        name: String,
+    },
+    /// Approve a SOP run waiting for out-of-band approval (talks to the running daemon)
+    Approve {
+        /// The run ID to approve
+        run_id: String,
+    },
+    /// Deny (cancel) a SOP run waiting for approval (talks to the running daemon)
+    Deny {
+        /// The run ID to deny
+        run_id: String,
+        /// Optional reason recorded in the approval ledger
+        reason: Option<String>,
+    },
+    /// List SOP runs currently waiting for approval (talks to the running daemon)
+    Pending,
+    /// Render an SOP's node graph as text
+    Graph {
+        /// Name of the SOP to render
+        name: String,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = SopGraphFormat::Outline)]
+        format: SopGraphFormat,
+    },
+    /// Delete an SOP definition from disk
+    Delete {
+        /// Name of the SOP to delete
+        name: String,
+    },
+}
+
+/// Text output format for `sop graph`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum SopGraphFormat {
+    /// One line per node with its outbound flow edges.
+    Outline,
+    /// `from -> to [role]` adjacency, one edge per line.
+    Adjacency,
+    /// Pretty-printed JSON of the whole projection.
+    Json,
+}

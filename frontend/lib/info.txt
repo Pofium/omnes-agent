@@ -1,0 +1,10 @@
+3.8.1 => 4.0.0
+
+add local notification,
+admob,
+set reminder,
+create love notes,
+sing in system update,
+chat gpt response with animated text,
+change primary color,
+change app icon
