@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/banner.jpg" alt="Omnes Agent Emblem" width="380" style="border-radius: 20px; box-shadow: 0 8px 32px rgba(0, 229, 255, 0.2);" />
+<img src="assets/banner.jpg" alt="Omnes Agent Banner" width="100%" style="border-radius: 12px;" />
 
 # Omnes Agent
 
