@@ -24,6 +24,29 @@ class _DesktopShellState extends State<DesktopShell> {
 
   int selectedNavIndex = 0;
   bool isInspectorOpen = true;
+  int inspectorTabIndex = 0;
+  Key inspectorKey = UniqueKey();
+
+  void _openInspectorWithTab(int index) {
+    setState(() {
+      isInspectorOpen = true;
+      inspectorTabIndex = index;
+      inspectorKey = UniqueKey();
+    });
+  }
+
+  void _openCommandPalette() {
+    DesktopCommandPaletteDialog.show(
+      context,
+      controller: workspaceController,
+      onToggleInspector: () {
+        setState(() => isInspectorOpen = !isInspectorOpen);
+      },
+      onSelectInspectorTab: (tabIdx) {
+        _openInspectorWithTab(tabIdx);
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -31,11 +54,19 @@ class _DesktopShellState extends State<DesktopShell> {
       focusNode: FocusNode(),
       autofocus: true,
       onKey: (event) {
-        // Global Ctrl + K listener
-        if (event is RawKeyDownEvent &&
-            event.isControlPressed &&
-            event.logicalKey == LogicalKeyboardKey.keyK) {
-          DesktopCommandPaletteDialog.show(context);
+        if (event is RawKeyDownEvent && event.isControlPressed) {
+          // Global Ctrl + K: Command Palette
+          if (event.logicalKey == LogicalKeyboardKey.keyK) {
+            _openCommandPalette();
+          }
+          // Global Ctrl + J: Open Terminal in Inspector
+          else if (event.logicalKey == LogicalKeyboardKey.keyJ) {
+            _openInspectorWithTab(1); // Terminal tab
+          }
+          // Global Ctrl + B: Toggle Inspector Panel
+          else if (event.logicalKey == LogicalKeyboardKey.keyB) {
+            setState(() => isInspectorOpen = !isInspectorOpen);
+          }
         }
       },
       child: Scaffold(
@@ -45,9 +76,7 @@ class _DesktopShellState extends State<DesktopShell> {
             children: [
               // 1. Frameless Custom Window Titlebar
               DesktopTitleBar(
-                onOpenCommandPalette: () {
-                  DesktopCommandPaletteDialog.show(context);
-                },
+                onOpenCommandPalette: _openCommandPalette,
                 onToggleInspector: () {
                   setState(() => isInspectorOpen = !isInspectorOpen);
                 },
@@ -58,7 +87,7 @@ class _DesktopShellState extends State<DesktopShell> {
               Expanded(
                 child: Row(
                   children: [
-                    // Pane 1: Collapsible Left Sidebar (250px / 60px)
+                    // Pane 1: Collapsible Left Sidebar (280px / 60px)
                     DesktopSidebar(
                       selectedIndex: selectedNavIndex,
                       onSelectIndex: (idx) {
@@ -73,10 +102,12 @@ class _DesktopShellState extends State<DesktopShell> {
                       ),
                     ),
 
-                    // Pane 3: Right Inspector Panel (340px)
+                    // Pane 3: Right Inspector Panel (460px)
                     if (isInspectorOpen)
                       DesktopInspectorPanel(
+                        key: inspectorKey,
                         controller: workspaceController,
+                        initialTabIndex: inspectorTabIndex,
                       ),
                   ],
                 ),

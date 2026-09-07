@@ -2,6 +2,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:get/get.dart';
 import '../theme/desktop_theme.dart';
 
 class DesktopTitleBar extends StatelessWidget {
@@ -21,7 +22,7 @@ class DesktopTitleBar extends StatelessWidget {
     return Container(
       height: 46,
       padding: const EdgeInsets.symmetric(horizontal: 14),
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: DesktopTheme.bgSidebar,
         border: Border(
           bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
@@ -52,7 +53,7 @@ class DesktopTitleBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 10),
-          const Text(
+          Text(
             'OmnesAgent',
             style: TextStyle(
               color: DesktopTheme.textPrimary,
@@ -84,24 +85,49 @@ class DesktopTitleBar extends StatelessWidget {
           ),
           const SizedBox(width: 16),
 
-          // 2. Workspace Breadcrumb
+          // 2. Workspace Breadcrumb & Git Branch
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
             decoration: BoxDecoration(
               color: DesktopTheme.bgSurface,
               borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: DesktopTheme.borderSubtle),
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(Icons.folder_outlined, size: 13, color: DesktopTheme.textMuted),
                 const SizedBox(width: 6),
-                const Text(
-                  'workspace/chief',
+                Text(
+                  'omnes-agent',
                   style: TextStyle(
                     color: DesktopTheme.textSecondary,
                     fontSize: 12,
                     fontFamily: 'Consolas',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.accentSky.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: const [
+                      Icon(FontAwesomeIcons.codeBranch, size: 9, color: DesktopTheme.accentSky),
+                      SizedBox(width: 4),
+                      Text(
+                        'main*',
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontFamily: 'Consolas',
+                          fontWeight: FontWeight.bold,
+                          color: DesktopTheme.accentSky,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -125,9 +151,9 @@ class DesktopTitleBar extends StatelessWidget {
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.search, size: 15, color: DesktopTheme.textMuted),
+                  Icon(Icons.search, size: 15, color: DesktopTheme.textMuted),
                   const SizedBox(width: 8),
-                  const Expanded(
+                  Expanded(
                     child: Text(
                       'Search tasks, tools, models...',
                       style: TextStyle(
@@ -144,7 +170,7 @@ class DesktopTitleBar extends StatelessWidget {
                       borderRadius: BorderRadius.circular(3),
                       border: Border.all(color: Colors.white12),
                     ),
-                    child: const Text(
+                    child: Text(
                       'Ctrl K',
                       style: TextStyle(
                         fontSize: 10,
@@ -168,9 +194,24 @@ class DesktopTitleBar extends StatelessWidget {
           _buildGatewayStatusBadge(),
           const SizedBox(width: 10),
 
-          // 6. Inspector Toggle Button
+          // 6. Theme Toggle (Dark / Light)
+          Obx(() {
+            final isDark = DesktopThemeController.to.isDarkMode.value;
+            return IconButton(
+              tooltip: isDark ? 'Переключить на светлую тему' : 'Переключить на тёмную тему',
+              icon: Icon(
+                isDark ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+                size: 18,
+                color: isDark ? DesktopTheme.accentCyan : DesktopTheme.accentSapphire,
+              ),
+              onPressed: DesktopThemeController.to.toggleTheme,
+            );
+          }),
+          const SizedBox(width: 4),
+
+          // 7. Tool Panel (Browser / Terminal) Toggle Button
           IconButton(
-            tooltip: isInspectorOpen ? 'Hide Inspector' : 'Show Inspector',
+            tooltip: isInspectorOpen ? 'Скрыть панель инструментов (⌘J)' : 'Показать панель инструментов (⌘J)',
             icon: Icon(
               Icons.view_sidebar_outlined,
               size: 18,
@@ -203,7 +244,7 @@ class DesktopTitleBar extends StatelessWidget {
             color: DesktopTheme.accentSky,
           ),
           const SizedBox(width: 6),
-          const Text(
+          Text(
             'Claude 3.5 Sonnet',
             style: TextStyle(
               fontSize: 12,
@@ -239,7 +280,7 @@ class DesktopTitleBar extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 6),
-          const Text(
+          Text(
             '127.0.0.1:42617',
             style: TextStyle(
               fontSize: 11,

@@ -11,6 +11,7 @@ import 'theme/desktop_theme.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await GetStorage.init();
+  Get.put(DesktopThemeController());
 
   runApp(const OmnesDesktopApp());
 }
@@ -21,9 +22,9 @@ class OmnesDesktopApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GetMaterialApp(
-      title: 'OmnesAgent Desktop',
+      title: 'OmnesAgent Desktop ADE',
       debugShowCheckedModeBanner: false,
-      theme: DesktopTheme.darkTheme,
+      theme: DesktopTheme.lightTheme,
       darkTheme: DesktopTheme.darkTheme,
       themeMode: ThemeMode.dark,
       translations: LocalString(),

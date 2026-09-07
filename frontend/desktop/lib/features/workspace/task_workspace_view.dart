@@ -1,4 +1,4 @@
-// Desktop Task Workspace Canvas: Task Header, Reasoning Blocks, Tool Cards, and Input Bar.
+// Desktop Task Workspace View: Goal Mode Summary, Reasoning Stream, and ADE Composer.
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -20,8 +20,8 @@ class DesktopTaskWorkspaceView extends StatelessWidget {
       color: DesktopTheme.bgCanvas,
       child: Column(
         children: [
-          // 1. Task Objective Header
-          _buildTaskHeader(context),
+          // 1. Goal Mode Summary Card (Sticky Header if Active)
+          Obx(() => _buildGoalHeader(context)),
 
           // 2. Chat / Event Stream Canvas
           Expanded(
@@ -34,320 +34,427 @@ class DesktopTaskWorkspaceView extends StatelessWidget {
                       itemCount: controller.messages.length,
                       itemBuilder: (context, index) {
                         final msg = controller.messages[index];
-                        return _buildMessageItem(context, msg);
+                        return _buildMessageItem(context, msg, index);
                       },
                     ),
             ),
           ),
 
-          // 3. Bottom Prompt Input Station
-          _buildInputStation(context),
+          // 3. Central Prompt Box (Composer)
+          _buildComposer(context),
         ],
       ),
     );
   }
 
-  Widget _buildTaskHeader(BuildContext context) {
-    return Container(
-      height: 44,
-      padding: const EdgeInsets.symmetric(horizontal: 20),
-      decoration: const BoxDecoration(
-        color: DesktopTheme.bgSurface,
-        border: Border(
-          bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
-        ),
-      ),
-      child: Row(
-        children: [
-          const Icon(
-            FontAwesomeIcons.circleDot,
-            size: 11,
-            color: DesktopTheme.accentCyan,
-          ),
-          const SizedBox(width: 8),
-          const Text(
-            'ACTIVE TASK:',
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 0.8,
-              color: DesktopTheme.textMuted,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Obx(
-              () => Text(
-                controller.activeTaskTitle.value,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                  color: DesktopTheme.textPrimary,
-                ),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-
-          // Supervised / Autonomous Switcher
-          Obx(
-            () => InkWell(
-              onTap: () {
-                controller.isSupervisedMode.value =
-                    !controller.isSupervisedMode.value;
-              },
-              borderRadius: BorderRadius.circular(4),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: controller.isSupervisedMode.value
-                      ? DesktopTheme.accentBlue.withOpacity(0.15)
-                      : DesktopTheme.statusSuccess.withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(
-                    color: controller.isSupervisedMode.value
-                        ? DesktopTheme.accentBlue.withOpacity(0.4)
-                        : DesktopTheme.statusSuccess.withOpacity(0.4),
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      controller.isSupervisedMode.value
-                          ? Icons.security_rounded
-                          : Icons.bolt_rounded,
-                      size: 13,
-                      color: controller.isSupervisedMode.value
-                          ? DesktopTheme.accentSky
-                          : DesktopTheme.statusSuccess,
-                    ),
-                    const SizedBox(width: 4),
-                    Text(
-                      controller.isSupervisedMode.value
-                          ? 'Supervised'
-                          : 'Autonomous',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: controller.isSupervisedMode.value
-                            ? DesktopTheme.accentSky
-                            : DesktopTheme.statusSuccess,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMessageItem(BuildContext context, ChatMessage msg) {
-    final isBot = msg.chatMessageType == ChatMessageType.bot;
-
-    if (!isBot) {
-      // User message
+  Widget _buildGoalHeader(BuildContext context) {
+    final goal = controller.activeGoal.value;
+    if (goal == null) {
       return Container(
-        margin: const EdgeInsets.only(bottom: 18, left: 60),
-        padding: const EdgeInsets.all(14),
+        height: 40,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
         decoration: BoxDecoration(
-          color: DesktopTheme.bgSurfaceElevated,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: DesktopTheme.borderSubtle),
+          color: DesktopTheme.bgSurface,
+          border: Border(
+            bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
+          ),
         ),
         child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Container(
-              padding: const EdgeInsets.all(6),
-              decoration: BoxDecoration(
-                color: DesktopTheme.borderMedium,
-                borderRadius: BorderRadius.circular(4),
-              ),
-              child: const Icon(Icons.person, size: 14, color: Colors.white),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: SelectableText(
-                msg.text,
-                style: const TextStyle(
-                  fontSize: 14,
-                  height: 1.5,
-                  color: DesktopTheme.textPrimary,
-                ),
-              ),
+            const Icon(Icons.gps_fixed, size: 13, color: DesktopTheme.textMutedDark),
+            const SizedBox(width: 8),
+            Text(
+              'No active goal. Type /goal <objective> to start an autonomous loop.',
+              style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
             ),
           ],
         ),
       );
     }
 
-    // Bot message
     return Container(
-      margin: const EdgeInsets.only(bottom: 18),
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
       decoration: BoxDecoration(
         color: DesktopTheme.bgSurface,
-        borderRadius: BorderRadius.circular(8),
+        border: Border(
+          bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: DesktopTheme.accentCyan.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: DesktopTheme.accentCyan.withOpacity(0.3)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: const [
+                    Icon(Icons.flag_rounded, size: 12, color: DesktopTheme.accentCyan),
+                    SizedBox(width: 4),
+                    Text(
+                      'GOAL MODE',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.5,
+                        color: DesktopTheme.accentCyan,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  goal.objective,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: DesktopTheme.textPrimary,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                'Elapsed: ${goal.formattedElapsed}',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontFamily: 'Consolas',
+                  color: DesktopTheme.textMuted,
+                ),
+              ),
+              const SizedBox(width: 12),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: DesktopTheme.bgSurfaceElevated,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  'Iteration ${goal.currentIteration}/${goal.maxIterations}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontFamily: 'Consolas',
+                    fontWeight: FontWeight.bold,
+                    color: DesktopTheme.textSecondary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (goal.checklist.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 4,
+              children: goal.checklist.map((item) {
+                return Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: item.isCompleted
+                        ? DesktopTheme.statusSuccess.withOpacity(0.08)
+                        : DesktopTheme.bgCanvas,
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(
+                      color: item.isCompleted
+                          ? DesktopTheme.statusSuccess.withOpacity(0.25)
+                          : DesktopTheme.borderSubtle,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        item.isCompleted ? Icons.check_circle : Icons.radio_button_unchecked,
+                        size: 12,
+                        color: item.isCompleted
+                            ? DesktopTheme.statusSuccess
+                            : DesktopTheme.textMuted,
+                      ),
+                      const SizedBox(width: 5),
+                      Text(
+                        item.title,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: item.isCompleted
+                              ? DesktopTheme.textSecondary
+                              : DesktopTheme.textMuted,
+                          decoration: item.isCompleted ? TextDecoration.lineThrough : null,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMessageItem(BuildContext context, ChatMessage msg, int index) {
+    final isBot = msg.chatMessageType == ChatMessageType.bot;
+
+    // Optional: Iteration Divider before a bot message if goal is active
+    Widget? iterationDivider;
+    if (isBot && index == 1) {
+      iterationDivider = Container(
+        margin: const EdgeInsets.symmetric(vertical: 16),
+        child: Row(
+          children: [
+            Expanded(child: Divider(color: DesktopTheme.borderSubtle)),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurface,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: DesktopTheme.borderSubtle),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.refresh_rounded, size: 12, color: DesktopTheme.accentCyan),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Iteration 1 · Goal not met, task continues',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'Consolas',
+                      color: DesktopTheme.textSecondary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(child: Divider(color: DesktopTheme.borderSubtle)),
+          ],
+        ),
+      );
+    }
+
+    if (!isBot) {
+      // User message
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (iterationDivider != null) iterationDivider,
+          Container(
+            margin: const EdgeInsets.only(bottom: 16, left: 80),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurfaceElevated,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: DesktopTheme.borderSubtle),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(5),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.borderMedium,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Icon(Icons.person, size: 14, color: Colors.white),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: SelectableText(
+                    msg.text,
+                    style: TextStyle(
+                      fontSize: 13,
+                      height: 1.5,
+                      color: DesktopTheme.textPrimary,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      );
+    }
+
+    // Bot message
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (iterationDivider != null) iterationDivider,
+        Container(
+          margin: const EdgeInsets.only(bottom: 18),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgSurface,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: DesktopTheme.borderSubtle),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Header: Agent Icon + Model & Thought Level Pill
+              Row(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(5),
+                    child: Image.asset(
+                      'assets/Logo/app_launcher.png',
+                      width: 24,
+                      height: 24,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    'OmnesAgent',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: DesktopTheme.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: DesktopTheme.bgSurfaceElevated,
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: Text(
+                      '${controller.activeModel.value} (Thought: ${controller.thoughtLevel.value})',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontFamily: 'Consolas',
+                        color: DesktopTheme.textMuted,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+
+              // Thought Accordion Block
+              if (msg.thinking != null && msg.thinking!.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.bgCanvas,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border(
+                      left: BorderSide(color: DesktopTheme.accentCyan, width: 3),
+                      top: BorderSide(color: DesktopTheme.borderSubtle),
+                      right: BorderSide(color: DesktopTheme.borderSubtle),
+                      bottom: BorderSide(color: DesktopTheme.borderSubtle),
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.lightbulb_outline, size: 13, color: DesktopTheme.accentCyan),
+                          const SizedBox(width: 6),
+                          Text(
+                            'Agent Thought (${controller.thoughtLevel.value})',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 0.4,
+                              color: DesktopTheme.accentCyan,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      SelectableText(
+                        msg.thinking!,
+                        style: TextStyle(
+                          fontSize: 12,
+                          height: 1.4,
+                          fontFamily: 'Consolas',
+                          color: DesktopTheme.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+
+              // Main Message Text
+              const SizedBox(height: 12),
+              SelectableText(
+                msg.text,
+                style: TextStyle(
+                  fontSize: 13,
+                  height: 1.5,
+                  color: DesktopTheme.textPrimary,
+                ),
+              ),
+
+              // Tool Calls
+              if (msg.toolCalls.isNotEmpty) ...[
+                const SizedBox(height: 14),
+                ...msg.toolCalls.map((tool) => _buildToolCard(tool)),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildToolCard(ToolCallInfo tool) {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgCanvas,
+        borderRadius: BorderRadius.circular(6),
         border: Border.all(color: DesktopTheme.borderSubtle),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header: Agent Icon + Name + Model
           Row(
             children: [
-              Container(
-                width: 24,
-                height: 24,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(5),
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(5),
-                  child: Image.asset(
-                    'assets/Logo/app_launcher.png',
-                    fit: BoxFit.cover,
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              const Text(
-                'OmnesAgent',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  color: DesktopTheme.textPrimary,
-                ),
-              ),
+              const Icon(FontAwesomeIcons.wrench, size: 11, color: DesktopTheme.accentSky),
               const SizedBox(width: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                decoration: BoxDecoration(
-                  color: DesktopTheme.bgSurfaceElevated,
-                  borderRadius: BorderRadius.circular(3),
-                ),
-                child: const Text(
-                  'Claude 3.5 Sonnet',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontFamily: 'Consolas',
-                    color: DesktopTheme.textMuted,
-                  ),
-                ),
-              ),
-            ],
-          ),
-
-          // Collapsible Thinking Block
-          if (msg.thinking != null && msg.thinking!.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            _buildThinkingBlock(msg.thinking!),
-          ],
-
-          // Tool execution blocks
-          if (msg.toolCalls.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            ...msg.toolCalls.map((t) => _buildToolCallBlock(t)),
-          ],
-
-          const SizedBox(height: 12),
-
-          // Message content
-          SelectableText(
-            msg.text,
-            style: const TextStyle(
-              fontSize: 14,
-              height: 1.6,
-              color: DesktopTheme.textPrimary,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildThinkingBlock(String thinking) {
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: Colors.black26,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: Colors.amber.withOpacity(0.2)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
-            children: [
-              Icon(Icons.psychology_outlined, size: 14, color: Colors.amberAccent),
-              SizedBox(width: 6),
               Text(
-                'Reasoning & Plan',
-                style: TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.amberAccent,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          SelectableText(
-            thinking,
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.4,
-              fontFamily: 'Consolas',
-              color: Colors.white.withOpacity(0.75),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildToolCallBlock(ToolCallInfo tool) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: DesktopTheme.bgSurfaceElevated,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: DesktopTheme.accentCyan.withOpacity(0.2)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.build_circle_outlined, size: 14, color: DesktopTheme.accentCyan),
-              const SizedBox(width: 6),
-              Text(
-                'tool: ${tool.name}',
+                'Tool: ${tool.name}',
                 style: const TextStyle(
                   fontSize: 12,
-                  fontWeight: FontWeight.w600,
+                  fontWeight: FontWeight.bold,
                   fontFamily: 'Consolas',
-                  color: DesktopTheme.accentCyan,
+                  color: DesktopTheme.accentSky,
                 ),
               ),
               const Spacer(),
               const Icon(Icons.check_circle, size: 13, color: DesktopTheme.statusSuccess),
             ],
           ),
-          if (tool.output != null) ...[
-            const SizedBox(height: 4),
-            Text(
-              tool.output!,
-              style: const TextStyle(
-                fontSize: 11,
-                fontFamily: 'Consolas',
-                color: DesktopTheme.textMuted,
+          if (tool.output != null && tool.output!.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurface,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: SelectableText(
+                tool.output!,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontFamily: 'Consolas',
+                  color: DesktopTheme.textMuted,
+                ),
               ),
             ),
           ],
@@ -356,117 +463,258 @@ class DesktopTaskWorkspaceView extends StatelessWidget {
     );
   }
 
-  Widget _buildInputStation(BuildContext context) {
+  // 3. Central Prompt Box (Composer)
+  Widget _buildComposer(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: const BoxDecoration(
-        color: DesktopTheme.bgSidebar,
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurface,
         border: Border(
           top: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
         ),
       ),
-      child: Container(
-        decoration: BoxDecoration(
-          color: DesktopTheme.bgSurface,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: DesktopTheme.borderMedium),
-        ),
-        child: Column(
-          children: [
-            // Multiline prompt field
-            RawKeyboardListener(
-              focusNode: FocusNode(),
-              onKey: (event) {
-                if (event is RawKeyDownEvent &&
-                    event.logicalKey == LogicalKeyboardKey.enter &&
-                    !event.isShiftPressed) {
-                  controller.sendMessage();
-                }
-              },
-              child: TextField(
-                controller: controller.inputController,
-                maxLines: 4,
-                minLines: 2,
-                style: const TextStyle(
-                  fontSize: 14,
-                  color: DesktopTheme.textPrimary,
-                  fontFamily: 'Segoe UI',
-                ),
-                decoration: const InputDecoration(
-                  hintText: 'Ask OmnesAgent to plan, write code, run commands, or execute tasks...',
-                  hintStyle: TextStyle(
-                    color: DesktopTheme.textMuted,
-                    fontSize: 13,
-                  ),
-                  filled: false,
-                  border: InputBorder.none,
-                  enabledBorder: InputBorder.none,
-                  focusedBorder: InputBorder.none,
-                  contentPadding: EdgeInsets.all(14),
-                ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Attachment Chips (Mentions, DOM elements, etc.)
+          Obx(() {
+            if (controller.attachments.isEmpty) return const SizedBox.shrink();
+            return Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 4,
+                children: controller.attachments.asMap().entries.map((entry) {
+                  final idx = entry.key;
+                  final text = entry.value;
+                  return Chip(
+                    label: Text(text, style: const TextStyle(fontSize: 11, fontFamily: 'Consolas')),
+                    backgroundColor: DesktopTheme.bgCanvas,
+                    deleteIcon: const Icon(Icons.close, size: 12),
+                    onDeleted: () => controller.removeAttachment(idx),
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  );
+                }).toList(),
               ),
-            ),
+            );
+          }),
 
-            // Bottom toolbar inside input station
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              decoration: const BoxDecoration(
-                border: Border(
-                  top: BorderSide(color: DesktopTheme.borderSubtle, width: 0.8),
+          // Input Text Field with Context Button "+"
+          Container(
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgCanvas,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: DesktopTheme.borderSubtle),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                // Quick Context Insert "+" Menu
+                PopupMenuButton<String>(
+                  tooltip: 'Добавить контекст (+)',
+                  icon: const Icon(Icons.add_circle_outline, size: 18, color: DesktopTheme.accentCyan),
+                  onSelected: (action) {
+                    if (action == 'mention') {
+                      controller.addAttachment('@lib/main.dart');
+                    } else if (action == 'chat') {
+                      controller.addAttachment('#session-prev');
+                    } else if (action == 'cmd') {
+                      controller.inputController.text = '/goal ';
+                    } else if (action == 'skill') {
+                      controller.addAttachment(r'$ob2h');
+                    }
+                  },
+                  itemBuilder: (context) => [
+                    const PopupMenuItem(
+                      value: 'mention',
+                      child: Text('Вставить @ Mention (файл/директория)'),
+                    ),
+                    const PopupMenuItem(
+                      value: 'chat',
+                      child: Text('Подключить # Conversation (история)'),
+                    ),
+                    const PopupMenuItem(
+                      value: 'cmd',
+                      child: Text('Выполнить / Command (/goal, /side)'),
+                    ),
+                    const PopupMenuItem(
+                      value: 'skill',
+                      child: Text(r'Вызвать $ Skill ($ob2h, $flutter)'),
+                    ),
+                  ],
                 ),
-              ),
-              child: Row(
-                children: [
-                  IconButton(
-                    tooltip: 'Attach Workspace File',
-                    icon: const Icon(Icons.attach_file, size: 16, color: DesktopTheme.textMuted),
-                    onPressed: () {},
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                  ),
-                  const SizedBox(width: 12),
-                  const Text(
-                    'Shift + Enter for new line',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: DesktopTheme.textMuted,
+
+                // Text Input
+                Expanded(
+                  child: RawKeyboardListener(
+                    focusNode: FocusNode(),
+                    onKey: (event) {
+                      // Shift + Tab listener to cycle permission mode
+                      if (event is RawKeyDownEvent &&
+                          event.isShiftPressed &&
+                          event.logicalKey == LogicalKeyboardKey.tab) {
+                        controller.cyclePermissionMode();
+                      }
+                    },
+                    child: TextField(
+                      controller: controller.inputController,
+                      maxLines: 4,
+                      minLines: 1,
+                      style: TextStyle(fontSize: 13, color: DesktopTheme.textPrimary),
+                      decoration: const InputDecoration(
+                        hintText: 'Задайте цель (/goal) или промпт агенту (@file, #chat, /cmd)...',
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        focusedBorder: InputBorder.none,
+                        fillColor: Colors.transparent,
+                        contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+                      ),
+                      onSubmitted: (_) => controller.sendMessage(),
                     ),
                   ),
-                  const Spacer(),
-                  Obx(
-                    () => controller.isRunning.value
-                        ? OutlinedButton.icon(
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: Colors.redAccent,
-                              side: const BorderSide(color: Colors.redAccent),
-                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            ),
-                            icon: const Icon(Icons.stop_circle_outlined, size: 15),
-                            label: const Text('Abort Run', style: TextStyle(fontSize: 12)),
-                            onPressed: controller.abortRun,
-                          )
-                        : ElevatedButton.icon(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: DesktopTheme.accentSky,
-                              foregroundColor: Colors.black,
-                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                            ),
-                            icon: const Icon(Icons.send_rounded, size: 14),
-                            label: const Text(
-                              'Run',
-                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-                            ),
-                            onPressed: controller.sendMessage,
-                          ),
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
-          ],
-        ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // Sub-bar Controls: Permission Mode Switcher + Model & Thought Level + Token Count + Send
+          Row(
+            children: [
+              // Permission Mode Switcher (Shift+Tab)
+              Obx(() {
+                final mode = controller.permissionMode.value;
+                return PopupMenuButton<PermissionMode>(
+                  tooltip: 'Режим разрешений (${mode.description})',
+                  onSelected: controller.setPermissionMode,
+                  itemBuilder: (context) => PermissionMode.values.map((m) {
+                    return PopupMenuItem(
+                      value: m,
+                      child: Row(
+                        children: [
+                          Icon(
+                            m == mode ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+                            size: 14,
+                            color: DesktopTheme.accentCyan,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(m.label, style: const TextStyle(fontSize: 12)),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: DesktopTheme.bgCanvas,
+                      borderRadius: BorderRadius.circular(5),
+                      border: Border.all(color: DesktopTheme.borderSubtle),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.shield_outlined, size: 12, color: DesktopTheme.accentSky),
+                        const SizedBox(width: 6),
+                        Text(
+                          mode.label,
+                          style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary),
+                        ),
+                        const SizedBox(width: 4),
+                        const Text(
+                          '⇧⇥',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontFamily: 'Consolas',
+                            color: DesktopTheme.textMutedDark,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              }),
+
+              const SizedBox(width: 8),
+
+              // Model & Thought Level Dropdown
+              Obx(() => Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: DesktopTheme.bgCanvas,
+                      borderRadius: BorderRadius.circular(5),
+                      border: Border.all(color: DesktopTheme.borderSubtle),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          controller.activeModel.value,
+                          style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: DesktopTheme.textSecondary),
+                        ),
+                        const SizedBox(width: 6),
+                        PopupMenuButton<String>(
+                          tooltip: 'Уровень рассуждений (Thought Level)',
+                          onSelected: controller.setThoughtLevel,
+                          itemBuilder: (context) => ['Low', 'High', 'Max'].map((lvl) {
+                            return PopupMenuItem(value: lvl, child: Text(lvl));
+                          }).toList(),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: DesktopTheme.bgSurfaceElevated,
+                              borderRadius: BorderRadius.circular(3),
+                            ),
+                            child: Text(
+                              controller.thoughtLevel.value,
+                              style: const TextStyle(fontSize: 10, color: DesktopTheme.accentCyan),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  )),
+
+              const Spacer(),
+
+              // Token Count Meter
+              Obx(() => Text(
+                    controller.tokenCount.value,
+                    style: TextStyle(fontSize: 10, fontFamily: 'Consolas', color: DesktopTheme.textMuted),
+                  )),
+
+              const SizedBox(width: 12),
+
+              // Send / Abort Button
+              Obx(() {
+                return controller.isRunning.value
+                    ? OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.redAccent,
+                          side: const BorderSide(color: Colors.redAccent),
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        ),
+                        icon: const Icon(Icons.stop, size: 14),
+                        label: const Text('Stop', style: TextStyle(fontSize: 11)),
+                        onPressed: controller.abortRun,
+                      )
+                    : ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: DesktopTheme.accentCyan,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                          elevation: 0,
+                        ),
+                        icon: const Icon(Icons.arrow_upward_rounded, size: 14),
+                        label: const Text('Run', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                        onPressed: controller.sendMessage,
+                      );
+              }),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -499,7 +747,7 @@ class DesktopTaskWorkspaceView extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 20),
-            const Text(
+            Text(
               'OmnesAgent ADE',
               style: TextStyle(
                 fontSize: 22,
@@ -509,7 +757,7 @@ class DesktopTaskWorkspaceView extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 8),
-            const Text(
+            Text(
               'Agentic Development Environment — постановка целей и автономная разработка',
               style: TextStyle(
                 fontSize: 13,
@@ -564,7 +812,7 @@ class DesktopTaskWorkspaceView extends StatelessWidget {
           const SizedBox(width: 8),
           Text(
             desc,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 11,
               color: DesktopTheme.textSecondary,
             ),
