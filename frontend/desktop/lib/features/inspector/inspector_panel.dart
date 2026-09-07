@@ -10,11 +10,13 @@ import '../workspace/task_workspace_controller.dart';
 class DesktopInspectorPanel extends StatefulWidget {
   final DesktopTaskWorkspaceController controller;
   final int initialTabIndex;
+  final VoidCallback? onClose;
 
   const DesktopInspectorPanel({
     super.key,
     required this.controller,
     this.initialTabIndex = 0,
+    this.onClose,
   });
 
   @override
@@ -122,7 +124,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       ),
       child: Column(
         children: [
-          // Inspector Header with 4 ZCode Tabs
+          // Inspector Header with 4 ZCode Tabs and Close button
           Container(
             height: 44,
             decoration: BoxDecoration(
@@ -131,35 +133,47 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                 bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
               ),
             ),
-            child: TabBar(
-              controller: tabController,
-              labelColor: DesktopTheme.accentSky,
-              unselectedLabelColor: DesktopTheme.textMuted,
-              indicatorColor: DesktopTheme.accentSky,
-              indicatorWeight: 2.5,
-              indicatorSize: TabBarIndicatorSize.tab,
-              labelStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-              tabs: const [
-                Tab(
-                  iconMargin: EdgeInsets.only(bottom: 2),
-                  icon: Icon(FontAwesomeIcons.globe, size: 13),
-                  text: 'Live Browser',
+            child: Row(
+              children: [
+                Expanded(
+                  child: TabBar(
+                    controller: tabController,
+                    labelColor: DesktopTheme.accentSky,
+                    unselectedLabelColor: DesktopTheme.textMuted,
+                    indicatorColor: DesktopTheme.accentSky,
+                    indicatorWeight: 2.5,
+                    indicatorSize: TabBarIndicatorSize.tab,
+                    labelStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                    tabs: const [
+                      Tab(
+                        iconMargin: EdgeInsets.only(bottom: 2),
+                        icon: Icon(FontAwesomeIcons.globe, size: 13),
+                        text: 'Live Browser',
+                      ),
+                      Tab(
+                        iconMargin: EdgeInsets.only(bottom: 2),
+                        icon: Icon(FontAwesomeIcons.terminal, size: 13),
+                        text: 'Terminal',
+                      ),
+                      Tab(
+                        iconMargin: EdgeInsets.only(bottom: 2),
+                        icon: Icon(FontAwesomeIcons.eye, size: 13),
+                        text: 'Preview',
+                      ),
+                      Tab(
+                        iconMargin: EdgeInsets.only(bottom: 2),
+                        icon: Icon(FontAwesomeIcons.comments, size: 13),
+                        text: 'Side Chat',
+                      ),
+                    ],
+                  ),
                 ),
-                Tab(
-                  iconMargin: EdgeInsets.only(bottom: 2),
-                  icon: Icon(FontAwesomeIcons.terminal, size: 13),
-                  text: 'Terminal',
-                ),
-                Tab(
-                  iconMargin: EdgeInsets.only(bottom: 2),
-                  icon: Icon(FontAwesomeIcons.eye, size: 13),
-                  text: 'Preview',
-                ),
-                Tab(
-                  iconMargin: EdgeInsets.only(bottom: 2),
-                  icon: Icon(FontAwesomeIcons.comments, size: 13),
-                  text: 'Side Chat',
-                ),
+                if (widget.onClose != null)
+                  IconButton(
+                    icon: const Icon(Icons.close, size: 16, color: Color(0xFF94A3B8)),
+                    tooltip: 'Close panel',
+                    onPressed: widget.onClose,
+                  ),
               ],
             ),
           ),
