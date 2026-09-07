@@ -16,6 +16,11 @@ class DesktopTaskWorkspaceController extends GetxController {
   final thoughtLevel = 'Max'.obs;
   final activeModel = 'GLM-5.3-Flash'.obs;
   final tokenCount = '28.4k tokens'.obs;
+  final isTerminalOpen = false.obs;
+
+  void toggleTerminal() {
+    isTerminalOpen.value = !isTerminalOpen.value;
+  }
 
   // Goal Mode State
   final Rxn<GoalStatus> activeGoal = Rxn<GoalStatus>();
@@ -85,6 +90,10 @@ class DesktopTaskWorkspaceController extends GetxController {
             output: 'No issues found! (0 errors)',
           ),
         ],
+      ),
+      ChatMessage(
+        text: 'То есть, например, картинки Training the Wife лежат в C:\\Users\\ipres\\AppData\\Local\\Temp\\final_tw\\images\\... , а кадры из SWF — в Temp\\final_swf\\Olivia Ellie and Paul rus\\images .\n\nЕсли осмотрели и всё лишнее — можно освободить место одной командой:\n\n```text\nrm -rf /tmp/final_tw /tmp/tw_folder /tmp/final_swf /tmp/swf_folder /tmp/swf_test /tmp/wdpk_test /tmp/wdpk_test2 /tmp/wc\n```\n\nСкажите, если хотите, чтобы я сам их удалил (или наоборот — перенёс куда-нибудь в постоянную папку).',
+        chatMessageType: ChatMessageType.bot,
       ),
     ]);
 

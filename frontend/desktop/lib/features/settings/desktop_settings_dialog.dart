@@ -250,7 +250,6 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       _buildSectionHeader('Возможности агента'),
                       _buildNavItem('MCP Серверы', Icons.extension_outlined),
                       _buildNavItem('Навыки', Icons.auto_awesome),
-                      _buildNavItem('Плагины', FontAwesomeIcons.puzzlePiece),
                       _buildNavItem('Команды', FontAwesomeIcons.terminal),
 
                       const SizedBox(height: 16),
@@ -427,7 +426,6 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       case 'MCP Серверы':
         return _buildMcpServersSection();
       case 'Навыки':
-      case 'Плагины':
         return _buildSkillsSection();
       case 'Оформление':
         return _buildAppearanceSection();

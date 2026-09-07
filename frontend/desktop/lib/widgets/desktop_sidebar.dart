@@ -34,8 +34,15 @@ class DesktopSidebar extends StatefulWidget {
   State<DesktopSidebar> createState() => _DesktopSidebarState();
 }
 
+enum SidebarViewMode { byProject, timeline }
+enum SidebarSortMode { updated, created }
+
 class _DesktopSidebarState extends State<DesktopSidebar> {
   bool isGroupView = false; // false: Project, true: Group
+  SidebarViewMode viewMode = SidebarViewMode.byProject;
+  SidebarSortMode sortMode = SidebarSortMode.updated;
+  bool isAllExpanded = true;
+  final Set<String> collapsedProjects = {};
 
   final List<Map<String, dynamic>> projects = [
     {
@@ -182,12 +189,6 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   shortcut: '',
                   onTap: () {},
                 ),
-                _buildActionRow(
-                  icon: FontAwesomeIcons.puzzlePiece,
-                  label: 'Plugin Marketplace',
-                  shortcut: '',
-                  onTap: widget.onOpenSkills ?? widget.onOpenSettings,
-                ),
               ],
             ),
           ),
@@ -258,22 +259,33 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
                 const Spacer(),
 
-                // Quick actions right of tabs
+                // Quick actions right of tabs: Expand / Collapse all & Filter menu (Image 1 match)
                 IconButton(
-                  tooltip: 'Фильтр',
-                  icon: const Icon(Icons.filter_list, size: 13, color: Color(0xFF64748B)),
-                  onPressed: () {},
+                  tooltip: isAllExpanded ? 'Свернуть все' : 'Развернуть все',
+                  icon: Icon(
+                    isAllExpanded ? Icons.close_fullscreen : Icons.open_in_full,
+                    size: 13,
+                    color: const Color(0xFF94A3B8),
+                  ),
+                  onPressed: () {
+                    setState(() {
+                      isAllExpanded = !isAllExpanded;
+                      if (!isAllExpanded) {
+                        for (final p in (isGroupView ? groups : projects)) {
+                          collapsedProjects.add(p['name'] as String);
+                        }
+                      } else {
+                        collapsedProjects.clear();
+                      }
+                    });
+                  },
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
+                  constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
                 ),
                 const SizedBox(width: 4),
-                IconButton(
-                  tooltip: 'Свернуть все',
-                  icon: const Icon(Icons.unfold_less, size: 13, color: Color(0xFF64748B)),
-                  onPressed: () {},
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
-                ),
+
+                // Working Filter & Sort Popover Menu (Image 1 match)
+                _buildFilterPopupMenu(),
               ],
             ),
           ),
@@ -281,24 +293,44 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           // 4. Projects / Groups Header
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-            child: Text(
-              isGroupView ? 'Groups' : 'Projects',
-              style: const TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-                color: Color(0xFF64748B),
-                letterSpacing: 0.4,
-              ),
+            child: Row(
+              children: [
+                Text(
+                  isGroupView
+                      ? 'Groups'
+                      : (viewMode == SidebarViewMode.timeline ? 'Timeline' : 'Projects'),
+                  style: const TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF64748B),
+                    letterSpacing: 0.4,
+                  ),
+                ),
+                if (viewMode == SidebarViewMode.timeline) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF00D2FF).withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      sortMode == SidebarSortMode.updated ? 'Updated' : 'Created',
+                      style: const TextStyle(fontSize: 9, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
 
-          // 5. Scrollable Projects List
+          // 5. Scrollable Projects / Timeline List
           Expanded(
             child: ListView(
               padding: const EdgeInsets.symmetric(horizontal: 8),
-              children: (isGroupView ? groups : projects).map((proj) {
-                return _buildProjectItem(proj);
-              }).toList(),
+              children: viewMode == SidebarViewMode.byProject
+                  ? (isGroupView ? groups : projects).map((proj) => _buildProjectItem(proj)).toList()
+                  : _buildTimelineItems(),
             ),
           ),
 
@@ -388,91 +420,254 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     );
   }
 
-  Widget _buildProjectItem(Map<String, dynamic> proj) {
-    final tasks = proj['tasks'] as List<dynamic>;
+  Widget _buildFilterPopupMenu() {
+    return PopupMenuButton<String>(
+      tooltip: 'Вид и сортировка',
+      offset: const Offset(0, 26),
+      color: const Color(0xFF1E2127),
+      elevation: 12,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(10),
+        side: const BorderSide(color: Color(0xFF2C323E), width: 1),
+      ),
+      onSelected: (val) {
+        setState(() {
+          if (val == 'by_project') viewMode = SidebarViewMode.byProject;
+          if (val == 'timeline') viewMode = SidebarViewMode.timeline;
+          if (val == 'updated') sortMode = SidebarSortMode.updated;
+          if (val == 'created') sortMode = SidebarSortMode.created;
+        });
+      },
+      itemBuilder: (ctx) => [
+        // View header
+        const PopupMenuItem<String>(
+          enabled: false,
+          height: 28,
+          child: Text('View', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF64748B))),
+        ),
+        _buildFilterItem('by_project', Icons.folder_outlined, 'By project', viewMode == SidebarViewMode.byProject),
+        _buildFilterItem('timeline', Icons.access_time, 'Timeline', viewMode == SidebarViewMode.timeline),
+        const PopupMenuDivider(height: 10),
+        // Sort by header
+        const PopupMenuItem<String>(
+          enabled: false,
+          height: 28,
+          child: Text('Sort by', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF64748B))),
+        ),
+        _buildFilterItem('updated', Icons.chat_bubble_outline, 'Updated', sortMode == SidebarSortMode.updated),
+        _buildFilterItem('created', Icons.add_comment_outlined, 'Created', sortMode == SidebarSortMode.created),
+      ],
+      child: Container(
+        padding: const EdgeInsets.all(4),
+        decoration: BoxDecoration(
+          color: (viewMode == SidebarViewMode.timeline || sortMode == SidebarSortMode.created)
+              ? const Color(0xFF00D2FF).withOpacity(0.18)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: const Icon(Icons.filter_list, size: 14, color: Color(0xFF94A3B8)),
+      ),
+    );
+  }
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+  PopupMenuItem<String> _buildFilterItem(String value, IconData icon, String label, bool isSelected) {
+    return PopupMenuItem<String>(
+      value: value,
+      height: 36,
+      child: Row(
         children: [
-          // Project Folder Header
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            child: Row(
-              children: [
-                Icon(
-                  isGroupView ? Icons.chat_bubble_outline : Icons.folder_outlined,
-                  size: 13,
-                  color: const Color(0xFF64748B),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    proj['name'],
-                    style: const TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFFCBD5E1),
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
+          Icon(icon, size: 14, color: isSelected ? const Color(0xFF00D2FF) : const Color(0xFFCBD5E1)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                color: isSelected ? Colors.white : const Color(0xFFCBD5E1),
+              ),
             ),
           ),
+          if (isSelected)
+            const Icon(Icons.check, size: 14, color: Color(0xFF00D2FF)),
+        ],
+      ),
+    );
+  }
 
-          // Tasks under project
-          ...tasks.map((task) {
-            final hasUnread = task['unread'] == true;
+  List<Widget> _buildTimelineItems() {
+    final all = <Map<String, dynamic>>[];
+    for (final proj in (isGroupView ? groups : projects)) {
+      for (final t in proj['tasks']) {
+        all.add({
+          ...t,
+          'project': proj['name'],
+        });
+      }
+    }
 
-            return InkWell(
-              onTap: () {
-                widget.onSelectTask(0, task['title']);
-              },
-              borderRadius: BorderRadius.circular(6),
-              child: Container(
-                margin: const EdgeInsets.only(bottom: 1, left: 6, right: 6),
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(6),
+    if (sortMode == SidebarSortMode.created) {
+      all.sort((a, b) => (a['title'] as String).compareTo(b['title'] as String));
+    }
+
+    return all.map((task) {
+      final hasUnread = task['unread'] == true;
+      return InkWell(
+        onTap: () {
+          widget.onSelectTask(0, task['title']);
+        },
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          margin: const EdgeInsets.only(bottom: 2, left: 6, right: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          decoration: BoxDecoration(borderRadius: BorderRadius.circular(6)),
+          child: Row(
+            children: [
+              if (hasUnread) ...[
+                Container(
+                  width: 5,
+                  height: 5,
+                  decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFFEF4444)),
                 ),
-                child: Row(
+                const SizedBox(width: 6),
+              ] else ...[
+                const Icon(Icons.chat_bubble_outline, size: 12, color: Color(0xFF64748B)),
+                const SizedBox(width: 6),
+              ],
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    if (hasUnread) ...[
-                      Container(
-                        width: 5,
-                        height: 5,
-                        decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFFEF4444)),
-                      ),
-                      const SizedBox(width: 6),
-                    ],
-                    Expanded(
-                      child: Text(
-                        task['title'],
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Color(0xFF94A3B8),
-                        ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
                     Text(
-                      task['time'],
-                      style: const TextStyle(
-                        fontSize: 10,
-                        color: Color(0xFF64748B),
-                        fontFamily: 'Consolas',
-                      ),
+                      task['title'],
+                      style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    Text(
+                      task['project'],
+                      style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontFamily: 'Consolas'),
                     ),
                   ],
                 ),
               ),
-            );
-          }),
+              const SizedBox(width: 6),
+              Text(
+                task['time'],
+                style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontFamily: 'Consolas'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }).toList();
+  }
+
+  Widget _buildProjectItem(Map<String, dynamic> proj) {
+    final tasks = proj['tasks'] as List<dynamic>;
+    final isCollapsed = collapsedProjects.contains(proj['name']);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Project Folder Header
+          InkWell(
+            onTap: () {
+              setState(() {
+                if (isCollapsed) {
+                  collapsedProjects.remove(proj['name']);
+                } else {
+                  collapsedProjects.add(proj['name'] as String);
+                }
+              });
+            },
+            borderRadius: BorderRadius.circular(6),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: Row(
+                children: [
+                  Icon(
+                    isCollapsed ? Icons.chevron_right : Icons.keyboard_arrow_down,
+                    size: 14,
+                    color: const Color(0xFF64748B),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(
+                    isGroupView ? Icons.chat_bubble_outline : Icons.folder_outlined,
+                    size: 13,
+                    color: isCollapsed ? const Color(0xFF64748B) : const Color(0xFF00D2FF),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      proj['name'],
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFFCBD5E1),
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Tasks under project (if not collapsed)
+          if (!isCollapsed)
+            ...tasks.map((task) {
+              final hasUnread = task['unread'] == true;
+
+              return InkWell(
+                onTap: () {
+                  widget.onSelectTask(0, task['title']);
+                },
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  margin: const EdgeInsets.only(bottom: 1, left: 18, right: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Row(
+                    children: [
+                      if (hasUnread) ...[
+                        Container(
+                          width: 5,
+                          height: 5,
+                          decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFFEF4444)),
+                        ),
+                        const SizedBox(width: 6),
+                      ],
+                      Expanded(
+                        child: Text(
+                          task['title'],
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFF94A3B8),
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        task['time'],
+                        style: const TextStyle(
+                          fontSize: 10,
+                          color: Color(0xFF64748B),
+                          fontFamily: 'Consolas',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
         ],
       ),
     );

@@ -3,6 +3,7 @@
 // git diff chips, and localized Russian assistant prompts.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:omnes_shared/omnes_shared.dart';
@@ -32,7 +33,6 @@ class DesktopTaskWorkspaceView extends StatefulWidget {
 class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   bool isBannerDismissed = false;
   bool isGitToolsOpen = false;
-  bool isBottomTerminalOpen = false;
 
   @override
   Widget build(BuildContext context) {
@@ -55,13 +55,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       : _buildNewTaskWelcomeScreen(),
                 ),
 
-                // 3. Bottom Terminal (if opened below prompt)
-                if (hasMessages && isBottomTerminalOpen)
-                  _buildBottomTerminal(),
-
-                // 4. Bottom Floating Composer when messages exist
+                // 3. Bottom Floating Composer when messages exist (staying ABOVE terminal!)
                 if (hasMessages)
                   _buildBottomFloatingComposer(),
+
+                // 4. Bottom Terminal (docked at the very bottom UNDER prompt!)
+                if (hasMessages && widget.controller.isTerminalOpen.value)
+                  _buildBottomTerminal(),
               ],
             ),
 
@@ -152,48 +152,52 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           const SizedBox(width: 8),
 
           // Terminal quick toggle (>_)
-          InkWell(
-            onTap: () {
-              setState(() => isBottomTerminalOpen = !isBottomTerminalOpen);
-            },
-            borderRadius: BorderRadius.circular(4),
-            child: Container(
-              padding: const EdgeInsets.all(5),
-              decoration: BoxDecoration(
-                color: isBottomTerminalOpen ? const Color(0xFF00D2FF).withOpacity(0.18) : const Color(0xFF22262E),
-                borderRadius: BorderRadius.circular(5),
-                border: Border.all(
-                  color: isBottomTerminalOpen ? const Color(0xFF00D2FF) : Colors.transparent,
-                  width: 0.8,
+          Tooltip(
+            message: 'Встроенный терминал',
+            child: InkWell(
+              onTap: widget.controller.toggleTerminal,
+              borderRadius: BorderRadius.circular(4),
+              child: Container(
+                padding: const EdgeInsets.all(5),
+                decoration: BoxDecoration(
+                  color: widget.controller.isTerminalOpen.value ? const Color(0xFF00D2FF).withOpacity(0.18) : const Color(0xFF22262E),
+                  borderRadius: BorderRadius.circular(5),
+                  border: Border.all(
+                    color: widget.controller.isTerminalOpen.value ? const Color(0xFF00D2FF) : Colors.transparent,
+                    width: 0.8,
+                  ),
                 ),
-              ),
-              child: Icon(
-                FontAwesomeIcons.terminal,
-                size: 12,
-                color: isBottomTerminalOpen ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+                child: Icon(
+                  FontAwesomeIcons.terminal,
+                  size: 12,
+                  color: widget.controller.isTerminalOpen.value ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+                ),
               ),
             ),
           ),
           const SizedBox(width: 8),
 
           // Side Pane / Inspector toggle ([|])
-          InkWell(
-            onTap: widget.onToggleTools,
-            borderRadius: BorderRadius.circular(4),
-            child: Container(
-              padding: const EdgeInsets.all(5),
-              decoration: BoxDecoration(
-                color: widget.isToolsOpen ? const Color(0xFF00D2FF).withOpacity(0.18) : const Color(0xFF22262E),
-                borderRadius: BorderRadius.circular(5),
-                border: Border.all(
-                  color: widget.isToolsOpen ? const Color(0xFF00D2FF) : Colors.transparent,
-                  width: 0.8,
+          Tooltip(
+            message: 'Боковая панель инструментов',
+            child: InkWell(
+              onTap: widget.onToggleTools,
+              borderRadius: BorderRadius.circular(4),
+              child: Container(
+                padding: const EdgeInsets.all(5),
+                decoration: BoxDecoration(
+                  color: widget.isToolsOpen ? const Color(0xFF00D2FF).withOpacity(0.18) : const Color(0xFF22262E),
+                  borderRadius: BorderRadius.circular(5),
+                  border: Border.all(
+                    color: widget.isToolsOpen ? const Color(0xFF00D2FF) : Colors.transparent,
+                    width: 0.8,
+                  ),
                 ),
-              ),
-              child: Icon(
-                Icons.view_sidebar_outlined,
-                size: 14,
-                color: widget.isToolsOpen ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+                child: Icon(
+                  Icons.view_sidebar_outlined,
+                  size: 14,
+                  color: widget.isToolsOpen ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+                ),
               ),
             ),
           ),
@@ -376,7 +380,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 const Text('Terminal (bash / pwsh) — OmnesAgent Daemon', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white)),
                 const Spacer(),
                 InkWell(
-                  onTap: () => setState(() => isBottomTerminalOpen = false),
+                  onTap: () => widget.controller.isTerminalOpen.value = false,
                   child: const Icon(Icons.close, size: 13, color: Color(0xFF94A3B8)),
                 ),
               ],
@@ -780,10 +784,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       ),
                     ],
 
-                    SelectableText(
-                      msg.text,
-                      style: const TextStyle(fontSize: 13, height: 1.5, color: Color(0xFFE2E8F0)),
-                    ),
+                    _buildMessageContent(context, msg),
 
                     // Tool calls
                     if (msg.toolCalls.isNotEmpty) ...[
@@ -815,7 +816,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                     ],
 
                     // Git diff chip (Screenshot 2 match)
-                    if (!isUser) ...[
+                    if (!isUser && msg.toolCalls.isNotEmpty) ...[
                       const SizedBox(height: 12),
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -847,8 +848,199 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         ),
                       ),
                     ],
+
+                    // Message Reactions Row (Image 2 match: [⎘ Copy] [👍] [👎] [🔀 Branch] 9/5, 10:07 AM)
+                    if (!isUser)
+                      _buildMessageReactionsRow(context, msg),
                   ],
                 ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildMessageContent(BuildContext context, ChatMessage msg) {
+    if (!msg.text.contains('```')) {
+      return SelectableText(
+        msg.text,
+        style: const TextStyle(fontSize: 13, height: 1.5, color: Color(0xFFE2E8F0)),
+      );
+    }
+
+    final parts = msg.text.split('```');
+    final widgets = <Widget>[];
+
+    for (int i = 0; i < parts.length; i++) {
+      final part = parts[i];
+      if (i % 2 == 0) {
+        if (part.trim().isNotEmpty) {
+          widgets.add(
+            SelectableText(
+              part.trim(),
+              style: const TextStyle(fontSize: 13, height: 1.5, color: Color(0xFFE2E8F0)),
+            ),
+          );
+        }
+      } else {
+        final lines = part.split('\n');
+        final lang = lines.isNotEmpty && lines.first.trim().isNotEmpty ? lines.first.trim() : 'text';
+        final codeBody = lines.length > 1 ? lines.sublist(1).join('\n').trim() : part.trim();
+
+        widgets.add(
+          Container(
+            margin: const EdgeInsets.symmetric(vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF191C22),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFF282F3B)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  decoration: const BoxDecoration(
+                    color: Color(0xFF20252F),
+                    borderRadius: BorderRadius.vertical(top: Radius.circular(7)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.description_outlined, size: 14, color: Color(0xFF00D2FF)),
+                      const SizedBox(width: 8),
+                      Text(
+                        lang,
+                        style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFFCBD5E1)),
+                      ),
+                      const Spacer(),
+                      InkWell(
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: codeBody));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Команда скопирована'), duration: Duration(seconds: 1)),
+                          );
+                        },
+                        child: const Padding(
+                          padding: EdgeInsets.all(2),
+                          child: Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      InkWell(
+                        onTap: () {
+                          widget.controller.isTerminalOpen.value = true;
+                        },
+                        child: const Padding(
+                          padding: EdgeInsets.all(2),
+                          child: Icon(Icons.play_arrow_outlined, size: 16, color: Color(0xFF94A3B8)),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: SelectableText(
+                    codeBody,
+                    style: const TextStyle(fontSize: 12, fontFamily: 'Consolas', color: Color(0xFFE2E8F0)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: widgets,
+    );
+  }
+
+  Widget _buildMessageReactionsRow(BuildContext context, ChatMessage msg) {
+    bool isLiked = false;
+    bool isDisliked = false;
+
+    return StatefulBuilder(
+      builder: (context, setReactionState) {
+
+        return Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Row(
+            children: [
+              InkWell(
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: msg.text));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Скопировано в буфер обмена'),
+                      duration: Duration(seconds: 1),
+                      behavior: SnackBarBehavior.floating,
+                    ),
+                  );
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(Icons.copy, size: 14, color: Color(0xFF94A3B8)),
+                ),
+              ),
+              const SizedBox(width: 4),
+
+              InkWell(
+                onTap: () {
+                  setReactionState(() {
+                    isLiked = !isLiked;
+                    if (isLiked) isDisliked = false;
+                  });
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: Icon(
+                    isLiked ? Icons.thumb_up : Icons.thumb_up_alt_outlined,
+                    size: 14,
+                    color: isLiked ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+
+              InkWell(
+                onTap: () {
+                  setReactionState(() {
+                    isDisliked = !isDisliked;
+                    if (isDisliked) isLiked = false;
+                  });
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: Icon(
+                    isDisliked ? Icons.thumb_down : Icons.thumb_down_alt_outlined,
+                    size: 14,
+                    color: isDisliked ? const Color(0xFFEF4444) : const Color(0xFF94A3B8),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+
+              InkWell(
+                onTap: () {},
+                borderRadius: BorderRadius.circular(4),
+                child: const Padding(
+                  padding: EdgeInsets.all(4),
+                  child: Icon(FontAwesomeIcons.codeBranch, size: 11, color: Color(0xFF94A3B8)),
+                ),
+              ),
+              const SizedBox(width: 8),
+
+              const Text(
+                '9/5, 10:07 AM',
+                style: TextStyle(fontSize: 11, color: Color(0xFF64748B), fontFamily: 'Consolas'),
               ),
             ],
           ),
