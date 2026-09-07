@@ -1,4 +1,5 @@
 class Assets {
+  static const String appLauncher = 'assets/Logo/app_launcher.png';
   static const String bot = 'assets/Logo/bot.png';
   static const String botLight = 'assets/Logo/basic_logo_light.png';
   static const String botDark = 'assets/Logo/basic_logo_dark.png';
