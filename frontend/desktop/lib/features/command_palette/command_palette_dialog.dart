@@ -65,8 +65,7 @@ class _DesktopCommandPaletteDialogState
           shortcut: 'Ctrl + N',
           icon: FontAwesomeIcons.plus,
           onExecute: () {
-            widget.controller?.messages.clear();
-            widget.controller?.activeTaskTitle.value = DesktopI18n.tr('Новая задача', 'New Task Session');
+            widget.controller?.createNewTask();
           },
         ),
         _CommandAction(

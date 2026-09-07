@@ -1,9 +1,7 @@
-import 'dart:io';
-import 'dart:typed_data';
-
+import 'package:universal_io/io.dart';
+import 'package:flutter/foundation.dart';
 import 'package:omagent_front/widgets/api/toast_message.dart';
 import 'package:device_info_plus/device_info_plus.dart';
-import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -11,6 +9,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 mixin DownloadFile {
   Future<bool> checkPermission() async {
+    if (kIsWeb) return false;
     bool checkPermission1 = await Permission.storage.isGranted;
 
     //For android
@@ -42,6 +41,7 @@ mixin DownloadFile {
   }
 
   Future<void> downloadFile({required String url, required String name}) async {
+    if (kIsWeb) return;
     bool isChecked = Platform.isIOS ? true : await checkPermission();
     if (isChecked) {
       final http.Response response = await http.get(Uri.parse(url));

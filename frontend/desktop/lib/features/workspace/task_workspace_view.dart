@@ -8,6 +8,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 
+import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
 import 'task_workspace_controller.dart';
 
@@ -37,13 +38,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      color: const Color(0xFF16181D),
-      child: Obx(() {
-        final _ = DesktopI18n.currentLanguage.value;
-        final hasMessages = widget.controller.messages.isNotEmpty;
+    return Obx(() {
+      final _ = DesktopI18n.currentLanguage.value;
+      final hasMessages = widget.controller.messages.isNotEmpty;
 
-        return Stack(
+      return Container(
+        color: DesktopTheme.bgCanvas,
+        child: Stack(
           children: [
             Column(
               children: [
@@ -75,55 +76,67 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 child: _buildGitToolsCard(),
               ),
           ],
-        );
-      }),
-    );
+        ),
+      );
+    });
   }
 
   // ==========================================
-  // TOP NAV BAR MATCHING SCREENSHOT 2
+  // TOP NAV BAR MATCHING AUTHENTIC WINDOWS ADE
   // ==========================================
   Widget _buildTopNavBar(bool hasMessages) {
+    final isNewTask = widget.controller.isNewTask.value;
+
     return Container(
       height: 44,
       padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: const BoxDecoration(
-        color: Color(0xFF16181D),
-        border: Border(bottom: BorderSide(color: Color(0xFF22262E), width: 0.8)),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurface,
+        border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 0.8)),
       ),
       child: Row(
         children: [
-          if (hasMessages) ...[
+          if (!isNewTask && hasMessages) ...[
             // Task Title
             Flexible(
               child: Text(
                 widget.controller.activeTaskTitle.value,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
-                  color: Colors.white,
+                  color: DesktopTheme.textPrimary,
                 ),
                 overflow: TextOverflow.ellipsis,
                 maxLines: 1,
               ),
             ),
-            const SizedBox(width: 10),
-
-            // Project folder chip
-            _buildProjectChip(),
-            const SizedBox(width: 6),
-
-            // Branch chip with toggle for Git Tools
-            _buildBranchChip(),
+            if (widget.controller.activeProject.value != null && widget.controller.activeProject.value!.isNotEmpty) ...[
+              const SizedBox(width: 10),
+              _buildProjectChip(),
+            ],
+            if (widget.controller.activeBranch.value != null && widget.controller.activeBranch.value!.isNotEmpty) ...[
+              const SizedBox(width: 6),
+              _buildBranchChip(),
+            ],
             const SizedBox(width: 6),
 
             // Menu dots
             InkWell(
               onTap: () => setState(() => isGitToolsOpen = !isGitToolsOpen),
               borderRadius: BorderRadius.circular(4),
-              child: const Padding(
-                padding: EdgeInsets.all(4),
-                child: Icon(Icons.more_horiz, size: 16, color: Color(0xFF94A3B8)),
+              child: Padding(
+                padding: const EdgeInsets.all(4),
+                child: Icon(Icons.more_horiz, size: 16, color: DesktopTheme.textMuted),
+              ),
+            ),
+          ] else ...[
+            // Clean New Task Mode - no stale pinned branch or project!
+            Text(
+              DesktopI18n.newTask,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: DesktopTheme.textMuted,
               ),
             ),
           ],
@@ -138,15 +151,73 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
               decoration: BoxDecoration(
-                color: const Color(0xFF22262E),
+                color: DesktopTheme.bgSurfaceElevated,
                 borderRadius: BorderRadius.circular(4),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
-                children: const [
-                  Icon(Icons.folder_outlined, size: 13, color: Color(0xFF00D2FF)),
-                  SizedBox(width: 4),
-                  Icon(Icons.keyboard_arrow_down, size: 12, color: Color(0xFF94A3B8)),
+                children: [
+                  const Icon(Icons.folder_outlined, size: 13, color: Color(0xFF00D2FF)),
+                  const SizedBox(width: 4),
+                  Icon(Icons.keyboard_arrow_down, size: 12, color: DesktopTheme.textMuted),
+                ],
+              ),
+            ),
+          ),
+          // Gateway Live Status Badge
+          InkWell(
+            onTap: () => widget.controller.initGatewayConnection(),
+            borderRadius: BorderRadius.circular(4),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: widget.controller.wsStatus.value == 'connected'
+                    ? const Color(0xFF10B981).withOpacity(0.15)
+                    : widget.controller.wsStatus.value == 'connecting'
+                        ? const Color(0xFFF59E0B).withOpacity(0.15)
+                        : const Color(0xFFEF4444).withOpacity(0.15),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: widget.controller.wsStatus.value == 'connected'
+                      ? const Color(0xFF10B981)
+                      : widget.controller.wsStatus.value == 'connecting'
+                          ? const Color(0xFFF59E0B)
+                          : const Color(0xFFEF4444),
+                  width: 0.8,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 6,
+                    height: 6,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: widget.controller.wsStatus.value == 'connected'
+                          ? const Color(0xFF10B981)
+                          : widget.controller.wsStatus.value == 'connecting'
+                              ? const Color(0xFFF59E0B)
+                              : const Color(0xFFEF4444),
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    widget.controller.wsStatus.value == 'connected'
+                        ? 'Gateway 42617'
+                        : widget.controller.wsStatus.value == 'connecting'
+                            ? 'Шлюз...'
+                            : 'Шлюз оффлайн',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: widget.controller.wsStatus.value == 'connected'
+                          ? const Color(0xFF10B981)
+                          : widget.controller.wsStatus.value == 'connecting'
+                              ? const Color(0xFFF59E0B)
+                              : const Color(0xFFEF4444),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -162,7 +233,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               child: Container(
                 padding: const EdgeInsets.all(5),
                 decoration: BoxDecoration(
-                  color: widget.controller.isTerminalOpen.value ? const Color(0xFF00D2FF).withOpacity(0.18) : const Color(0xFF22262E),
+                  color: widget.controller.isTerminalOpen.value
+                      ? const Color(0xFF00D2FF).withOpacity(0.18)
+                      : DesktopTheme.bgSurfaceElevated,
                   borderRadius: BorderRadius.circular(5),
                   border: Border.all(
                     color: widget.controller.isTerminalOpen.value ? const Color(0xFF00D2FF) : Colors.transparent,
@@ -172,7 +245,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 child: Icon(
                   FontAwesomeIcons.terminal,
                   size: 12,
-                  color: widget.controller.isTerminalOpen.value ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+                  color: widget.controller.isTerminalOpen.value ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
                 ),
               ),
             ),
@@ -188,7 +261,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               child: Container(
                 padding: const EdgeInsets.all(5),
                 decoration: BoxDecoration(
-                  color: widget.isToolsOpen ? const Color(0xFF00D2FF).withOpacity(0.18) : const Color(0xFF22262E),
+                  color: widget.isToolsOpen ? const Color(0xFF00D2FF).withOpacity(0.18) : DesktopTheme.bgSurfaceElevated,
                   borderRadius: BorderRadius.circular(5),
                   border: Border.all(
                     color: widget.isToolsOpen ? const Color(0xFF00D2FF) : Colors.transparent,
@@ -198,37 +271,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 child: Icon(
                   Icons.view_sidebar_outlined,
                   size: 14,
-                  color: widget.isToolsOpen ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+                  color: widget.isToolsOpen ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
                 ),
               ),
             ),
           ),
-          const SizedBox(width: 14),
-
-          // Windows native window controls: [ — ] [ 🗖 ] [ ✕ ]
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _buildWinButton(Icons.remove, DesktopI18n.minimize, () {}),
-              const SizedBox(width: 6),
-              _buildWinButton(Icons.crop_square, DesktopI18n.maximize, () {}),
-              const SizedBox(width: 6),
-              _buildWinButton(Icons.close, DesktopI18n.close, () {}, isClose: true),
-            ],
-          ),
         ],
-      ),
-    );
-  }
-
-  Widget _buildWinButton(IconData icon, String tooltip, VoidCallback onTap, {bool isClose = false}) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(3),
-      hoverColor: isClose ? const Color(0xFFE81123) : const Color(0xFF2A2E37),
-      child: Padding(
-        padding: const EdgeInsets.all(4),
-        child: Icon(icon, size: 12, color: const Color(0xFF94A3B8)),
       ),
     );
   }
@@ -241,12 +289,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       width: 380,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF1B1D22),
+        color: DesktopTheme.bgSurface,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF2A2F3B), width: 1.2),
+        border: Border.all(color: DesktopTheme.borderSubtle, width: 1.2),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.7),
+            color: DesktopTheme.isDark ? Colors.black.withOpacity(0.7) : Colors.black.withOpacity(0.12),
             blurRadius: 28,
             offset: const Offset(0, 10),
           ),
@@ -261,17 +309,17 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             children: [
               Text(
                 DesktopI18n.gitTools,
-                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
               ),
               const Spacer(),
               InkWell(
                 onTap: () {},
-                child: const Icon(Icons.more_horiz, size: 14, color: Color(0xFF94A3B8)),
+                child: Icon(Icons.more_horiz, size: 14, color: DesktopTheme.textMuted),
               ),
               const SizedBox(width: 8),
               InkWell(
                 onTap: () => setState(() => isGitToolsOpen = false),
-                child: const Icon(Icons.close, size: 14, color: Color(0xFF94A3B8)),
+                child: Icon(Icons.close, size: 14, color: DesktopTheme.textMuted),
               ),
             ],
           ),
@@ -280,9 +328,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           // Changes
           Row(
             children: [
-              const Icon(Icons.assignment_outlined, size: 14, color: Color(0xFF94A3B8)),
+              Icon(Icons.assignment_outlined, size: 14, color: DesktopTheme.textMuted),
               const SizedBox(width: 8),
-              Text(DesktopI18n.tr('Изменения', 'Changes'), style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0))),
+              Text(DesktopI18n.tr('Изменения', 'Changes'), style: TextStyle(fontSize: 12, color: DesktopTheme.textSecondary)),
               const Spacer(),
               const Text(
                 '+72347 -0',
@@ -295,11 +343,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           // Branch
           Row(
             children: [
-              const Icon(FontAwesomeIcons.codeBranch, size: 12, color: Color(0xFF94A3B8)),
+              Icon(FontAwesomeIcons.codeBranch, size: 12, color: DesktopTheme.textMuted),
               const SizedBox(width: 8),
               const Text('desktop-brand-ru', style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: Color(0xFF00D2FF))),
               const SizedBox(width: 4),
-              const Icon(Icons.keyboard_arrow_down, size: 14, color: Color(0xFF94A3B8)),
+              Icon(Icons.keyboard_arrow_down, size: 14, color: DesktopTheme.textMuted),
             ],
           ),
           const SizedBox(height: 10),
@@ -307,17 +355,17 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           // Commit or push
           Row(
             children: [
-              const Icon(Icons.commit, size: 14, color: Color(0xFF94A3B8)),
+              Icon(Icons.commit, size: 14, color: DesktopTheme.textMuted),
               const SizedBox(width: 8),
-              Text(DesktopI18n.tr('Коммит или пуш', 'Commit or push'), style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8))),
+              Text(DesktopI18n.tr('Коммит или пуш', 'Commit or push'), style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted)),
             ],
           ),
-          const Divider(height: 20, color: Color(0xFF262B34)),
+          Divider(height: 20, color: DesktopTheme.borderSubtle),
 
           // Progress 5/5
           Row(
             children: [
-              Text(DesktopI18n.tr('Прогресс', 'Progress'), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+              Text(DesktopI18n.tr('Прогресс', 'Progress'), style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
               const SizedBox(width: 8),
               const Text('5/5', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
             ],
@@ -345,7 +393,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           Expanded(
             child: Text(
               text,
-              style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8), height: 1.3),
+              style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary, height: 1.3),
             ),
           ),
         ],
@@ -361,9 +409,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       height: 180,
       margin: const EdgeInsets.fromLTRB(24, 0, 24, 10),
       decoration: BoxDecoration(
-        color: const Color(0xFF0E1015),
+        color: DesktopTheme.isDark ? const Color(0xFF0E1015) : const Color(0xFFF8FAFC),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: const Color(0xFF242934)),
+        border: Border.all(color: DesktopTheme.borderSubtle),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -371,19 +419,20 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           Container(
             height: 30,
             padding: const EdgeInsets.symmetric(horizontal: 12),
-            decoration: const BoxDecoration(
-              color: Color(0xFF16181F),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(9)),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurfaceElevated,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(9)),
+              border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
             ),
             child: Row(
               children: [
                 const Icon(FontAwesomeIcons.terminal, size: 11, color: Color(0xFF00D2FF)),
                 const SizedBox(width: 8),
-                Text(DesktopI18n.terminalConsole, style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white)),
+                Text(DesktopI18n.terminalConsole, style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textPrimary)),
                 const Spacer(),
                 InkWell(
                   onTap: () => widget.controller.isTerminalOpen.value = false,
-                  child: const Icon(Icons.close, size: 13, color: Color(0xFF94A3B8)),
+                  child: Icon(Icons.close, size: 13, color: DesktopTheme.textMuted),
                 ),
               ],
             ),
@@ -422,12 +471,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               const SizedBox(height: 10),
               Text(
                 DesktopI18n.startNewTaskTitle,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.w400,
                   fontFamily: 'Georgia',
                   letterSpacing: 0.4,
-                  color: Colors.white,
+                  color: DesktopTheme.textPrimary,
                 ),
                 textAlign: TextAlign.center,
               ),
@@ -443,13 +492,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1B1D22),
+                    color: DesktopTheme.bgSurfaceElevated,
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFF252A33)),
+                    border: Border.all(color: DesktopTheme.borderSubtle),
                   ),
                   child: Row(
                     children: [
-                       const Icon(Icons.campaign_outlined, size: 16, color: Color(0xFF94A3B8)),
+                      Icon(Icons.campaign_outlined, size: 16, color: DesktopTheme.textMuted),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
@@ -522,24 +571,24 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         height: 110,
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
-          color: const Color(0xFF1B1D22),
+          color: DesktopTheme.bgSurfaceElevated,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: const Color(0xFF262B34)),
+          border: Border.all(color: DesktopTheme.borderSubtle),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                const Icon(Icons.nightlight_round, size: 14, color: Color(0xFF94A3B8)),
+                const Icon(Icons.nightlight_round, size: 14, color: Color(0xFF00D2FF)),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
                     title,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.bold,
-                      color: Colors.white,
+                      color: DesktopTheme.textPrimary,
                     ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
@@ -550,9 +599,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             const SizedBox(height: 8),
             Text(
               desc,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 11,
-                color: Color(0xFF8B949E),
+                color: DesktopTheme.textMuted,
                 height: 1.35,
               ),
               maxLines: 3,
@@ -570,12 +619,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   Widget _buildComposerCard({bool isHero = false}) {
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFF1E2127),
+        color: DesktopTheme.bgSurface,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFF2E333D), width: 1.2),
+        border: Border.all(color: DesktopTheme.borderSubtle, width: 1.2),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.35),
+            color: DesktopTheme.isDark ? Colors.black.withOpacity(0.35) : Colors.black.withOpacity(0.06),
             blurRadius: 24,
             offset: const Offset(0, 8),
           ),
@@ -585,7 +634,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // 1. Top inside row: Project & Branch switchers (Hero mode)
-          if (isHero)
+          if (isHero && widget.controller.activeProject.value != null && widget.controller.activeProject.value!.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(left: 14, top: 12, right: 14),
               child: Row(
@@ -610,7 +659,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   return Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF282D37),
+                      color: DesktopTheme.bgSurfaceElevated,
                       borderRadius: BorderRadius.circular(6),
                       border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
                     ),
@@ -621,12 +670,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         const SizedBox(width: 4),
                         Text(
                           att,
-                          style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white),
+                          style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
                         ),
                         const SizedBox(width: 4),
                         InkWell(
                           onTap: () => widget.controller.removeAttachment(idx),
-                          child: const Icon(Icons.close, size: 12, color: Color(0xFF94A3B8)),
+                          child: Icon(Icons.close, size: 12, color: DesktopTheme.textMuted),
                         ),
                       ],
                     ),
@@ -643,13 +692,15 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               controller: widget.controller.inputController,
               maxLines: isHero ? 4 : 3,
               minLines: isHero ? 2 : 1,
-              style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.4),
+              style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, height: 1.4),
               decoration: InputDecoration(
                 hintText: isHero
                     ? DesktopI18n.heroInputHint
                     : DesktopI18n.promptPlaceholder,
-                hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF6B7280)),
+                hintStyle: TextStyle(fontSize: 13, color: DesktopTheme.textMuted),
                 border: InputBorder.none,
+                enabledBorder: InputBorder.none,
+                focusedBorder: InputBorder.none,
                 isDense: true,
                 contentPadding: EdgeInsets.zero,
               ),
@@ -677,7 +728,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
                 // [🧠 Thought Level ⌵]
                 _buildThoughtLevelMenuButton(),
-                const SizedBox(width: 10),
+                const SizedBox(width: 8),
+
+                // [🎙️ Voice Duplex Button]
+                _buildVoiceDuplexButton(),
+                const SizedBox(width: 8),
 
                 // [↑ Send Button]
                 _buildSendButton(),
@@ -737,19 +792,19 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   const SizedBox(width: 8),
                   Text(
                     isUser ? 'You' : 'OmnesAgent',
-                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
                   ),
                   if (!isUser) ...[
                     const SizedBox(width: 8),
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF22262E),
+                        color: DesktopTheme.bgSurfaceElevated,
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
                         widget.controller.activeModel.value,
-                        style: const TextStyle(fontSize: 10, color: Color(0xFF94A3B8), fontFamily: 'Consolas'),
+                        style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted, fontFamily: 'Consolas'),
                       ),
                     ),
                   ],
@@ -762,9 +817,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 width: double.infinity,
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  color: isUser ? const Color(0xFF1B1E24) : const Color(0xFF14161A),
+                  color: isUser ? DesktopTheme.bgSurfaceElevated : DesktopTheme.bgSurface,
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: const Color(0xFF242832)),
+                  border: Border.all(color: DesktopTheme.borderSubtle),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -775,13 +830,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         padding: const EdgeInsets.all(10),
                         margin: const EdgeInsets.only(bottom: 12),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF191C22),
+                          color: DesktopTheme.bgSurfaceElevated,
                           borderRadius: BorderRadius.circular(6),
                           border: const Border(left: BorderSide(color: Color(0xFF00D2FF), width: 2.5)),
                         ),
                         child: Text(
                           msg.thinking!,
-                          style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF94A3B8)),
+                          style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textSecondary),
                         ),
                       ),
                     ],
@@ -795,9 +850,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                             margin: const EdgeInsets.only(top: 6),
                             padding: const EdgeInsets.all(8),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF191C22),
+                              color: DesktopTheme.bgSurfaceElevated,
                               borderRadius: BorderRadius.circular(4),
-                              border: Border.all(color: const Color(0xFF262A34)),
+                              border: Border.all(color: DesktopTheme.borderSubtle),
                             ),
                             child: Row(
                               children: [
@@ -805,7 +860,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                                 const SizedBox(width: 8),
                                 Text(
                                   tool.name,
-                                  style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white),
+                                  style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
                                 ),
                                 const Spacer(),
                                 Text(
@@ -823,16 +878,16 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF191C22),
+                          color: DesktopTheme.bgSurfaceElevated,
                           borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: const Color(0xFF262A34)),
+                          border: Border.all(color: DesktopTheme.borderSubtle),
                         ),
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Icon(Icons.chevron_right, size: 14, color: Color(0xFF94A3B8)),
+                            Icon(Icons.chevron_right, size: 14, color: DesktopTheme.textMuted),
                             const SizedBox(width: 4),
-                            Text('${DesktopI18n.oneFileChanged} ', style: const TextStyle(fontSize: 11, color: Color(0xFFCBD5E1))),
+                            Text('${DesktopI18n.oneFileChanged} ', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
                             const Text('+9', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
                             const Text(' -0', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFFEF4444))),
                             const SizedBox(width: 14),
@@ -840,9 +895,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                               onTap: () {},
                               child: Row(
                                 children: [
-                                  const Icon(Icons.undo, size: 12, color: Color(0xFF94A3B8)),
+                                  Icon(Icons.undo, size: 12, color: DesktopTheme.textMuted),
                                   const SizedBox(width: 4),
-                                  Text(DesktopI18n.undo, style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8))),
+                                  Text(DesktopI18n.undo, style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted)),
                                 ],
                               ),
                             ),
@@ -868,7 +923,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     if (!msg.text.contains('```')) {
       return SelectableText(
         msg.text,
-        style: const TextStyle(fontSize: 13, height: 1.5, color: Color(0xFFE2E8F0)),
+        style: TextStyle(fontSize: 13, height: 1.5, color: DesktopTheme.textPrimary),
       );
     }
 
@@ -882,7 +937,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           widgets.add(
             SelectableText(
               part.trim(),
-              style: const TextStyle(fontSize: 13, height: 1.5, color: Color(0xFFE2E8F0)),
+              style: TextStyle(fontSize: 13, height: 1.5, color: DesktopTheme.textPrimary),
             ),
           );
         }
@@ -895,18 +950,18 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           Container(
             margin: const EdgeInsets.symmetric(vertical: 8),
             decoration: BoxDecoration(
-              color: const Color(0xFF191C22),
+              color: DesktopTheme.isDark ? const Color(0xFF14171F) : const Color(0xFFF1F5F9),
               borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF282F3B)),
+              border: Border.all(color: DesktopTheme.borderSubtle),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  decoration: const BoxDecoration(
-                    color: Color(0xFF20252F),
-                    borderRadius: BorderRadius.vertical(top: Radius.circular(7)),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.isDark ? const Color(0xFF1B1E28) : const Color(0xFFE2E8F0),
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(7)),
                   ),
                   child: Row(
                     children: [
@@ -914,7 +969,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       const SizedBox(width: 8),
                       Text(
                         lang,
-                        style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFFCBD5E1)),
+                        style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
                       ),
                       const Spacer(),
                       InkWell(
@@ -924,9 +979,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                             SnackBar(content: Text(DesktopI18n.commandCopied), duration: const Duration(seconds: 1)),
                           );
                         },
-                        child: const Padding(
-                          padding: EdgeInsets.all(2),
-                          child: Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(2),
+                          child: Icon(Icons.copy, size: 13, color: DesktopTheme.textMuted),
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -934,9 +989,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         onTap: () {
                           widget.controller.isTerminalOpen.value = true;
                         },
-                        child: const Padding(
-                          padding: EdgeInsets.all(2),
-                          child: Icon(Icons.play_arrow_outlined, size: 16, color: Color(0xFF94A3B8)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(2),
+                          child: Icon(Icons.play_arrow_outlined, size: 16, color: DesktopTheme.textMuted),
                         ),
                       ),
                     ],
@@ -946,7 +1001,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   padding: const EdgeInsets.all(12),
                   child: SelectableText(
                     codeBody,
-                    style: const TextStyle(fontSize: 12, fontFamily: 'Consolas', color: Color(0xFFE2E8F0)),
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'Consolas',
+                      color: DesktopTheme.isDark ? const Color(0xFFE2E8F0) : const Color(0xFF0F172A),
+                    ),
                   ),
                 ),
               ],
@@ -1282,47 +1341,67 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
+  Widget _buildVoiceDuplexButton() {
+    return Obx(() {
+      final active = widget.controller.isVoiceDuplexActive.value;
+      return IconButton(
+        icon: Icon(
+          active ? Icons.mic : Icons.mic_none,
+          size: 18,
+          color: active ? Colors.redAccent : DesktopTheme.textMuted,
+        ),
+        tooltip: active ? 'Голосовой дуплекс активен (нажмите для остановки)' : 'Голосовой дуплекс (микрофон + синтез речи)',
+        onPressed: widget.controller.toggleVoiceDuplex,
+        splashRadius: 18,
+      );
+    });
+  }
+
   // Helpers
   Widget _buildProjectChip() {
+    final proj = widget.controller.activeProject.value ?? '';
+    if (proj.isEmpty) return const SizedBox.shrink();
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: const Color(0xFF20242D),
+        color: DesktopTheme.bgSurfaceElevated,
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFF2C323E)),
+        border: Border.all(color: DesktopTheme.borderSubtle),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
-        children: const [
-          Icon(Icons.folder_outlined, size: 12, color: Color(0xFF00D2FF)),
-          SizedBox(width: 6),
-          Text('deepseek-harness-mas...', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white)),
-          SizedBox(width: 4),
-          Icon(Icons.keyboard_arrow_down, size: 13, color: Color(0xFF94A3B8)),
+        children: [
+          const Icon(Icons.folder_outlined, size: 12, color: Color(0xFF00D2FF)),
+          const SizedBox(width: 6),
+          Text(proj, style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textPrimary)),
+          const SizedBox(width: 4),
+          Icon(Icons.keyboard_arrow_down, size: 13, color: DesktopTheme.textMuted),
         ],
       ),
     );
   }
 
   Widget _buildBranchChip() {
+    final branch = widget.controller.activeBranch.value ?? '';
+    if (branch.isEmpty) return const SizedBox.shrink();
     return InkWell(
       onTap: () => setState(() => isGitToolsOpen = !isGitToolsOpen),
       borderRadius: BorderRadius.circular(6),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
         decoration: BoxDecoration(
-          color: const Color(0xFF20242D),
+          color: DesktopTheme.bgSurfaceElevated,
           borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: isGitToolsOpen ? const Color(0xFF00D2FF) : const Color(0xFF2C323E)),
+          border: Border.all(color: isGitToolsOpen ? const Color(0xFF00D2FF) : DesktopTheme.borderSubtle),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
-          children: const [
-            Icon(FontAwesomeIcons.codeBranch, size: 10, color: Color(0xFF00D2FF)),
-            SizedBox(width: 6),
-            Text('desktop-bran...', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF00D2FF))),
-            SizedBox(width: 4),
-            Icon(Icons.keyboard_arrow_down, size: 13, color: Color(0xFF94A3B8)),
+          children: [
+            const Icon(FontAwesomeIcons.codeBranch, size: 10, color: Color(0xFF00D2FF)),
+            const SizedBox(width: 6),
+            Text(branch, style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF00D2FF))),
+            const SizedBox(width: 4),
+            Icon(Icons.keyboard_arrow_down, size: 13, color: DesktopTheme.textMuted),
           ],
         ),
       ),

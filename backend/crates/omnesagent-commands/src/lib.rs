@@ -14,6 +14,8 @@ pub enum CommandSurface {
     Tui,
     /// Command is available from message-channel ingress.
     Channel,
+    /// Command is available from the Desktop ADE client.
+    Desktop,
 }
 
 /// Stable built-in command identity.
@@ -103,6 +105,7 @@ impl CommandSurface {
             Self::Web => "web",
             Self::Tui => "tui",
             Self::Channel => "channel",
+            Self::Desktop => "desktop",
         }
     }
 }
@@ -114,8 +117,8 @@ pub struct ParsedCommandToken {
     pub command: CommandSpec,
 }
 
-const CHANNEL_ONLY: &[CommandSurface] = &[CommandSurface::Channel];
-const CHANNEL_AND_TUI: &[CommandSurface] = &[CommandSurface::Channel, CommandSurface::Tui];
+const CHANNEL_ONLY: &[CommandSurface] = &[CommandSurface::Channel, CommandSurface::Desktop];
+const CHANNEL_AND_TUI: &[CommandSurface] = &[CommandSurface::Channel, CommandSurface::Tui, CommandSurface::Desktop];
 
 static BUILTIN_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -337,6 +340,7 @@ mod tests {
         assert!(parse_command_token("/goal", CommandSurface::Web).is_none());
         assert!(parse_command_token("/goal", CommandSurface::Tui).is_none());
         assert!(parse_command_token("/goal", CommandSurface::Channel).is_some());
+        assert!(parse_command_token("/goal", CommandSurface::Desktop).is_some());
         let goal = command_by_name("/goal").expect("goal command should be registered");
         assert!(
             goal.usage.contains("start <objective>"),

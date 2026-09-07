@@ -1,11 +1,16 @@
-// Desktop Inspector Panel: OmnesAgent ADE Right Tool Canvas with Live Browser & Element Picker,
-// Integrated Terminal, Markdown/Mermaid Preview, and Side Chat (/side, /btw).
-
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
+import 'package:omnes_shared/omnes_shared.dart';
+import 'package:webview_windows/webview_windows.dart';
 import '../../theme/desktop_theme.dart';
+import '../terminal/desktop_terminal_service.dart';
 import '../workspace/task_workspace_controller.dart';
+import 'browser/desktop_webview_controller.dart';
+import 'artifacts/artifacts_viewer_controller.dart';
+import 'artifacts/diff_viewer_widget.dart';
+import 'side_chat/side_chat_controller.dart';
 
 class DesktopInspectorPanel extends StatefulWidget {
   final DesktopTaskWorkspaceController controller;
@@ -27,84 +32,109 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
     with SingleTickerProviderStateMixin {
   late TabController tabController;
 
-  // Live Browser State
-  final browserUrlController = TextEditingController(text: 'http://localhost:3000/dashboard');
+  // Real Terminal Service & Live Canvas State
+  late final DesktopTerminalService terminalService;
+  final GatewayHttpClient httpClient = GatewayHttpClient();
+  CanvasWsClient? canvasWsClient;
+  CanvasFrame? currentCanvasFrame;
+  String activeCanvasId = 'main';
+  final List<String> availableCanvases = ['main'];
+  StreamSubscription? _canvasSub;
+  bool isCanvasLoading = false;
+
+  // Live Browser State & WebView2 Controller
+  final browserUrlController = TextEditingController(text: 'http://localhost:3000');
+  late final DesktopWebviewController webviewController;
+  int browserViewportMode = 0; // 0: Desktop, 1: Tablet, 2: Mobile
   bool isElementPickerActive = false;
   String? hoveredElementSelector;
   String? selectedElementSelector;
   String? selectedElementTag;
   String? selectedElementText;
-  int browserViewportMode = 0; // 0: Desktop, 1: Tablet, 2: Mobile
+
+  // Artifacts & Diff Controller
+  late final ArtifactsViewerController artifactsController;
 
   // Terminal State
-  int selectedTerminalSession = 0;
   final terminalInputController = TextEditingController();
-  final List<String> terminalSessions = ['1: cargo test', '2: flutter analyze', '3: bash'];
-  final List<List<String>> terminalLogs = [
-    [
-      '\$ cargo test --package omnesagent-runtime',
-      '   Compiling omnesagent-runtime v0.1.0 (C:\\Projects\\Omnes-agent\\backend\\crates\\omnesagent-runtime)',
-      '   Finished test [unoptimized + debuginfo] target(s) in 1.42s',
-      '     Running unittests src\\lib.rs (target\\debug\\deps\\omnesagent_runtime-84a1.exe)',
-      '',
-      'running 18 tests',
-      'test agent::tests::test_memory_ast_provider ... ok',
-      'test runtime::tests::test_gateway_ws_connection ... ok',
-      'test security::tests::test_sop_permission_mode ... ok',
-      'test tools::tests::test_browser_element_picker ... ok',
-      'test stream::tests::test_goal_mode_iteration_divider ... ok',
-      '',
-      'test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out',
-    ],
-    [
-      '\$ flutter analyze lib/features/workspace/task_workspace_view.dart',
-      'Analyzing workspace/task_workspace_view.dart...',
-      '• No issues found! (ran in 1.1s)',
-      '',
-      '\$ flutter analyze lib/features/inspector/inspector_panel.dart',
-      'Analyzing inspector/inspector_panel.dart...',
-      '• No issues found! (ran in 0.9s)',
-    ],
-    [
-      '\$ git status --short',
-      ' M frontend/desktop/lib/features/inspector/inspector_panel.dart',
-      ' M frontend/desktop/lib/widgets/desktop_sidebar.dart',
-      ' M frontend/desktop/lib/widgets/desktop_titlebar.dart',
-      '?? frontend/desktop/assets/Logo/',
-      '',
-      '\$ echo "OmnesAgent ADE background daemon ready on 127.0.0.1:42617"',
-      'OmnesAgent ADE background daemon ready on 127.0.0.1:42617',
-    ],
-  ];
 
   // Preview State
   int previewModeIndex = 0; // 0: Markdown Report, 1: Architecture Mermaid, 2: Git Diff
 
-  // Side Chat State
+  // Side Chat State & Logic Controller
   final sideChatController = TextEditingController();
-  final List<Map<String, String>> sideMessages = [
-    {
-      'role': 'user',
-      'text': 'Как Element Picker передает селектор в Composer?',
-    },
-    {
-      'role': 'bot',
-      'text': 'При клике на DOM-узел в Live Browser извлекаются тег, селектор и текст, после чего вызывается addElementContext(...) и селектор добавляется в Composer в виде чипа-вложения.',
-    },
-  ];
+  late final SideChatController sideChatLogicController;
 
   bool showTabChooser = false;
 
   @override
   void initState() {
     super.initState();
-    final effectiveIndex = widget.initialTabIndex < 0 ? 0 : widget.initialTabIndex;
+    terminalService = DesktopTerminalService.to;
+    _initCanvas();
+
+    // Initialize WebView2 Controller
+    webviewController = DesktopWebviewController();
+    webviewController.onElementPicked = (selector, tag, text) {
+      widget.controller.addDomSelectorChip(selector);
+      setState(() {
+        selectedElementSelector = selector;
+        selectedElementTag = tag;
+        selectedElementText = text;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Селектор "$selector" добавлен в контекст Composer'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+    };
+    webviewController.initialize(initialUrl: browserUrlController.text);
+
+    // Initialize Artifacts & Side Chat
+    artifactsController = ArtifactsViewerController(httpClient: httpClient);
+    sideChatLogicController = SideChatController(httpClient: httpClient);
+
+    final effectiveIndex = widget.initialTabIndex < 0 ? 0 : widget.initialTabIndex.clamp(0, 4);
     showTabChooser = widget.initialTabIndex < 0;
     tabController = TabController(
-      length: 4,
+      length: 5,
       vsync: this,
       initialIndex: effectiveIndex,
     );
+  }
+
+  Future<void> _initCanvas() async {
+    try {
+      final list = await httpClient.getCanvasList();
+      if (list.isNotEmpty && mounted) {
+        setState(() {
+          availableCanvases.addAll(
+            list.map((e) => e['canvas_id']?.toString() ?? e['id']?.toString() ?? e['name']?.toString() ?? 'main'),
+          );
+          if (!availableCanvases.contains(activeCanvasId)) {
+            activeCanvasId = availableCanvases.first;
+          }
+        });
+      }
+    } catch (_) {}
+    _connectCanvasWs();
+  }
+
+  void _connectCanvasWs() {
+    _canvasSub?.cancel();
+    canvasWsClient?.disconnect();
+    canvasWsClient = CanvasWsClient(canvasId: activeCanvasId);
+    _canvasSub = canvasWsClient!.stream.listen((frame) {
+      if (mounted) {
+        setState(() {
+          currentCanvasFrame = frame;
+        });
+      }
+    });
+    canvasWsClient!.connect();
   }
 
   @override
@@ -113,6 +143,12 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
     browserUrlController.dispose();
     terminalInputController.dispose();
     sideChatController.dispose();
+    webviewController.dispose();
+    artifactsController.dispose();
+    sideChatLogicController.dispose();
+    _canvasSub?.cancel();
+    canvasWsClient?.dispose();
+    httpClient.dispose();
     super.dispose();
   }
 
@@ -161,6 +197,11 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                       ),
                       Tab(
                         iconMargin: EdgeInsets.only(bottom: 2),
+                        icon: Icon(FontAwesomeIcons.wandMagicSparkles, size: 13),
+                        text: 'Canvas',
+                      ),
+                      Tab(
+                        iconMargin: EdgeInsets.only(bottom: 2),
                         icon: Icon(FontAwesomeIcons.eye, size: 13),
                         text: 'Preview',
                       ),
@@ -196,6 +237,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                     children: [
                       _buildLiveBrowserTab(),
                       _buildTerminalTab(),
+                      _buildCanvasTab(),
                       _buildPreviewTab(),
                       _buildSideChatTab(),
                     ],
@@ -239,18 +281,29 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
               onTap: () {
                 setState(() {
                   showTabChooser = false;
-                  tabController.animateTo(3); // Side Chat
+                  tabController.animateTo(4); // Side Chat
                 });
               },
             ),
             const SizedBox(height: 12),
             _buildChooserCard(
               icon: Icons.assignment_outlined,
-              label: 'Review',
+              label: 'Review & Diff',
               onTap: () {
                 setState(() {
                   showTabChooser = false;
-                  tabController.animateTo(2); // Preview / Review
+                  tabController.animateTo(3); // Preview / Review
+                });
+              },
+            ),
+            const SizedBox(height: 12),
+            _buildChooserCard(
+              icon: FontAwesomeIcons.wandMagicSparkles,
+              label: 'Live Canvas (A2UI)',
+              onTap: () {
+                setState(() {
+                  showTabChooser = false;
+                  tabController.animateTo(2); // Canvas
                 });
               },
             ),
@@ -320,705 +373,773 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   // TAB 1: LIVE BROWSER & ELEMENT PICKER
   // ==========================================
   Widget _buildLiveBrowserTab() {
-    return Column(
-      children: [
-        // Address bar and controls
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
-            border: Border(
-              bottom: BorderSide(color: DesktopTheme.borderSubtle),
-            ),
-          ),
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  // Back / Forward / Refresh
-                  Icon(Icons.arrow_back, size: 15, color: DesktopTheme.textMuted),
-                  const SizedBox(width: 6),
-                  Icon(Icons.arrow_forward, size: 15, color: DesktopTheme.textMuted.withOpacity(0.4)),
-                  const SizedBox(width: 8),
-                  InkWell(
-                    onTap: () {
-                      setState(() {
-                        selectedElementSelector = null;
-                      });
-                    },
-                    borderRadius: BorderRadius.circular(4),
-                    child: Icon(Icons.refresh, size: 16, color: DesktopTheme.textSecondary),
-                  ),
-                  const SizedBox(width: 8),
+    return AnimatedBuilder(
+      animation: webviewController,
+      builder: (context, _) {
+        final isInitialized = webviewController.isInitialized;
+        final isPickerActive = webviewController.isPickerActive;
+        final selected = selectedElementSelector ?? webviewController.selectedSelector;
 
-                  // URL Input Bar
-                  Expanded(
-                    child: Container(
-                      height: 28,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      decoration: BoxDecoration(
-                        color: DesktopTheme.bgCanvas,
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: DesktopTheme.borderSubtle),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.lock_outline, size: 12, color: DesktopTheme.statusSuccess),
-                          const SizedBox(width: 6),
-                          Expanded(
-                            child: TextField(
-                              controller: browserUrlController,
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontFamily: 'Consolas',
-                                color: DesktopTheme.textPrimary,
-                              ),
-                              decoration: const InputDecoration(
-                                isDense: true,
-                                border: InputBorder.none,
-                                contentPadding: EdgeInsets.zero,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-
-                  // Viewport toggles: Desktop / Mobile
-                  InkWell(
-                    onTap: () => setState(() => browserViewportMode = (browserViewportMode + 1) % 3),
-                    borderRadius: BorderRadius.circular(4),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: DesktopTheme.bgSurfaceElevated,
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: DesktopTheme.borderSubtle),
-                      ),
-                      child: Icon(
-                        browserViewportMode == 0
-                            ? Icons.desktop_windows
-                            : (browserViewportMode == 1 ? Icons.tablet : Icons.smartphone),
-                        size: 14,
-                        color: DesktopTheme.accentSky,
-                      ),
-                    ),
-                  ),
-                ],
+        return Column(
+          children: [
+            // Address bar and controls
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurface,
+                border: Border(
+                  bottom: BorderSide(color: DesktopTheme.borderSubtle),
+                ),
               ),
-              const SizedBox(height: 8),
-
-              // Element Picker Toolbar Strip
-              Row(
+              child: Column(
                 children: [
-                  // Crosshair Button
-                  InkWell(
-                    onTap: () {
-                      setState(() {
-                        isElementPickerActive = !isElementPickerActive;
-                        if (!isElementPickerActive) {
-                          hoveredElementSelector = null;
-                        }
-                      });
-                    },
-                    borderRadius: BorderRadius.circular(5),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: isElementPickerActive
-                            ? DesktopTheme.accentSky.withOpacity(0.18)
-                            : DesktopTheme.bgCanvas,
-                        borderRadius: BorderRadius.circular(5),
-                        border: Border.all(
-                          color: isElementPickerActive
-                              ? DesktopTheme.accentSky
-                              : DesktopTheme.borderSubtle,
-                          width: 1.2,
+                  Row(
+                    children: [
+                      // Back / Forward / Refresh
+                      InkWell(
+                        onTap: isInitialized ? () => webviewController.reload() : null,
+                        child: Icon(Icons.arrow_back, size: 15, color: DesktopTheme.textMuted),
+                      ),
+                      const SizedBox(width: 6),
+                      Icon(Icons.arrow_forward, size: 15, color: DesktopTheme.textMuted.withOpacity(0.4)),
+                      const SizedBox(width: 8),
+                      InkWell(
+                        onTap: () {
+                          if (isInitialized) {
+                            webviewController.reload();
+                          } else {
+                            webviewController.initialize(initialUrl: browserUrlController.text);
+                          }
+                          setState(() {
+                            selectedElementSelector = null;
+                          });
+                        },
+                        borderRadius: BorderRadius.circular(4),
+                        child: Icon(Icons.refresh, size: 16, color: DesktopTheme.textSecondary),
+                      ),
+                      const SizedBox(width: 8),
+
+                      // URL Input Bar
+                      Expanded(
+                        child: Container(
+                          height: 28,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          decoration: BoxDecoration(
+                            color: DesktopTheme.bgCanvas,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: DesktopTheme.borderSubtle),
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                isInitialized ? Icons.lock_outline : Icons.cloud_queue,
+                                size: 12,
+                                color: isInitialized ? DesktopTheme.statusSuccess : DesktopTheme.textMuted,
+                              ),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: TextField(
+                                  controller: browserUrlController,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontFamily: 'Consolas',
+                                    color: DesktopTheme.textPrimary,
+                                  ),
+                                  decoration: const InputDecoration(
+                                    isDense: true,
+                                    border: InputBorder.none,
+                                    contentPadding: EdgeInsets.zero,
+                                  ),
+                                  onSubmitted: (url) {
+                                    if (isInitialized) {
+                                      webviewController.loadUrl(url);
+                                    } else {
+                                      webviewController.initialize(initialUrl: url);
+                                    }
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
-                      child: Row(
+                      const SizedBox(width: 8),
+
+                      // Viewport toggles: Desktop / Mobile
+                      InkWell(
+                        onTap: () => setState(() => browserViewportMode = (browserViewportMode + 1) % 3),
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: DesktopTheme.bgSurfaceElevated,
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: DesktopTheme.borderSubtle),
+                          ),
+                          child: Icon(
+                            browserViewportMode == 0
+                                ? Icons.desktop_windows
+                                : (browserViewportMode == 1 ? Icons.tablet : Icons.smartphone),
+                            size: 14,
+                            color: DesktopTheme.accentSky,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Element Picker Toolbar Strip
+                  Row(
+                    children: [
+                      // Crosshair Button
+                      InkWell(
+                        onTap: () {
+                          if (isInitialized) {
+                            webviewController.toggleElementPicker();
+                          } else {
+                            setState(() {
+                              isElementPickerActive = !isElementPickerActive;
+                              if (!isElementPickerActive) {
+                                hoveredElementSelector = null;
+                              }
+                            });
+                          }
+                        },
+                        borderRadius: BorderRadius.circular(5),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: (isPickerActive || isElementPickerActive)
+                                ? DesktopTheme.accentSky.withOpacity(0.18)
+                                : DesktopTheme.bgCanvas,
+                            borderRadius: BorderRadius.circular(5),
+                            border: Border.all(
+                              color: (isPickerActive || isElementPickerActive)
+                                  ? DesktopTheme.accentSky
+                                  : DesktopTheme.borderSubtle,
+                              width: 1.2,
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                FontAwesomeIcons.crosshairs,
+                                size: 12,
+                                color: (isPickerActive || isElementPickerActive)
+                                    ? DesktopTheme.accentSky
+                                    : DesktopTheme.textMuted,
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                (isPickerActive || isElementPickerActive)
+                                    ? 'Element Picker Active'
+                                    : 'Pick Element',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                  color: (isPickerActive || isElementPickerActive)
+                                      ? DesktopTheme.accentSky
+                                      : DesktopTheme.textSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      if (webviewController.isLoading)
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: DesktopTheme.accentSky.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text(
+                            'LOADING...',
+                            style: TextStyle(
+                              fontSize: 9,
+                              fontFamily: 'Consolas',
+                              fontWeight: FontWeight.bold,
+                              color: DesktopTheme.accentSky,
+                            ),
+                          ),
+                        ),
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: isInitialized
+                              ? DesktopTheme.statusSuccess.withOpacity(0.1)
+                              : DesktopTheme.statusWarning.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          isInitialized ? 'EDGE WEBVIEW2 · 60 FPS' : 'STANDBY MODE',
+                          style: TextStyle(
+                            fontSize: 9,
+                            fontFamily: 'Consolas',
+                            fontWeight: FontWeight.bold,
+                            color: isInitialized
+                                ? DesktopTheme.statusSuccess
+                                : DesktopTheme.statusWarning,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            // Live Webview Viewport / Simulator
+            Expanded(
+              child: Container(
+                color: DesktopTheme.bgCanvas,
+                child: Center(
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    width: browserViewportMode == 0
+                        ? double.infinity
+                        : (browserViewportMode == 1 ? 380 : 310),
+                    margin: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: DesktopTheme.borderMedium, width: 1.5),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.2),
+                          blurRadius: 16,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(7),
+                      child: isInitialized
+                          ? Webview(webviewController.rawController)
+                          : _buildBrowserStandbyView(),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // Picked Element Details & Inject Button
+            if (selected != null)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: DesktopTheme.bgSurface,
+                  border: Border(top: BorderSide(color: DesktopTheme.borderSubtle)),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(
-                            FontAwesomeIcons.crosshairs,
-                            size: 12,
-                            color: isElementPickerActive
-                                ? DesktopTheme.accentSky
-                                : DesktopTheme.textMuted,
+                          Row(
+                            children: [
+                              const Icon(Icons.check_circle, size: 13, color: DesktopTheme.accentSky),
+                              const SizedBox(width: 6),
+                              Text(
+                                'Element Selected:',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                  color: DesktopTheme.textPrimary,
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                '<${selectedElementTag ?? 'el'}>',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontFamily: 'Consolas',
+                                  color: DesktopTheme.accentCyan,
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(width: 6),
+                          const SizedBox(height: 2),
                           Text(
-                            isElementPickerActive ? 'Element Picker Active' : 'Pick Element',
+                            selected,
                             style: TextStyle(
                               fontSize: 11,
-                              fontWeight: FontWeight.bold,
-                              color: isElementPickerActive
-                                  ? DesktopTheme.accentSky
-                                  : DesktopTheme.textSecondary,
+                              fontFamily: 'Consolas',
+                              color: DesktopTheme.textSecondary,
                             ),
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ],
                       ),
                     ),
-                  ),
-                  const Spacer(),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: DesktopTheme.statusSuccess.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: const Text(
-                      'DOM READY · 60 FPS',
-                      style: TextStyle(
-                        fontSize: 9,
-                        fontFamily: 'Consolas',
-                        fontWeight: FontWeight.bold,
-                        color: DesktopTheme.statusSuccess,
+                    ElevatedButton.icon(
+                      onPressed: () {
+                        widget.controller.addElementContext(
+                          selector: selected,
+                          text: selectedElementText ?? '',
+                          tag: selectedElementTag ?? 'div',
+                        );
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('Селектор "$selected" добавлен в контекст задачи'),
+                            duration: const Duration(seconds: 2),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.add, size: 14),
+                      label: const Text('Add to Composer', style: TextStyle(fontSize: 11)),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: DesktopTheme.accentSky,
+                        foregroundColor: const Color(0xFF090D12),
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                       ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-
-        // Live Webview Viewport / Simulator
-        Expanded(
-          child: Container(
-            color: DesktopTheme.bgCanvas,
-            child: Center(
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 200),
-                width: browserViewportMode == 0
-                    ? double.infinity
-                    : (browserViewportMode == 1 ? 380 : 310),
-                margin: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: DesktopTheme.borderMedium, width: 1.5),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.2),
-                      blurRadius: 16,
-                      offset: const Offset(0, 4),
                     ),
                   ],
                 ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(7),
-                  child: Column(
-                    children: [
-                      // Simulated Web Page Header
-                      _buildSimulatedElement(
-                        tag: 'header',
-                        selector: 'header.navbar-main',
-                        text: 'OmnesAgent Web Dashboard',
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                          color: const Color(0xFF0F172A),
-                          child: Row(
-                            children: [
-                              const Icon(Icons.bolt, color: Color(0xFF00D2FF), size: 16),
-                              const SizedBox(width: 8),
-                              const Text(
-                                'OmnesAgent Web',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                              const Spacer(),
-                              _buildSimulatedElement(
-                                tag: 'a',
-                                selector: 'a.nav-link-docs',
-                                text: 'Docs',
-                                child: const Text(
-                                  'Docs',
-                                  style: TextStyle(color: Color(0xFF94A3B8), fontSize: 11),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              _buildSimulatedElement(
-                                tag: 'button',
-                                selector: 'button.btn-sign-in',
-                                text: 'Sign In',
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFF00D2FF),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: const Text(
-                                    'Sign In',
-                                    style: TextStyle(
-                                      color: Color(0xFF090D12),
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-
-                      // Simulated Web Page Hero Body
-                      Expanded(
-                        child: Container(
-                          color: const Color(0xFFF8FAFC),
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _buildSimulatedElement(
-                                tag: 'h1',
-                                selector: 'h1.hero-title',
-                                text: 'Agentic Development Environment',
-                                child: const Text(
-                                  'Agentic Development\nEnvironment',
-                                  style: TextStyle(
-                                    fontSize: 17,
-                                    fontWeight: FontWeight.w800,
-                                    color: Color(0xFF0F172A),
-                                    height: 1.2,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              _buildSimulatedElement(
-                                tag: 'p',
-                                selector: 'p.hero-subtitle',
-                                text: 'Autonomous coding agent powered by OmnesAgent ADE architecture.',
-                                child: const Text(
-                                  'Autonomous coding agent powered by OmnesAgent ADE architecture and multimodal visual inspection.',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: Color(0xFF64748B),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-
-                              // Simulated Action Button
-                              _buildSimulatedElement(
-                                tag: 'button',
-                                selector: 'button.action-btn-primary',
-                                text: 'Run Integration Tests',
-                                child: Container(
-                                  width: double.infinity,
-                                  padding: const EdgeInsets.symmetric(vertical: 8),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFF0284C7),
-                                    borderRadius: BorderRadius.circular(6),
-                                  ),
-                                  child: const Center(
-                                    child: Text(
-                                      'Run Integration Tests',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 11,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 14),
-
-                              // Simulated Code Card
-                              Expanded(
-                                child: _buildSimulatedElement(
-                                  tag: 'div',
-                                  selector: 'div.code-preview-card',
-                                  text: 'Runtime Status: Healthy',
-                                  child: Container(
-                                    width: double.infinity,
-                                    padding: const EdgeInsets.all(10),
-                                    decoration: BoxDecoration(
-                                      color: const Color(0xFF0F172A),
-                                      borderRadius: BorderRadius.circular(6),
-                                    ),
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: const [
-                                        Text(
-                                          '// omnesagent-runtime: active',
-                                          style: TextStyle(
-                                            fontSize: 10,
-                                            fontFamily: 'Consolas',
-                                            color: Color(0xFF64748B),
-                                          ),
-                                        ),
-                                        SizedBox(height: 4),
-                                        Text(
-                                          'const port = 42617;\nawait startDaemon({ mode: "ade" });',
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            fontFamily: 'Consolas',
-                                            color: Color(0xFF38BDF8),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
               ),
-            ),
-          ),
-        ),
-
-        // Picked Element Details & Inject Button
-        if (selectedElementSelector != null)
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: DesktopTheme.bgSurface,
-              border: Border(top: BorderSide(color: DesktopTheme.borderSubtle)),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Row(
-                        children: [
-                          const Icon(Icons.check_circle, size: 13, color: DesktopTheme.accentSky),
-                          const SizedBox(width: 6),
-                          Text(
-                            'Element Selected:',
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontWeight: FontWeight.bold,
-                              color: DesktopTheme.textPrimary,
-                            ),
-                          ),
-                          const SizedBox(width: 6),
-                          Text(
-                            '<$selectedElementTag>',
-                            style: const TextStyle(
-                              fontSize: 11,
-                              fontFamily: 'Consolas',
-                              color: DesktopTheme.accentCyan,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        selectedElementSelector!,
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontFamily: 'Consolas',
-                          color: DesktopTheme.textSecondary,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
-                  ),
-                ),
-                ElevatedButton.icon(
-                  onPressed: () {
-                    widget.controller.addElementContext(
-                      selector: selectedElementSelector!,
-                      text: selectedElementText ?? '',
-                      tag: selectedElementTag ?? 'div',
-                    );
-                    Get.snackbar(
-                      'Element Injected',
-                      'Селектор $selectedElementSelector добавлен в контекст Composer.',
-                      snackPosition: SnackPosition.BOTTOM,
-                      backgroundColor: DesktopTheme.bgSurfaceElevated,
-                      colorText: DesktopTheme.accentSky,
-                      duration: const Duration(seconds: 2),
-                      margin: const EdgeInsets.all(12),
-                    );
-                  },
-                  icon: const Icon(Icons.add, size: 14),
-                  label: const Text('Add to Composer', style: TextStyle(fontSize: 11)),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: DesktopTheme.accentSky,
-                    foregroundColor: const Color(0xFF090D12),
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  ),
-                ),
-              ],
-            ),
-          ),
-      ],
+          ],
+        );
+      },
     );
   }
 
-  Widget _buildSimulatedElement({
-    required String tag,
-    required String selector,
-    required String text,
-    required Widget child,
-  }) {
-    final isHovered = hoveredElementSelector == selector && isElementPickerActive;
-    final isSelected = selectedElementSelector == selector;
-
-    return MouseRegion(
-      cursor: isElementPickerActive ? SystemMouseCursors.precise : SystemMouseCursors.basic,
-      onEnter: (_) {
-        if (isElementPickerActive) {
-          setState(() => hoveredElementSelector = selector);
-        }
-      },
-      onExit: (_) {
-        if (isElementPickerActive && hoveredElementSelector == selector) {
-          setState(() => hoveredElementSelector = null);
-        }
-      },
-      child: GestureDetector(
-        onTap: () {
-          if (isElementPickerActive) {
-            setState(() {
-              selectedElementSelector = selector;
-              selectedElementTag = tag;
-              selectedElementText = text;
-              isElementPickerActive = false;
-            });
-          }
-        },
-        child: Stack(
-          clipBehavior: Clip.none,
+  Widget _buildBrowserStandbyView() {
+    return Container(
+      color: const Color(0xFF0F172A),
+      padding: const EdgeInsets.all(24),
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Container(
-              decoration: BoxDecoration(
-                border: Border.all(
-                  color: isSelected
-                      ? const Color(0xFF0284C7)
-                      : (isHovered ? const Color(0xFF00D2FF) : Colors.transparent),
-                  width: (isSelected || isHovered) ? 2.0 : 0.0,
-                ),
-              ),
-              child: child,
+            const Icon(FontAwesomeIcons.globe, size: 36, color: Color(0xFF00D2FF)),
+            const SizedBox(height: 16),
+            const Text(
+              'Microsoft Edge WebView2',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
             ),
-            if (isHovered || isSelected)
-              Positioned(
-                top: -16,
-                left: 0,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                  decoration: BoxDecoration(
-                    color: isSelected ? const Color(0xFF0284C7) : const Color(0xFF00D2FF),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                  child: Text(
-                    selector,
-                    style: const TextStyle(
-                      fontSize: 9,
-                      fontFamily: 'Consolas',
-                      fontWeight: FontWeight.bold,
-                      color: Colors.black,
-                    ),
-                  ),
-                ),
+            const SizedBox(height: 8),
+            Text(
+              'Встроенный браузер для живого предпросмотра веб-приложений и захвата DOM-элементов.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+            ),
+            const SizedBox(height: 20),
+            ElevatedButton.icon(
+              onPressed: () {
+                webviewController.initialize(initialUrl: browserUrlController.text);
+              },
+              icon: const Icon(Icons.play_arrow, size: 16),
+              label: const Text('Запустить WebView2'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF00D2FF),
+                foregroundColor: const Color(0xFF090D12),
               ),
+            ),
           ],
         ),
       ),
     );
   }
 
+
+
   // ==========================================
-  // TAB 2: TERMINAL & GIT (Dark Slate Container)
+  // TAB 2: TERMINAL & GIT (Real Process Terminal)
   // ==========================================
   Widget _buildTerminalTab() {
     return Container(
-      color: const Color(0xFF0F172A), // Always dark slate for code legibility
-      child: Column(
-        children: [
-          // Terminal Session Tabs Strip
-          Container(
-            height: 34,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            decoration: const BoxDecoration(
-              color: Color(0xFF0B101E),
-              border: Border(
-                bottom: BorderSide(color: Color(0xFF1E293B)),
+      color: const Color(0xFF0F172A),
+      child: Obx(() {
+        final sessions = terminalService.sessions;
+        final activeIdx = terminalService.activeSessionIndex.value;
+        final activeSession = terminalService.activeSession;
+
+        return Column(
+          children: [
+            // Terminal Session Tabs Strip
+            Container(
+              height: 36,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              decoration: const BoxDecoration(
+                color: Color(0xFF0B101E),
+                border: Border(bottom: BorderSide(color: Color(0xFF1E293B))),
               ),
-            ),
-            child: Row(
-              children: [
-                for (int i = 0; i < terminalSessions.length; i++)
-                  InkWell(
-                    onTap: () => setState(() => selectedTerminalSession = i),
-                    borderRadius: BorderRadius.circular(4),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      margin: const EdgeInsets.only(right: 6),
-                      decoration: BoxDecoration(
-                        color: selectedTerminalSession == i
-                            ? const Color(0xFF1E293B)
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(
-                          color: selectedTerminalSession == i
-                              ? const Color(0xFF38BDF8)
-                              : Colors.transparent,
-                          width: 0.8,
+              child: Row(
+                children: [
+                  for (int i = 0; i < sessions.length; i++)
+                    InkWell(
+                      onTap: () => terminalService.activeSessionIndex.value = i,
+                      borderRadius: BorderRadius.circular(4),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        margin: const EdgeInsets.only(right: 6),
+                        decoration: BoxDecoration(
+                          color: activeIdx == i ? const Color(0xFF1E293B) : Colors.transparent,
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(
+                            color: activeIdx == i ? const Color(0xFF38BDF8) : Colors.transparent,
+                            width: 0.8,
+                          ),
                         ),
-                      ),
-                      child: Text(
-                        terminalSessions[i],
-                        style: TextStyle(
-                          fontSize: 10,
-                          fontFamily: 'Consolas',
-                          fontWeight: selectedTerminalSession == i
-                              ? FontWeight.bold
-                              : FontWeight.normal,
-                          color: selectedTerminalSession == i
-                              ? const Color(0xFF38BDF8)
-                              : const Color(0xFF94A3B8),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              sessions[i].title,
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontFamily: 'Consolas',
+                                fontWeight: activeIdx == i ? FontWeight.bold : FontWeight.normal,
+                                color: activeIdx == i ? const Color(0xFF38BDF8) : const Color(0xFF94A3B8),
+                              ),
+                            ),
+                            if (sessions.length > 1) ...[
+                              const SizedBox(width: 4),
+                              InkWell(
+                                onTap: () => terminalService.closeSession(i),
+                                child: const Icon(Icons.close, size: 10, color: Color(0xFF64748B)),
+                              ),
+                            ],
+                          ],
                         ),
                       ),
                     ),
+                  IconButton(
+                    tooltip: 'Новая консоль (powershell)',
+                    icon: const Icon(Icons.add, size: 14, color: Color(0xFF38BDF8)),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                    onPressed: () => terminalService.startNewSession(),
                   ),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: 'Прервать (Ctrl+C)',
+                    icon: const Icon(Icons.stop_circle_outlined, size: 13, color: Color(0xFFF87171)),
+                    onPressed: () => terminalService.interruptActiveSession(),
+                  ),
+                  IconButton(
+                    tooltip: 'Очистить вывод',
+                    icon: const Icon(FontAwesomeIcons.trashCan, size: 11, color: Color(0xFF64748B)),
+                    onPressed: () => terminalService.clearActiveSession(),
+                  ),
+                ],
+              ),
+            ),
+
+            // Terminal Output Log
+            Expanded(
+              child: activeSession == null
+                  ? const Center(child: Text('Нет активных сессий консоли', style: TextStyle(color: Color(0xFF64748B))))
+                  : ListView.builder(
+                      padding: const EdgeInsets.all(12),
+                      itemCount: activeSession.lines.length,
+                      itemBuilder: (context, index) {
+                        final line = activeSession.lines[index];
+                        Color lineColor = const Color(0xFFE2E8F0);
+                        FontWeight fontWeight = FontWeight.normal;
+
+                        if (line.startsWith('>') || line.startsWith('\$')) {
+                          lineColor = const Color(0xFF38BDF8);
+                          fontWeight = FontWeight.bold;
+                        } else if (line.contains('ok') || line.contains('No issues found') || line.contains('passed')) {
+                          lineColor = const Color(0xFF34D399);
+                        } else if (line.contains('error') || line.contains('failed') || line.contains('[STDERR]')) {
+                          lineColor = const Color(0xFFF87171);
+                        } else if (line.contains('Compiling') || line.contains('Analyzing')) {
+                          lineColor = const Color(0xFFFBBF24);
+                        }
+
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 1.5),
+                          child: SelectableText(
+                            line,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontFamily: 'Consolas',
+                              color: lineColor,
+                              fontWeight: fontWeight,
+                              height: 1.35,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+
+            // Quick command chips
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: const BoxDecoration(
+                color: Color(0xFF0B101E),
+                border: Border(top: BorderSide(color: Color(0xFF1E293B))),
+              ),
+              child: Row(
+                children: [
+                  _buildQuickCommandChip('cargo test', () => terminalService.sendCommand('cargo test')),
+                  const SizedBox(width: 6),
+                  _buildQuickCommandChip('flutter analyze', () => terminalService.sendCommand('flutter analyze')),
+                  const SizedBox(width: 6),
+                  _buildQuickCommandChip('git status', () => terminalService.sendCommand('git status')),
+                ],
+              ),
+            ),
+
+            // Terminal Input Prompt
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              color: const Color(0xFF070A12),
+              child: Row(
+                children: [
+                  const Text(
+                    '> ',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontFamily: 'Consolas',
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF38BDF8),
+                    ),
+                  ),
+                  Expanded(
+                    child: TextField(
+                      controller: terminalInputController,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'Consolas',
+                        color: Colors.white,
+                      ),
+                      decoration: const InputDecoration(
+                        hintText: 'Введите команду shell (powershell / cmd)...',
+                        hintStyle: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+                        isDense: true,
+                        border: InputBorder.none,
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                      onSubmitted: (cmd) {
+                        if (cmd.trim().isEmpty) return;
+                        terminalService.sendCommand(cmd.trim());
+                        terminalInputController.clear();
+                      },
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.send, size: 14, color: Color(0xFF38BDF8)),
+                    tooltip: 'Отправить',
+                    onPressed: () {
+                      final cmd = terminalInputController.text.trim();
+                      if (cmd.isNotEmpty) {
+                        terminalService.sendCommand(cmd);
+                        terminalInputController.clear();
+                      }
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      }),
+    );
+  }
+
+  // ==========================================
+  // TAB 3: LIVE CANVAS (A2UI & Artifacts)
+  // ==========================================
+  Widget _buildCanvasTab() {
+    final frame = currentCanvasFrame;
+    final isWsConnected = canvasWsClient?.isConnected == true;
+
+    return Container(
+      color: DesktopTheme.bgCanvas,
+      child: Column(
+        children: [
+          // Canvas Top Bar
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurface,
+              border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: isWsConnected ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Canvas: $activeCanvasId',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: 'Consolas',
+                    color: DesktopTheme.textPrimary,
+                  ),
+                ),
+                if (frame != null) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: DesktopTheme.accentCyan.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      '${frame.contentType} v${frame.version}',
+                      style: const TextStyle(fontSize: 10, fontFamily: 'Consolas', color: DesktopTheme.accentCyan),
+                    ),
+                  ),
+                ],
                 const Spacer(),
                 IconButton(
-                  tooltip: 'Clear terminal output',
-                  icon: const Icon(FontAwesomeIcons.trashCan, size: 11, color: Color(0xFF64748B)),
-                  onPressed: () {
-                    setState(() {
-                      terminalLogs[selectedTerminalSession].clear();
-                    });
+                  icon: const Icon(Icons.refresh, size: 14),
+                  color: DesktopTheme.textMuted,
+                  tooltip: 'Обновить холст',
+                  onPressed: () async {
+                    final res = await httpClient.getCanvas(activeCanvasId);
+                    if (res != null && res['frame'] != null && mounted) {
+                      setState(() {
+                        currentCanvasFrame = CanvasFrame.fromJson(res['frame'] as Map<String, dynamic>);
+                      });
+                    }
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(FontAwesomeIcons.trashCan, size: 12),
+                  color: DesktopTheme.textMuted,
+                  tooltip: 'Очистить холст',
+                  onPressed: () async {
+                    await httpClient.clearCanvas(activeCanvasId);
+                    if (mounted) setState(() => currentCanvasFrame = null);
                   },
                 ),
               ],
             ),
           ),
 
-          // Terminal Output Log
+          // Canvas Content View
           Expanded(
-            child: ListView.builder(
-              padding: const EdgeInsets.all(12),
-              itemCount: terminalLogs[selectedTerminalSession].length,
-              itemBuilder: (context, index) {
-                final line = terminalLogs[selectedTerminalSession][index];
-                Color lineColor = const Color(0xFFE2E8F0);
-                FontWeight fontWeight = FontWeight.normal;
-
-                if (line.startsWith('\$')) {
-                  lineColor = const Color(0xFF38BDF8); // Cyan prompt
-                  fontWeight = FontWeight.bold;
-                } else if (line.contains('ok') || line.contains('No issues found') || line.contains('passed')) {
-                  lineColor = const Color(0xFF34D399); // Emerald success
-                } else if (line.contains('error') || line.contains('failed')) {
-                  lineColor = const Color(0xFFF87171); // Red error
-                } else if (line.contains('Compiling') || line.contains('Analyzing')) {
-                  lineColor = const Color(0xFFFBBF24); // Amber status
-                }
-
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 1.5),
-                  child: SelectableText(
-                    line,
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontFamily: 'Consolas',
-                      color: lineColor,
-                      fontWeight: fontWeight,
-                      height: 1.35,
+            child: frame == null
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(FontAwesomeIcons.wandMagicSparkles, size: 36, color: DesktopTheme.accentCyan.withOpacity(0.6)),
+                          const SizedBox(height: 14),
+                          Text(
+                            'Live Canvas пуст',
+                            style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Агент может транслировать сюда интерактивные A2UI формы, графики, HTML и диаграммы через /ws/canvas.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+                          ),
+                          const SizedBox(height: 20),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              OutlinedButton.icon(
+                                icon: const Icon(FontAwesomeIcons.code, size: 11),
+                                label: const Text('Демо HTML формы', style: TextStyle(fontSize: 11)),
+                                onPressed: () async {
+                                  await httpClient.postCanvas(activeCanvasId, {
+                                    'content_type': 'html',
+                                    'content': '<form class="omnes-a2ui"><label>Параметры деплоя:</label><input type="text" value="v1.0.0-rc2" /><button>Подтвердить</button></form>',
+                                  });
+                                },
+                              ),
+                              OutlinedButton.icon(
+                                icon: const Icon(FontAwesomeIcons.diagramProject, size: 11),
+                                label: const Text('Демо Mermaid схемы', style: TextStyle(fontSize: 11)),
+                                onPressed: () async {
+                                  await httpClient.postCanvas(activeCanvasId, {
+                                    'content_type': 'markdown',
+                                    'content': '```mermaid\ngraph LR\nClient[Omnes Desktop ADE] -->|WS/chat| Gateway\nGateway --> Runtime\nGateway --> Canvas\n```',
+                                  });
+                                },
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                : SingleChildScrollView(
+                    padding: const EdgeInsets.all(16),
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: DesktopTheme.bgSurfaceElevated,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: DesktopTheme.borderSubtle),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                frame.contentType == 'html' ? FontAwesomeIcons.code : FontAwesomeIcons.diagramProject,
+                                size: 14,
+                                color: DesktopTheme.accentCyan,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                'A2UI Live Artifact (${frame.contentType})',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  color: DesktopTheme.textPrimary,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const Divider(height: 20),
+                          SelectableText(
+                            frame.content,
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontFamily: 'Consolas',
+                              color: DesktopTheme.textPrimary,
+                              height: 1.45,
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          Row(
+                            children: [
+                              ElevatedButton.icon(
+                                icon: const Icon(Icons.touch_app, size: 13),
+                                label: const Text('Отправить действие (Action callback)', style: TextStyle(fontSize: 11)),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: DesktopTheme.accentCyan,
+                                  foregroundColor: Colors.black,
+                                ),
+                                onPressed: () {
+                                  canvasWsClient?.sendAction('submit', {'canvas_id': activeCanvasId});
+                                  Get.snackbar('Canvas Action', 'Действие отправлено в шлюз через WS');
+                                },
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                );
-              },
-            ),
-          ),
-
-          // Terminal Quick Action Bar
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            decoration: const BoxDecoration(
-              color: Color(0xFF0B101E),
-              border: Border(top: BorderSide(color: Color(0xFF1E293B))),
-            ),
-            child: Row(
-              children: [
-                _buildQuickCommandChip('cargo test', () {
-                  setState(() {
-                    terminalLogs[0].add('\$ cargo test');
-                    terminalLogs[0].add('test result: ok. All tests passing.');
-                  });
-                }),
-                const SizedBox(width: 6),
-                _buildQuickCommandChip('flutter analyze', () {
-                  setState(() {
-                    terminalLogs[1].add('\$ flutter analyze');
-                    terminalLogs[1].add('• 0 issues found! (ran in 0.8s)');
-                  });
-                }),
-                const SizedBox(width: 6),
-                _buildQuickCommandChip('git diff', () {
-                  setState(() {
-                    terminalLogs[2].add('\$ git diff --stat');
-                    terminalLogs[2].add(' 4 files changed, 142 insertions(+), 28 deletions(-)');
-                  });
-                }),
-              ],
-            ),
-          ),
-
-          // Terminal Input Prompt
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-            color: const Color(0xFF070A12),
-            child: Row(
-              children: [
-                const Text(
-                  '\$ ',
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontFamily: 'Consolas',
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF38BDF8),
-                  ),
-                ),
-                Expanded(
-                  child: TextField(
-                    controller: terminalInputController,
-                    style: const TextStyle(
-                      fontSize: 12,
-                      fontFamily: 'Consolas',
-                      color: Colors.white,
-                    ),
-                    decoration: const InputDecoration(
-                      hintText: 'Enter shell command...',
-                      hintStyle: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
-                      isDense: true,
-                      border: InputBorder.none,
-                      contentPadding: EdgeInsets.zero,
-                    ),
-                    onSubmitted: (cmd) {
-                      if (cmd.trim().isEmpty) return;
-                      setState(() {
-                        terminalLogs[selectedTerminalSession].add('\$ $cmd');
-                        terminalLogs[selectedTerminalSession].add('Command executed successfully.');
-                        terminalInputController.clear();
-                      });
-                    },
-                  ),
-                ),
-              ],
-            ),
           ),
         ],
       ),
@@ -1049,357 +1170,197 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   }
 
   // ==========================================
-  // TAB 3: PREVIEW (Markdown, Mermaid, Diff)
+  // TAB 3: ARTIFACTS & GIT DIFF VIEWER
   // ==========================================
   Widget _buildPreviewTab() {
-    return Column(
-      children: [
-        // Mode Selector (Markdown / Mermaid / Diff)
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
-            border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
-          ),
-          child: Row(
-            children: [
-              _buildPreviewModeButton(0, 'Markdown Report', FontAwesomeIcons.fileLines),
-              const SizedBox(width: 8),
-              _buildPreviewModeButton(1, 'Architecture Graph', FontAwesomeIcons.sitemap),
-              const SizedBox(width: 8),
-              _buildPreviewModeButton(2, 'Git Diff', FontAwesomeIcons.codeBranch),
-            ],
-          ),
-        ),
-
-        // Preview Content
-        Expanded(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(16),
-            child: previewModeIndex == 0
-                ? _buildMarkdownReportPreview()
-                : (previewModeIndex == 1
-                    ? _buildMermaidDiagramPreview()
-                    : _buildGitDiffPreview()),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildPreviewModeButton(int index, String title, IconData icon) {
-    final isSelected = previewModeIndex == index;
-    return InkWell(
-      onTap: () => setState(() => previewModeIndex = index),
-      borderRadius: BorderRadius.circular(5),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: isSelected ? DesktopTheme.accentSky.withOpacity(0.14) : Colors.transparent,
-          borderRadius: BorderRadius.circular(5),
-          border: Border.all(
-            color: isSelected ? DesktopTheme.accentSky : DesktopTheme.borderSubtle,
-          ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 11, color: isSelected ? DesktopTheme.accentSky : DesktopTheme.textMuted),
-            const SizedBox(width: 6),
-            Text(
-              title,
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                color: isSelected ? DesktopTheme.accentSky : DesktopTheme.textSecondary,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildMarkdownReportPreview() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'OmnesAgent ADE Specification v1.0',
-          style: TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.bold,
-            color: DesktopTheme.textPrimary,
-          ),
-        ),
-        const SizedBox(height: 6),
-        Text(
-          'Architectural validation report for desktop workstation client.',
-          style: TextStyle(fontSize: 12, color: DesktopTheme.textSecondary),
-        ),
-        const SizedBox(height: 14),
-
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: DesktopTheme.borderSubtle),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                '✓ Verification Results',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.statusSuccess),
-              ),
-              const SizedBox(height: 6),
-              Text('• OmnesAgent ADE workstation layout mounted', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
-              Text('• Permission Mode switcher (Shift+Tab) wired to controller', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
-              Text('• Goal Mode (/goal) tracking with iteration dividers active', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
-              Text('• Live Browser & Element Picker integration verified', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildMermaidDiagramPreview() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            const Icon(FontAwesomeIcons.sitemap, size: 14, color: DesktopTheme.accentSky),
-            const SizedBox(width: 8),
-            Text(
-              'ADE Architecture Flow (Mermaid)',
-              style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
-            ),
-          ],
-        ),
-        const SizedBox(height: 14),
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: DesktopTheme.borderSubtle),
-          ),
-          child: Column(
-            children: [
-              _buildDiagramNode('Agent Goal Mode (/goal)', DesktopTheme.accentSky),
-              Icon(Icons.arrow_downward, size: 16, color: DesktopTheme.textMuted),
-              _buildDiagramNode('AST CodeGraph & Tool Execution', DesktopTheme.statusWarning),
-              Icon(Icons.arrow_downward, size: 16, color: DesktopTheme.textMuted),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  _buildDiagramNode('Live Browser', DesktopTheme.accentCyan),
-                  const SizedBox(width: 12),
-                  _buildDiagramNode('PTY Terminal', DesktopTheme.statusSuccess),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildDiagramNode(String title, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withOpacity(0.5), width: 1.2),
-      ),
-      child: Text(
-        title,
-        style: TextStyle(
-          fontSize: 11,
-          fontWeight: FontWeight.bold,
-          color: color,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildGitDiffPreview() {
-    final diffLines = [
-      {'type': 'header', 'text': 'diff --git a/desktop_sidebar.dart b/desktop_sidebar.dart'},
-      {'type': 'header', 'text': '@@ -12,6 +12,18 @@ class DesktopSidebar'},
-      {'type': 'del', 'text': '- const oldTaskRow();'},
-      {'type': 'add', 'text': '+ _buildDiffBadge(task.addedLines, task.deletedLines);'},
-      {'type': 'add', 'text': '+ _buildGroupSegmentedSwitcher();'},
-      {'type': 'normal', 'text': '  Widget build(BuildContext context) {'},
-      {'type': 'normal', 'text': '    return Container('},
-    ];
-
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF0F172A),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: diffLines.map((l) {
-          Color bg = Colors.transparent;
-          Color text = const Color(0xFFE2E8F0);
-          if (l['type'] == 'add') {
-            bg = const Color(0xFF059669).withOpacity(0.2);
-            text = const Color(0xFF34D399);
-          } else if (l['type'] == 'del') {
-            bg = const Color(0xFFDC2626).withOpacity(0.2);
-            text = const Color(0xFFF87171);
-          } else if (l['type'] == 'header') {
-            text = const Color(0xFF38BDF8);
-          }
-
-          return Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            color: bg,
-            child: Text(
-              l['text']!,
-              style: TextStyle(
-                fontSize: 11,
-                fontFamily: 'Consolas',
-                color: text,
-              ),
-            ),
-          );
-        }).toList(),
-      ),
-    );
+    return DiffViewerWidget(controller: artifactsController);
   }
 
   // ==========================================
   // TAB 4: SIDE CHAT (/side, /btw)
   // ==========================================
   Widget _buildSideChatTab() {
-    return Column(
-      children: [
-        // Side Chat Banner
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
-            border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
-          ),
-          child: Row(
-            children: [
-              const Icon(FontAwesomeIcons.comments, size: 12, color: DesktopTheme.accentSky),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Side Channel (/side) · Isolated thread',
-                  style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
-                  overflow: TextOverflow.ellipsis,
-                ),
+    return AnimatedBuilder(
+      animation: sideChatLogicController,
+      builder: (context, _) {
+        return Column(
+          children: [
+            // Side Chat Banner
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurface,
+                border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
               ),
-            ],
-          ),
-        ),
-
-        // Messages list
-        Expanded(
-          child: ListView.builder(
-            padding: const EdgeInsets.all(12),
-            itemCount: sideMessages.length,
-            itemBuilder: (context, index) {
-              final msg = sideMessages[index];
-              final isUser = msg['role'] == 'user';
-
-              return Align(
-                alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-                child: Container(
-                  margin: const EdgeInsets.only(bottom: 8),
-                  padding: const EdgeInsets.all(10),
-                  constraints: const BoxConstraints(maxWidth: 340),
-                  decoration: BoxDecoration(
-                    color: isUser ? DesktopTheme.accentSky.withOpacity(0.18) : DesktopTheme.bgSurface,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: isUser ? DesktopTheme.accentSky.withOpacity(0.4) : DesktopTheme.borderSubtle,
+              child: Row(
+                children: [
+                  const Icon(FontAwesomeIcons.comments, size: 12, color: DesktopTheme.accentSky),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Side Channel (/side, /btw) · Isolated thread',
+                      style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
-                  child: Text(
-                    msg['text']!,
-                    style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary, height: 1.3),
-                  ),
-                ),
-              );
-            },
-          ),
-        ),
-
-        // Input field
-        Container(
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
-            border: Border(top: BorderSide(color: DesktopTheme.borderSubtle)),
-          ),
-          child: Row(
-            children: [
-              Expanded(
-                child: Container(
-                  height: 32,
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  decoration: BoxDecoration(
-                    color: DesktopTheme.bgCanvas,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: DesktopTheme.borderSubtle),
-                  ),
-                  child: TextField(
-                    controller: sideChatController,
-                    style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
-                    decoration: InputDecoration(
-                      hintText: 'Ask side question (/side, /btw)...',
-                      hintStyle: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
-                      border: InputBorder.none,
-                      isDense: true,
-                      contentPadding: const EdgeInsets.only(top: 8),
+                  InkWell(
+                    onTap: sideChatLogicController.clearChat,
+                    borderRadius: BorderRadius.circular(4),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      child: Text(
+                        'Очистить',
+                        style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted),
+                      ),
                     ),
-                    onSubmitted: (txt) => _sendSideMessage(),
                   ),
+                ],
+              ),
+            ),
+
+            // Messages list
+            Expanded(
+              child: ListView.builder(
+                padding: const EdgeInsets.all(12),
+                itemCount: sideChatLogicController.messages.length,
+                itemBuilder: (context, index) {
+                  final msg = sideChatLogicController.messages[index];
+                  final isUser = msg.isUser;
+
+                  return Align(
+                    alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+                    child: Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.all(10),
+                      constraints: const BoxConstraints(maxWidth: 340),
+                      decoration: BoxDecoration(
+                        color: isUser ? DesktopTheme.accentSky.withOpacity(0.18) : DesktopTheme.bgSurface,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: isUser ? DesktopTheme.accentSky.withOpacity(0.4) : DesktopTheme.borderSubtle,
+                        ),
+                      ),
+                      child: SelectableText(
+                        msg.text,
+                        style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary, height: 1.35),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+
+            if (sideChatLogicController.isLoading)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                child: Row(
+                  children: [
+                    const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: DesktopTheme.accentSky),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      'Шлюз формирует ответ...',
+                      style: TextStyle(fontSize: 10, fontFamily: 'Consolas', color: DesktopTheme.textMuted),
+                    ),
+                  ],
                 ),
               ),
-              const SizedBox(width: 8),
-              IconButton(
-                icon: const Icon(FontAwesomeIcons.paperPlane, size: 13, color: DesktopTheme.accentSky),
-                onPressed: _sendSideMessage,
+
+            // Quick prompts strip
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              color: DesktopTheme.bgSurface,
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    _buildSidePromptChip('/btw '),
+                    _buildSidePromptChip('/explain '),
+                    _buildSidePromptChip('/test '),
+                    _buildSidePromptChip('/refactor '),
+                  ],
+                ),
               ),
-            ],
+            ),
+
+            // Input field
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurface,
+                border: Border(top: BorderSide(color: DesktopTheme.borderSubtle)),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Container(
+                      height: 32,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      decoration: BoxDecoration(
+                        color: DesktopTheme.bgCanvas,
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: DesktopTheme.borderSubtle),
+                      ),
+                      child: TextField(
+                        controller: sideChatController,
+                        style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
+                        decoration: InputDecoration(
+                          hintText: 'Задайте вопрос (/side, /btw)...',
+                          hintStyle: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                          border: InputBorder.none,
+                          isDense: true,
+                          contentPadding: const EdgeInsets.only(top: 8),
+                        ),
+                        onSubmitted: (txt) => _sendSideMessage(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(FontAwesomeIcons.paperPlane, size: 13, color: DesktopTheme.accentSky),
+                    onPressed: _sendSideMessage,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSidePromptChip(String prompt) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: InkWell(
+        onTap: () {
+          sideChatController.text = prompt;
+          sideChatController.selection = TextSelection.fromPosition(TextPosition(offset: prompt.length));
+        },
+        borderRadius: BorderRadius.circular(4),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgCanvas,
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: DesktopTheme.borderSubtle),
+          ),
+          child: Text(
+            prompt.trim(),
+            style: const TextStyle(fontSize: 10, fontFamily: 'Consolas', color: DesktopTheme.accentSky),
           ),
         ),
-      ],
+      ),
     );
   }
 
   void _sendSideMessage() {
     final txt = sideChatController.text.trim();
     if (txt.isEmpty) return;
-
-    setState(() {
-      sideMessages.add({'role': 'user', 'text': txt});
-      sideChatController.clear();
-    });
-
-    Future.delayed(const Duration(milliseconds: 600), () {
-      if (!mounted) return;
-      setState(() {
-        sideMessages.add({
-          'role': 'bot',
-          'text': 'Понял вопрос по "$txt". Контекст сохранен в боковом канале без изменения основной цели.',
-        });
-      });
-    });
+    sideChatLogicController.sendMessage(txt);
+    sideChatController.clear();
   }
 }

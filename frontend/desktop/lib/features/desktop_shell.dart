@@ -2,10 +2,13 @@
 // Comprises Left Sidebar (Projects/Groups), Central Task Workspace, Right Tool Canvas,
 // Modal Settings Dialog, and User Onboarding/Profile Dialog.
 
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
+import 'package:omnes_shared/omnes_shared.dart';
 
+import '../theme/desktop_theme.dart';
 import '../widgets/desktop_sidebar.dart';
 import 'automations/automations_view.dart';
 import 'command_palette/command_palette_dialog.dart';
@@ -29,7 +32,6 @@ class _DesktopShellState extends State<DesktopShell> {
   UserProfileData userProfile = UserProfileData(
     firstName: 'Илья',
     lastName: 'Пресняков',
-    tier: 'Lite',
     role: 'Tech Lead / AI Engineer',
     primaryStack: 'Rust / Dart / Python',
     autonomyStyle: 'Full access (максимальная автономность)',
@@ -42,6 +44,45 @@ class _DesktopShellState extends State<DesktopShell> {
   bool isInspectorOpen = false; // Closed by default
   int inspectorTabIndex = -1; // -1 opens the 'Open tab' chooser from Screenshot 2
   Key inspectorKey = UniqueKey();
+
+  @override
+  void initState() {
+    super.initState();
+    _checkInitialState();
+  }
+
+  Future<void> _checkInitialState() async {
+    try {
+      final http = GatewayHttpClient();
+      final qs = await http.getQuickstartState();
+      final memList = await http.memoryList(category: 'core');
+      final profileMem = memList.firstWhereOrNull((m) => m['key'] == 'user_profile');
+      if (profileMem != null && profileMem['content'] != null) {
+        final decoded = jsonDecode(profileMem['content'].toString());
+        if (decoded is Map<String, dynamic>) {
+          final fullName = (decoded['name'] ?? '').toString();
+          final parts = fullName.split(' ');
+          if (mounted) {
+            setState(() {
+              userProfile = UserProfileData(
+                firstName: parts.isNotEmpty && parts[0].isNotEmpty ? parts[0] : userProfile.firstName,
+                lastName: parts.length > 1 ? parts.sublist(1).join(' ') : userProfile.lastName,
+                role: decoded['role']?.toString() ?? userProfile.role,
+                primaryStack: decoded['stack']?.toString() ?? userProfile.primaryStack,
+                autonomyStyle: decoded['autonomy']?.toString() ?? userProfile.autonomyStyle,
+                language: decoded['language']?.toString() ?? userProfile.language,
+                enableAstMemory: decoded['ast_memory'] == true,
+              );
+            });
+          }
+        }
+      } else if (qs != null && qs['ready'] == false) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _openOnboardingDialog();
+        });
+      }
+    } catch (_) {}
+  }
 
   void _openInspectorWithTab(int index) {
     setState(() {
@@ -87,9 +128,9 @@ class _DesktopShellState extends State<DesktopShell> {
             child: Container(
               constraints: const BoxConstraints(maxWidth: 1060, maxHeight: 720),
               decoration: BoxDecoration(
-                color: const Color(0xFF131518),
+                color: DesktopTheme.bgSurface,
                 borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: const Color(0xFF262A33), width: 1.2),
+                border: Border.all(color: DesktopTheme.borderSubtle, width: 1.2),
                 boxShadow: [
                   BoxShadow(
                     color: Colors.black.withOpacity(0.65),
@@ -126,9 +167,7 @@ class _DesktopShellState extends State<DesktopShell> {
   }
 
   void _onNewTask() {
-    workspaceController.messages.clear();
-    workspaceController.activeTaskTitle.value = 'New Task';
-    workspaceController.inputController.clear();
+    workspaceController.createNewTask();
     setState(() => selectedNavIndex = -1);
   }
 
@@ -161,8 +200,8 @@ class _DesktopShellState extends State<DesktopShell> {
           }
         }
       },
-      child: Scaffold(
-        backgroundColor: const Color(0xFF141619),
+      child: Obx(() => Scaffold(
+        backgroundColor: DesktopTheme.bgCanvas,
         body: SafeArea(
           child: Row(
             children: [
@@ -171,9 +210,9 @@ class _DesktopShellState extends State<DesktopShell> {
                 DesktopSidebar(
                   selectedIndex: selectedNavIndex,
                   userProfile: userProfile,
-                  onSelectTask: (idx, title) {
-                    setState(() => selectedNavIndex = idx);
-                    workspaceController.activeTaskTitle.value = title;
+                  onSelectTask: (id, title, project) {
+                    setState(() => selectedNavIndex = 0);
+                    workspaceController.switchToSession(id, title: title, project: project);
                   },
                   onNewTask: _onNewTask,
                   onOpenSearch: _openCommandPalette,
@@ -214,7 +253,7 @@ class _DesktopShellState extends State<DesktopShell> {
             ],
           ),
         ),
-      ),
+      )),
     );
   }
 }

@@ -8,7 +8,9 @@
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
+import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
+import 'sop_studio_controller.dart';
 
 class AutomationsView extends StatefulWidget {
   final VoidCallback? onBackToWorkspace;
@@ -23,10 +25,18 @@ class AutomationsView extends StatefulWidget {
 }
 
 class _AutomationsViewState extends State<AutomationsView> {
+  int selectedTab = 0; // 0: SOP Studio, 1: Scheduled Tasks
+  late final SopStudioController sopController;
   bool isKeepAwakeEnabled = true;
 
   // Active scheduled tasks list
   final List<Map<String, dynamic>> scheduledTasks = [];
+
+  @override
+  void initState() {
+    super.initState();
+    sopController = Get.put(SopStudioController());
+  }
 
   void _showCreateTaskDialog({
     String? initialTitle,
@@ -193,63 +203,123 @@ class _AutomationsViewState extends State<AutomationsView> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Obx(() {
-      return Scaffold(
-        backgroundColor: const Color(0xFF141619),
-        body: Column(
+  Widget _buildTabButton(int index, String label, IconData icon) {
+    final isSelected = selectedTab == index;
+    return InkWell(
+      onTap: () => setState(() => selectedTab = index),
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: isSelected ? DesktopTheme.accentCyan.withOpacity(0.12) : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isSelected ? DesktopTheme.accentCyan : DesktopTheme.borderSubtle,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            // Top Window Controls Bar
-            Container(
-              height: 38,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
-                children: [
-                  const Spacer(),
-                  _buildWinButton(Icons.remove, () {}),
-                  const SizedBox(width: 6),
-                  _buildWinButton(Icons.crop_square, () {}),
-                  const SizedBox(width: 6),
-                  _buildWinButton(Icons.close, () {}, isClose: true),
-                ],
+            Icon(
+              icon,
+              size: 13,
+              color: isSelected ? DesktopTheme.accentCyan : DesktopTheme.textMuted,
+            ),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                color: isSelected ? DesktopTheme.textPrimary : DesktopTheme.textMuted,
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
 
-            // Main Scrollable Automations Content
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: DesktopTheme.bgCanvas,
+      body: Column(
+        children: [
+          // Top Navigation & Tab Bar
+          Container(
+            padding: const EdgeInsets.fromLTRB(32, 20, 32, 16),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurface,
+              border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    if (widget.onBackToWorkspace != null) ...[
+                      IconButton(
+                        icon: const Icon(Icons.arrow_back, size: 18),
+                        color: DesktopTheme.textMuted,
+                        onPressed: widget.onBackToWorkspace,
+                        tooltip: 'Назад в рабочую область',
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          DesktopI18n.automationsTitle,
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.bold,
+                            color: DesktopTheme.textPrimary,
+                            letterSpacing: -0.3,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          DesktopI18n.automationsSubtitle,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: DesktopTheme.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    _buildTabButton(0, '⚡ Студия SOP (Workflow Studio)', FontAwesomeIcons.diagramProject),
+                    const SizedBox(width: 8),
+                    _buildTabButton(1, '🕒 Задачи по расписанию (Cron)', FontAwesomeIcons.clock),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          // Tab Content
+          if (selectedTab == 0)
+            Expanded(child: _buildSopStudioTab())
+          else
             Expanded(
               child: SingleChildScrollView(
-                padding: const EdgeInsets.fromLTRB(48, 12, 48, 48),
+                padding: const EdgeInsets.fromLTRB(48, 24, 48, 48),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 980),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // Header
-                      Text(
-                        DesktopI18n.automationsTitle,
-                        style: const TextStyle(
-                          fontSize: 26,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                          letterSpacing: -0.3,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        DesktopI18n.automationsSubtitle,
-                        style: const TextStyle(
-                          fontSize: 13,
-                          color: Color(0xFF94A3B8),
-                        ),
-                      ),
-                      const SizedBox(height: 24),
-
                       // Top Empty State Card or Active Tasks List
                       _buildScheduledTasksCard(),
                       const SizedBox(height: 16),
 
-                      // Keep Awake Row (Image 1 match)
+                      // Keep Awake Row
                       _buildKeepAwakeSettingRow(),
                       const SizedBox(height: 36),
 
@@ -284,11 +354,689 @@ class _AutomationsViewState extends State<AutomationsView> {
                 ),
               ),
             ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================
+  // SOP WORKFLOW STUDIO TAB (EPIC P1 - 5.5)
+  // ==========================================
+  Widget _buildSopStudioTab() {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Left Column: SOP List
+        Container(
+          width: 310,
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgSurface,
+            border: Border(right: BorderSide(color: DesktopTheme.borderSubtle)),
+          ),
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+                child: Row(
+                  children: [
+                    Text(
+                      'Пайплайны (SOP)',
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.bold,
+                        color: DesktopTheme.textPrimary,
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      icon: const Icon(Icons.refresh, size: 16),
+                      color: DesktopTheme.textMuted,
+                      tooltip: 'Обновить',
+                      onPressed: () => sopController.loadSops(),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.add, size: 16),
+                      color: DesktopTheme.accentCyan,
+                      tooltip: 'Создать SOP',
+                      onPressed: _showCreateSopDialog,
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: Obx(() {
+                  if (sopController.isLoading.value && sopController.sops.isEmpty) {
+                    return const Center(child: CircularProgressIndicator(strokeWidth: 2));
+                  }
+                  return ListView.builder(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                    itemCount: sopController.sops.length,
+                    itemBuilder: (ctx, i) {
+                      final sop = sopController.sops[i];
+                      final name = sop['name']?.toString() ?? '';
+                      final title = sop['title']?.toString() ?? name;
+                      final isSelected = sopController.selectedSopName.value == name;
+                      final mode = sop['execution_mode']?.toString() ?? 'autonomous';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 6),
+                        decoration: BoxDecoration(
+                          color: isSelected ? DesktopTheme.accentCyan.withOpacity(0.12) : Colors.transparent,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: isSelected ? DesktopTheme.accentCyan : DesktopTheme.borderSubtle.withOpacity(0.5),
+                          ),
+                        ),
+                        child: ListTile(
+                          dense: true,
+                          title: Text(
+                            title,
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                              color: DesktopTheme.textPrimary,
+                            ),
+                          ),
+                          subtitle: Text(
+                            name,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontFamily: 'Consolas',
+                              color: DesktopTheme.textMuted,
+                            ),
+                          ),
+                          trailing: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: mode == 'supervised'
+                                  ? Colors.amber.withOpacity(0.15)
+                                  : const Color(0xFF10B981).withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              mode,
+                              style: TextStyle(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w600,
+                                color: mode == 'supervised' ? Colors.amber : const Color(0xFF10B981),
+                              ),
+                            ),
+                          ),
+                          onTap: () => sopController.selectSop(name),
+                        ),
+                      );
+                    },
+                  );
+                }),
+              ),
+            ],
+          ),
+        ),
+
+        // Right Column: DAG Graph & Execution Panel
+        Expanded(
+          child: Obx(() {
+            final selectedName = sopController.selectedSopName.value;
+            if (selectedName == null) {
+              return Center(
+                child: Text(
+                  'Выберите SOP пайплайн из списка слева',
+                  style: TextStyle(color: DesktopTheme.textMuted),
+                ),
+              );
+            }
+            final graph = sopController.selectedGraph.value;
+            final nodes = (graph?['nodes'] as List<dynamic>?) ?? [];
+
+            return Column(
+              children: [
+                // SOP Header Bar
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.bgSurfaceElevated,
+                    border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
+                  ),
+                  child: Row(
+                    children: [
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              const Icon(FontAwesomeIcons.diagramProject, size: 15, color: DesktopTheme.accentCyan),
+                              const SizedBox(width: 8),
+                              Text(
+                                selectedName,
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.bold,
+                                  color: DesktopTheme.textPrimary,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Интерактивный DAG граф исполнения процедур OmnesAgent Gateway',
+                            style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted),
+                          ),
+                        ],
+                      ),
+                      const Spacer(),
+                      OutlinedButton.icon(
+                        icon: const Icon(FontAwesomeIcons.robot, size: 12),
+                        label: const Text('AI Wire-Draft', style: TextStyle(fontSize: 12)),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: DesktopTheme.accentCyan,
+                          side: BorderSide(color: DesktopTheme.accentCyan.withOpacity(0.5)),
+                        ),
+                        onPressed: () => _showAiWireDraftDialog(selectedName),
+                      ),
+                      const SizedBox(width: 10),
+                      ElevatedButton.icon(
+                        icon: const Icon(FontAwesomeIcons.play, size: 11),
+                        label: const Text('Запустить SOP', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: DesktopTheme.accentCyan,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        onPressed: () => sopController.runActiveSop(),
+                      ),
+                    ],
+                  ),
+                ),
+
+                // Main Graph Area
+                Expanded(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(28),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // Visual DAG Nodes Flow
+                        _buildDagGraphNodes(nodes),
+                        const SizedBox(height: 24),
+
+                        // Approval Gate (if any node has status 'pending')
+                        if (nodes.any((n) => n['kind'] == 'gate' && n['status'] == 'pending'))
+                          _buildApprovalGateCard(selectedName),
+
+                        const SizedBox(height: 32),
+                        _buildRunsTimeline(),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            );
+          }),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDagGraphNodes(List<dynamic> nodes) {
+    if (nodes.isEmpty) {
+      return Center(
+        child: Text('Граф узлов пуст', style: TextStyle(color: DesktopTheme.textMuted)),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Узлы пайплайна (DAG Pipeline)',
+          style: TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+            color: DesktopTheme.textPrimary,
+          ),
+        ),
+        const SizedBox(height: 16),
+        ...nodes.asMap().entries.map((entry) {
+          final idx = entry.key;
+          final node = entry.value as Map<String, dynamic>;
+          final isLast = idx == nodes.length - 1;
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildNodeCard(node),
+              if (!isLast) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 36),
+                  child: Container(
+                    width: 2,
+                    height: 24,
+                    color: DesktopTheme.accentCyan.withOpacity(0.4),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(left: 32),
+                  child: Icon(
+                    Icons.arrow_downward,
+                    size: 14,
+                    color: DesktopTheme.accentCyan.withOpacity(0.6),
+                  ),
+                ),
+                const SizedBox(height: 4),
+              ],
+            ],
+          );
+        }),
+      ],
+    );
+  }
+
+  Widget _buildNodeCard(Map<String, dynamic> node) {
+    final kind = node['kind']?.toString() ?? 'step';
+    final title = node['title']?.toString() ?? node['id']?.toString() ?? '';
+    final status = node['status']?.toString() ?? 'idle';
+
+    IconData icon;
+    Color iconColor;
+    switch (kind) {
+      case 'trigger':
+        icon = FontAwesomeIcons.bolt;
+        iconColor = const Color(0xFF38BDF8);
+        break;
+      case 'tool':
+        icon = FontAwesomeIcons.wrench;
+        iconColor = const Color(0xFFA78BFA);
+        break;
+      case 'gate':
+        icon = FontAwesomeIcons.shieldHalved;
+        iconColor = const Color(0xFFF59E0B);
+        break;
+      default:
+        icon = FontAwesomeIcons.gears;
+        iconColor = DesktopTheme.accentCyan;
+    }
+
+    Color statusColor;
+    String statusLabel;
+    switch (status) {
+      case 'completed':
+        statusColor = const Color(0xFF10B981);
+        statusLabel = 'Выполнено';
+        break;
+      case 'running':
+        statusColor = DesktopTheme.accentCyan;
+        statusLabel = 'В процессе';
+        break;
+      case 'pending':
+        statusColor = const Color(0xFFF59E0B);
+        statusLabel = 'Ожидает одобрения';
+        break;
+      default:
+        statusColor = const Color(0xFF64748B);
+        statusLabel = 'Ожидание';
+    }
+
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 720),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurfaceElevated,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: status == 'pending' ? const Color(0xFFF59E0B) : DesktopTheme.borderSubtle,
+          width: status == 'pending' ? 1.5 : 1,
+        ),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: iconColor.withOpacity(0.12),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(icon, size: 14, color: iconColor),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                    color: DesktopTheme.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  'Тип: $kind • ID: ${node['id']}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontFamily: 'Consolas',
+                    color: DesktopTheme.textMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: statusColor.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 6,
+                  height: 6,
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  statusLabel,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: statusColor,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildApprovalGateCard(String sopName) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(maxWidth: 720),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF59E0B).withOpacity(0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFF59E0B)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(FontAwesomeIcons.shieldHalved, size: 16, color: Color(0xFFF59E0B)),
+              const SizedBox(width: 10),
+              Text(
+                'Human-in-the-loop: Требуется подтверждение оператора',
+                style: TextStyle(
+                  fontSize: 13.5,
+                  fontWeight: FontWeight.bold,
+                  color: DesktopTheme.textPrimary,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Выполнение пайплайна "$sopName" остановлено на шаге согласования деструктивных операций.',
+            style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              ElevatedButton.icon(
+                icon: const Icon(Icons.check, size: 14),
+                label: const Text('Одобрить (Approve)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF10B981),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                ),
+                onPressed: () async {
+                  await sopController.httpClient.sopApprove(sopName);
+                  sopController.selectSop(sopName);
+                  Get.snackbar('SOP согласован', 'Шаг пайплайна утвержден оператором');
+                },
+              ),
+              const SizedBox(width: 10),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.close, size: 14),
+                label: const Text('Отклонить (Deny)', style: TextStyle(fontSize: 12)),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFEF4444),
+                  side: const BorderSide(color: Color(0xFFEF4444)),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                ),
+                onPressed: () async {
+                  await sopController.httpClient.sopDeny(sopName);
+                  sopController.selectSop(sopName);
+                  Get.snackbar('SOP отклонен', 'Шаг пайплайна заблокирован');
+                },
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRunsTimeline() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text(
+              'История запусков (Recent Runs)',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+                color: DesktopTheme.textPrimary,
+              ),
+            ),
+            const Spacer(),
+            TextButton.icon(
+              icon: const Icon(Icons.refresh, size: 14),
+              label: const Text('Обновить', style: TextStyle(fontSize: 12)),
+              onPressed: () => sopController.loadRuns(),
+            ),
           ],
         ),
-      );
-    });
+        const SizedBox(height: 10),
+        Obx(() {
+          if (sopController.sopRuns.isEmpty) {
+            return Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurfaceElevated,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: DesktopTheme.borderSubtle),
+              ),
+              child: Text(
+                'Запусков пока не зафиксировано',
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+              ),
+            );
+          }
+          return Column(
+            children: sopController.sopRuns.map((run) {
+              final id = run['run_id']?.toString() ?? run['id']?.toString() ?? 'unknown';
+              final status = run['status']?.toString() ?? 'completed';
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: DesktopTheme.bgSurfaceElevated,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: DesktopTheme.borderSubtle),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      status == 'completed' ? Icons.check_circle : Icons.error,
+                      size: 16,
+                      color: status == 'completed' ? const Color(0xFF10B981) : const Color(0xFFEF4444),
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      'Run #$id',
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontFamily: 'Consolas',
+                        fontWeight: FontWeight.bold,
+                        color: DesktopTheme.textPrimary,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      status,
+                      style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
+          );
+        }),
+      ],
+    );
   }
+
+  void _showCreateSopDialog() {
+    final nameCtrl = TextEditingController();
+    final titleCtrl = TextEditingController();
+    final descCtrl = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DesktopTheme.bgSurfaceElevated,
+        title: Text('Новый SOP пайплайн', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: nameCtrl,
+                decoration: InputDecoration(
+                  labelText: 'Идентификатор (латиница)',
+                  labelStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
+                  hintText: 'security-scan',
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: titleCtrl,
+                decoration: InputDecoration(
+                  labelText: 'Название',
+                  labelStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
+                  hintText: 'Сканирование безопасности',
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: descCtrl,
+                maxLines: 2,
+                decoration: InputDecoration(
+                  labelText: 'Описание',
+                  labelStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: Colors.black),
+            onPressed: () async {
+              if (nameCtrl.text.trim().isNotEmpty) {
+                final name = nameCtrl.text.trim();
+                final sopData = {
+                  'name': name,
+                  'title': titleCtrl.text.trim().isNotEmpty ? titleCtrl.text.trim() : name,
+                  'description': descCtrl.text.trim(),
+                  'execution_mode': 'autonomous',
+                  'triggers': ['manual'],
+                };
+                Navigator.of(ctx).pop();
+                await sopController.httpClient.saveSop(name, sopData);
+                sopController.loadSops();
+              }
+            },
+            child: const Text('Создать'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAiWireDraftDialog(String sopName) {
+    final promptCtrl = TextEditingController(text: 'Сгенерируй пайплайн для автоматической проверки $sopName');
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DesktopTheme.bgSurfaceElevated,
+        title: Text('AI Wire-Draft для $sopName', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Опишите словами желаемые этапы и инструменты. LLM-агент сформирует DAG-граф и спецификацию.',
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: promptCtrl,
+                maxLines: 3,
+                decoration: InputDecoration(
+                  labelText: 'Промпт генерации',
+                  labelStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted)),
+          ),
+          ElevatedButton.icon(
+            icon: const Icon(FontAwesomeIcons.robot, size: 12),
+            label: const Text('Сгенерировать'),
+            style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: Colors.black),
+            onPressed: () async {
+              Navigator.of(ctx).pop();
+              Get.snackbar('AI Wire-Draft', 'Промпт отправлен в OmnesAgent runtime...');
+              await sopController.httpClient.sopWireDraft({'prompt': promptCtrl.text.trim(), 'name': sopName});
+              sopController.selectSop(sopName);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
 
   // ==========================================
   // TOP SCHEDULED TASKS CONTAINER (Image 1 match)
@@ -632,9 +1380,9 @@ class _AutomationsViewState extends State<AutomationsView> {
       child: Container(
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: const Color(0xFF181B22),
+          color: DesktopTheme.bgSurfaceElevated,
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: const Color(0xFF262B36)),
+          border: Border.all(color: DesktopTheme.borderSubtle),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -646,10 +1394,10 @@ class _AutomationsViewState extends State<AutomationsView> {
                 Expanded(
                   child: Text(
                     title,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.bold,
-                      color: Colors.white,
+                      color: DesktopTheme.textPrimary,
                     ),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
@@ -660,36 +1408,24 @@ class _AutomationsViewState extends State<AutomationsView> {
             const SizedBox(height: 10),
             Text(
               desc,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 11.5,
-                color: Color(0xFF94A3B8),
+                color: DesktopTheme.textMuted,
                 height: 1.45,
               ),
             ),
             const SizedBox(height: 16),
             Text(
               badge,
-              style: const TextStyle(
+              style: TextStyle(
                 fontSize: 11,
                 fontFamily: 'Consolas',
-                color: Color(0xFF64748B),
+                color: DesktopTheme.textMuted,
                 fontWeight: FontWeight.w500,
               ),
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildWinButton(IconData icon, VoidCallback onTap, {bool isClose = false}) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(3),
-      hoverColor: isClose ? const Color(0xFFE81123) : const Color(0xFF2A2E37),
-      child: Padding(
-        padding: const EdgeInsets.all(4),
-        child: Icon(icon, size: 12, color: const Color(0xFF94A3B8)),
       ),
     );
   }

@@ -2,7 +2,7 @@ use axum::extract::Request;
 use axum::http::HeaderValue;
 use axum::http::header::{HeaderMap, HeaderName};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
 const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("x-content-type-options", "nosniff"),
@@ -36,13 +36,33 @@ const HSTS_HEADER: (&str, &str) = (
 );
 
 pub async fn apply(request: Request, next: Next) -> Response {
+    if request.method() == axum::http::Method::OPTIONS {
+        let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
+        let h = response.headers_mut();
+        h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        h.insert("access-control-allow-methods", HeaderValue::from_static("GET, POST, PUT, DELETE, PATCH, OPTIONS"));
+        h.insert("access-control-allow-headers", HeaderValue::from_static("*"));
+        h.insert("access-control-max-age", HeaderValue::from_static("86400"));
+        return response;
+    }
     let mut response = next.run(request).await;
+    response.headers_mut().insert("access-control-allow-origin", HeaderValue::from_static("*"));
     inject(response.headers_mut(), false);
     response
 }
 
 pub async fn apply_with_hsts(request: Request, next: Next) -> Response {
+    if request.method() == axum::http::Method::OPTIONS {
+        let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
+        let h = response.headers_mut();
+        h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        h.insert("access-control-allow-methods", HeaderValue::from_static("GET, POST, PUT, DELETE, PATCH, OPTIONS"));
+        h.insert("access-control-allow-headers", HeaderValue::from_static("*"));
+        h.insert("access-control-max-age", HeaderValue::from_static("86400"));
+        return response;
+    }
     let mut response = next.run(request).await;
+    response.headers_mut().insert("access-control-allow-origin", HeaderValue::from_static("*"));
     inject(response.headers_mut(), true);
     response
 }

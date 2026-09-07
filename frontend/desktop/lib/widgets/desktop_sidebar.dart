@@ -7,11 +7,13 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import '../features/onboarding/user_onboarding_dialog.dart';
+import '../features/workspace/task_workspace_controller.dart';
+import '../theme/desktop_theme.dart';
 import '../utils/desktop_i18n.dart';
 
 class DesktopSidebar extends StatefulWidget {
   final int selectedIndex;
-  final Function(int, String) onSelectTask;
+  final Function(String id, String title, String project) onSelectTask;
   final VoidCallback onNewTask;
   final VoidCallback onOpenSearch;
   final VoidCallback onOpenSettings;
@@ -53,34 +55,34 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     {
       'name': 'Omnes agent',
       'tasks': [
-        {'title': 'План миграции Dart фронтенда в агента Zero...', 'time': '2d', 'unread': false},
+        {'id': 'omnes-1', 'title': 'План миграции Dart фронтенда в агента Zero...', 'time': '2d', 'unread': false},
       ],
     },
     {
       'name': 'deepseek-harness-master',
       'tasks': [
-        {'title': 'Запуск exe-файла', 'time': '1h', 'unread': false},
-        {'title': 'Переключение на ветку desktop и запуск exe', 'time': '1d', 'unread': false},
+        {'id': 'deepseek-1', 'title': 'Запуск exe-файла', 'time': '1h', 'unread': false},
+        {'id': 'deepseek-2', 'title': 'Переключение на ветку desktop и запуск exe', 'time': '1d', 'unread': false},
       ],
     },
     {
       'name': 'us proxy vps',
       'tasks': [
-        {'title': 'реши проблему с прокси нихера не работает', 'time': '7d', 'unread': false},
-        {'title': 'Отладка прокси Hermes и LLM API', 'time': '7d', 'unread': false},
+        {'id': 'proxy-1', 'title': 'реши проблему с прокси нихера не работает', 'time': '7d', 'unread': false},
+        {'id': 'proxy-2', 'title': 'Отладка прокси Hermes и LLM API', 'time': '7d', 'unread': false},
       ],
     },
     {
       'name': 'aprh.serv',
       'tasks': [
-        {'title': 'проанализируй проект посмотри логи напи...', 'time': '15d', 'unread': false},
+        {'id': 'aprh-1', 'title': 'проанализируй проект посмотри логи напи...', 'time': '15d', 'unread': false},
       ],
     },
     {
       'name': 'AmoParallel',
       'tasks': [
-        {'title': 'Диагностика ошибки агента Antigravity IDE', 'time': '9d', 'unread': false},
-        {'title': 'выполный план, только поставь веху и остан...', 'time': '19d', 'unread': true},
+        {'id': 'amo-1', 'title': 'Диагностика ошибки агента Antigravity IDE', 'time': '9d', 'unread': false},
+        {'id': 'amo-2', 'title': 'выполный план, только поставь веху и остан...', 'time': '19d', 'unread': true},
       ],
     },
   ];
@@ -89,15 +91,15 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     {
       'name': 'Личные диалоги и черновики',
       'tasks': [
-        {'title': 'Идеи для оптимизации рендеринга Flutter Web', 'time': '3h', 'unread': false},
-        {'title': 'Сравнение моделей GLM-5.3 и Claude 3.5 Sonnet', 'time': '1d', 'unread': false},
+        {'id': 'group-1', 'title': 'Идеи для оптимизации рендеринга Flutter Web', 'time': '3h', 'unread': false},
+        {'id': 'group-2', 'title': 'Сравнение моделей GLM-5.3 и Claude 3.5 Sonnet', 'time': '1d', 'unread': false},
       ],
     },
     {
       'name': 'Исследования и архитектура',
       'tasks': [
-        {'title': 'Дизайн-документ ob2h графа памяти', 'time': '2d', 'unread': false},
-        {'title': 'Интеграция протокола MCP через WebSocket', 'time': '4d', 'unread': false},
+        {'id': 'group-3', 'title': 'Дизайн-документ ob2h графа памяти', 'time': '2d', 'unread': false},
+        {'id': 'group-4', 'title': 'Интеграция протокола MCP через WebSocket', 'time': '4d', 'unread': false},
       ],
     },
   ];
@@ -107,9 +109,9 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     return Obx(() {
       return Container(
         width: 260,
-        decoration: const BoxDecoration(
-          color: Color(0xFF141619),
-          border: Border(right: BorderSide(color: Color(0xFF22262E), width: 1)),
+        decoration: BoxDecoration(
+          color: DesktopTheme.bgSidebar,
+          border: Border(right: BorderSide(color: DesktopTheme.borderSubtle, width: 1)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -314,20 +316,39 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
           // 5. Scrollable Projects / Timeline List
           Expanded(
-            child: ListView(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              children: viewMode == SidebarViewMode.byProject
-                  ? (isGroupView ? groups : projects).map((proj) => _buildProjectItem(proj)).toList()
-                  : _buildTimelineItems(),
-            ),
+            child: Obx(() {
+              final workspaceCtrl = Get.isRegistered<DesktopTaskWorkspaceController>()
+                  ? Get.find<DesktopTaskWorkspaceController>()
+                  : null;
+
+              final currentProjects = List<Map<String, dynamic>>.from(projects);
+              if (workspaceCtrl != null && workspaceCtrl.backendSessions.isNotEmpty) {
+                currentProjects.insert(0, {
+                  'name': '⚡ Шлюз 42617',
+                  'tasks': workspaceCtrl.backendSessions.map((s) => {
+                    'id': s.sessionId,
+                    'title': s.previewText.isNotEmpty ? s.previewText : s.sessionId,
+                    'time': s.formattedLastActivity,
+                    'unread': false,
+                  }).toList(),
+                });
+              }
+
+              return ListView(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                children: viewMode == SidebarViewMode.byProject
+                    ? (isGroupView ? groups : currentProjects).map((proj) => _buildProjectItem(proj)).toList()
+                    : _buildTimelineItems(),
+              );
+            }),
           ),
 
           // 6. Fixed Bottom User, Remote & Settings Bar (NEVER SCROLLED!)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: const BoxDecoration(
-              color: Color(0xFF141619),
-              border: Border(top: BorderSide(color: Color(0xFF22262E), width: 1)),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSidebar,
+              border: Border(top: BorderSide(color: DesktopTheme.borderSubtle, width: 1)),
             ),
             child: Row(
               children: [
@@ -349,48 +370,23 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                         child: Center(
                           child: Text(
                             widget.userProfile.initials,
-                            style: const TextStyle(fontSize: 11, color: Colors.white, fontWeight: FontWeight.bold),
+                            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
                           ),
                         ),
                       ),
                       const SizedBox(width: 8),
                       ConstrainedBox(
-                        constraints: const BoxConstraints(maxWidth: 110),
+                        constraints: const BoxConstraints(maxWidth: 105),
                         child: Text(
                           widget.userProfile.fullName,
-                          style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0), fontWeight: FontWeight.w500),
+                          style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary, fontWeight: FontWeight.w500),
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(width: 6),
-
-                // Lite Badge
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF22262E),
-                    borderRadius: BorderRadius.circular(3),
-                  ),
-                  child: Text(
-                    widget.userProfile.tier,
-                    style: const TextStyle(fontSize: 10, color: Color(0xFF94A3B8), fontWeight: FontWeight.bold),
-                  ),
-                ),
-
                 const Spacer(),
-
-                // Mobile Remote Control
-                IconButton(
-                  tooltip: DesktopI18n.remoteControl,
-                  icon: const Icon(Icons.phone_iphone, size: 16, color: Color(0xFF94A3B8)),
-                  onPressed: () {},
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
-                ),
-                const SizedBox(width: 4),
 
                 // Settings Gear Button
                 IconButton(
@@ -503,8 +499,18 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       final hasUnread = task['unread'] == true;
       return InkWell(
         onTap: () {
-          widget.onSelectTask(0, task['title']);
+          widget.onSelectTask(
+            task['id'] as String? ?? 'task-timeline',
+            task['title'] as String,
+            task['project'] as String? ?? '',
+          );
         },
+        onSecondaryTapDown: (details) => _showTaskContextMenu(
+          context,
+          details.globalPosition,
+          task,
+          task['project'] as String? ?? '',
+        ),
         borderRadius: BorderRadius.circular(6),
         child: Container(
           margin: const EdgeInsets.only(bottom: 2, left: 6, right: 6),
@@ -520,7 +526,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 ),
                 const SizedBox(width: 6),
               ] else ...[
-                const Icon(Icons.chat_bubble_outline, size: 12, color: Color(0xFF64748B)),
+                Icon(Icons.chat_bubble_outline, size: 12, color: DesktopTheme.textMuted),
                 const SizedBox(width: 6),
               ],
               Expanded(
@@ -529,13 +535,13 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   children: [
                     Text(
                       task['title'],
-                      style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                      style: TextStyle(fontSize: 12, color: DesktopTheme.textSecondary),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
                     Text(
                       task['project'],
-                      style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontFamily: 'Consolas'),
+                      style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted, fontFamily: 'Consolas'),
                     ),
                   ],
                 ),
@@ -543,7 +549,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
               const SizedBox(width: 6),
               Text(
                 task['time'],
-                style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontFamily: 'Consolas'),
+                style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted, fontFamily: 'Consolas'),
               ),
             ],
           ),
@@ -580,22 +586,22 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   Icon(
                     isCollapsed ? Icons.chevron_right : Icons.keyboard_arrow_down,
                     size: 14,
-                    color: const Color(0xFF64748B),
+                    color: DesktopTheme.textMuted,
                   ),
                   const SizedBox(width: 4),
                   Icon(
                     isGroupView ? Icons.chat_bubble_outline : Icons.folder_outlined,
                     size: 13,
-                    color: isCollapsed ? const Color(0xFF64748B) : const Color(0xFF00D2FF),
+                    color: isCollapsed ? DesktopTheme.textMuted : DesktopTheme.accentCyan,
                   ),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
                       proj['name'],
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.bold,
-                        color: Color(0xFFCBD5E1),
+                        color: DesktopTheme.textPrimary,
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
@@ -613,8 +619,18 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
               return InkWell(
                 onTap: () {
-                  widget.onSelectTask(0, task['title']);
+                  widget.onSelectTask(
+                    task['id'] as String? ?? 'task-${task['title']}',
+                    task['title'] as String,
+                    proj['name'] as String,
+                  );
                 },
+                onSecondaryTapDown: (details) => _showTaskContextMenu(
+                  context,
+                  details.globalPosition,
+                  task as Map<String, dynamic>,
+                  proj['name'] as String,
+                ),
                 borderRadius: BorderRadius.circular(6),
                 child: Container(
                   margin: const EdgeInsets.only(bottom: 1, left: 18, right: 6),
@@ -635,9 +651,9 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       Expanded(
                         child: Text(
                           task['title'],
-                          style: const TextStyle(
+                          style: TextStyle(
                             fontSize: 12,
-                            color: Color(0xFF94A3B8),
+                            color: DesktopTheme.textSecondary,
                           ),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
@@ -646,9 +662,9 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       const SizedBox(width: 6),
                       Text(
                         task['time'],
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 10,
-                          color: Color(0xFF64748B),
+                          color: DesktopTheme.textMuted,
                           fontFamily: 'Consolas',
                         ),
                       ),
@@ -657,6 +673,130 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 ),
               );
             }),
+        ],
+      ),
+    );
+  }
+
+  void _showTaskContextMenu(
+    BuildContext context,
+    Offset position,
+    Map<String, dynamic> task,
+    String projectName,
+  ) async {
+    final taskId = task['id'] as String? ?? '';
+    final taskTitle = task['title'] as String? ?? '';
+
+    final value = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx + 1, position.dy + 1),
+      color: DesktopTheme.bgSurfaceElevated,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: BorderSide(color: DesktopTheme.borderSubtle),
+      ),
+      items: [
+        PopupMenuItem(
+          value: 'rename',
+          height: 32,
+          child: Row(
+            children: [
+              Icon(Icons.edit_outlined, size: 14, color: DesktopTheme.textSecondary),
+              const SizedBox(width: 8),
+              Text('Переименовать', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'clear',
+          height: 32,
+          child: Row(
+            children: [
+              Icon(Icons.cleaning_services_outlined, size: 14, color: DesktopTheme.textSecondary),
+              const SizedBox(width: 8),
+              Text('Очистить историю', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(height: 1),
+        PopupMenuItem(
+          value: 'delete',
+          height: 32,
+          child: Row(
+            children: [
+              const Icon(Icons.delete_outline, size: 14, color: Color(0xFFEF4444)),
+              const SizedBox(width: 8),
+              const Text('Удалить задачу', style: TextStyle(fontSize: 12, color: Color(0xFFEF4444))),
+            ],
+          ),
+        ),
+      ],
+    );
+
+    if (value == null || !mounted || !context.mounted) return;
+    if (!Get.isRegistered<DesktopTaskWorkspaceController>()) return;
+    final controller = Get.find<DesktopTaskWorkspaceController>();
+
+    if (value == 'rename') {
+      _promptRenameTask(context, taskId, taskTitle, controller);
+    } else if (value == 'clear') {
+      controller.clearSessionHistory(taskId);
+      Get.snackbar('История очищена', 'Сообщения задачи $taskId очищены');
+    } else if (value == 'delete') {
+      controller.deleteSession(taskId);
+      setState(() {
+        for (final p in projects) {
+          (p['tasks'] as List).removeWhere((t) => t['id'] == taskId);
+        }
+      });
+      Get.snackbar('Задача удалена', 'Сессия $taskId удалена');
+    }
+  }
+
+  void _promptRenameTask(
+    BuildContext context,
+    String taskId,
+    String currentTitle,
+    DesktopTaskWorkspaceController controller,
+  ) {
+    final ctrl = TextEditingController(text: currentTitle);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DesktopTheme.bgSurfaceElevated,
+        title: Text('Переименовать задачу', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 15)),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 13),
+          decoration: InputDecoration(
+            hintText: 'Новое название...',
+            hintStyle: TextStyle(color: DesktopTheme.textMuted),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: Colors.black),
+            onPressed: () {
+              final newName = ctrl.text.trim();
+              if (newName.isNotEmpty) {
+                controller.renameSession(taskId, newName);
+                setState(() {
+                  for (final p in projects) {
+                    for (final t in (p['tasks'] as List)) {
+                      if (t['id'] == taskId) t['title'] = newName;
+                    }
+                  }
+                });
+              }
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('Сохранить'),
+          ),
         ],
       ),
     );
