@@ -1,4 +1,4 @@
-// Desktop Inspector Panel: ZCode ADE Right Tool Canvas with Live Browser & Element Picker,
+// Desktop Inspector Panel: OmnesAgent ADE Right Tool Canvas with Live Browser & Element Picker,
 // Integrated Terminal, Markdown/Mermaid Preview, and Side Chat (/side, /btw).
 
 import 'package:flutter/material.dart';
@@ -93,13 +93,17 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
     },
   ];
 
+  bool showTabChooser = false;
+
   @override
   void initState() {
     super.initState();
+    final effectiveIndex = widget.initialTabIndex < 0 ? 0 : widget.initialTabIndex;
+    showTabChooser = widget.initialTabIndex < 0;
     tabController = TabController(
       length: 4,
       vsync: this,
-      initialIndex: widget.initialTabIndex,
+      initialIndex: effectiveIndex,
     );
   }
 
@@ -168,29 +172,146 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                     ],
                   ),
                 ),
+                IconButton(
+                  icon: const Icon(Icons.dashboard_customize_outlined, size: 15, color: Color(0xFF94A3B8)),
+                  tooltip: 'Выбор вкладки (Open tab)',
+                  onPressed: () => setState(() => showTabChooser = true),
+                ),
                 if (widget.onClose != null)
                   IconButton(
                     icon: const Icon(Icons.close, size: 16, color: Color(0xFF94A3B8)),
-                    tooltip: 'Close panel',
+                    tooltip: 'Закрыть панель',
                     onPressed: widget.onClose,
                   ),
               ],
             ),
           ),
 
-          // Tab Views
+          // Tab Views or Open Tab Chooser
           Expanded(
-            child: TabBarView(
-              controller: tabController,
-              children: [
-                _buildLiveBrowserTab(),
-                _buildTerminalTab(),
-                _buildPreviewTab(),
-                _buildSideChatTab(),
-              ],
-            ),
+            child: showTabChooser
+                ? _buildOpenTabChooser()
+                : TabBarView(
+                    controller: tabController,
+                    children: [
+                      _buildLiveBrowserTab(),
+                      _buildTerminalTab(),
+                      _buildPreviewTab(),
+                      _buildSideChatTab(),
+                    ],
+                  ),
           ),
         ],
+      ),
+    );
+  }
+
+  // ==========================================
+  // OPEN TAB CHOOSER SCREEN (Screenshot 2 Match)
+  // ==========================================
+  Widget _buildOpenTabChooser() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 36),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text(
+              'Open tab',
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Choose a tab to open in the side pane.',
+              style: TextStyle(
+                fontSize: 13,
+                color: Color(0xFF94A3B8),
+              ),
+            ),
+            const SizedBox(height: 32),
+            _buildChooserCard(
+              icon: Icons.chat_bubble_outline,
+              label: 'Side conversation',
+              onTap: () {
+                setState(() {
+                  showTabChooser = false;
+                  tabController.animateTo(3); // Side Chat
+                });
+              },
+            ),
+            const SizedBox(height: 12),
+            _buildChooserCard(
+              icon: Icons.assignment_outlined,
+              label: 'Review',
+              onTap: () {
+                setState(() {
+                  showTabChooser = false;
+                  tabController.animateTo(2); // Preview / Review
+                });
+              },
+            ),
+            const SizedBox(height: 12),
+            _buildChooserCard(
+              icon: FontAwesomeIcons.terminal,
+              label: 'Terminal',
+              onTap: () {
+                setState(() {
+                  showTabChooser = false;
+                  tabController.animateTo(1); // Terminal
+                });
+              },
+            ),
+            const SizedBox(height: 12),
+            _buildChooserCard(
+              icon: FontAwesomeIcons.globe,
+              label: 'Browser',
+              onTap: () {
+                setState(() {
+                  showTabChooser = false;
+                  tabController.animateTo(0); // Browser
+                });
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChooserCard({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E222A),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xFF2B3240)),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, size: 16, color: const Color(0xFF94A3B8)),
+            const SizedBox(width: 14),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -474,9 +595,9 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                               _buildSimulatedElement(
                                 tag: 'p',
                                 selector: 'p.hero-subtitle',
-                                text: 'Autonomous coding agent powered by ZCode architecture.',
+                                text: 'Autonomous coding agent powered by OmnesAgent ADE architecture.',
                                 child: const Text(
-                                  'Autonomous coding agent powered by ZCode architecture and multimodal visual inspection.',
+                                  'Autonomous coding agent powered by OmnesAgent ADE architecture and multimodal visual inspection.',
                                   style: TextStyle(
                                     fontSize: 11,
                                     color: Color(0xFF64748B),
@@ -1033,7 +1154,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                 style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.statusSuccess),
               ),
               const SizedBox(height: 6),
-              Text('• ZCode ADE 3-pane workstation layout mounted', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
+              Text('• OmnesAgent ADE workstation layout mounted', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
               Text('• Permission Mode switcher (Shift+Tab) wired to controller', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
               Text('• Goal Mode (/goal) tracking with iteration dividers active', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),
               Text('• Live Browser & Element Picker integration verified', style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary)),

@@ -1,4 +1,4 @@
-// Desktop Workstation Theme: ZCode ADE Dual Theme (Dark & Light).
+// Desktop Workstation Theme: OmnesAgent ADE Dual Theme (Dark & Light).
 
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';

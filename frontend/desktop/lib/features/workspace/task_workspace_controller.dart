@@ -9,12 +9,12 @@ class DesktopTaskWorkspaceController extends GetxController {
   final scrollController = ScrollController();
 
   final isRunning = false.obs;
-  final activeTaskTitle = 'Goal: Рефакторинг UI десктопа под ZCode ADE'.obs;
+  final activeTaskTitle = 'Запуск exe-файла'.obs;
 
-  // ZCode ADE Core State
-  final permissionMode = PermissionMode.askBeforeChanges.obs;
+  // OmnesAgent ADE Core State
+  final permissionMode = PermissionMode.fullAccess.obs;
   final thoughtLevel = 'Max'.obs;
-  final activeModel = 'GLM-5.3'.obs;
+  final activeModel = 'GLM-5.3-Flash'.obs;
   final tokenCount = '28.4k tokens'.obs;
 
   // Goal Mode State
@@ -70,22 +70,18 @@ class DesktopTaskWorkspaceController extends GetxController {
 
     messages.addAll([
       ChatMessage(
-        text: '/goal Полная адаптация десктопного UI под ZCode ADE и проверка тестами',
-        chatMessageType: ChatMessageType.user,
-      ),
-      ChatMessage(
-        text: 'Цель принята. Запускаю автономный итерационный цикл разработки с подтверждением по тестам (Goal Mode).\n\nШаг 1: Развёрнута трёхпанельная архитектура ZCode ADE.\nШаг 2: Внедрены цветовые схемы Dark (#090D12, #00D2FF) и Light (#F8FAFC, #0284C7).\nШаг 3: Сайдбар оснащен бейджами изменений строк кода `+142 -28`.\n\nПриступаю к интеграции Live Browser с Element Picker и инспектора терминала `⌘J`.',
+        text: 'вообще отсутствует -> сравнение патча бандла в рантайме против свежего -> diff ровно в этой строке.\n\nСервер 0.1.3 теперь поднимается, exe проверен, поднимается за считанные секунды и загрузил UI. Фикс внесён в сам скрипт сборки, поэтому при будущих синках воспроизведения не будет.\n\nob2h подключён\n• Проект зарегистрирован как dsh-desktop, 362 символа в AST графе.\n• В долговременную память записаны: состояние запуска, факты окружения, мерж ветки.\n\nСостояние ветки:\ndesktop-brand-ru запущена полностью: merge с upstream dsh v0.1.3-alpha.1, дрейфа нет, словари ru под ключ.',
         chatMessageType: ChatMessageType.bot,
-        thinking: 'Thought (Max):\n1. Анализ layout: центральный холст отведен под агента, правая панель — под Live Browser и Terminal.\n2. Реализация Permission Mode (Ask before changes / Edit auto / Plan / Full access).\n3. Проверка тестами компиляции через `flutter analyze`.',
+        thinking: 'Progress 5/5:\n✓ Graft + merge upstream dsh v0.1.3-alpha.1, resolve 519 conflicts\n✓ typecheck/i18n/tests/build green; ru dictionaries completed\n✓ Runtime synced to 0.1.3; root cause of fileUploads pending found and fixed\n✓ Exe smoke: boots with live URL on synced 0.1.3 runtime\n✓ ob2h подключён (project dsh-desktop), факты в памяти, всё запущено',
         toolCalls: [
           ToolCallInfo(
             name: 'git_status_check',
-            args: '{"branch": "main", "diff_stats": true}',
-            output: 'Changes: +142 -28 in 4 modules',
+            args: '{"branch": "desktop-brand-ru", "diff_stats": true}',
+            output: 'Changes: +72347 -0 in 48 modules',
           ),
           ToolCallInfo(
             name: 'flutter_analyze',
-            args: '{"target": "lib/widgets/desktop_sidebar.dart"}',
+            args: '{"target": "lib/features/workspace/task_workspace_view.dart"}',
             output: 'No issues found! (0 errors)',
           ),
         ],
@@ -94,7 +90,7 @@ class DesktopTaskWorkspaceController extends GetxController {
 
     runTimelineSteps.addAll([
       {
-        'title': 'Setup ZCode ADE Architecture',
+        'title': 'Setup OmnesAgent ADE Architecture',
         'tool': 'architect_ade',
         'duration': '140ms',
         'status': 'success',

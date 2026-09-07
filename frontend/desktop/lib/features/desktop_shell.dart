@@ -1,6 +1,6 @@
-// Top-Level ZCode ADE Desktop Shell: Minimalist Layout matching official ZCode Desktop screenshots.
-// Comprises Left Sidebar, Central Task Workspace Canvas, Collapsible Right Tool Canvas,
-// and Modal Settings Popup.
+// Top-Level OmnesAgent ADE Desktop Shell: Windows layout matching Screenshot 2.
+// Comprises Left Sidebar (Projects/Groups), Central Task Workspace, Right Tool Canvas,
+// Modal Settings Dialog, and User Onboarding/Profile Dialog.
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,7 +9,8 @@ import 'package:get/get.dart';
 import '../widgets/desktop_sidebar.dart';
 import 'command_palette/command_palette_dialog.dart';
 import 'inspector/inspector_panel.dart';
-import 'settings/zcode_settings_view.dart';
+import 'onboarding/user_onboarding_dialog.dart';
+import 'settings/desktop_settings_dialog.dart';
 import 'workspace/task_workspace_controller.dart';
 import 'workspace/task_workspace_view.dart';
 
@@ -23,10 +24,22 @@ class DesktopShell extends StatefulWidget {
 class _DesktopShellState extends State<DesktopShell> {
   final workspaceController = Get.put(DesktopTaskWorkspaceController());
 
+  // User Profile state (Screenshot 2: Ilya Presnyakov, Lite)
+  UserProfileData userProfile = UserProfileData(
+    firstName: 'Илья',
+    lastName: 'Пресняков',
+    tier: 'Lite',
+    role: 'Tech Lead / AI Engineer',
+    primaryStack: 'Rust / Dart / Python',
+    autonomyStyle: 'Full access (максимальная автономность)',
+    language: 'Русский',
+    enableAstMemory: true,
+  );
+
   int selectedNavIndex = 0;
   bool isSidebarVisible = true;
-  bool isInspectorOpen = false; // Closed by default, exactly like ZCode!
-  int inspectorTabIndex = 0;
+  bool isInspectorOpen = false; // Closed by default
+  int inspectorTabIndex = -1; // -1 opens the 'Open tab' chooser from Screenshot 2
   Key inspectorKey = UniqueKey();
 
   void _openInspectorWithTab(int index) {
@@ -41,6 +54,7 @@ class _DesktopShellState extends State<DesktopShell> {
     setState(() {
       isInspectorOpen = !isInspectorOpen;
       if (isInspectorOpen) {
+        inspectorTabIndex = -1; // Show Open Tab Chooser
         inspectorKey = UniqueKey();
       }
     });
@@ -57,8 +71,8 @@ class _DesktopShellState extends State<DesktopShell> {
     );
   }
 
-  /// Opens the ZCode Settings screen as a modal popup dialog over the workspace.
-  void _openSettingsDialog([String initialSection = 'General']) {
+  /// Opens the Settings modal dialog over the workspace.
+  void _openSettingsDialog([String initialSection = 'Общие']) {
     showDialog(
       context: context,
       barrierColor: Colors.black.withOpacity(0.7),
@@ -84,13 +98,28 @@ class _DesktopShellState extends State<DesktopShell> {
                   ),
                 ],
               ),
-              child: ZCodeSettingsView(
+              child: DesktopSettingsDialog(
                 initialSection: initialSection,
+                userProfile: userProfile,
+                onUpdateProfile: (updated) {
+                  setState(() => userProfile = updated);
+                },
                 onBackToWorkspace: () => Navigator.of(ctx).pop(),
               ),
             ),
           ),
         );
+      },
+    );
+  }
+
+  /// Opens the Registration / Onboarding questionnaire dialog.
+  void _openOnboardingDialog() {
+    UserOnboardingDialog.show(
+      context,
+      initialProfile: userProfile,
+      onSave: (updated) {
+        setState(() => userProfile = updated);
       },
     );
   }
@@ -136,39 +165,37 @@ class _DesktopShellState extends State<DesktopShell> {
         body: SafeArea(
           child: Row(
             children: [
-              // 1. Left Sidebar (ZCode ADE Left Panel)
+              // 1. Left Sidebar (Projects / Groups)
               if (isSidebarVisible)
                 DesktopSidebar(
                   selectedIndex: selectedNavIndex,
-                  onSelectIndex: (idx) {
+                  userProfile: userProfile,
+                  onSelectTask: (idx, title) {
                     setState(() => selectedNavIndex = idx);
-                    // Load sample task or reset
-                    if (idx >= 0) {
-                      workspaceController.activeTaskTitle.value = 'Task #$idx';
-                    }
+                    workspaceController.activeTaskTitle.value = title;
                   },
                   onNewTask: _onNewTask,
                   onOpenSearch: _openCommandPalette,
-                  onOpenSettings: () => _openSettingsDialog('General'),
-                  onOpenSkills: () => _openSettingsDialog('Skills'),
+                  onOpenSettings: () => _openSettingsDialog('Общие'),
+                  onOpenSkills: () => _openSettingsDialog('Навыки'),
+                  onOpenProfile: _openOnboardingDialog,
                   onToggleSidebar: () {
                     setState(() => isSidebarVisible = !isSidebarVisible);
                   },
                 ),
 
-              // 2. Central Task Canvas & Composer (Full Width by Default!)
+              // 2. Central Task Canvas & Composer (Screenshot 2 Match)
               Expanded(
                 child: DesktopTaskWorkspaceView(
                   controller: workspaceController,
                   isToolsOpen: isInspectorOpen,
                   onToggleTools: _toggleInspector,
                   onToggleTerminal: () => _openInspectorWithTab(1),
-                  onOpenSettings: () => _openSettingsDialog('Model Settings'),
+                  onOpenSettings: () => _openSettingsDialog('Провайдеры'),
                 ),
               ),
 
-              // 3. Right Tool Canvas / Inspector (Browser, Terminal, Preview, Side Chat)
-              // Hidden by default, toggled smoothly via top right buttons or Ctrl+B / Ctrl+J
+              // 3. Right Tool Canvas / Inspector (Open tab: Side conversation, Review, Terminal, Browser)
               if (isInspectorOpen)
                 DesktopInspectorPanel(
                   key: inspectorKey,

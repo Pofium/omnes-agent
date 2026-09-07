@@ -1,4 +1,4 @@
-// Command Palette Modal Dialog (Ctrl + K) with ZCode ADE Shortcuts and Actions.
+// Command Palette Modal Dialog (Ctrl + K) with OmnesAgent ADE Shortcuts and Actions.
 
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';

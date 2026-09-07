@@ -1,4 +1,6 @@
-// ZCode ADE Task Workspace View matching official ZCode Desktop screenshots.
+// OmnesAgent ADE Task Workspace View matching authentic Windows ADE layout (Screenshot 2).
+// Features Git Tools status card popover, bottom terminal toggle, multi-project breadcrumbs,
+// git diff chips, and localized Russian assistant prompts.
 
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -29,6 +31,8 @@ class DesktopTaskWorkspaceView extends StatefulWidget {
 
 class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   bool isBannerDismissed = false;
+  bool isGitToolsOpen = false;
+  bool isBottomTerminalOpen = false;
 
   @override
   Widget build(BuildContext context) {
@@ -37,21 +41,37 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       child: Obx(() {
         final hasMessages = widget.controller.messages.isNotEmpty;
 
-        return Column(
+        return Stack(
           children: [
-            // Top Navigation Bar
-            _buildTopNavBar(hasMessages),
+            Column(
+              children: [
+                // 1. Top Navigation Bar
+                _buildTopNavBar(hasMessages),
 
-            // Main Body: Either Empty State (New Task) or Chat Timeline
-            Expanded(
-              child: hasMessages
-                  ? _buildChatTimeline()
-                  : _buildZCodeNewTaskScreen(),
+                // 2. Main Body: Either Empty State (New Task) or Chat Timeline
+                Expanded(
+                  child: hasMessages
+                      ? _buildChatTimeline()
+                      : _buildNewTaskWelcomeScreen(),
+                ),
+
+                // 3. Bottom Terminal (if opened below prompt)
+                if (hasMessages && isBottomTerminalOpen)
+                  _buildBottomTerminal(),
+
+                // 4. Bottom Floating Composer when messages exist
+                if (hasMessages)
+                  _buildBottomFloatingComposer(),
+              ],
             ),
 
-            // Bottom Floating Composer when messages exist
-            if (hasMessages)
-              _buildBottomFloatingComposer(),
+            // Floating Git Tools Popover Card (Screenshot 2 Match)
+            if (isGitToolsOpen)
+              Positioned(
+                top: 48,
+                left: 180,
+                child: _buildGitToolsCard(),
+              ),
           ],
         );
       }),
@@ -59,12 +79,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   }
 
   // ==========================================
-  // TOP NAV BAR MATCHING ZCODE
+  // TOP NAV BAR MATCHING SCREENSHOT 2
   // ==========================================
   Widget _buildTopNavBar(bool hasMessages) {
     return Container(
-      height: 48,
-      padding: const EdgeInsets.symmetric(horizontal: 20),
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
       decoration: const BoxDecoration(
         color: Color(0xFF16181D),
         border: Border(bottom: BorderSide(color: Color(0xFF22262E), width: 0.8)),
@@ -72,11 +92,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       child: Row(
         children: [
           if (hasMessages) ...[
+            // Task Title
             Flexible(
               child: Text(
                 widget.controller.activeTaskTitle.value,
                 style: const TextStyle(
-                  fontSize: 14,
+                  fontSize: 13,
                   fontWeight: FontWeight.w600,
                   color: Colors.white,
                 ),
@@ -84,51 +105,78 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 maxLines: 1,
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 10),
+
+            // Project folder chip
             _buildProjectChip(),
             const SizedBox(width: 6),
+
+            // Branch chip with toggle for Git Tools
             _buildBranchChip(),
             const SizedBox(width: 6),
-            const Icon(Icons.more_horiz, size: 16, color: Color(0xFF94A3B8)),
+
+            // Menu dots
+            InkWell(
+              onTap: () => setState(() => isGitToolsOpen = !isGitToolsOpen),
+              borderRadius: BorderRadius.circular(4),
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.more_horiz, size: 16, color: Color(0xFF94A3B8)),
+              ),
+            ),
           ],
 
           const Spacer(),
 
-          // Right Window Actions
-          // User profile avatar badge
-          Container(
-            width: 26,
-            height: 26,
-            decoration: BoxDecoration(
-              color: const Color(0xFF00D2FF).withOpacity(0.2),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
-            ),
-            child: const Center(
-              child: Text(
-                'O',
-                style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF00D2FF)),
-              ),
-            ),
-          ),
-          const SizedBox(width: 10),
-
-          // Terminal quick toggle (>_)
+          // Right Toolbar Controls
+          // Workspace / folder switcher
           InkWell(
-            onTap: widget.onToggleTerminal,
+            onTap: () {},
             borderRadius: BorderRadius.circular(4),
             child: Container(
-              padding: const EdgeInsets.all(5),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
               decoration: BoxDecoration(
                 color: const Color(0xFF22262E),
-                borderRadius: BorderRadius.circular(5),
+                borderRadius: BorderRadius.circular(4),
               ),
-              child: const Icon(FontAwesomeIcons.terminal, size: 12, color: Color(0xFF94A3B8)),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: const [
+                  Icon(Icons.folder_outlined, size: 13, color: Color(0xFF00D2FF)),
+                  SizedBox(width: 4),
+                  Icon(Icons.keyboard_arrow_down, size: 12, color: Color(0xFF94A3B8)),
+                ],
+              ),
             ),
           ),
           const SizedBox(width: 8),
 
-          // Inspector / Tools Drawer toggle ([|])
+          // Terminal quick toggle (>_)
+          InkWell(
+            onTap: () {
+              setState(() => isBottomTerminalOpen = !isBottomTerminalOpen);
+            },
+            borderRadius: BorderRadius.circular(4),
+            child: Container(
+              padding: const EdgeInsets.all(5),
+              decoration: BoxDecoration(
+                color: isBottomTerminalOpen ? const Color(0xFF00D2FF).withOpacity(0.18) : const Color(0xFF22262E),
+                borderRadius: BorderRadius.circular(5),
+                border: Border.all(
+                  color: isBottomTerminalOpen ? const Color(0xFF00D2FF) : Colors.transparent,
+                  width: 0.8,
+                ),
+              ),
+              child: Icon(
+                FontAwesomeIcons.terminal,
+                size: 12,
+                color: isBottomTerminalOpen ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+
+          // Side Pane / Inspector toggle ([|])
           InkWell(
             onTap: widget.onToggleTools,
             borderRadius: BorderRadius.circular(4),
@@ -149,15 +197,214 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               ),
             ),
           ),
+          const SizedBox(width: 14),
+
+          // Windows native window controls: [ — ] [ 🗖 ] [ ✕ ]
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildWinButton(Icons.remove, 'Свернуть', () {}),
+              const SizedBox(width: 6),
+              _buildWinButton(Icons.crop_square, 'Развернуть', () {}),
+              const SizedBox(width: 6),
+              _buildWinButton(Icons.close, 'Закрыть', () {}, isClose: true),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWinButton(IconData icon, String tooltip, VoidCallback onTap, {bool isClose = false}) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(3),
+      hoverColor: isClose ? const Color(0xFFE81123) : const Color(0xFF2A2E37),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Icon(icon, size: 12, color: const Color(0xFF94A3B8)),
+      ),
+    );
+  }
+
+  // ==========================================
+  // GIT TOOLS POPOVER CARD (Screenshot 2 Match)
+  // ==========================================
+  Widget _buildGitToolsCard() {
+    return Container(
+      width: 380,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1B1D22),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF2A2F3B), width: 1.2),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.7),
+            blurRadius: 28,
+            offset: const Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          Row(
+            children: [
+              const Text(
+                'Git tools',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+              ),
+              const Spacer(),
+              InkWell(
+                onTap: () {},
+                child: const Icon(Icons.more_horiz, size: 14, color: Color(0xFF94A3B8)),
+              ),
+              const SizedBox(width: 8),
+              InkWell(
+                onTap: () => setState(() => isGitToolsOpen = false),
+                child: const Icon(Icons.close, size: 14, color: Color(0xFF94A3B8)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          // Changes
+          Row(
+            children: [
+              const Icon(Icons.assignment_outlined, size: 14, color: Color(0xFF94A3B8)),
+              const SizedBox(width: 8),
+              const Text('Changes', style: TextStyle(fontSize: 12, color: Color(0xFFE2E8F0))),
+              const Spacer(),
+              const Text(
+                '+72347 -0',
+                style: TextStyle(fontSize: 12, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFF10B981)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          // Branch
+          Row(
+            children: [
+              const Icon(FontAwesomeIcons.codeBranch, size: 12, color: Color(0xFF94A3B8)),
+              const SizedBox(width: 8),
+              const Text('desktop-brand-ru', style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: Color(0xFF00D2FF))),
+              const SizedBox(width: 4),
+              const Icon(Icons.keyboard_arrow_down, size: 14, color: Color(0xFF94A3B8)),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          // Commit or push
+          Row(
+            children: const [
+              Icon(Icons.commit, size: 14, color: Color(0xFF94A3B8)),
+              SizedBox(width: 8),
+              Text('Commit or push', style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8))),
+            ],
+          ),
+          const Divider(height: 20, color: Color(0xFF262B34)),
+
+          // Progress 5/5
+          Row(
+            children: const [
+              Text('Progress', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+              SizedBox(width: 8),
+              Text('5/5', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          _buildCheckItem('Graft + merge upstream dsh v0.1.3-alpha.1, resolve 519 conflicts'),
+          _buildCheckItem('typecheck/i18n/tests/build green; ru dictionaries completed'),
+          _buildCheckItem('Runtime synced to 0.1.3; root cause of fileUploads pending found and fixed'),
+          _buildCheckItem('Exe smoke: boots with live URL on synced 0.1.3 runtime'),
+          _buildCheckItem('ob2h подключён (project dsh-desktop), факты в памяти, всё запущено'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCheckItem(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.check_circle_outline, size: 14, color: Color(0xFF10B981)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8), height: 1.3),
+            ),
+          ),
         ],
       ),
     );
   }
 
   // ==========================================
-  // ZCODE NEW TASK / WELCOME SCREEN
+  // BOTTOM INLINE TERMINAL
   // ==========================================
-  Widget _buildZCodeNewTaskScreen() {
+  Widget _buildBottomTerminal() {
+    return Container(
+      height: 180,
+      margin: const EdgeInsets.fromLTRB(24, 0, 24, 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0E1015),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF242934)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            height: 30,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            decoration: const BoxDecoration(
+              color: Color(0xFF16181F),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(9)),
+            ),
+            child: Row(
+              children: [
+                const Icon(FontAwesomeIcons.terminal, size: 11, color: Color(0xFF00D2FF)),
+                const SizedBox(width: 8),
+                const Text('Terminal (bash / pwsh) — OmnesAgent Daemon', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white)),
+                const Spacer(),
+                InkWell(
+                  onTap: () => setState(() => isBottomTerminalOpen = false),
+                  child: const Icon(Icons.close, size: 13, color: Color(0xFF94A3B8)),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(10),
+              child: ListView(
+                children: const [
+                  Text('\$ cargo check --workspace', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF00D2FF))),
+                  Text('   Compiling omnesagent-gateway v0.1.0 (C:\\Projects\\Omnes-agent)...', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF94A3B8))),
+                  Text('   Finished dev [unoptimized + debuginfo] in 1.8s', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF10B981))),
+                  Text('\$ flutter analyze', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF00D2FF))),
+                  Text('No issues found! (ran in 1.2s)', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF10B981))),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================
+  // NEW TASK / WELCOME SCREEN
+  // ==========================================
+  Widget _buildNewTaskWelcomeScreen() {
     return Center(
       child: SingleChildScrollView(
         padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
@@ -166,7 +413,6 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Subtle background watermark & Title
               const SizedBox(height: 10),
               const Text(
                 'Start a new task in the omnes-agent project',
@@ -181,7 +427,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               ),
               const SizedBox(height: 32),
 
-              // Central Composer Card (Exact ZCode match)
+              // Central Composer Card
               _buildComposerCard(isHero: true),
 
               const SizedBox(height: 20),
@@ -201,7 +447,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       const SizedBox(width: 10),
                       const Expanded(
                         child: Text(
-                          'New feature for subscribers: Create "Idle-time task", We will complete your assigned task for free during periods of surplus computing power.',
+                          'Новая функция: Создание фоновых задач "Idle-time task". Агент выполняет рутинные проверки в периоды простоя.',
                           style: TextStyle(
                             fontSize: 12,
                             color: Color(0xFF94A3B8),
@@ -219,13 +465,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
               const SizedBox(height: 20),
 
-              // 3 Quick Action Cards matching ZCode
+              // 3 Quick Action Cards
               Row(
                 children: [
                   Expanded(
                     child: _buildTemplateCard(
                       title: 'Standup Git Summary',
-                      desc: 'A Friday summary of what happened this week.',
+                      desc: 'Сводка последних коммитов, веток и изменений за прошедшую неделю.',
                       onTap: () {
                         widget.controller.inputController.text = 'Сформируй Git Standup summary за последнюю неделю.';
                       },
@@ -235,9 +481,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   Expanded(
                     child: _buildTemplateCard(
                       title: 'CI Failures & Flaky Test Report',
-                      desc: 'A report on recent CI failures, flaky tests, and likely causes.',
+                      desc: 'Отчёт о последних падениях тестов компиляции и интеграционных проверок.',
                       onTap: () {
-                        widget.controller.inputController.text = 'Проанализируй недавние падения CI тестов и сформируй отчет.';
+                        widget.controller.inputController.text = 'Проанализируй недавние падения CI тестов и предложи исправления.';
                       },
                     ),
                   ),
@@ -245,7 +491,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   Expanded(
                     child: _buildTemplateCard(
                       title: 'Customize',
-                      desc: 'Skip the template and tell it directly what you want to do.',
+                      desc: 'Прямой ввод свободной задачи без использования готовых шаблонов.',
                       onTap: () {},
                     ),
                   ),
@@ -394,7 +640,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.4),
               decoration: InputDecoration(
                 hintText: isHero
-                    ? 'Ask ZCode, type @ to add files, / for commands, \$ for skills, # to link chats'
+                    ? 'Спросите OmnesAgent, введите @ для файлов, / для команд, \$ для навыков, # для чатов'
                     : 'Ask for follow-up changes...',
                 hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF6B7280)),
                 border: InputBorder.none,
@@ -405,7 +651,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             ),
           ),
 
-          // 4. Bottom Controls Row: [+] [✋ Mode ⌵] ... [Model ⌵] [🧠 Max ⌵] [↑]
+          // 4. Bottom Controls Row: [+] [🛡️ Mode ⌵] ... [🟢 Model ⌵] [🧠 Max ⌵] [↑]
           Padding(
             padding: const EdgeInsets.only(left: 12, right: 12, bottom: 10),
             child: Row(
@@ -414,12 +660,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 _buildAddMenuButton(),
                 const SizedBox(width: 8),
 
-                // [✋ Permission Mode ⌵]
+                // [🛡️ Permission Mode ⌵]
                 _buildPermissionModeMenuButton(),
 
                 const Spacer(),
 
-                // [Model ⌵]
+                // [🟢 Model ⌵]
                 _buildModelMenuButton(),
                 const SizedBox(width: 8),
 
@@ -567,6 +813,40 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                             ),
                           )),
                     ],
+
+                    // Git diff chip (Screenshot 2 match)
+                    if (!isUser) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF191C22),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: const Color(0xFF262A34)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.chevron_right, size: 14, color: Color(0xFF94A3B8)),
+                            const SizedBox(width: 4),
+                            const Text('1 file changed ', style: TextStyle(fontSize: 11, color: Color(0xFFCBD5E1))),
+                            const Text('+9', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
+                            const Text(' -0', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFFEF4444))),
+                            const SizedBox(width: 14),
+                            InkWell(
+                              onTap: () {},
+                              child: Row(
+                                children: const [
+                                  Icon(Icons.undo, size: 12, color: Color(0xFF94A3B8)),
+                                  SizedBox(width: 4),
+                                  Text('Undo', style: TextStyle(fontSize: 11, color: Color(0xFF94A3B8))),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -578,13 +858,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   }
 
   // ==========================================
-  // ZCODE POPUP MENUS
+  // POPUP MENUS
   // ==========================================
-
-  // 1. [+] Add Menu
   Widget _buildAddMenuButton() {
     return PopupMenuButton<String>(
-      tooltip: 'Add context (@file, #chat, /cmd)',
+      tooltip: 'Добавить контекст (@файл, #чат, /команда)',
       offset: const Offset(0, -170),
       color: const Color(0xFF22252A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -600,10 +878,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         }
       },
       itemBuilder: (context) => [
-        _buildPopupItem('attachment', Icons.attach_file, 'Add attachment'),
-        _buildPopupItem('mention', Icons.alternate_email, 'Insert @ mention'),
-        _buildPopupItem('chat', Icons.chat_bubble_outline, 'Insert # conversation'),
-        _buildPopupItem('command', Icons.terminal, 'Insert / command'),
+        _buildPopupItem('attachment', Icons.attach_file, 'Прикрепить файл (Attachment)'),
+        _buildPopupItem('mention', Icons.alternate_email, 'Упомянуть файл (@ mention)'),
+        _buildPopupItem('chat', Icons.chat_bubble_outline, 'Связать с задачей (# chat)'),
+        _buildPopupItem('command', Icons.terminal, 'Вставить команду (/ command)'),
       ],
       child: Container(
         width: 28,
@@ -617,13 +895,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
-  // 2. [✋ Ask before changes ⌵] Popup Menu
   Widget _buildPermissionModeMenuButton() {
     return Obx(() {
       final mode = widget.controller.permissionMode.value;
 
       return PopupMenuButton<PermissionMode>(
-        tooltip: 'Permission Mode',
+        tooltip: 'Режим подтверждений',
         offset: const Offset(0, -220),
         color: const Color(0xFF22252A),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -633,28 +910,28 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             PermissionMode.askBeforeChanges,
             Icons.pan_tool_outlined,
             'Ask before changes',
-            'Ask before file changes.',
+            'Спрашивать перед правками файлов.',
             mode == PermissionMode.askBeforeChanges,
           ),
           _buildPermissionItem(
             PermissionMode.editAutomatically,
             Icons.shield_outlined,
             'Edit automatically',
-            'Edit files automatically.',
+            'Автоматически вносить правки.',
             mode == PermissionMode.editAutomatically,
           ),
           _buildPermissionItem(
             PermissionMode.planMode,
             Icons.calendar_today_outlined,
             'Plan mode',
-            'Plan before editing.',
+            'Планировать шаги перед действиями.',
             mode == PermissionMode.planMode,
           ),
           _buildPermissionItem(
             PermissionMode.fullAccess,
             Icons.security,
             'Full access',
-            'Run with fewer confirmations.',
+            'Минимум подтверждений (полный доступ).',
             mode == PermissionMode.fullAccess,
           ),
         ],
@@ -690,13 +967,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     });
   }
 
-  // 3. [Model ⌵] Popup Menu
   Widget _buildModelMenuButton() {
     return Obx(() {
       final active = widget.controller.activeModel.value;
 
       return PopupMenuButton<String>(
-        tooltip: 'Select Model',
+        tooltip: 'Выбор модели',
         offset: const Offset(0, -230),
         color: const Color(0xFF22252A),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -711,8 +987,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           const PopupMenuItem(
             enabled: false,
             height: 28,
-            child: Text('Z.ai API', style: TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.bold)),
+            child: Text('Провайдеры моделей', style: TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.bold)),
           ),
+          _buildModelItem('GLM-5.3-Flash', active == 'GLM-5.3-Flash'),
           _buildModelItem('GLM-5.3', active == 'GLM-5.3'),
           _buildModelItem('Claude 3.5 Sonnet', active == 'Claude 3.5 Sonnet'),
           _buildModelItem('DeepSeek V3', active == 'DeepSeek V3'),
@@ -725,7 +1002,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               children: [
                 Icon(Icons.settings_outlined, size: 14, color: Color(0xFF94A3B8)),
                 SizedBox(width: 8),
-                Text('Manage models', style: TextStyle(fontSize: 12, color: Color(0xFFCBD5E1))),
+                Text('Настройки провайдеров', style: TextStyle(fontSize: 12, color: Color(0xFFCBD5E1))),
               ],
             ),
           ),
@@ -739,6 +1016,16 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              // Green active status dot (Screenshot 2 Match)
+              Container(
+                width: 6,
+                height: 6,
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Color(0xFF10B981),
+                ),
+              ),
+              const SizedBox(width: 6),
               Text(active, style: const TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w500)),
               const SizedBox(width: 4),
               const Icon(Icons.keyboard_arrow_down, size: 14, color: Color(0xFF94A3B8)),
@@ -749,7 +1036,6 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     });
   }
 
-  // 4. [🧠 Thought Level ⌵] Popup Menu
   Widget _buildThoughtLevelMenuButton() {
     return Obx(() {
       final level = widget.controller.thoughtLevel.value;
@@ -786,7 +1072,6 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     });
   }
 
-  // 5. Send button
   Widget _buildSendButton() {
     return InkWell(
       onTap: widget.controller.sendMessage,
@@ -803,16 +1088,62 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
-  // Helper popup item builders
-  PopupMenuItem<String> _buildPopupItem(String val, IconData icon, String text) {
-    return PopupMenuItem(
-      value: val,
+  // Helpers
+  Widget _buildProjectChip() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: const Color(0xFF20242D),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: const Color(0xFF2C323E)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: const [
+          Icon(Icons.folder_outlined, size: 12, color: Color(0xFF00D2FF)),
+          SizedBox(width: 6),
+          Text('deepseek-harness-mas...', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white)),
+          SizedBox(width: 4),
+          Icon(Icons.keyboard_arrow_down, size: 13, color: Color(0xFF94A3B8)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBranchChip() {
+    return InkWell(
+      onTap: () => setState(() => isGitToolsOpen = !isGitToolsOpen),
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: const Color(0xFF20242D),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: isGitToolsOpen ? const Color(0xFF00D2FF) : const Color(0xFF2C323E)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: const [
+            Icon(FontAwesomeIcons.codeBranch, size: 10, color: Color(0xFF00D2FF)),
+            SizedBox(width: 6),
+            Text('desktop-bran...', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF00D2FF))),
+            SizedBox(width: 4),
+            Icon(Icons.keyboard_arrow_down, size: 13, color: Color(0xFF94A3B8)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  PopupMenuItem<String> _buildPopupItem(String value, IconData icon, String label) {
+    return PopupMenuItem<String>(
+      value: value,
       height: 38,
       child: Row(
         children: [
-          Icon(icon, size: 14, color: const Color(0xFF94A3B8)),
+          Icon(icon, size: 15, color: const Color(0xFF94A3B8)),
           const SizedBox(width: 10),
-          Text(text, style: const TextStyle(fontSize: 13, color: Colors.white)),
+          Text(label, style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0))),
         ],
       ),
     );
@@ -822,99 +1153,55 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     PermissionMode mode,
     IconData icon,
     String title,
-    String subtitle,
+    String desc,
     bool isSelected,
   ) {
-    return PopupMenuItem(
+    return PopupMenuItem<PermissionMode>(
       value: mode,
+      height: 48,
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, size: 16, color: isSelected ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8)),
-          const SizedBox(width: 12),
+          Icon(icon, size: 15, color: isSelected ? const Color(0xFF00D2FF) : const Color(0xFF94A3B8)),
+          const SizedBox(width: 10),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Text(title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white)),
-                const SizedBox(height: 2),
-                Text(subtitle, style: const TextStyle(fontSize: 11, color: Color(0xFF8B949E))),
+                Text(title, style: TextStyle(fontSize: 12, fontWeight: isSelected ? FontWeight.bold : FontWeight.w500, color: Colors.white)),
+                Text(desc, style: const TextStyle(fontSize: 10, color: Color(0xFF64748B))),
               ],
             ),
           ),
-          if (isSelected)
-            const Icon(Icons.check, size: 16, color: Color(0xFF00D2FF)),
+          if (isSelected) const Icon(Icons.check, size: 14, color: Color(0xFF00D2FF)),
         ],
       ),
     );
   }
 
   PopupMenuItem<String> _buildModelItem(String model, bool isSelected) {
-    return PopupMenuItem(
+    return PopupMenuItem<String>(
       value: model,
-      height: 36,
+      height: 34,
       child: Row(
         children: [
-          Text(model, style: const TextStyle(fontSize: 13, color: Colors.white)),
+          Text(model, style: TextStyle(fontSize: 12, color: isSelected ? const Color(0xFF00D2FF) : const Color(0xFFE2E8F0))),
           const Spacer(),
-          if (isSelected)
-            const Icon(Icons.check, size: 16, color: Color(0xFF00D2FF)),
+          if (isSelected) const Icon(Icons.check, size: 14, color: Color(0xFF00D2FF)),
         ],
       ),
     );
   }
 
   PopupMenuItem<String> _buildThoughtItem(String level, bool isSelected) {
-    return PopupMenuItem(
+    return PopupMenuItem<String>(
       value: level,
-      height: 34,
+      height: 32,
       child: Row(
         children: [
-          Text(level, style: const TextStyle(fontSize: 13, color: Colors.white)),
+          Text(level, style: TextStyle(fontSize: 12, color: isSelected ? const Color(0xFF00D2FF) : const Color(0xFFE2E8F0))),
           const Spacer(),
-          if (isSelected)
-            const Icon(Icons.check, size: 16, color: Color(0xFF00D2FF)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildProjectChip() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: const Color(0xFF22262E),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: const [
-          Icon(FontAwesomeIcons.folder, size: 11, color: Color(0xFF00D2FF)),
-          SizedBox(width: 6),
-          Text('omnes-agent', style: TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w500)),
-          SizedBox(width: 4),
-          Icon(Icons.keyboard_arrow_down, size: 13, color: Color(0xFF94A3B8)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildBranchChip() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: const Color(0xFF22262E),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: const [
-          Icon(FontAwesomeIcons.codeBranch, size: 11, color: Color(0xFF94A3B8)),
-          SizedBox(width: 6),
-          Text('main', style: TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w500)),
-          SizedBox(width: 4),
-          Icon(Icons.keyboard_arrow_down, size: 13, color: Color(0xFF94A3B8)),
+          if (isSelected) const Icon(Icons.check, size: 14, color: Color(0xFF00D2FF)),
         ],
       ),
     );
