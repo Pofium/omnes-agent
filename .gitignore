@@ -8,11 +8,11 @@ backend/target/
 # ==========================================
 # Flutter / Dart (Frontend)
 # ==========================================
-frontend/.dart_tool/
-frontend/.flutter-plugins
-frontend/.flutter-plugins-dependencies
-frontend/.packages
-frontend/build/
+**/build/
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
 frontend/android/.gradle/
 frontend/android/local.properties
 frontend/android/app/release/
@@ -21,6 +21,7 @@ frontend/ios/Pods/
 frontend/ios/Podfile.lock
 frontend/windows/flutter/ephemeral/
 frontend/windows/build/
+.playwright-mcp/
 
 # ==========================================
 # Database & Runtime Data

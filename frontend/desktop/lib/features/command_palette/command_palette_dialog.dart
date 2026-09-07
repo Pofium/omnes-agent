@@ -5,6 +5,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 import '../../theme/desktop_theme.dart';
+import '../../utils/desktop_i18n.dart';
 import '../workspace/task_workspace_controller.dart';
 
 class DesktopCommandPaletteDialog extends StatefulWidget {
@@ -48,8 +49,8 @@ class _DesktopCommandPaletteDialogState
 
   List<_CommandAction> get allActions => [
         _CommandAction(
-          category: 'GOAL & TASKS',
-          title: 'Set Goal Mode (/goal)',
+          category: DesktopI18n.tr('ЗАДАЧИ И ЦЕЛИ', 'GOAL & TASKS'),
+          title: DesktopI18n.tr('Задать режим цели (/goal)', 'Set Goal Mode (/goal)'),
           shortcut: '/goal',
           icon: FontAwesomeIcons.bullseye,
           onExecute: () {
@@ -59,18 +60,18 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'GOAL & TASKS',
-          title: 'Create New Task Run',
+          category: DesktopI18n.tr('ЗАДАЧИ И ЦЕЛИ', 'GOAL & TASKS'),
+          title: DesktopI18n.cmdNewTask,
           shortcut: 'Ctrl + N',
           icon: FontAwesomeIcons.plus,
           onExecute: () {
             widget.controller?.messages.clear();
-            widget.controller?.activeTaskTitle.value = 'New Task Session';
+            widget.controller?.activeTaskTitle.value = DesktopI18n.tr('Новая задача', 'New Task Session');
           },
         ),
         _CommandAction(
-          category: 'GOAL & TASKS',
-          title: 'Clear Current Workspace Session',
+          category: DesktopI18n.tr('ЗАДАЧИ И ЦЕЛИ', 'GOAL & TASKS'),
+          title: DesktopI18n.tr('Очистить историю сообщений', 'Clear Current Workspace Session'),
           shortcut: 'Ctrl + L',
           icon: FontAwesomeIcons.trashCan,
           onExecute: () {
@@ -78,8 +79,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'PERMISSION MODE',
-          title: 'Cycle Permission Mode (Ask -> Edit -> Plan -> Full)',
+          category: DesktopI18n.categoryPermissionModes,
+          title: DesktopI18n.cmdCyclePermission,
           shortcut: 'Shift + Tab',
           icon: Icons.shield_outlined,
           onExecute: () {
@@ -87,8 +88,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'PERMISSION MODE',
-          title: 'Set Mode: Ask before changes (Supervised)',
+          category: DesktopI18n.categoryPermissionModes,
+          title: DesktopI18n.cmdModeAsk,
           shortcut: '',
           icon: Icons.lock_clock,
           onExecute: () {
@@ -96,8 +97,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'PERMISSION MODE',
-          title: 'Set Mode: Edit automatically',
+          category: DesktopI18n.categoryPermissionModes,
+          title: DesktopI18n.cmdModeEdit,
           shortcut: '',
           icon: Icons.edit_note,
           onExecute: () {
@@ -105,8 +106,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'PERMISSION MODE',
-          title: 'Set Mode: Plan mode (Architecture First)',
+          category: DesktopI18n.categoryPermissionModes,
+          title: DesktopI18n.cmdModePlan,
           shortcut: '',
           icon: Icons.architecture,
           onExecute: () {
@@ -114,8 +115,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'PERMISSION MODE',
-          title: 'Set Mode: Full access (Unrestricted)',
+          category: DesktopI18n.categoryPermissionModes,
+          title: DesktopI18n.cmdModeFull,
           shortcut: '',
           icon: Icons.bolt,
           onExecute: () {
@@ -123,8 +124,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'TOOLS',
-          title: 'Open Integrated Terminal',
+          category: DesktopI18n.categoryActions,
+          title: DesktopI18n.cmdToggleTerminal,
           shortcut: 'Ctrl + J',
           icon: FontAwesomeIcons.terminal,
           onExecute: () {
@@ -132,8 +133,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'TOOLS',
-          title: 'Open Live Browser & Element Picker',
+          category: DesktopI18n.categoryActions,
+          title: DesktopI18n.tr('Открыть Live Browser и инспектор DOM', 'Open Live Browser & Element Picker'),
           shortcut: '',
           icon: FontAwesomeIcons.globe,
           onExecute: () {
@@ -141,8 +142,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'TOOLS',
-          title: 'Toggle Tool Canvas Panel',
+          category: DesktopI18n.categoryActions,
+          title: DesktopI18n.tr('Переключить боковую панель инструментов', 'Toggle Tool Canvas Panel'),
           shortcut: 'Ctrl + B',
           icon: Icons.view_sidebar_outlined,
           onExecute: () {
@@ -150,8 +151,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'APPEARANCE',
-          title: 'Toggle Dark / Light Theme',
+          category: DesktopI18n.appearance,
+          title: DesktopI18n.tr('Переключить темную / светлую тему', 'Toggle Dark / Light Theme'),
           shortcut: 'Ctrl + T',
           icon: Icons.brightness_6_outlined,
           onExecute: () {
@@ -159,8 +160,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'MODELS',
-          title: 'Switch to GLM-5.3 ADE Agent',
+          category: DesktopI18n.tr('МОДЕЛИ', 'MODELS'),
+          title: DesktopI18n.tr('Переключиться на GLM-5.3 Agent', 'Switch to GLM-5.3 Agent'),
           shortcut: 'Alt + 1',
           icon: FontAwesomeIcons.brain,
           onExecute: () {
@@ -168,8 +169,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'MODELS',
-          title: 'Switch to Claude 3.5 Sonnet',
+          category: DesktopI18n.tr('МОДЕЛИ', 'MODELS'),
+          title: DesktopI18n.tr('Переключиться на Claude 3.5 Sonnet', 'Switch to Claude 3.5 Sonnet'),
           shortcut: 'Alt + 2',
           icon: FontAwesomeIcons.brain,
           onExecute: () {
@@ -177,8 +178,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'MODELS',
-          title: 'Switch to DeepSeek V3 / Reasoner',
+          category: DesktopI18n.tr('МОДЕЛИ', 'MODELS'),
+          title: DesktopI18n.tr('Переключиться на DeepSeek V3', 'Switch to DeepSeek V3'),
           shortcut: 'Alt + 3',
           icon: FontAwesomeIcons.brain,
           onExecute: () {
@@ -186,8 +187,8 @@ class _DesktopCommandPaletteDialogState
           },
         ),
         _CommandAction(
-          category: 'SYSTEM',
-          title: 'Run Diagnostic Doctor & Gateway Health',
+          category: DesktopI18n.categorySystem,
+          title: DesktopI18n.tr('Диагностика окружения и шлюза Gateway', 'Run Diagnostic Doctor & Gateway Health'),
           shortcut: 'F5',
           icon: FontAwesomeIcons.stethoscope,
           onExecute: () {},
@@ -196,70 +197,72 @@ class _DesktopCommandPaletteDialogState
 
   @override
   Widget build(BuildContext context) {
-    final filtered = allActions.where((a) {
-      if (query.isEmpty) return true;
-      return a.title.toLowerCase().contains(query.toLowerCase()) ||
-          a.category.toLowerCase().contains(query.toLowerCase());
-    }).toList();
+    return Obx(() {
+      final _ = DesktopI18n.currentLanguage.value;
+      final filtered = allActions.where((a) {
+        if (query.isEmpty) return true;
+        return a.title.toLowerCase().contains(query.toLowerCase()) ||
+            a.category.toLowerCase().contains(query.toLowerCase());
+      }).toList();
 
-    return Center(
-      child: Material(
-        color: Colors.transparent,
-        child: Container(
-          width: 600,
-          constraints: const BoxConstraints(maxHeight: 480),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: DesktopTheme.borderMedium, width: 1.2),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withOpacity(0.5),
-                blurRadius: 32,
-                offset: const Offset(0, 12),
-              ),
-            ],
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Search input
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                child: Row(
-                  children: [
-                    const Icon(Icons.search, size: 20, color: DesktopTheme.accentSky),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextField(
-                        controller: searchController,
-                        autofocus: true,
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: DesktopTheme.textPrimary,
-                        ),
-                        decoration: InputDecoration(
-                          hintText: 'Type a command, tool or search actions...',
-                          hintStyle: TextStyle(
-                            color: DesktopTheme.textMuted,
-                            fontSize: 13,
-                          ),
-                          filled: false,
-                          border: InputBorder.none,
-                          enabledBorder: InputBorder.none,
-                          focusedBorder: InputBorder.none,
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                        onChanged: (val) => setState(() => query = val),
-                      ),
-                    ),
-                    IconButton(
-                      icon: Icon(Icons.close, size: 18, color: DesktopTheme.textMuted),
-                      onPressed: () => Get.back(),
-                    ),
-                  ],
+      return Center(
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            width: 600,
+            constraints: const BoxConstraints(maxHeight: 480),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurface,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: DesktopTheme.borderMedium, width: 1.2),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.5),
+                  blurRadius: 32,
+                  offset: const Offset(0, 12),
                 ),
-              ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Search input
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.search, size: 20, color: DesktopTheme.accentSky),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: searchController,
+                          autofocus: true,
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: DesktopTheme.textPrimary,
+                          ),
+                          decoration: InputDecoration(
+                            hintText: DesktopI18n.searchCommandsOrFiles,
+                            hintStyle: TextStyle(
+                              color: DesktopTheme.textMuted,
+                              fontSize: 13,
+                            ),
+                            filled: false,
+                            border: InputBorder.none,
+                            enabledBorder: InputBorder.none,
+                            focusedBorder: InputBorder.none,
+                            contentPadding: EdgeInsets.zero,
+                          ),
+                          onChanged: (val) => setState(() => query = val),
+                        ),
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.close, size: 18, color: DesktopTheme.textMuted),
+                        onPressed: () => Get.back(),
+                      ),
+                    ],
+                  ),
+                ),
               Divider(height: 1, color: DesktopTheme.borderSubtle),
 
               // Results List
@@ -337,7 +340,8 @@ class _DesktopCommandPaletteDialogState
         ),
       ),
     );
-  }
+  });
+}
 }
 
 class _CommandAction {

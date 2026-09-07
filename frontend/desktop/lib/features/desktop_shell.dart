@@ -134,11 +134,11 @@ class _DesktopShellState extends State<DesktopShell> {
 
   @override
   Widget build(BuildContext context) {
-    return RawKeyboardListener(
+    return KeyboardListener(
       focusNode: FocusNode(),
       autofocus: true,
-      onKey: (event) {
-        if (event is RawKeyDownEvent && event.isControlPressed) {
+      onKeyEvent: (event) {
+        if (event is KeyDownEvent && HardwareKeyboard.instance.isControlPressed) {
           // Global Ctrl + K: Command Palette
           if (event.logicalKey == LogicalKeyboardKey.keyK) {
             _openCommandPalette();

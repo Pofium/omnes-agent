@@ -72,8 +72,8 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       ' M frontend/desktop/lib/widgets/desktop_titlebar.dart',
       '?? frontend/desktop/assets/Logo/',
       '',
-      '\$ echo "ZCode ADE background daemon ready on 127.0.0.1:42617"',
-      'ZCode ADE background daemon ready on 127.0.0.1:42617',
+      '\$ echo "OmnesAgent ADE background daemon ready on 127.0.0.1:42617"',
+      'OmnesAgent ADE background daemon ready on 127.0.0.1:42617',
     ],
   ];
 
@@ -128,7 +128,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       ),
       child: Column(
         children: [
-          // Inspector Header with 4 ZCode Tabs and Close button
+          // Inspector Header with 4 ADE Tabs and Close button
           Container(
             height: 44,
             decoration: BoxDecoration(

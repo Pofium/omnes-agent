@@ -1,8 +1,7 @@
-// User Onboarding and Registration Dialog for OmnesAgent Desktop.
-// Collects First & Last Name, Avatar selection, role/stack, and personalization questionnaire for the agent.
-
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:get/get.dart';
+import '../../utils/desktop_i18n.dart';
 
 class UserProfileData {
   String firstName;
@@ -153,108 +152,114 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        // Top Header
-        Container(
-          height: 60,
-          padding: const EdgeInsets.symmetric(horizontal: 24),
-          decoration: const BoxDecoration(
-            color: Color(0xFF181B22),
-            border: Border(bottom: BorderSide(color: Color(0xFF242933))),
-          ),
-          child: Row(
-            children: [
-              Container(
-                width: 28,
-                height: 28,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF00D2FF).withOpacity(0.18),
-                  borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.35)),
-                ),
-                child: const Icon(FontAwesomeIcons.userAstronaut, size: 14, color: Color(0xFF00D2FF)),
-              ),
-              const SizedBox(width: 12),
-              Text(
-                currentStep == 0 ? 'Регистрация и профиль пользователя' : 'Персонализация агента (Анкета)',
-                style: const TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
-                ),
-              ),
-              const Spacer(),
-              IconButton(
-                icon: const Icon(Icons.close, size: 18, color: Color(0xFF94A3B8)),
-                onPressed: () => Navigator.of(context).pop(),
-              ),
-            ],
-          ),
-        ),
+    return Obx(() {
+      final _ = DesktopI18n.currentLanguage.value;
 
-        // Body with Step Content
-        Expanded(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
-            child: currentStep == 0 ? _buildStepPersonalInfo() : _buildStepQuestionnaire(),
+      return Column(
+        children: [
+          // Top Header
+          Container(
+            height: 60,
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            decoration: const BoxDecoration(
+              color: Color(0xFF181B22),
+              border: Border(bottom: BorderSide(color: Color(0xFF242933))),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 28,
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00D2FF).withOpacity(0.18),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.35)),
+                  ),
+                  child: const Icon(FontAwesomeIcons.userAstronaut, size: 14, color: Color(0xFF00D2FF)),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  currentStep == 0
+                      ? DesktopI18n.tr('Регистрация и профиль пользователя', 'User Registration & Profile')
+                      : DesktopI18n.tr('Персонализация агента (Анкета)', 'Agent Personalization (Questionnaire)'),
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 18, color: Color(0xFF94A3B8)),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ],
+            ),
           ),
-        ),
 
-        // Bottom Actions
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
-          decoration: const BoxDecoration(
-            color: Color(0xFF181B22),
-            border: Border(top: BorderSide(color: Color(0xFF242933))),
+          // Body with Step Content
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: currentStep == 0 ? _buildStepPersonalInfo() : _buildStepQuestionnaire(),
+            ),
           ),
-          child: Row(
-            children: [
-              if (currentStep > 0)
-                OutlinedButton(
-                  onPressed: () => setState(() => currentStep = 0),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFF94A3B8),
-                    side: const BorderSide(color: Color(0xFF333A47)),
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+
+          // Bottom Actions
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+            decoration: const BoxDecoration(
+              color: Color(0xFF181B22),
+              border: Border(top: BorderSide(color: Color(0xFF242933))),
+            ),
+            child: Row(
+              children: [
+                if (currentStep > 0)
+                  OutlinedButton(
+                    onPressed: () => setState(() => currentStep = 0),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF94A3B8),
+                      side: const BorderSide(color: Color(0xFF333A47)),
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    ),
+                    child: Text(DesktopI18n.tr('Назад', 'Back')),
                   ),
-                  child: const Text('Назад'),
-                ),
-              const Spacer(),
-              if (currentStep == 0)
-                ElevatedButton(
-                  onPressed: () => setState(() => currentStep = 1),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF00D2FF),
-                    foregroundColor: const Color(0xFF0F172A),
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                const Spacer(),
+                if (currentStep == 0)
+                  ElevatedButton(
+                    onPressed: () => setState(() => currentStep = 1),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF00D2FF),
+                      foregroundColor: const Color(0xFF0F172A),
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(DesktopI18n.tr('Далее к анкете агента', 'Next to Agent Questionnaire'), style: const TextStyle(fontWeight: FontWeight.bold)),
+                        const SizedBox(width: 8),
+                        const Icon(Icons.arrow_forward, size: 16),
+                      ],
+                    ),
+                  )
+                else
+                  ElevatedButton(
+                    onPressed: _submitProfile,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF00D2FF),
+                      foregroundColor: const Color(0xFF0F172A),
+                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    child: Text(DesktopI18n.finishBtn, style: const TextStyle(fontWeight: FontWeight.bold)),
                   ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: const [
-                      Text('Далее к анкете агента', style: TextStyle(fontWeight: FontWeight.bold)),
-                      SizedBox(width: 8),
-                      Icon(Icons.arrow_forward, size: 16),
-                    ],
-                  ),
-                )
-              else
-                ElevatedButton(
-                  onPressed: _submitProfile,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF00D2FF),
-                    foregroundColor: const Color(0xFF0F172A),
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  ),
-                  child: const Text('Сохранить и начать работу', style: TextStyle(fontWeight: FontWeight.bold)),
-                ),
-            ],
+              ],
+            ),
           ),
-        ),
-      ],
-    );
+        ],
+      );
+    });
   }
 
   Widget _buildStepPersonalInfo() {
@@ -303,19 +308,19 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
         const SizedBox(height: 24),
 
         // First Name
-        const Text('Имя', style: TextStyle(fontSize: 13, color: Color(0xFF94A3B8), fontWeight: FontWeight.w600)),
+        Text(DesktopI18n.firstName, style: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8), fontWeight: FontWeight.w600)),
         const SizedBox(height: 6),
-        _buildTextField(firstNameController, 'Введите ваше имя (например: Илья)'),
+        _buildTextField(firstNameController, DesktopI18n.tr('Введите ваше имя (например: Илья)', 'Enter your first name (e.g. Ilya)')),
         const SizedBox(height: 16),
 
         // Last Name
-        const Text('Фамилия', style: TextStyle(fontSize: 13, color: Color(0xFF94A3B8), fontWeight: FontWeight.w600)),
+        Text(DesktopI18n.lastName, style: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8), fontWeight: FontWeight.w600)),
         const SizedBox(height: 6),
-        _buildTextField(lastNameController, 'Введите вашу фамилию (например: Пресняков)'),
+        _buildTextField(lastNameController, DesktopI18n.tr('Введите вашу фамилию (например: Пресняков)', 'Enter your last name (e.g. Presnyakov)')),
         const SizedBox(height: 16),
 
         // Tier / Status
-        const Text('Тарифный статус', style: TextStyle(fontSize: 13, color: Color(0xFF94A3B8), fontWeight: FontWeight.w600)),
+        Text(DesktopI18n.tr('Тарифный статус', 'Subscription Tier'), style: const TextStyle(fontSize: 13, color: Color(0xFF94A3B8), fontWeight: FontWeight.w600)),
         const SizedBox(height: 6),
         Row(
           children: ['Lite', 'Pro', 'Enterprise'].map((tier) {
@@ -354,20 +359,23 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Анкета адаптации агента',
-          style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+        Text(
+          DesktopI18n.tr('Анкета адаптации агента', 'Agent Adaptation Questionnaire'),
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
         ),
         const SizedBox(height: 6),
-        const Text(
-          'Агент сохранит ваши предпочтения в долговременную память ob2h и будет учитывать их при генерации решений и команд.',
-          style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8), height: 1.4),
+        Text(
+          DesktopI18n.tr(
+            'Агент сохранит ваши предпочтения в долговременную память ob2h и будет учитывать их при генерации решений и команд.',
+            'The agent will save your preferences to ob2h AST memory and consider them when generating solutions.',
+          ),
+          style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8), height: 1.4),
         ),
         const SizedBox(height: 20),
 
         // 1. Role
         _buildDropdownSetting(
-          label: '1. Ваша роль / специализация:',
+          label: DesktopI18n.tr('1. Ваша роль / специализация:', '1. Your Role / Specialization:'),
           value: selectedRole,
           items: availableRoles,
           onChanged: (val) => setState(() => selectedRole = val!),
@@ -376,7 +384,7 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
 
         // 2. Primary Stack
         _buildDropdownSetting(
-          label: '2. Основной стек технологий:',
+          label: DesktopI18n.tr('2. Основной стек технологий:', '2. Primary Tech Stack:'),
           value: selectedStack,
           items: availableStacks,
           onChanged: (val) => setState(() => selectedStack = val!),
@@ -385,7 +393,7 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
 
         // 3. Autonomy Style
         _buildDropdownSetting(
-          label: '3. Предпочитаемый режим автономности:',
+          label: DesktopI18n.tr('3. Предпочитаемый режим автономности:', '3. Preferred Autonomy Mode:'),
           value: selectedAutonomy,
           items: autonomyStyles,
           onChanged: (val) => setState(() => selectedAutonomy = val!),
@@ -394,7 +402,7 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
 
         // 4. Communication Language
         _buildDropdownSetting(
-          label: '4. Язык общения агента:',
+          label: DesktopI18n.tr('4. Язык общения агента:', '4. Agent Communication Language:'),
           value: selectedLanguage,
           items: const ['Русский', 'English'],
           onChanged: (val) => setState(() => selectedLanguage = val!),
@@ -416,10 +424,13 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: const [
-                    Text('Долговременная память ob2h AST', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white)),
-                    SizedBox(height: 4),
-                    Text('Автоматически сохранять факты о структуре репозитория и окружении', style: TextStyle(fontSize: 11, color: Color(0xFF94A3B8))),
+                  children: [
+                    Text(DesktopI18n.memorySettingTitle, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white)),
+                    const SizedBox(height: 4),
+                    Text(
+                      DesktopI18n.tr('Автоматически сохранять факты о структуре репозитория и окружении', 'Automatically persist repo structure and workspace facts'),
+                      style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8)),
+                    ),
                   ],
                 ),
               ),

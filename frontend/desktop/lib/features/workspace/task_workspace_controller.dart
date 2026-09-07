@@ -1,4 +1,4 @@
-// Desktop Task Workspace Controller with ZCode ADE Permission Modes, Goal Tracking, and Context.
+// Desktop Task Workspace Controller with OmnesAgent ADE Permission Modes, Goal Tracking, and Context.
 
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
@@ -41,7 +41,7 @@ class DesktopTaskWorkspaceController extends GetxController {
   void _loadSampleWorkspaceState() {
     // Initialize sample goal mode
     activeGoal.value = GoalStatus(
-      objective: 'Полная адаптация десктопного UI под ZCode ADE и проверка тестами',
+      objective: 'Полная адаптация десктопного UI OmnesAgent ADE и проверка тестами',
       elapsedSeconds: 245,
       currentIteration: 2,
       maxIterations: 10,

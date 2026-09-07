@@ -1,4 +1,4 @@
-// Automations View matching ZCode Screenshot 1:
+// Automations View for OmnesAgent ADE:
 // - Header with Title and Subtitle
 // - Scheduled tasks empty-state container with 'Create scheduled task' and 'Create idle-time task'
 // - 'Keep your computer awake while OmnesAgent is running a chat' setting
@@ -7,6 +7,8 @@
 
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:get/get.dart';
+import '../../utils/desktop_i18n.dart';
 
 class AutomationsView extends StatefulWidget {
   final VoidCallback? onBackToWorkspace;
@@ -34,7 +36,7 @@ class _AutomationsViewState extends State<AutomationsView> {
   }) {
     final titleController = TextEditingController(text: initialTitle ?? '');
     final promptController = TextEditingController(text: initialPrompt ?? '');
-    final scheduleController = TextEditingController(text: initialSchedule ?? (isIdleTime ? 'Soonest available' : 'Daily at 10:00'));
+    final scheduleController = TextEditingController(text: initialSchedule ?? (isIdleTime ? DesktopI18n.soonestAvailable : 'Daily at 10:00'));
 
     showDialog(
       context: context,
@@ -70,7 +72,9 @@ class _AutomationsViewState extends State<AutomationsView> {
                     ),
                     const SizedBox(width: 10),
                     Text(
-                      isIdleTime ? 'Новая idle-time задача' : 'Новая cron/scheduled задача',
+                      isIdleTime
+                          ? DesktopI18n.tr('Новая idle-time задача', 'New idle-time task')
+                          : DesktopI18n.tr('Новая задача по расписанию', 'New scheduled task'),
                       style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
                     ),
                     const Spacer(),
@@ -84,13 +88,13 @@ class _AutomationsViewState extends State<AutomationsView> {
                 ),
                 const SizedBox(height: 16),
 
-                const Text('Название задачи', style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8), fontWeight: FontWeight.w500)),
+                Text(DesktopI18n.taskName, style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8), fontWeight: FontWeight.w500)),
                 const SizedBox(height: 6),
                 TextField(
                   controller: titleController,
                   style: const TextStyle(fontSize: 13, color: Colors.white),
                   decoration: InputDecoration(
-                    hintText: 'Например: Standup Git Summary',
+                    hintText: DesktopI18n.tr('Например: Standup Git Summary', 'E.g.: Standup Git Summary'),
                     hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF64748B)),
                     filled: true,
                     fillColor: const Color(0xFF131519),
@@ -101,14 +105,14 @@ class _AutomationsViewState extends State<AutomationsView> {
                 ),
                 const SizedBox(height: 14),
 
-                const Text('Промпт / Инструкция агенту', style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8), fontWeight: FontWeight.w500)),
+                Text(DesktopI18n.taskPrompt, style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8), fontWeight: FontWeight.w500)),
                 const SizedBox(height: 6),
                 TextField(
                   controller: promptController,
                   maxLines: 4,
                   style: const TextStyle(fontSize: 12, color: Colors.white),
                   decoration: InputDecoration(
-                    hintText: 'Опишите, что именно агент должен проверить или сформировать...',
+                    hintText: DesktopI18n.tr('Опишите, что именно агент должен проверить или сформировать...', 'Describe what the agent should verify or generate...'),
                     hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
                     filled: true,
                     fillColor: const Color(0xFF131519),
@@ -119,7 +123,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                 ),
                 const SizedBox(height: 14),
 
-                const Text('Расписание выполнения', style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8), fontWeight: FontWeight.w500)),
+                Text(DesktopI18n.taskSchedule, style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8), fontWeight: FontWeight.w500)),
                 const SizedBox(height: 6),
                 TextField(
                   controller: scheduleController,
@@ -141,7 +145,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                   children: [
                     TextButton(
                       onPressed: () => Navigator.of(ctx).pop(),
-                      child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+                      child: Text(DesktopI18n.cancel, style: const TextStyle(color: Color(0xFF94A3B8))),
                     ),
                     const SizedBox(width: 10),
                     ElevatedButton(
@@ -159,7 +163,12 @@ class _AutomationsViewState extends State<AutomationsView> {
                           Navigator.of(ctx).pop();
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(
-                              content: Text('Задача "${titleController.text.trim()}" успешно добавлена в Automations!'),
+                              content: Text(
+                                DesktopI18n.tr(
+                                  'Задача "${titleController.text.trim()}" успешно добавлена в Automations!',
+                                  'Task "${titleController.text.trim()}" added to Automations!',
+                                ),
+                              ),
                               backgroundColor: const Color(0xFF1E293B),
                               behavior: SnackBarBehavior.floating,
                             ),
@@ -172,7 +181,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                       ),
-                      child: const Text('Запланировать', style: TextStyle(fontWeight: FontWeight.bold)),
+                      child: Text(DesktopI18n.scheduleAction, style: const TextStyle(fontWeight: FontWeight.bold)),
                     ),
                   ],
                 ),
@@ -186,97 +195,99 @@ class _AutomationsViewState extends State<AutomationsView> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF141619),
-      body: Column(
-        children: [
-          // Top Window Controls Bar
-          Container(
-            height: 38,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              children: [
-                const Spacer(),
-                _buildWinButton(Icons.remove, () {}),
-                const SizedBox(width: 6),
-                _buildWinButton(Icons.crop_square, () {}),
-                const SizedBox(width: 6),
-                _buildWinButton(Icons.close, () {}, isClose: true),
-              ],
+    return Obx(() {
+      return Scaffold(
+        backgroundColor: const Color(0xFF141619),
+        body: Column(
+          children: [
+            // Top Window Controls Bar
+            Container(
+              height: 38,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Row(
+                children: [
+                  const Spacer(),
+                  _buildWinButton(Icons.remove, () {}),
+                  const SizedBox(width: 6),
+                  _buildWinButton(Icons.crop_square, () {}),
+                  const SizedBox(width: 6),
+                  _buildWinButton(Icons.close, () {}, isClose: true),
+                ],
+              ),
             ),
-          ),
 
-          // Main Scrollable Automations Content
-          Expanded(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.fromLTRB(48, 12, 48, 48),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 980),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Header
-                    const Text(
-                      'Automations',
-                      style: TextStyle(
-                        fontSize: 26,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                        letterSpacing: -0.3,
+            // Main Scrollable Automations Content
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(48, 12, 48, 48),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 980),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Header
+                      Text(
+                        DesktopI18n.automationsTitle,
+                        style: const TextStyle(
+                          fontSize: 26,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                          letterSpacing: -0.3,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 6),
-                    const Text(
-                      'Schedule recurring tasks or queue background work that runs during idle time.',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: Color(0xFF94A3B8),
+                      const SizedBox(height: 6),
+                      Text(
+                        DesktopI18n.automationsSubtitle,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          color: Color(0xFF94A3B8),
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 24),
+                      const SizedBox(height: 24),
 
-                    // Top Empty State Card or Active Tasks List
-                    _buildScheduledTasksCard(),
-                    const SizedBox(height: 16),
+                      // Top Empty State Card or Active Tasks List
+                      _buildScheduledTasksCard(),
+                      const SizedBox(height: 16),
 
-                    // Keep Awake Row (Image 1 match)
-                    _buildKeepAwakeSettingRow(),
-                    const SizedBox(height: 36),
+                      // Keep Awake Row (Image 1 match)
+                      _buildKeepAwakeSettingRow(),
+                      const SizedBox(height: 36),
 
-                    // Section 1: Idle-time task template
-                    const Text(
-                      'Idle-time task template',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF94A3B8),
-                        letterSpacing: 0.2,
+                      // Section 1: Idle-time task template
+                      Text(
+                        DesktopI18n.idleTimeTemplates,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF94A3B8),
+                          letterSpacing: 0.2,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 14),
-                    _buildIdleTimeTemplatesGrid(),
-                    const SizedBox(height: 36),
+                      const SizedBox(height: 14),
+                      _buildIdleTimeTemplatesGrid(),
+                      const SizedBox(height: 36),
 
-                    // Section 2: Scheduled task template
-                    const Text(
-                      'Scheduled task template',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF94A3B8),
-                        letterSpacing: 0.2,
+                      // Section 2: Scheduled task template
+                      Text(
+                        DesktopI18n.scheduledTemplates,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF94A3B8),
+                          letterSpacing: 0.2,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 14),
-                    _buildScheduledTemplatesGrid(),
-                  ],
+                      const SizedBox(height: 14),
+                      _buildScheduledTemplatesGrid(),
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
-        ],
-      ),
-    );
+          ],
+        ),
+      );
+    });
   }
 
   // ==========================================
@@ -299,14 +310,14 @@ class _AutomationsViewState extends State<AutomationsView> {
                 const Icon(FontAwesomeIcons.circleCheck, size: 14, color: Color(0xFF00D2FF)),
                 const SizedBox(width: 8),
                 Text(
-                  'Активные задачи (${scheduledTasks.length})',
+                  '${DesktopI18n.activeTasks} (${scheduledTasks.length})',
                   style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
                 ),
                 const Spacer(),
                 TextButton.icon(
                   onPressed: () => _showCreateTaskDialog(),
                   icon: const Icon(Icons.add, size: 14, color: Color(0xFF00D2FF)),
-                  label: const Text('Добавить', style: TextStyle(color: Color(0xFF00D2FF), fontSize: 12)),
+                  label: Text(DesktopI18n.add, style: const TextStyle(color: Color(0xFF00D2FF), fontSize: 12)),
                 ),
               ],
             ),
@@ -366,9 +377,9 @@ class _AutomationsViewState extends State<AutomationsView> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Text(
-            'No scheduled tasks yet.',
-            style: TextStyle(
+          Text(
+            DesktopI18n.noScheduledTasks,
+            style: const TextStyle(
               fontSize: 13,
               color: Color(0xFF64748B),
               fontWeight: FontWeight.w500,
@@ -392,17 +403,17 @@ class _AutomationsViewState extends State<AutomationsView> {
                   ),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
-                    children: const [
+                    children: [
                       Text(
-                        'Create scheduled task',
-                        style: TextStyle(
+                        DesktopI18n.createScheduledTask,
+                        style: const TextStyle(
                           fontSize: 12.5,
                           fontWeight: FontWeight.w600,
                           color: Color(0xFF0F172A),
                         ),
                       ),
-                      SizedBox(width: 6),
-                      Icon(Icons.keyboard_arrow_down, size: 14, color: Color(0xFF0F172A)),
+                      const SizedBox(width: 6),
+                      const Icon(Icons.keyboard_arrow_down, size: 14, color: Color(0xFF0F172A)),
                     ],
                   ),
                 ),
@@ -420,9 +431,9 @@ class _AutomationsViewState extends State<AutomationsView> {
                     borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: const Color(0xFF333846)),
                   ),
-                  child: const Text(
-                    'Create idle-time task',
-                    style: TextStyle(
+                  child: Text(
+                    DesktopI18n.createIdleTask,
+                    style: const TextStyle(
                       fontSize: 12.5,
                       fontWeight: FontWeight.w500,
                       color: Color(0xFFE2E8F0),
@@ -451,10 +462,10 @@ class _AutomationsViewState extends State<AutomationsView> {
         children: [
           const Icon(Icons.info_outline, size: 15, color: Color(0xFF64748B)),
           const SizedBox(width: 10),
-          const Expanded(
+          Expanded(
             child: Text(
-              'Keep your computer awake while OmnesAgent is running a chat.',
-              style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+              DesktopI18n.keepAwakeText,
+              style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
             ),
           ),
           Switch(
@@ -482,24 +493,30 @@ class _AutomationsViewState extends State<AutomationsView> {
         final templates = [
           {
             'icon': FontAwesomeIcons.listCheck,
-            'title': 'Standup Git Summary',
-            'desc':
-                "Summarize this week's git activity into a Friday standup: notable commits, merged PRs, and what changed. Keep it concise.",
-            'badge': 'Soonest available',
+            'title': DesktopI18n.tr('Итоги недели в Git (Standup Summary)', 'Standup Git Summary'),
+            'desc': DesktopI18n.tr(
+              "Сформировать краткую сводку активности git за неделю к пятничному стендапу: главные коммиты, смерженные PR и изменения.",
+              "Summarize this week's git activity into a Friday standup: notable commits, merged PRs, and what changed. Keep it concise.",
+            ),
+            'badge': DesktopI18n.soonestAvailable,
           },
           {
             'icon': FontAwesomeIcons.chartLine,
-            'title': 'CI Failures & Flaky Test Report',
-            'desc':
-                'Scan recent CI runs, list failing and flaky tests with likely causes, and propose fixes ranked by impact.',
-            'badge': 'Soonest available',
+            'title': DesktopI18n.tr('Отчет о сбоях CI и нестабильных тестах', 'CI Failures & Flaky Test Report'),
+            'desc': DesktopI18n.tr(
+              'Просканировать недавние прогоны CI, составить список упавших тестов с вероятными причинами и предложить исправления.',
+              'Scan recent CI runs, list failing and flaky tests with likely causes, and propose fixes ranked by impact.',
+            ),
+            'badge': DesktopI18n.soonestAvailable,
           },
           {
             'icon': FontAwesomeIcons.fileLines,
-            'title': 'Documentation sync check',
-            'desc':
-                'Using the current implementation and recent commits as evidence, check whether README files, docs, configuration guidance, and usage examples are outdated or inconsistent with the code. Modify only content that can be directly verified from code, configuration, or commit history; do not infer unverified behavior, and preserve the existing document structure, terminology, and writing style. When finished, list the files changed and the evidence for each change. If no update is needed, report the scope checked, the evidence reviewed, and the conclusion.',
-            'badge': 'Soonest available',
+            'title': DesktopI18n.tr('Синхронизация документации с кодом', 'Documentation sync check'),
+            'desc': DesktopI18n.tr(
+              'На основе актуального кода и коммитов проверить, не устарели ли файлы README, документация и примеры использования.',
+              'Using the current implementation and recent commits as evidence, check whether README files, docs, configuration guidance, and usage examples are outdated or inconsistent with the code. Modify only content that can be directly verified from code, configuration, or commit history; do not infer unverified behavior, and preserve the existing document structure, terminology, and writing style. When finished, list the files changed and the evidence for each change. If no update is needed, report the scope checked, the evidence reviewed, and the conclusion.',
+            ),
+            'badge': DesktopI18n.soonestAvailable,
           },
         ];
 
@@ -535,31 +552,39 @@ class _AutomationsViewState extends State<AutomationsView> {
         final templates = [
           {
             'icon': FontAwesomeIcons.sun,
-            'title': 'Morning dev brief',
-            'desc':
-                'Summarize commits, module changes, CI status, and follow-ups since the previous workday, then produce no more than five stand-up-ready bullets. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
-            'badge': 'Every weekday at 09:00',
+            'title': DesktopI18n.tr('Утренний брифинг разработчика', 'Morning dev brief'),
+            'desc': DesktopI18n.tr(
+              'Суммировать коммиты, изменения модулей, статус CI и задачи со вчерашнего дня в виде до пяти тезисов к утреннему созвону.',
+              'Summarize commits, module changes, CI status, and follow-ups since the previous workday, then produce no more than five stand-up-ready bullets. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
+            ),
+            'badge': DesktopI18n.tr('Каждый будний день в 09:00', 'Every weekday at 09:00'),
           },
           {
             'icon': FontAwesomeIcons.shieldHalved,
-            'title': 'Risk scan',
-            'desc':
-                'Inspect code changes from the last 24 hours for high-confidence risks involving runtime failures, data loss, authorization bypasses, resource leaks, or cross-platform compatibility, and attach code and commit/diff evidence. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
-            'badge': 'Daily at 10:00',
+            'title': DesktopI18n.tr('Сканирование рисков и регрессий', 'Risk scan'),
+            'desc': DesktopI18n.tr(
+              'Проверить изменения за 24 часа на предмет сбоев в рантайме, утечек ресурсов или потери кроссплатформенной совместимости.',
+              'Inspect code changes from the last 24 hours for high-confidence risks involving runtime failures, data loss, authorization bypasses, resource leaks, or cross-platform compatibility, and attach code and commit/diff evidence. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
+            ),
+            'badge': DesktopI18n.tr('Ежедневно в 10:00', 'Daily at 10:00'),
           },
           {
             'icon': FontAwesomeIcons.rocket,
-            'title': 'Release brief',
-            'desc':
-                'Organize PRs and commits merged this week into Features, Fixes, Experience improvements, and Engineering improvements, then produce both a team brief and concise user-facing release notes. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
-            'badge': 'Weekly on Fri at 16:00',
+            'title': DesktopI18n.tr('Сводка релиза (Release Notes)', 'Release brief'),
+            'desc': DesktopI18n.tr(
+              'Сгруппировать PR и коммиты недели по фичам, багфиксам и улучшениям, подготовив заметки к релизу для команды и пользователей.',
+              'Organize PRs and commits merged this week into Features, Fixes, Experience improvements, and Engineering improvements, then produce both a team brief and concise user-facing release notes. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
+            ),
+            'badge': DesktopI18n.tr('Еженедельно по пятницам в 16:00', 'Weekly on Fri at 16:00'),
           },
           {
             'icon': FontAwesomeIcons.bookBookmark,
-            'title': 'Documentation sync check',
-            'desc':
-                'Compare code, configuration, API, and documentation changes from the last seven days. Identify high-confidence cases where public behavior changed without matching documentation, attach file paths and commit/diff evidence, and name the documentation locations and key points that should be updated. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
-            'badge': 'Weekly on Wed at 15:00',
+            'title': DesktopI18n.tr('Ревизия актуальности документации', 'Documentation sync check'),
+            'desc': DesktopI18n.tr(
+              'Сравнить изменения в кодовой базе и API за последние 7 дней и составить список документов, требующих обновления.',
+              'Compare code, configuration, API, and documentation changes from the last seven days. Identify high-confidence cases where public behavior changed without matching documentation, attach file paths and commit/diff evidence, and name the documentation locations and key points that should be updated. Perform read-only analysis using only verifiable repository facts; state when evidence is insufficient, do not speculate, and do not modify code or external state.',
+            ),
+            'badge': DesktopI18n.tr('Еженедельно по средам в 15:00', 'Weekly on Wed at 15:00'),
           },
         ];
 

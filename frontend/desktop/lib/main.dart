@@ -7,10 +7,12 @@ import 'package:omnes_shared/omnes_shared.dart';
 
 import 'features/desktop_shell.dart';
 import 'theme/desktop_theme.dart';
+import 'utils/desktop_i18n.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await GetStorage.init();
+  DesktopI18n.init();
   Get.put(DesktopThemeController());
 
   runApp(const OmnesDesktopApp());

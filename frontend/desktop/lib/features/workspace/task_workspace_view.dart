@@ -8,6 +8,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 
+import '../../utils/desktop_i18n.dart';
 import 'task_workspace_controller.dart';
 
 class DesktopTaskWorkspaceView extends StatefulWidget {
@@ -39,6 +40,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     return Container(
       color: const Color(0xFF16181D),
       child: Obx(() {
+        final _ = DesktopI18n.currentLanguage.value;
         final hasMessages = widget.controller.messages.isNotEmpty;
 
         return Stack(
@@ -153,7 +155,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
           // Terminal quick toggle (>_)
           Tooltip(
-            message: 'Встроенный терминал',
+            message: DesktopI18n.terminalTooltip,
             child: InkWell(
               onTap: widget.controller.toggleTerminal,
               borderRadius: BorderRadius.circular(4),
@@ -179,7 +181,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
           // Side Pane / Inspector toggle ([|])
           Tooltip(
-            message: 'Боковая панель инструментов',
+            message: DesktopI18n.toolsTooltip,
             child: InkWell(
               onTap: widget.onToggleTools,
               borderRadius: BorderRadius.circular(4),
@@ -207,11 +209,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              _buildWinButton(Icons.remove, 'Свернуть', () {}),
+              _buildWinButton(Icons.remove, DesktopI18n.minimize, () {}),
               const SizedBox(width: 6),
-              _buildWinButton(Icons.crop_square, 'Развернуть', () {}),
+              _buildWinButton(Icons.crop_square, DesktopI18n.maximize, () {}),
               const SizedBox(width: 6),
-              _buildWinButton(Icons.close, 'Закрыть', () {}, isClose: true),
+              _buildWinButton(Icons.close, DesktopI18n.close, () {}, isClose: true),
             ],
           ),
         ],
@@ -257,9 +259,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           // Header
           Row(
             children: [
-              const Text(
-                'Git tools',
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+              Text(
+                DesktopI18n.gitTools,
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
               ),
               const Spacer(),
               InkWell(
@@ -280,7 +282,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             children: [
               const Icon(Icons.assignment_outlined, size: 14, color: Color(0xFF94A3B8)),
               const SizedBox(width: 8),
-              const Text('Changes', style: TextStyle(fontSize: 12, color: Color(0xFFE2E8F0))),
+              Text(DesktopI18n.tr('Изменения', 'Changes'), style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0))),
               const Spacer(),
               const Text(
                 '+72347 -0',
@@ -304,20 +306,20 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
           // Commit or push
           Row(
-            children: const [
-              Icon(Icons.commit, size: 14, color: Color(0xFF94A3B8)),
-              SizedBox(width: 8),
-              Text('Commit or push', style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8))),
+            children: [
+              const Icon(Icons.commit, size: 14, color: Color(0xFF94A3B8)),
+              const SizedBox(width: 8),
+              Text(DesktopI18n.tr('Коммит или пуш', 'Commit or push'), style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8))),
             ],
           ),
           const Divider(height: 20, color: Color(0xFF262B34)),
 
           // Progress 5/5
           Row(
-            children: const [
-              Text('Progress', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
-              SizedBox(width: 8),
-              Text('5/5', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+            children: [
+              Text(DesktopI18n.tr('Прогресс', 'Progress'), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white)),
+              const SizedBox(width: 8),
+              const Text('5/5', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
             ],
           ),
           const SizedBox(height: 10),
@@ -377,7 +379,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               children: [
                 const Icon(FontAwesomeIcons.terminal, size: 11, color: Color(0xFF00D2FF)),
                 const SizedBox(width: 8),
-                const Text('Terminal (bash / pwsh) — OmnesAgent Daemon', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white)),
+                Text(DesktopI18n.terminalConsole, style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white)),
                 const Spacer(),
                 InkWell(
                   onTap: () => widget.controller.isTerminalOpen.value = false,
@@ -418,9 +420,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               const SizedBox(height: 10),
-              const Text(
-                'Start a new task in the omnes-agent project',
-                style: TextStyle(
+              Text(
+                DesktopI18n.startNewTaskTitle,
+                style: const TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.w400,
                   fontFamily: 'Georgia',
@@ -447,12 +449,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   ),
                   child: Row(
                     children: [
-                      const Icon(Icons.campaign_outlined, size: 16, color: Color(0xFF94A3B8)),
+                       const Icon(Icons.campaign_outlined, size: 16, color: Color(0xFF94A3B8)),
                       const SizedBox(width: 10),
-                      const Expanded(
+                      Expanded(
                         child: Text(
-                          'Новая функция: Создание фоновых задач "Idle-time task". Агент выполняет рутинные проверки в периоды простоя.',
-                          style: TextStyle(
+                          DesktopI18n.bannerText,
+                          style: const TextStyle(
                             fontSize: 12,
                             color: Color(0xFF94A3B8),
                             height: 1.3,
@@ -474,28 +476,28 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 children: [
                   Expanded(
                     child: _buildTemplateCard(
-                      title: 'Standup Git Summary',
-                      desc: 'Сводка последних коммитов, веток и изменений за прошедшую неделю.',
+                      title: DesktopI18n.standupGitTitle,
+                      desc: DesktopI18n.standupGitDesc,
                       onTap: () {
-                        widget.controller.inputController.text = 'Сформируй Git Standup summary за последнюю неделю.';
+                        widget.controller.inputController.text = DesktopI18n.standupPrompt;
                       },
                     ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: _buildTemplateCard(
-                      title: 'CI Failures & Flaky Test Report',
-                      desc: 'Отчёт о последних падениях тестов компиляции и интеграционных проверок.',
+                      title: DesktopI18n.ciFailuresTitle,
+                      desc: DesktopI18n.ciFailuresDesc,
                       onTap: () {
-                        widget.controller.inputController.text = 'Проанализируй недавние падения CI тестов и предложи исправления.';
+                        widget.controller.inputController.text = DesktopI18n.ciFailuresPrompt;
                       },
                     ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: _buildTemplateCard(
-                      title: 'Customize',
-                      desc: 'Прямой ввод свободной задачи без использования готовых шаблонов.',
+                      title: DesktopI18n.customizeTitle,
+                      desc: DesktopI18n.customizeDesc,
                       onTap: () {},
                     ),
                   ),
@@ -644,8 +646,8 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               style: const TextStyle(fontSize: 14, color: Colors.white, height: 1.4),
               decoration: InputDecoration(
                 hintText: isHero
-                    ? 'Спросите OmnesAgent, введите @ для файлов, / для команд, \$ для навыков, # для чатов'
-                    : 'Ask for follow-up changes...',
+                    ? DesktopI18n.heroInputHint
+                    : DesktopI18n.promptPlaceholder,
                 hintStyle: const TextStyle(fontSize: 13, color: Color(0xFF6B7280)),
                 border: InputBorder.none,
                 isDense: true,
@@ -806,9 +808,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                                   style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Colors.white),
                                 ),
                                 const Spacer(),
-                                const Text(
-                                  '✓ done',
-                                  style: TextStyle(fontSize: 10, color: Color(0xFF10B981)),
+                                Text(
+                                  '✓ ${DesktopI18n.done}',
+                                  style: const TextStyle(fontSize: 10, color: Color(0xFF10B981)),
                                 ),
                               ],
                             ),
@@ -830,17 +832,17 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                           children: [
                             const Icon(Icons.chevron_right, size: 14, color: Color(0xFF94A3B8)),
                             const SizedBox(width: 4),
-                            const Text('1 file changed ', style: TextStyle(fontSize: 11, color: Color(0xFFCBD5E1))),
+                            Text('${DesktopI18n.oneFileChanged} ', style: const TextStyle(fontSize: 11, color: Color(0xFFCBD5E1))),
                             const Text('+9', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
                             const Text(' -0', style: TextStyle(fontSize: 11, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFFEF4444))),
                             const SizedBox(width: 14),
                             InkWell(
                               onTap: () {},
                               child: Row(
-                                children: const [
-                                  Icon(Icons.undo, size: 12, color: Color(0xFF94A3B8)),
-                                  SizedBox(width: 4),
-                                  Text('Undo', style: TextStyle(fontSize: 11, color: Color(0xFF94A3B8))),
+                                children: [
+                                  const Icon(Icons.undo, size: 12, color: Color(0xFF94A3B8)),
+                                  const SizedBox(width: 4),
+                                  Text(DesktopI18n.undo, style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8))),
                                 ],
                               ),
                             ),
@@ -919,7 +921,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         onTap: () {
                           Clipboard.setData(ClipboardData(text: codeBody));
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Команда скопирована'), duration: Duration(seconds: 1)),
+                            SnackBar(content: Text(DesktopI18n.commandCopied), duration: const Duration(seconds: 1)),
                           );
                         },
                         child: const Padding(
@@ -975,9 +977,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 onTap: () {
                   Clipboard.setData(ClipboardData(text: msg.text));
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Скопировано в буфер обмена'),
-                      duration: Duration(seconds: 1),
+                    SnackBar(
+                      content: Text(DesktopI18n.copiedToClipboard),
+                      duration: const Duration(seconds: 1),
                       behavior: SnackBarBehavior.floating,
                     ),
                   );
@@ -1054,7 +1056,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   // ==========================================
   Widget _buildAddMenuButton() {
     return PopupMenuButton<String>(
-      tooltip: 'Добавить контекст (@файл, #чат, /команда)',
+      tooltip: DesktopI18n.addContextTooltip,
       offset: const Offset(0, -170),
       color: const Color(0xFF22252A),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -1070,10 +1072,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         }
       },
       itemBuilder: (context) => [
-        _buildPopupItem('attachment', Icons.attach_file, 'Прикрепить файл (Attachment)'),
-        _buildPopupItem('mention', Icons.alternate_email, 'Упомянуть файл (@ mention)'),
-        _buildPopupItem('chat', Icons.chat_bubble_outline, 'Связать с задачей (# chat)'),
-        _buildPopupItem('command', Icons.terminal, 'Вставить команду (/ command)'),
+        _buildPopupItem('attachment', Icons.attach_file, DesktopI18n.attachFileItem),
+        _buildPopupItem('mention', Icons.alternate_email, DesktopI18n.mentionFileItem),
+        _buildPopupItem('chat', Icons.chat_bubble_outline, DesktopI18n.linkChatItem),
+        _buildPopupItem('command', Icons.terminal, DesktopI18n.insertCommandItem),
       ],
       child: Container(
         width: 28,
@@ -1092,7 +1094,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       final mode = widget.controller.permissionMode.value;
 
       return PopupMenuButton<PermissionMode>(
-        tooltip: 'Режим подтверждений',
+        tooltip: DesktopI18n.permissionModeTooltip,
         offset: const Offset(0, -220),
         color: const Color(0xFF22252A),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -1101,29 +1103,29 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           _buildPermissionItem(
             PermissionMode.askBeforeChanges,
             Icons.pan_tool_outlined,
-            'Ask before changes',
-            'Спрашивать перед правками файлов.',
+            DesktopI18n.askBeforeChangesTitle,
+            DesktopI18n.askBeforeChangesDesc,
             mode == PermissionMode.askBeforeChanges,
           ),
           _buildPermissionItem(
             PermissionMode.editAutomatically,
             Icons.shield_outlined,
-            'Edit automatically',
-            'Автоматически вносить правки.',
+            DesktopI18n.editAutomaticallyTitle,
+            DesktopI18n.editAutomaticallyDesc,
             mode == PermissionMode.editAutomatically,
           ),
           _buildPermissionItem(
             PermissionMode.planMode,
             Icons.calendar_today_outlined,
-            'Plan mode',
-            'Планировать шаги перед действиями.',
+            DesktopI18n.planModeTitle,
+            DesktopI18n.planModeDesc,
             mode == PermissionMode.planMode,
           ),
           _buildPermissionItem(
             PermissionMode.fullAccess,
             Icons.security,
-            'Full access',
-            'Минимум подтверждений (полный доступ).',
+            DesktopI18n.fullAccessTitle,
+            DesktopI18n.fullAccessDesc,
             mode == PermissionMode.fullAccess,
           ),
         ],
@@ -1164,7 +1166,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       final active = widget.controller.activeModel.value;
 
       return PopupMenuButton<String>(
-        tooltip: 'Выбор модели',
+        tooltip: DesktopI18n.modelTooltip,
         offset: const Offset(0, -230),
         color: const Color(0xFF22252A),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -1176,10 +1178,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           }
         },
         itemBuilder: (context) => [
-          const PopupMenuItem(
+          PopupMenuItem(
             enabled: false,
             height: 28,
-            child: Text('Провайдеры моделей', style: TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.bold)),
+            child: Text(DesktopI18n.modelProvidersHeader, style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.bold)),
           ),
           _buildModelItem('GLM-5.3-Flash', active == 'GLM-5.3-Flash'),
           _buildModelItem('GLM-5.3', active == 'GLM-5.3'),
@@ -1187,14 +1189,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           _buildModelItem('DeepSeek V3', active == 'DeepSeek V3'),
           _buildModelItem('Local Ollama', active == 'Local Ollama'),
           const PopupMenuDivider(height: 1),
-          const PopupMenuItem(
+          PopupMenuItem(
             value: 'manage',
             height: 36,
             child: Row(
               children: [
-                Icon(Icons.settings_outlined, size: 14, color: Color(0xFF94A3B8)),
-                SizedBox(width: 8),
-                Text('Настройки провайдеров', style: TextStyle(fontSize: 12, color: Color(0xFFCBD5E1))),
+                const Icon(Icons.settings_outlined, size: 14, color: Color(0xFF94A3B8)),
+                const SizedBox(width: 8),
+                Text(DesktopI18n.providerSettingsAction, style: const TextStyle(fontSize: 12, color: Color(0xFFCBD5E1))),
               ],
             ),
           ),
@@ -1233,7 +1235,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       final level = widget.controller.thoughtLevel.value;
 
       return PopupMenuButton<String>(
-        tooltip: 'Thought Level',
+        tooltip: DesktopI18n.thoughtLevelTooltip,
         offset: const Offset(0, -140),
         color: const Color(0xFF22252A),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),

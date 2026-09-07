@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import '../../theme/desktop_theme.dart';
+import '../../utils/desktop_i18n.dart';
 import '../onboarding/user_onboarding_dialog.dart';
 
 class DesktopSettingsDialog extends StatefulWidget {
@@ -17,7 +18,7 @@ class DesktopSettingsDialog extends StatefulWidget {
   const DesktopSettingsDialog({
     super.key,
     required this.onBackToWorkspace,
-    this.initialSection = 'Общие',
+    this.initialSection = 'general',
     required this.userProfile,
     required this.onUpdateProfile,
   });
@@ -137,10 +138,25 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   @override
   void initState() {
     super.initState();
-    selectedSection = widget.initialSection;
-    if (selectedSection == 'Model Settings') selectedSection = 'Провайдеры';
-    if (selectedSection == 'General') selectedSection = 'Общие';
-    if (selectedSection == 'Skills') selectedSection = 'Навыки';
+    final init = widget.initialSection.toLowerCase();
+    if (init.contains('prov') || init.contains('пров') || init.contains('model')) {
+      selectedSection = 'providers';
+    } else if (init.contains('skill') || init.contains('навык')) {
+      selectedSection = 'skills';
+    } else if (init.contains('mcp')) {
+      selectedSection = 'mcp';
+    } else if (init.contains('prof') || init.contains('проф')) {
+      selectedSection = 'profile';
+    } else if (init.contains('appear') || init.contains('оформ')) {
+      selectedSection = 'appearance';
+    } else if (init.contains('memo') || init.contains('пам')) {
+      selectedSection = 'memory';
+    } else if (init.contains('stat') || init.contains('стат')) {
+      selectedSection = 'stats';
+    } else {
+      selectedSection = 'general';
+    }
+    currentLanguage = DesktopI18n.isRu ? 'Русский (Russian)' : 'English';
   }
 
   @override
@@ -194,178 +210,205 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      color: const Color(0xFF131518),
-      child: Row(
-        children: [
-          // 1. Left Navigation Menu (250px)
-          Container(
-            width: 250,
-            decoration: const BoxDecoration(
-              color: Color(0xFF16181D),
-              border: Border(right: BorderSide(color: Color(0xFF23272F))),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Back to Workspace
-                Padding(
-                  padding: const EdgeInsets.only(left: 16, top: 16, bottom: 16, right: 16),
-                  child: InkWell(
-                    onTap: widget.onBackToWorkspace,
-                    borderRadius: BorderRadius.circular(6),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
-                      child: Row(
-                        children: const [
-                          Icon(Icons.arrow_back, size: 16, color: Color(0xFF94A3B8)),
-                          SizedBox(width: 8),
-                          Text(
-                            'Назад в рабочую область',
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w500,
-                              color: Color(0xFFCBD5E1),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-
-                const Divider(height: 1, color: Color(0xFF23272F)),
-
-                Expanded(
-                  child: ListView(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                    children: [
-                      _buildSectionHeader('Основные настройки'),
-                      _buildNavItem('Общие', Icons.tune),
-                      _buildNavItem('Провайдеры', FontAwesomeIcons.brain),
-                      _buildNavItem('Оформление', Icons.brightness_6_outlined),
-                      _buildNavItem('Профиль', FontAwesomeIcons.userAstronaut),
-
-                      const SizedBox(height: 16),
-                      _buildSectionHeader('Возможности агента'),
-                      _buildNavItem('MCP Серверы', Icons.extension_outlined),
-                      _buildNavItem('Навыки', Icons.auto_awesome),
-                      _buildNavItem('Команды', FontAwesomeIcons.terminal),
-
-                      const SizedBox(height: 16),
-                      _buildSectionHeader('Данные и анализ'),
-                      _buildNavItem('ob2h AST Память', Icons.shield_outlined),
-                      _buildNavItem('Статистика использования', Icons.bar_chart),
-                    ],
-                  ),
-                ),
-
-                // Bottom Profile Card
-                Container(
-                  padding: const EdgeInsets.all(14),
-                  decoration: const BoxDecoration(
-                    border: Border(top: BorderSide(color: Color(0xFF23272F))),
-                  ),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 30,
-                        height: 30,
-                        decoration: BoxDecoration(
-                          gradient: const LinearGradient(
-                            colors: [Color(0xFF00D2FF), Color(0xFF0072FF)],
-                          ),
-                          borderRadius: BorderRadius.circular(15),
-                        ),
-                        child: Center(
-                          child: Text(
-                            widget.userProfile.initials,
-                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+    return Obx(() {
+      return Container(
+        color: const Color(0xFF131518),
+        child: Row(
+          children: [
+            // 1. Left Navigation Menu (250px)
+            Container(
+              width: 250,
+              decoration: const BoxDecoration(
+                color: Color(0xFF16181D),
+                border: Border(right: BorderSide(color: Color(0xFF23272F))),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Back to Workspace
+                  Padding(
+                    padding: const EdgeInsets.only(left: 16, top: 16, bottom: 16, right: 16),
+                    child: InkWell(
+                      onTap: widget.onBackToWorkspace,
+                      borderRadius: BorderRadius.circular(6),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+                        child: Row(
                           children: [
+                            const Icon(Icons.arrow_back, size: 16, color: Color(0xFF94A3B8)),
+                            const SizedBox(width: 8),
                             Text(
-                              widget.userProfile.fullName,
-                              style: const TextStyle(fontSize: 13, color: Colors.white, fontWeight: FontWeight.w600),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            Text(
-                              widget.userProfile.tier,
-                              style: const TextStyle(fontSize: 10, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold),
+                              DesktopI18n.backToWorkspace,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w500,
+                                color: Color(0xFFCBD5E1),
+                              ),
                             ),
                           ],
                         ),
                       ),
-                      IconButton(
-                        tooltip: 'Изменить профиль',
-                        icon: const Icon(Icons.edit_outlined, size: 14, color: Color(0xFF94A3B8)),
-                        onPressed: () {
-                          UserOnboardingDialog.show(
-                            context,
-                            initialProfile: widget.userProfile,
-                            onSave: widget.onUpdateProfile,
-                          );
-                        },
-                      ),
-                    ],
+                    ),
                   ),
-                ),
-              ],
-            ),
-          ),
 
-          // 2. Right Content Area
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Top bar with Section Title & Close button
-                Container(
-                  height: 56,
-                  padding: const EdgeInsets.symmetric(horizontal: 32),
-                  alignment: Alignment.centerLeft,
-                  decoration: const BoxDecoration(
-                    border: Border(bottom: BorderSide(color: Color(0xFF23272F))),
+                  const Divider(height: 1, color: Color(0xFF23272F)),
+
+                  Expanded(
+                    child: ListView(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                      children: [
+                        _buildSectionHeader(DesktopI18n.mainSettings),
+                        _buildNavItem('general', DesktopI18n.general, Icons.tune),
+                        _buildNavItem('providers', DesktopI18n.providers, FontAwesomeIcons.brain),
+                        _buildNavItem('appearance', DesktopI18n.appearance, Icons.brightness_6_outlined),
+                        _buildNavItem('profile', DesktopI18n.profile, FontAwesomeIcons.userAstronaut),
+
+                        const SizedBox(height: 16),
+                        _buildSectionHeader(DesktopI18n.agentCapabilities),
+                        _buildNavItem('mcp', DesktopI18n.mcpServers, Icons.extension_outlined),
+                        _buildNavItem('skills', DesktopI18n.skills, Icons.auto_awesome),
+                        _buildNavItem('commands', DesktopI18n.commands, FontAwesomeIcons.terminal),
+
+                        const SizedBox(height: 16),
+                        _buildSectionHeader(DesktopI18n.dataAndAnalysis),
+                        _buildNavItem('memory', DesktopI18n.memoryAst, Icons.shield_outlined),
+                        _buildNavItem('stats', DesktopI18n.usageStats, Icons.bar_chart),
+                      ],
+                    ),
                   ),
-                  child: Row(
-                    children: [
-                      Text(
-                        selectedSection,
-                        style: const TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
+
+                  // Bottom Profile Card
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: const BoxDecoration(
+                      border: Border(top: BorderSide(color: Color(0xFF23272F))),
+                    ),
+                    child: Row(
+                      children: [
+                        Container(
+                          width: 30,
+                          height: 30,
+                          decoration: BoxDecoration(
+                            gradient: const LinearGradient(
+                              colors: [Color(0xFF00D2FF), Color(0xFF0072FF)],
+                            ),
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          child: Center(
+                            child: Text(
+                              widget.userProfile.initials,
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+                            ),
+                          ),
                         ),
-                      ),
-                      const Spacer(),
-                      IconButton(
-                        icon: const Icon(Icons.close, size: 20, color: Color(0xFF94A3B8)),
-                        tooltip: 'Закрыть настройки',
-                        onPressed: widget.onBackToWorkspace,
-                      ),
-                    ],
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                widget.userProfile.fullName,
+                                style: const TextStyle(fontSize: 13, color: Colors.white, fontWeight: FontWeight.w600),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              Text(
+                                widget.userProfile.tier,
+                                style: const TextStyle(fontSize: 10, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: DesktopI18n.editProfile,
+                          icon: const Icon(Icons.edit_outlined, size: 14, color: Color(0xFF94A3B8)),
+                          onPressed: () {
+                            UserOnboardingDialog.show(
+                              context,
+                              initialProfile: widget.userProfile,
+                              onSave: widget.onUpdateProfile,
+                            );
+                          },
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-
-                // Section Content
-                Expanded(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
-                    child: _buildCurrentSectionContent(),
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-        ],
-      ),
-    );
+
+            // 2. Right Content Area
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Top bar with Section Title & Close button
+                  Container(
+                    height: 56,
+                    padding: const EdgeInsets.symmetric(horizontal: 32),
+                    alignment: Alignment.centerLeft,
+                    decoration: const BoxDecoration(
+                      border: Border(bottom: BorderSide(color: Color(0xFF23272F))),
+                    ),
+                    child: Row(
+                      children: [
+                        Text(
+                          _getSectionTitle(selectedSection),
+                          style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close, size: 20, color: Color(0xFF94A3B8)),
+                          tooltip: DesktopI18n.closeSettings,
+                          onPressed: widget.onBackToWorkspace,
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  // Section Content
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
+                      child: _buildCurrentSectionContent(),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    });
+  }
+
+  String _getSectionTitle(String section) {
+    switch (section) {
+      case 'general':
+        return DesktopI18n.general;
+      case 'providers':
+        return DesktopI18n.providers;
+      case 'mcp':
+        return DesktopI18n.mcpServers;
+      case 'skills':
+        return DesktopI18n.skills;
+      case 'appearance':
+        return DesktopI18n.appearance;
+      case 'profile':
+        return DesktopI18n.profile;
+      case 'commands':
+        return DesktopI18n.commands;
+      case 'memory':
+        return DesktopI18n.memoryAst;
+      case 'stats':
+        return DesktopI18n.usageStats;
+      default:
+        return DesktopI18n.general;
+    }
   }
 
   Widget _buildSectionHeader(String title) {
@@ -383,10 +426,10 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     );
   }
 
-  Widget _buildNavItem(String title, IconData icon) {
-    final isSelected = selectedSection == title;
+  Widget _buildNavItem(String sectionKey, String title, IconData icon) {
+    final isSelected = selectedSection == sectionKey;
     return InkWell(
-      onTap: () => setState(() => selectedSection = title),
+      onTap: () => setState(() => selectedSection = sectionKey),
       borderRadius: BorderRadius.circular(6),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -419,25 +462,78 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
   Widget _buildCurrentSectionContent() {
     switch (selectedSection) {
-      case 'Общие':
+      case 'general':
         return _buildGeneralSection();
-      case 'Провайдеры':
+      case 'providers':
         return _buildProvidersSection();
-      case 'MCP Серверы':
+      case 'mcp':
         return _buildMcpServersSection();
-      case 'Навыки':
+      case 'skills':
         return _buildSkillsSection();
-      case 'Оформление':
+      case 'appearance':
         return _buildAppearanceSection();
-      case 'Профиль':
+      case 'profile':
         return _buildProfileSection();
-      case 'ob2h AST Память':
+      case 'commands':
+        return _buildCommandsSection();
+      case 'memory':
         return _buildMemoryAstSection();
-      case 'Статистика использования':
+      case 'stats':
         return _buildUsageStatsSection();
       default:
         return _buildGeneralSection();
     }
+  }
+
+  Widget _buildCommandsSection() {
+    final commands = [
+      {'cmd': '/goal', 'desc': DesktopI18n.tr('Режим автономного достижения цели (Goal Mode)', 'Autonomous goal achievement mode (Goal Mode)')},
+      {'cmd': '/side, /btw', 'desc': DesktopI18n.tr('Быстрый вопрос агенту в боковом чате без сброса контекста', 'Side question without modifying main context')},
+      {'cmd': '/clear', 'desc': DesktopI18n.tr('Очистить историю диалога в текущей задаче', 'Clear conversation history for current task')},
+      {'cmd': '/test', 'desc': DesktopI18n.tr('Запустить unit-тесты проекта в фоне', 'Run project unit tests in the background')},
+    ];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          DesktopI18n.tr('Специальные команды чата OmnesAgent ADE', 'OmnesAgent ADE Special Chat Commands'),
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+        ),
+        const SizedBox(height: 16),
+        ...commands.map((c) => Container(
+              margin: const EdgeInsets.only(bottom: 10),
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1B1D22),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF262A33)),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF00D2FF).withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      c['cmd']!,
+                      style: const TextStyle(fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFF00D2FF), fontSize: 13),
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Text(
+                      c['desc']!,
+                      style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            )),
+      ],
+    );
   }
 
   // ========================================================
@@ -449,8 +545,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       children: [
         // Interface Language
         _buildSettingCard(
-          title: 'Язык интерфейса (Interface Language)',
-          subtitle: 'Выберите язык интерфейса рабочего окружения OmnesAgent.',
+          title: DesktopI18n.interfaceLanguage,
+          subtitle: DesktopI18n.selectInterfaceLang,
           control: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             decoration: BoxDecoration(
@@ -459,7 +555,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               border: Border.all(color: const Color(0xFF2D333F)),
             ),
             child: DropdownButton<String>(
-              value: currentLanguage,
+              value: DesktopI18n.isRu ? 'Русский (Russian)' : 'English',
               underline: const SizedBox.shrink(),
               dropdownColor: const Color(0xFF1E2229),
               style: const TextStyle(fontSize: 12, color: Colors.white),
@@ -468,7 +564,11 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                 DropdownMenuItem(value: 'English', child: Text('English')),
               ],
               onChanged: (val) {
-                if (val != null) setState(() => currentLanguage = val);
+                if (val != null) {
+                  final isRu = val.contains('Russian') || val.contains('Русский');
+                  DesktopI18n.setLanguage(isRu ? 'ru' : 'en');
+                  setState(() => currentLanguage = val);
+                }
               },
             ),
           ),
@@ -477,8 +577,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
         // Memory ob2h AST
         _buildSettingCard(
-          title: 'Долговременная память ob2h AST',
-          subtitle: 'Управляет использованием графа фактов и символов кода в задачах без лишней траты токенов контекста.',
+          title: DesktopI18n.memorySettingTitle,
+          subtitle: DesktopI18n.memorySettingSubtitle,
           control: Switch(
             value: memoryEnabled,
             activeColor: const Color(0xFF00D2FF),
@@ -489,8 +589,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
         // Gateway Daemon
         _buildSettingCard(
-          title: 'Gateway Runtime Daemon',
-          subtitle: 'Подключение клиента к локальному Rust gateway демону и исполнителям инструментов.',
+          title: DesktopI18n.gatewayDaemonTitle,
+          subtitle: DesktopI18n.gatewayDaemonSubtitle,
           control: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -517,7 +617,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   borderRadius: BorderRadius.circular(6),
                   border: Border.all(color: const Color(0xFF059669).withOpacity(0.4)),
                 ),
-                child: const Text('Подключено (3ms)', style: TextStyle(fontSize: 11, color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+                child: Text('${DesktopI18n.connected} (3ms)', style: const TextStyle(fontSize: 11, color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
               ),
             ],
           ),
@@ -526,8 +626,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
         // Terminal Font
         _buildSettingCard(
-          title: 'Шрифт встроенного терминала',
-          subtitle: 'Семейство моноширинных шрифтов для встроенной консоли и вывода bash/powershell.',
+          title: DesktopI18n.terminalFontTitle,
+          subtitle: DesktopI18n.terminalFontSubtitle,
           control: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -554,7 +654,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 ),
-                child: const Text('Сохранить', style: TextStyle(fontSize: 12)),
+                child: Text(DesktopI18n.save, style: const TextStyle(fontSize: 12)),
               ),
             ],
           ),
@@ -563,8 +663,11 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
         // Enhanced Grep
         _buildSettingCard(
-          title: 'Enhanced AST Grep (CodeGraph)',
-          subtitle: 'Использовать поиск по AST графу вместо обычного ripgrep для быстрого поиска символов и определений.',
+          title: DesktopI18n.tr('Enhanced AST Grep (CodeGraph)', 'Enhanced AST Grep (CodeGraph)'),
+          subtitle: DesktopI18n.tr(
+            'Использовать поиск по AST графу вместо обычного ripgrep для быстрого поиска символов и определений.',
+            'Use AST graph search instead of ripgrep for instant symbol and definition lookups.',
+          ),
           control: Switch(
             value: enhancedGrep,
             activeColor: const Color(0xFF00D2FF),
@@ -588,15 +691,18 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
-                children: const [
+                children: [
                   Text(
-                    'Конфигурация провайдеров моделей',
-                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+                    DesktopI18n.tr('Конфигурация провайдеров моделей', 'LLM Providers Configuration'),
+                    style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
                   ),
-                  SizedBox(height: 4),
+                  const SizedBox(height: 4),
                   Text(
-                    'Настройка стандартных провайдеров из бэкенда и добавление собственных OpenAI-совместимых эндпоинтов.',
-                    style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                    DesktopI18n.tr(
+                      'Настройка стандартных провайдеров из бэкенда и добавление собственных OpenAI-совместимых эндпоинтов.',
+                      'Configure built-in providers from backend or add custom OpenAI-compatible endpoints.',
+                    ),
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
                   ),
                 ],
               ),
@@ -604,7 +710,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             const SizedBox(width: 16),
             ElevatedButton.icon(
               icon: const Icon(Icons.add, size: 14),
-              label: const Text('Добавить провайдера'),
+              label: Text(DesktopI18n.tr('Добавить провайдера', 'Add Provider')),
               onPressed: () => setState(() => isAddingProvider = !isAddingProvider),
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF00D2FF),
@@ -629,16 +735,25 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Новый кастомный LLM провайдер', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                Text(
+                  DesktopI18n.tr('Новый кастомный LLM провайдер', 'New Custom LLM Provider'),
+                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                ),
                 const SizedBox(height: 14),
                 Row(
                   children: [
                     Expanded(
-                      child: _buildFormInput('Название (например: OpenRouter, vLLM)', customNameController),
+                      child: _buildFormInput(
+                        DesktopI18n.tr('Название (например: OpenRouter, vLLM)', 'Name (e.g. OpenRouter, vLLM)'),
+                        customNameController,
+                      ),
                     ),
                     const SizedBox(width: 12),
                     Expanded(
-                      child: _buildFormInput('Base URL (например: http://localhost:8000/v1)', customUrlController),
+                      child: _buildFormInput(
+                        DesktopI18n.tr('Base URL (например: http://localhost:8000/v1)', 'Base URL (e.g. http://localhost:8000/v1)'),
+                        customUrlController,
+                      ),
                     ),
                   ],
                 ),
@@ -646,11 +761,18 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                 Row(
                   children: [
                     Expanded(
-                      child: _buildFormInput('API Key (или оставьте пустым для локальных)', customKeyController, isPassword: true),
+                      child: _buildFormInput(
+                        DesktopI18n.tr('API Key (или оставьте пустым для локальных)', 'API Key (or leave blank for local)'),
+                        customKeyController,
+                        isPassword: true,
+                      ),
                     ),
                     const SizedBox(width: 12),
                     Expanded(
-                      child: _buildFormInput('Имя модели (например: Qwen/Qwen2.5-72B)', customModelController),
+                      child: _buildFormInput(
+                        DesktopI18n.tr('Имя модели (например: Qwen/Qwen2.5-72B)', 'Model name (e.g. Qwen/Qwen2.5-72B)'),
+                        customModelController,
+                      ),
                     ),
                   ],
                 ),
@@ -660,7 +782,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   children: [
                     TextButton(
                       onPressed: () => setState(() => isAddingProvider = false),
-                      child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+                      child: Text(DesktopI18n.cancel, style: const TextStyle(color: Color(0xFF94A3B8))),
                     ),
                     const SizedBox(width: 8),
                     ElevatedButton(
@@ -669,7 +791,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                         backgroundColor: const Color(0xFF00D2FF),
                         foregroundColor: const Color(0xFF0F172A),
                       ),
-                      child: const Text('Сохранить провайдера', style: TextStyle(fontWeight: FontWeight.bold)),
+                      child: Text(DesktopI18n.tr('Сохранить провайдера', 'Save Provider'), style: const TextStyle(fontWeight: FontWeight.bold)),
                     ),
                   ],
                 ),
@@ -776,15 +898,18 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
-                children: const [
+                children: [
                   Text(
-                    'MCP Серверы и Инструменты',
-                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+                    DesktopI18n.tr('MCP Серверы и Инструменты', 'MCP Servers & Tools'),
+                    style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
                   ),
-                  SizedBox(height: 4),
+                  const SizedBox(height: 4),
                   Text(
-                    'Управление внешними серверами протокола MCP, расширяющими возможности агента инструментами.',
-                    style: TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
+                    DesktopI18n.tr(
+                      'Управление внешними серверами протокола MCP, расширяющими возможности агента инструментами.',
+                      'Manage external Model Context Protocol servers expanding agent tool capabilities.',
+                    ),
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8)),
                   ),
                 ],
               ),
@@ -792,7 +917,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             const SizedBox(width: 16),
             ElevatedButton.icon(
               icon: const Icon(Icons.add, size: 14),
-              label: const Text('Добавить MCP сервер'),
+              label: Text(DesktopI18n.tr('Добавить MCP сервер', 'Add MCP Server')),
               onPressed: () => setState(() => isAddingMcp = !isAddingMcp),
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF00D2FF),
@@ -816,18 +941,30 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('Регистрация нового MCP сервера', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                Text(
+                  DesktopI18n.tr('Регистрация нового MCP сервера', 'Register New MCP Server'),
+                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
+                ),
                 const SizedBox(height: 12),
-                _buildFormInput('Идентификатор сервера (например: postgres-mcp, docker-tools)', newMcpNameController),
+                _buildFormInput(
+                  DesktopI18n.tr('Идентификатор сервера (например: postgres-mcp, docker-tools)', 'Server identifier (e.g. postgres-mcp, docker-tools)'),
+                  newMcpNameController,
+                ),
                 const SizedBox(height: 10),
-                _buildFormInput('Команда запуска / бинарник (например: npx -y @modelcontextprotocol/server-postgres)', newMcpCommandController),
+                _buildFormInput(
+                  DesktopI18n.tr(
+                    'Команда запуска / бинарник (например: npx -y @modelcontextprotocol/server-postgres)',
+                    'Launch command / binary (e.g. npx -y @modelcontextprotocol/server-postgres)',
+                  ),
+                  newMcpCommandController,
+                ),
                 const SizedBox(height: 14),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
                     TextButton(
                       onPressed: () => setState(() => isAddingMcp = false),
-                      child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+                      child: Text(DesktopI18n.cancel, style: const TextStyle(color: Color(0xFF94A3B8))),
                     ),
                     const SizedBox(width: 8),
                     ElevatedButton(
@@ -836,7 +973,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                         backgroundColor: const Color(0xFF00D2FF),
                         foregroundColor: const Color(0xFF0F172A),
                       ),
-                      child: const Text('Зарегистрировать', style: TextStyle(fontWeight: FontWeight.bold)),
+                      child: Text(DesktopI18n.tr('Зарегистрировать', 'Register'), style: const TextStyle(fontWeight: FontWeight.bold)),
                     ),
                   ],
                 ),
@@ -926,13 +1063,16 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   // ========================================================
   // SECTION: НАВЫКИ И ПЛАГИНЫ
   // ========================================================
+  // ========================================================
+  // SECTION: НАВЫКИ И ПЛАГИНЫ
+  // ========================================================
   Widget _buildSkillsSection() {
     final List<Map<String, String>> skills = [
-      {'name': 'ob2h', 'desc': 'Интеграция с долговременной памятью, фактами и AST анализом'},
-      {'name': 'android-cli', 'desc': 'Сборка, эмуляторы и инспекция Android приложений'},
-      {'name': 'chrome-devtools', 'desc': 'Автоматизация веб-браузера и интерактивный Element Picker'},
-      {'name': 'science', 'desc': 'Научные базы данных и обработка биологических последовательностей'},
-      {'name': 'workflow-skill-creator', 'desc': 'Автоматическое сохранение сессии в многоразовый навык'},
+      {'name': 'ob2h', 'desc': DesktopI18n.tr('Интеграция с долговременной памятью, фактами и AST анализом', 'Integration with long-term memory, facts, and AST analysis')},
+      {'name': 'android-cli', 'desc': DesktopI18n.tr('Сборка, эмуляторы и инспекция Android приложений', 'Builds, emulators, and inspection for Android applications')},
+      {'name': 'chrome-devtools', 'desc': DesktopI18n.tr('Автоматизация веб-браузера и интерактивный Element Picker', 'Browser automation and interactive Element Picker')},
+      {'name': 'science', 'desc': DesktopI18n.tr('Научные базы данных и обработка биологических последовательностей', 'Scientific databases and bioinformatics pipelines')},
+      {'name': 'workflow-skill-creator', 'desc': DesktopI18n.tr('Автоматическое сохранение сессии в многоразовый навык', 'Automatically distill current session into a reusable skill')},
     ];
 
     return Column(
@@ -960,7 +1100,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   ],
                 ),
               ),
-              const Text('Установлен', style: TextStyle(fontSize: 11, color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+              Text(DesktopI18n.tr('Установлен', 'Installed'), style: const TextStyle(fontSize: 11, color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
             ],
           ),
         );
@@ -976,8 +1116,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildSettingCard(
-          title: 'Цветовая схема',
-          subtitle: 'Переключение между тёмной темой Slate ADE и светлой скандинавской темой.',
+          title: DesktopI18n.tr('Цветовая схема', 'Color Scheme'),
+          subtitle: DesktopI18n.tr('Переключение между тёмной темой Slate ADE и светлой темой.', 'Toggle between Slate ADE dark theme and clean light theme.'),
           control: Obx(() {
             final isDark = DesktopThemeController.to.isDarkMode.value;
             return Row(
@@ -985,7 +1125,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               children: [
                 ElevatedButton.icon(
                   icon: const Icon(Icons.dark_mode_outlined, size: 14),
-                  label: const Text('Тёмная (Dark Slate)'),
+                  label: Text(DesktopI18n.tr('Тёмная (Dark Slate)', 'Dark (Dark Slate)')),
                   onPressed: () {
                     if (!isDark) DesktopThemeController.to.toggleTheme();
                   },
@@ -998,7 +1138,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                 const SizedBox(width: 10),
                 ElevatedButton.icon(
                   icon: const Icon(Icons.light_mode_outlined, size: 14),
-                  label: const Text('Светлая (Light)'),
+                  label: Text(DesktopI18n.tr('Светлая (Light)', 'Light (Clean)')),
                   onPressed: () {
                     if (isDark) DesktopThemeController.to.toggleTheme();
                   },
@@ -1055,7 +1195,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     children: [
                       Text(widget.userProfile.fullName, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
                       const SizedBox(height: 4),
-                      Text('${widget.userProfile.role} • Тариф ${widget.userProfile.tier}', style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8))),
+                      Text('${widget.userProfile.role} • ${DesktopI18n.tr('Тариф', 'Tier')} ${widget.userProfile.tier}', style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8))),
                     ],
                   ),
                   const Spacer(),
@@ -1071,15 +1211,20 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       backgroundColor: const Color(0xFF00D2FF),
                       foregroundColor: const Color(0xFF0F172A),
                     ),
-                    child: const Text('Пройти анкету заново'),
+                    child: Text(DesktopI18n.tr('Пройти анкету заново', 'Retake questionnaire')),
                   ),
                 ],
               ),
               const Divider(height: 28, color: Color(0xFF282D38)),
-              _buildProfileParam('Основной стек', widget.userProfile.primaryStack),
-              _buildProfileParam('Стиль автономности', widget.userProfile.autonomyStyle),
-              _buildProfileParam('Язык общения', widget.userProfile.language),
-              _buildProfileParam('ob2h AST Память', widget.userProfile.enableAstMemory ? 'Включена (активна)' : 'Отключена'),
+              _buildProfileParam(DesktopI18n.tr('Основной стек', 'Primary Stack'), widget.userProfile.primaryStack),
+              _buildProfileParam(DesktopI18n.tr('Стиль автономности', 'Autonomy Style'), widget.userProfile.autonomyStyle),
+              _buildProfileParam(DesktopI18n.tr('Язык общения', 'Language'), widget.userProfile.language),
+              _buildProfileParam(
+                DesktopI18n.tr('ob2h AST Память', 'ob2h AST Memory'),
+                widget.userProfile.enableAstMemory
+                    ? DesktopI18n.tr('Включена (активна)', 'Enabled (active)')
+                    : DesktopI18n.tr('Отключена', 'Disabled'),
+              ),
             ],
           ),
         ),
@@ -1107,12 +1252,15 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildSettingCard(
-          title: 'Индексация проекта в ob2h',
-          subtitle: 'Хранилище фактов о репозитории, зафиксированных решениях и ключевых зависимостях.',
+          title: DesktopI18n.tr('Индексация проекта в ob2h', 'ob2h Project Indexing'),
+          subtitle: DesktopI18n.tr(
+            'Хранилище фактов о репозитории, зафиксированных решениях и ключевых зависимостях.',
+            'Knowledge base of repository facts, architectural decisions and key symbols.',
+          ),
           control: ElevatedButton(
             onPressed: () {},
             style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2A303C)),
-            child: const Text('Переиндексировать AST'),
+            child: Text(DesktopI18n.tr('Переиндексировать AST', 'Reindex AST')),
           ),
         ),
       ],
@@ -1124,9 +1272,15 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildSettingCard(
-          title: 'Статистика токенов за текущую сессию',
-          subtitle: 'Prompt: 14,250 tokens • Completion: 3,120 tokens • Сэкономлено через ob2h: ~42,000 tokens',
-          control: const Text('Активно', style: TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+          title: DesktopI18n.tr('Статистика токенов за текущую сессию', 'Token statistics for current session'),
+          subtitle: DesktopI18n.tr(
+            'Prompt: 14,250 tokens • Completion: 3,120 tokens • Сэкономлено через ob2h: ~42,000 tokens',
+            'Prompt: 14,250 tokens • Completion: 3,120 tokens • Saved via ob2h AST: ~42,000 tokens',
+          ),
+          control: Text(
+            DesktopI18n.tr('Активно', 'Active'),
+            style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold),
+          ),
         ),
       ],
     );

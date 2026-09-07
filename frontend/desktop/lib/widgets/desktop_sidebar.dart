@@ -3,8 +3,11 @@
 // and fixed bottom user profile with avatar, 'Lite' badge, mobile remote, and settings gear.
 
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:get/get.dart';
 import '../features/onboarding/user_onboarding_dialog.dart';
+import '../utils/desktop_i18n.dart';
 
 class DesktopSidebar extends StatefulWidget {
   final int selectedIndex;
@@ -101,45 +104,29 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: 260,
-      decoration: const BoxDecoration(
-        color: Color(0xFF141619),
-        border: Border(right: BorderSide(color: Color(0xFF22262E), width: 1)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // 1. Top Windows ADE Header (Logo + Back/Forward + Collapse)
-          Padding(
-            padding: const EdgeInsets.only(left: 14, top: 12, right: 12, bottom: 8),
-            child: Row(
-              children: [
-                // OmnesAgent Brand Logo (Metallic emblem from Image 3)
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: Image.asset(
-                    'assets/Logo/app_icon.png',
+    return Obx(() {
+      return Container(
+        width: 260,
+        decoration: const BoxDecoration(
+          color: Color(0xFF141619),
+          border: Border(right: BorderSide(color: Color(0xFF22262E), width: 1)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 1. Top Windows ADE Header (Logo + Back/Forward + Collapse)
+            Padding(
+              padding: const EdgeInsets.only(left: 14, top: 12, right: 12, bottom: 8),
+              child: Row(
+                children: [
+                  // OmnesAgent Brand Logo (SVG emblem from OA_icon.svg)
+                  SvgPicture.asset(
+                    'assets/Logo/OA_icon.svg',
                     width: 22,
                     height: 22,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => Container(
-                      width: 22,
-                      height: 22,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1E293B),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: const Center(
-                        child: Text(
-                          'CA',
-                          style: TextStyle(fontSize: 10, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                    ),
+                    fit: BoxFit.contain,
                   ),
-                ),
-                const SizedBox(width: 14),
+                  const SizedBox(width: 14),
 
                 // Navigation Arrows
                 InkWell(
@@ -173,19 +160,19 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
               children: [
                 _buildActionRow(
                   icon: FontAwesomeIcons.plus,
-                  label: 'New task',
+                  label: DesktopI18n.newTask,
                   shortcut: 'Ctrl+N',
                   onTap: widget.onNewTask,
                 ),
                 _buildActionRow(
                   icon: FontAwesomeIcons.magnifyingGlass,
-                  label: 'Search',
+                  label: DesktopI18n.search,
                   shortcut: 'Ctrl+K',
                   onTap: widget.onOpenSearch,
                 ),
                 _buildActionRow(
                   icon: FontAwesomeIcons.bolt,
-                  label: 'Automations',
+                  label: DesktopI18n.automations,
                   shortcut: '',
                   isSelected: widget.selectedIndex == -3,
                   onTap: widget.onOpenAutomations ?? () {},
@@ -217,7 +204,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                         Icon(FontAwesomeIcons.hashtag, size: 11, color: isGroupView ? Colors.white : const Color(0xFF64748B)),
                         const SizedBox(width: 5),
                         Text(
-                          'Group',
+                          DesktopI18n.group,
                           style: TextStyle(
                             fontSize: 12,
                             fontWeight: isGroupView ? FontWeight.bold : FontWeight.w500,
@@ -246,7 +233,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                         Icon(Icons.folder_outlined, size: 13, color: !isGroupView ? const Color(0xFF00D2FF) : const Color(0xFF64748B)),
                         const SizedBox(width: 5),
                         Text(
-                          'Project',
+                          DesktopI18n.project,
                           style: TextStyle(
                             fontSize: 12,
                             fontWeight: !isGroupView ? FontWeight.bold : FontWeight.w500,
@@ -262,7 +249,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
                 // Quick actions right of tabs: Expand / Collapse all & Filter menu (Image 1 match)
                 IconButton(
-                  tooltip: isAllExpanded ? 'Свернуть все' : 'Развернуть все',
+                  tooltip: isAllExpanded ? DesktopI18n.collapseAll : DesktopI18n.expandAll,
                   icon: Icon(
                     isAllExpanded ? Icons.close_fullscreen : Icons.open_in_full,
                     size: 13,
@@ -298,8 +285,8 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
               children: [
                 Text(
                   isGroupView
-                      ? 'Groups'
-                      : (viewMode == SidebarViewMode.timeline ? 'Timeline' : 'Projects'),
+                      ? DesktopI18n.groups
+                      : (viewMode == SidebarViewMode.timeline ? DesktopI18n.timeline : DesktopI18n.projects),
                   style: const TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.w600,
@@ -397,7 +384,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
                 // Mobile Remote Control
                 IconButton(
-                  tooltip: 'Удалённое управление (Mobile Remote)',
+                  tooltip: DesktopI18n.remoteControl,
                   icon: const Icon(Icons.phone_iphone, size: 16, color: Color(0xFF94A3B8)),
                   onPressed: () {},
                   padding: EdgeInsets.zero,
@@ -407,7 +394,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
                 // Settings Gear Button
                 IconButton(
-                  tooltip: 'Настройки (Провайдеры, MCP, Память, Язык)',
+                  tooltip: DesktopI18n.settings,
                   icon: const Icon(Icons.settings_outlined, size: 17, color: Color(0xFF00D2FF)),
                   onPressed: widget.onOpenSettings,
                   padding: EdgeInsets.zero,
@@ -419,11 +406,12 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
         ],
       ),
     );
-  }
+  });
+}
 
   Widget _buildFilterPopupMenu() {
     return PopupMenuButton<String>(
-      tooltip: 'Вид и сортировка',
+      tooltip: DesktopI18n.tr('Вид и сортировка', 'View and sort'),
       offset: const Offset(0, 26),
       color: const Color(0xFF1E2127),
       elevation: 12,
@@ -441,22 +429,22 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       },
       itemBuilder: (ctx) => [
         // View header
-        const PopupMenuItem<String>(
+        PopupMenuItem<String>(
           enabled: false,
           height: 28,
-          child: Text('View', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF64748B))),
+          child: Text(DesktopI18n.view, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF64748B))),
         ),
-        _buildFilterItem('by_project', Icons.folder_outlined, 'By project', viewMode == SidebarViewMode.byProject),
-        _buildFilterItem('timeline', Icons.access_time, 'Timeline', viewMode == SidebarViewMode.timeline),
+        _buildFilterItem('by_project', Icons.folder_outlined, DesktopI18n.byProject, viewMode == SidebarViewMode.byProject),
+        _buildFilterItem('timeline', Icons.access_time, DesktopI18n.timeline, viewMode == SidebarViewMode.timeline),
         const PopupMenuDivider(height: 10),
         // Sort by header
-        const PopupMenuItem<String>(
+        PopupMenuItem<String>(
           enabled: false,
           height: 28,
-          child: Text('Sort by', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF64748B))),
+          child: Text(DesktopI18n.sortBy, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF64748B))),
         ),
-        _buildFilterItem('updated', Icons.chat_bubble_outline, 'Updated', sortMode == SidebarSortMode.updated),
-        _buildFilterItem('created', Icons.add_comment_outlined, 'Created', sortMode == SidebarSortMode.created),
+        _buildFilterItem('updated', Icons.chat_bubble_outline, DesktopI18n.updated, sortMode == SidebarSortMode.updated),
+        _buildFilterItem('created', Icons.add_comment_outlined, DesktopI18n.created, sortMode == SidebarSortMode.created),
       ],
       child: Container(
         padding: const EdgeInsets.all(4),
