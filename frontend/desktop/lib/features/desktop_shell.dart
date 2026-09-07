@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 
 import '../widgets/desktop_sidebar.dart';
+import 'automations/automations_view.dart';
 import 'command_palette/command_palette_dialog.dart';
 import 'inspector/inspector_panel.dart';
 import 'onboarding/user_onboarding_dialog.dart';
@@ -178,21 +179,28 @@ class _DesktopShellState extends State<DesktopShell> {
                   onOpenSearch: _openCommandPalette,
                   onOpenSettings: () => _openSettingsDialog('Общие'),
                   onOpenSkills: () => _openSettingsDialog('Навыки'),
+                  onOpenAutomations: () {
+                    setState(() => selectedNavIndex = -3);
+                  },
                   onOpenProfile: _openOnboardingDialog,
                   onToggleSidebar: () {
                     setState(() => isSidebarVisible = !isSidebarVisible);
                   },
                 ),
 
-              // 2. Central Task Canvas & Composer (Screenshot 2 Match)
+              // 2. Central Task Canvas & Composer or Automations Screen (Screenshot 1 Match)
               Expanded(
-                child: DesktopTaskWorkspaceView(
-                  controller: workspaceController,
-                  isToolsOpen: isInspectorOpen,
-                  onToggleTools: _toggleInspector,
-                  onToggleTerminal: () => _openInspectorWithTab(1),
-                  onOpenSettings: () => _openSettingsDialog('Провайдеры'),
-                ),
+                child: selectedNavIndex == -3
+                    ? AutomationsView(
+                        onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
+                      )
+                    : DesktopTaskWorkspaceView(
+                        controller: workspaceController,
+                        isToolsOpen: isInspectorOpen,
+                        onToggleTools: _toggleInspector,
+                        onToggleTerminal: () => _openInspectorWithTab(1),
+                        onOpenSettings: () => _openSettingsDialog('Провайдеры'),
+                      ),
               ),
 
               // 3. Right Tool Canvas / Inspector (Open tab: Side conversation, Review, Terminal, Browser)

@@ -14,6 +14,7 @@ class DesktopSidebar extends StatefulWidget {
   final VoidCallback onOpenSettings;
   final VoidCallback onToggleSidebar;
   final VoidCallback? onOpenSkills;
+  final VoidCallback? onOpenAutomations;
   final UserProfileData userProfile;
   final VoidCallback onOpenProfile;
 
@@ -26,6 +27,7 @@ class DesktopSidebar extends StatefulWidget {
     required this.onOpenSettings,
     required this.onToggleSidebar,
     this.onOpenSkills,
+    this.onOpenAutomations,
     required this.userProfile,
     required this.onOpenProfile,
   });
@@ -113,29 +115,27 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
             padding: const EdgeInsets.only(left: 14, top: 12, right: 12, bottom: 8),
             child: Row(
               children: [
-                // OmnesAgent Brand Logo / 'Z' Symbol
-                Container(
-                  width: 22,
-                  height: 22,
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF00D2FF), Color(0xFF0072FF)],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    borderRadius: BorderRadius.circular(5),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF00D2FF).withOpacity(0.3),
-                        blurRadius: 6,
-                        offset: const Offset(0, 1),
+                // OmnesAgent Brand Logo (Metallic emblem from Image 3)
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Image.asset(
+                    'assets/Logo/app_icon.png',
+                    width: 22,
+                    height: 22,
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => Container(
+                      width: 22,
+                      height: 22,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E293B),
+                        borderRadius: BorderRadius.circular(6),
                       ),
-                    ],
-                  ),
-                  child: const Center(
-                    child: Text(
-                      'Ω',
-                      style: TextStyle(fontSize: 13, color: Colors.white, fontWeight: FontWeight.bold),
+                      child: const Center(
+                        child: Text(
+                          'CA',
+                          style: TextStyle(fontSize: 10, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold),
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -187,7 +187,8 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   icon: FontAwesomeIcons.bolt,
                   label: 'Automations',
                   shortcut: '',
-                  onTap: () {},
+                  isSelected: widget.selectedIndex == -3,
+                  onTap: widget.onOpenAutomations ?? () {},
                 ),
               ],
             ),
@@ -678,23 +679,28 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     required String label,
     required String shortcut,
     required VoidCallback onTap,
+    bool isSelected = false,
   }) {
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(6),
-      child: Padding(
+      child: Container(
+        decoration: BoxDecoration(
+          color: isSelected ? const Color(0xFF282D37) : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+        ),
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: Row(
           children: [
-            Icon(icon, size: 13, color: const Color(0xFFCBD5E1)),
+            Icon(icon, size: 13, color: isSelected ? Colors.white : const Color(0xFFCBD5E1)),
             const SizedBox(width: 10),
             Expanded(
               child: Text(
                 label,
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 13,
-                  fontWeight: FontWeight.w500,
-                  color: Color(0xFFE2E8F0),
+                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                  color: isSelected ? Colors.white : const Color(0xFFE2E8F0),
                 ),
               ),
             ),
