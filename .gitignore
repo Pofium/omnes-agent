@@ -13,14 +13,9 @@ backend/target/
 **/.flutter-plugins
 **/.flutter-plugins-dependencies
 **/.packages
-frontend/android/.gradle/
-frontend/android/local.properties
-frontend/android/app/release/
-frontend/ios/.symlinks/
-frontend/ios/Pods/
-frontend/ios/Podfile.lock
-frontend/windows/flutter/ephemeral/
-frontend/windows/build/
+frontend/desktop/windows/flutter/ephemeral/
+frontend/desktop/build/
+frontend/web/build/
 .playwright-mcp/
 
 # ==========================================

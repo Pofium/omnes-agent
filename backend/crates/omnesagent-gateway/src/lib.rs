@@ -54,6 +54,7 @@ mod webhook_ingress;
 pub mod ws;
 pub mod ws_approval;
 pub mod ws_sop_runs;
+pub mod ws_terminal;
 
 use anyhow::{Context, Result};
 #[cfg(any(
@@ -1946,6 +1947,8 @@ pub async fn run_gateway(
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
+        // ── WebSocket terminal PTY ──
+        .route("/ws/terminal/{id}", get(ws_terminal::handle_ws_terminal))
         // ── Static assets (web dashboard) ──
         .merge(static_file_routes())
         // ── SPA fallback: non-API GET requests serve index.html ──

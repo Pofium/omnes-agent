@@ -14,11 +14,9 @@ class ShadcnTheme {
         primary: ShadcnColors.primary,
         secondary: ShadcnColors.primaryMuted,
         surface: ShadcnColors.card,
-        background: ShadcnColors.background,
         error: ShadcnColors.destructive,
         onPrimary: Color(0xFF09090B),
         onSurface: ShadcnColors.foreground,
-        onBackground: ShadcnColors.foreground,
         onError: Colors.white,
       ),
       appBarTheme: const AppBarTheme(

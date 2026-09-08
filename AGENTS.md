@@ -7,15 +7,15 @@ UI Design System and styling rules are detailed in [`.gemini/style-guide.md`](./
 ## Monorepo Layout
 
 - **`backend/`**: Rust workspace (20+ crates: `omnesagent-gateway`, `omnesagent-runtime`, `omnesagent-tools`, etc.).
-- **`frontend/`**: Flutter client application (Android, iOS, Windows Desktop).
+- **`frontend/`**: Flutter client application (`frontend/desktop`, `frontend/web`, and `frontend/shared`).
 - **`.claude/`**: Claude Code skills and evaluation harnesses.
 
 ## Single Source Of Truth
 
 Do not duplicate state.
 - Backend gateway state, config, and agent runtime live in `backend/`.
-- Frontend client communicates exclusively via `GatewayHttpClient` (`frontend/lib/core/gateway/gateway_http.dart`) and WebSocket (`frontend/lib/core/gateway/gateway_ws.dart`).
-- UI components live in `frontend/lib/design_system/` following the `shadcn/ui + reui` cyber design pattern.
+- Frontend client communicates exclusively via `GatewayHttpClient` (`frontend/shared/lib/core/gateway/gateway_http.dart`) and WebSocket (`frontend/shared/lib/core/gateway/gateway_ws.dart`).
+- UI components live in `frontend/shared/lib/design_system/` following the `shadcn/ui + reui` cyber design pattern.
 
 ## Safety and Privacy
 

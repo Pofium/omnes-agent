@@ -21,21 +21,49 @@ cargo check -p omnesagent-gateway
 $backExitCode = $LASTEXITCODE
 Pop-Location
 
-# 2. Frontend Analyzer
+# 2. Frontend Analyzer (Desktop, Shared & Web)
 Write-Host ""
-Write-Host "[2/3] Frontend: flutter analyze..." -ForegroundColor Yellow
-Push-Location $FrontendDir
+Write-Host "[2/3] Frontend: flutter analyze (desktop, shared & web)..." -ForegroundColor Yellow
+$DesktopDir = Join-Path $FrontendDir "desktop"
+$SharedDir = Join-Path $FrontendDir "shared"
+$WebDir = Join-Path $FrontendDir "web"
+
+Push-Location $DesktopDir
 flutter analyze --no-pub
-$frontAnalyzeCode = $LASTEXITCODE
+$frontAnalyzeDesktop = $LASTEXITCODE
 Pop-Location
+
+Push-Location $SharedDir
+flutter analyze --no-pub
+$frontAnalyzeShared = $LASTEXITCODE
+Pop-Location
+
+$frontAnalyzeWeb = 0
+if (Test-Path $WebDir) {
+    Push-Location $WebDir
+    flutter analyze --no-pub
+    $frontAnalyzeWeb = $LASTEXITCODE
+    Pop-Location
+}
+
+$frontAnalyzeCode = $frontAnalyzeDesktop + $frontAnalyzeShared + $frontAnalyzeWeb
 
 # 3. Frontend Tests
 Write-Host ""
-Write-Host "[3/3] Frontend: flutter test..." -ForegroundColor Yellow
-Push-Location $FrontendDir
-flutter test --no-pub
-$frontTestCode = $LASTEXITCODE
-Pop-Location
+Write-Host "[3/3] Frontend: flutter test (desktop & web)..." -ForegroundColor Yellow
+$frontTestCode = 0
+if (Test-Path (Join-Path $DesktopDir "test")) {
+    Push-Location $DesktopDir
+    flutter test --no-pub
+    $frontTestCode += $LASTEXITCODE
+    Pop-Location
+}
+if (Test-Path (Join-Path $WebDir "test")) {
+    Push-Location $WebDir
+    flutter test --no-pub
+    $frontTestCode += $LASTEXITCODE
+    Pop-Location
+}
 
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Cyan

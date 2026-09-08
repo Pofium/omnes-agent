@@ -84,7 +84,7 @@ if ($Target -eq "All" -or $Target -eq "Backend") {
 # 2. Build Frontend
 # -------------------------------------------------------------
 if ($Target -eq "All" -or $Target -eq "Frontend") {
-    Write-Host "[2/2] Building Frontend (Flutter APK)..." -ForegroundColor Yellow
+    Write-Host "[2/2] Building Frontend (Flutter Windows Desktop)..." -ForegroundColor Yellow
 
     $flutterCmd = Get-Command flutter -ErrorAction SilentlyContinue
     if (-not $flutterCmd) {
@@ -92,30 +92,31 @@ if ($Target -eq "All" -or $Target -eq "Frontend") {
         exit 1
     }
 
-    Push-Location $FrontendDir
+    $DesktopDir = Join-Path $FrontendDir "desktop"
+    Push-Location $DesktopDir
     try {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         if ($Mode -eq "Release") {
-            flutter build apk --release
+            flutter build windows --release
         } else {
-            flutter build apk --debug
+            flutter build windows --debug
         }
         $sw.Stop()
         $sec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 
-        $apkPath = if ($Mode -eq "Release") {
-            Join-Path $FrontendDir "build\app\outputs\flutter-apk\app-release.apk"
+        $exePath = if ($Mode -eq "Release") {
+            Join-Path $DesktopDir "build\windows\x64\runner\Release\omnes_desktop.exe"
         } else {
-            Join-Path $FrontendDir "build\app\outputs\flutter-apk\app-debug.apk"
+            Join-Path $DesktopDir "build\windows\x64\runner\Debug\omnes_desktop.exe"
         }
 
-        if (Test-Path $apkPath) {
-            $f = Get-Item $apkPath
+        if (Test-Path $exePath) {
+            $f = Get-Item $exePath
             $size = [math]::Round($f.Length / 1MB, 2)
-            Write-Host "  [OK] Frontend built successfully in $sec s!" -ForegroundColor Green
-            Write-Host "       APK: $apkPath ($size MB)" -ForegroundColor DarkGray
+            Write-Host "  [OK] Frontend Desktop built successfully in $sec s!" -ForegroundColor Green
+            Write-Host "       EXE: $exePath ($size MB)" -ForegroundColor DarkGray
         } else {
-            Write-Warning "Frontend build finished but APK was not found at: $apkPath"
+            Write-Warning "Frontend Desktop build finished. Verify output at $DesktopDir\build\windows"
         }
     }
     finally {
