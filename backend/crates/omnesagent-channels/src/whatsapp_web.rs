@@ -650,6 +650,26 @@ impl WhatsAppWebChannel {
         self
     }
 
+    /// Attach a transcription manager the caller already resolved against the
+    /// owning agent's `transcription_provider`.
+    ///
+    /// [`Self::with_transcription`] registers legacy `[transcription]`
+    /// providers only and leaves the agent alias empty, so
+    /// `TranscriptionManager::transcribe` can never select a provider. Channel
+    /// wiring uses this instead, mirroring [`Self::with_tts`], which already
+    /// binds the channel-owning agent.
+    #[cfg(feature = "whatsapp-web")]
+    #[must_use]
+    pub fn with_transcription_manager(
+        mut self,
+        config: omnesagent_config::schema::TranscriptionConfig,
+        manager: super::transcription::TranscriptionManager,
+    ) -> Self {
+        self.transcription_manager = Some(std::sync::Arc::new(manager));
+        self.transcription = Some(config);
+        self
+    }
+
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &omnesagent_config::schema::Config) -> Self {
         if config.tts.enabled {
@@ -4883,6 +4903,47 @@ mod tests {
         .with_transcription(tc);
         assert!(ch.transcription.is_some());
         assert!(ch.transcription_manager.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_manager_installs_caller_resolved_manager() {
+        let mut config = omnesagent_config::schema::Config::default();
+        config.transcription.enabled = true;
+        config.providers.transcription.groq.insert(
+            "fast".to_string(),
+            omnesagent_config::schema::GroqTranscriptionProviderConfig {
+                base: omnesagent_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let manager = super::super::transcription::TranscriptionManager::from_config_with_provider(
+            &config,
+            "groq.fast".to_string(),
+        )
+        .expect("typed provider must build a manager");
+
+        let cfg = omnesagent_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp.db".into()),
+            ..Default::default()
+        };
+        let ch = WhatsAppWebChannel::new(
+            &cfg,
+            "whatsapp_web_test_alias",
+            Arc::new(|| vec!["+123****7890".into()]),
+            Arc::new(Vec::new),
+        )
+        .with_transcription_manager(config.transcription.clone(), manager);
+
+        assert!(ch.transcription.is_some());
+        assert!(
+            ch.transcription_manager.is_some(),
+            "caller-resolved manager must be installed on the channel"
+        );
     }
 
     #[test]

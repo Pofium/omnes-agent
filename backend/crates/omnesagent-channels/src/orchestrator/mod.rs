@@ -10233,7 +10233,8 @@ pub fn register_channels_for_tools(
     feature = "channel-telegram",
     feature = "channel-discord",
     feature = "voice-wake",
-    feature = "channel-matrix"
+    feature = "channel-matrix",
+    feature = "whatsapp-web"
 ))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
     let enabled_agents = enabled_agent_aliases(config);
@@ -10250,6 +10251,40 @@ fn configure_discord_transcription(
     config: &Config,
     channel_key: &str,
 ) -> DiscordChannel {
+    if !config.transcription.enabled {
+        return channel;
+    }
+
+    let provider = resolve_agent_transcription_provider(config, channel_key);
+    match crate::transcription::TranscriptionManager::from_config_with_provider(config, provider) {
+        Ok(manager) => channel.with_transcription_manager(config.transcription.clone(), manager),
+        Err(e) => {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "transcription manager init failed, voice transcription disabled"
+            );
+            channel
+        }
+    }
+}
+
+/// Bind the WhatsApp Web channel's transcription manager to the owning
+/// agent's `transcription_provider`.
+///
+/// `WhatsAppWebChannel::with_transcription` registers legacy `[transcription]`
+/// providers only and leaves the agent alias empty, so typed
+/// `[providers.transcription.<type>.<alias>]` entries are never reachable and
+/// `transcribe()` bails before dispatching. Mirrors
+/// `configure_discord_transcription`.
+#[cfg(feature = "whatsapp-web")]
+fn configure_whatsapp_transcription(
+    channel: WhatsAppWebChannel,
+    config: &Config,
+    channel_key: &str,
+) -> WhatsAppWebChannel {
     if !config.transcription.enabled {
         return channel;
     }
@@ -10865,7 +10900,7 @@ fn collect_configured_channels(
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
-                            Arc::new(
+                            Arc::new(configure_whatsapp_transcription(
                                 WhatsAppWebChannel::new(
                                     wa,
                                     alias.clone(),
@@ -10873,12 +10908,13 @@ fn collect_configured_channels(
                                     allowed_groups_resolver,
                                 )
                                 .with_persistence(config_arc.clone())
-                                .with_transcription(config.transcription.clone())
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                 .with_group_mention_patterns(wa.group_mention_patterns.clone()),
-                            ),
+                                &config,
+                                &format!("whatsapp.{alias}"),
+                            )),
                             wa,
                         ),
                     });
@@ -30463,6 +30499,60 @@ This is an example JSON object for profile settings."#;
         assert_ne!(
             resolved, "frontdoor",
             "must not resolve to the channel alias"
+        );
+    }
+
+    /// Regression: the WhatsApp Web channel built its manager from the legacy
+    /// `[transcription]` section alone, so typed
+    /// `[providers.transcription.*]` entries never registered and the owning
+    /// agent's alias stayed empty — `transcribe()` then bailed with "Agent has
+    /// no transcription_provider configured" for every voice note.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn whatsapp_transcription_registers_typed_provider_and_binds_the_agent_alias() {
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            omnesagent_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.groq.insert(
+            "fast".to_string(),
+            omnesagent_config::schema::GroqTranscriptionProviderConfig {
+                base: omnesagent_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "voice-agent".to_string(),
+            omnesagent_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["whatsapp.default".into()],
+                transcription_provider: "groq.fast".into(),
+                ..Default::default()
+            },
+        );
+
+        let provider = resolve_agent_transcription_provider(&config, "whatsapp.default");
+        assert_eq!(
+            provider, "groq.fast",
+            "the owning agent's provider must resolve for a whatsapp.<alias> key"
+        );
+
+        let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
+            &config, provider,
+        )
+        .expect("typed provider must build a manager");
+        assert!(
+            manager.available_providers().contains(&"groq.fast"),
+            "typed provider must register, got {:?}",
+            manager.available_providers()
         );
     }
 
