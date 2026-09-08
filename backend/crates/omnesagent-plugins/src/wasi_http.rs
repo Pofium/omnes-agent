@@ -35,7 +35,9 @@
 //! Redirects are not followed. A guest that wants to chase one issues a second
 //! request, and that request is authorized on its own from scratch.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 
 use hyper::header::HOST;
 use tokio::net::TcpStream;
@@ -96,6 +98,262 @@ fn record_denial(id: &PluginInstanceId, host: &str, reason: &str) {
             })),
         "Denied plugin outbound request by egress policy"
     );
+}
+
+/// The roots plugin HTTPS verifies against, and what this machine contributed.
+///
+/// The counts are not decoration. A test asserting that the platform store was
+/// actually consulted has to tell "read it, and it held nothing" apart from
+/// "read it, and it held roots", and the operator-facing record needs the same
+/// number to say whether this machine's own trust decision reached the plugin
+/// path at all.
+struct TrustAnchors {
+    store: rustls::RootCertStore,
+    native_added: usize,
+    native_rejected: usize,
+    read_errors: usize,
+}
+
+/// Assemble the trust anchors for plugin HTTPS: the bundled webpki root program
+/// plus the roots the operating system already trusts (upstream #10491).
+///
+/// Both sets, deliberately, and the reason is a divergence rather than a
+/// preference. Provider HTTPS in this same process reads the platform store,
+/// so a plugin that rejects a certificate the provider path accepts, on one
+/// machine at one moment, is one program disagreeing with itself. The operator
+/// who installed that CA — an enterprise MDM root, a TLS-inspecting proxy, a
+/// private PKI — has already made the trust decision for this machine, and the
+/// plugin sandbox is not the place to overrule it: the sandbox governs what a
+/// guest may reach, which is the egress policy's job, not which certificate
+/// authorities the host believes.
+///
+/// The bundled program stays in the store, so a machine with an empty or
+/// unreadable store keeps exactly the reach it has today.
+///
+/// Verification is untouched. Full chain building and hostname matching stay in
+/// force, and no code path here accepts an unverified certificate.
+fn build_trust_anchors() -> TrustAnchors {
+    let mut store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
+    let native = rustls_native_certs::load_native_certs();
+    let read_errors = native.errors.len();
+    // `add_parsable_certificates` skips what it cannot parse instead of
+    // failing the batch, which is the behaviour this path wants: one malformed
+    // entry in a machine store must not cost the operator every other root on
+    // it.
+    let (native_added, native_rejected) = store.add_parsable_certificates(native.certs);
+    TrustAnchors {
+        store,
+        native_added,
+        native_rejected,
+        read_errors,
+    }
+}
+
+/// What this machine's trust assembly contributed, as classified for the
+/// operator-facing record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustVerdict {
+    /// Nothing from this machine reached the verifier: the store was empty, or
+    /// nothing on it could be read.
+    BundledOnly,
+    /// Roots from this machine reached the verifier, and something on the store
+    /// could not be read.
+    Partial,
+    /// The store was read whole.
+    Complete,
+}
+
+/// Classify an assembly for the record.
+fn trust_verdict(anchors: &TrustAnchors) -> TrustVerdict {
+    match (anchors.native_added, anchors.read_errors) {
+        (0, _) => TrustVerdict::BundledOnly,
+        (_, 0) => TrustVerdict::Complete,
+        _ => TrustVerdict::Partial,
+    }
+}
+
+fn record_trust_anchors(anchors: &TrustAnchors) {
+    let attrs = ::serde_json::json!({
+        "bundled_roots": webpki_roots::TLS_SERVER_ROOTS.len(),
+        "native_roots_added": anchors.native_added,
+        "native_roots_rejected": anchors.native_rejected,
+        "native_store_read_errors": anchors.read_errors,
+        "error_key": "plugin_egress_trust_anchors",
+    });
+    match trust_verdict(anchors) {
+        TrustVerdict::BundledOnly => {
+            // Worth a warning on its own: plugin HTTPS still works against the
+            // public web, but any endpoint whose certificate chains only to a
+            // locally installed CA will fail, and this line is the only place that
+            // says why before the failure looks like a broken plugin.
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(attrs),
+                "Plugin HTTPS trusts the bundled roots only; the platform trust store added nothing"
+            );
+        }
+        TrustVerdict::Partial => {
+            // Still a warning, and a different one: the roots that were read
+            // are in force, so an operator chasing a failing endpoint needs to
+            // know their store was consulted and came back short, not that it
+            // was ignored.
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(attrs),
+                "Plugin HTTPS trusts the bundled roots plus part of the platform trust store; some of that store could not be read"
+            );
+        }
+        TrustVerdict::Complete => {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Success)
+                    .with_attrs(attrs),
+                "Plugin HTTPS trusts the bundled roots plus the platform trust store"
+            );
+        }
+    }
+}
+
+/// The environment that decides which roots the platform loader returns.
+///
+/// `rustls-native-certs` consults `SSL_CERT_FILE` and `SSL_CERT_DIR` before it
+/// touches the platform store, on every platform, and answers from them alone
+/// when either is set. They are therefore inputs to the trust decision, not
+/// ambient noise, and a cache that ignored them would keep answering for an
+/// environment the process no longer has.
+type TrustEnvironment = (Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+
+fn trust_environment() -> TrustEnvironment {
+    (
+        std::env::var_os("SSL_CERT_FILE"),
+        std::env::var_os("SSL_CERT_DIR"),
+    )
+}
+
+/// One trust environment's client configuration, and the assembly that fills it.
+///
+/// The assembly runs as its own blocking task and this slot keeps its handle,
+/// so the read outlives every request waiting on it. That is the whole point of
+/// the type: `connect_timeout` is the guest's number, and a guest that sets a
+/// short one must not be able to cancel the store read that the *next* request
+/// needs. What a timeout cancels here is the waiter, never the work.
+struct TrustSlot {
+    ready: tokio::sync::watch::Receiver<Option<Arc<rustls::ClientConfig>>>,
+    /// Held for its `Drop` alone. [`wasmtime_wasi::runtime::spawn_blocking`]
+    /// hands back a handle that aborts its task when dropped, so letting this
+    /// fall at the end of the miss branch would abort the very assembly the
+    /// waiters are about to await.
+    _assembly: wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
+}
+
+/// Test-only delay injected ahead of the store read.
+///
+/// Production compiles this away entirely. Under test it makes the read
+/// arbitrarily slow without touching the machine's real trust store, which is
+/// what lets a case prove the deadline is answered by the waiter rather than by
+/// the read finishing.
+#[cfg(test)]
+static ASSEMBLY_DELAY: std::sync::Mutex<Option<std::time::Duration>> = std::sync::Mutex::new(None);
+
+/// The TLS client configuration for plugin egress, assembled once per trust
+/// environment and cached.
+///
+/// Reading the platform store is a disk walk on Linux and a store enumeration
+/// on Windows and macOS; `rustls-native-certs` documents the call as expensive
+/// and asks callers to make it sparingly. A guest's outbound request must not
+/// pay that per call, so the assembled configuration is cached.
+///
+/// The cache is keyed rather than global because the trust environment above is
+/// an input: in a normal process it never changes and this map holds exactly
+/// one entry, while a process that does change it gets the roots it asked for
+/// instead of whichever set happened to be assembled first.
+///
+/// The read goes to the blocking pool, the lock is dropped before any await,
+/// and the caller waits on a watch channel under its own deadline. A caller
+/// that times out leaves; the assembly finishes and populates the slot
+/// regardless, because the slot holds both the receiver and the task handle.
+/// The next request finds the work done instead of starting it over.
+///
+/// The cache is keyed on the trust *environment*, not on the store's contents.
+/// Rewriting the certificate file at the same path, or changing the operating
+/// system's own store, does not change that key, so a process keeps the roots
+/// it assembled until it restarts.
+async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<TrustEnvironment, TrustSlot>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let key = trust_environment();
+
+    // The lock covers a map lookup and, at most, spawning the assembly. It is
+    // released at the end of this block, before the await below: holding a
+    // `std::sync::Mutex` across an await point is what would let one guest's
+    // slow store read stall every other request that wants the same slot.
+    let mut ready = {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = guard.get(&key) {
+            if let Some(config) = slot.ready.borrow().clone() {
+                return Ok(config);
+            }
+            slot.ready.clone()
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            let assembly = wasmtime_wasi::runtime::spawn_blocking(move || {
+                #[cfg(test)]
+                {
+                    let delay = *ASSEMBLY_DELAY
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(delay) = delay {
+                        std::thread::sleep(delay);
+                    }
+                }
+                let anchors = build_trust_anchors();
+                record_trust_anchors(&anchors);
+                let config = Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(anchors.store)
+                        .with_no_client_auth(),
+                );
+                // The slot keeps a receiver alive for the life of the process,
+                // so this send lands whether or not anyone is still waiting.
+                let _ = sender.send(Some(config));
+            });
+            guard.insert(
+                key.clone(),
+                TrustSlot {
+                    ready: receiver.clone(),
+                    _assembly: assembly,
+                },
+            );
+            receiver
+        }
+    };
+
+    match timeout_at(deadline, ready.wait_for(Option::is_some)).await {
+        Ok(Ok(value)) => Ok(value
+            .clone()
+            .expect("wait_for returns only once the slot holds a configuration")),
+        // The sender is gone and nothing was published: the assembly task died.
+        // Drop the slot so the next request assembles again rather than
+        // inheriting a permanently empty one.
+        Ok(Err(_)) => {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+            Err(ErrorCode::TlsProtocolError)
+        }
+        Err(_) => Err(ErrorCode::ConnectionTimeout),
+    }
 }
 
 /// Split a request authority into the one endpoint that must be authorized,
@@ -339,27 +597,31 @@ async fn send(
     // Canonical host from the pin, used for SNI and certificate verification —
     // never for a second resolution.
     let server_name = authorized.destination().host().to_string();
+
+    // Trust is assembled before the socket, not after it (upstream #10491).
+    // On a cold process the assembly is a read of this machine's store, and the
+    // lease is already held by this point: paying for that read with a socket
+    // open and a scarce connection slot booked is what would put both past the
+    // deadline meant to bound them. Expiring here returns before anything is
+    // dialed, and dropping `authorized` on the way out releases the slot at
+    // once. The read itself runs on the blocking pool and outlives this wait,
+    // so a guest that gives up does not cancel the work the next request needs.
+    //
+    // See `plugin_tls_config` for why both root sets, and for what stays
+    // unchanged about verification itself.
+    let tls_config = if config.use_tls {
+        Some(plugin_tls_config(deadline).await?)
+    } else {
+        None
+    };
+
     let tcp_stream = dial_pinned(authorized.destination().addresses(), deadline).await?;
 
-    let (mut sender, worker) = if config.use_tls {
+    let (mut sender, worker) = if let Some(tls_config) = tls_config {
         use rustls::pki_types::ServerName;
         use wasmtime_wasi_http::io::TokioIo;
 
-        // Trust is the bundled webpki root program and nothing else: this path
-        // deliberately does not read the operating system's trust store, so an
-        // enterprise or private CA installed on the host does not silently
-        // become trusted for plugin egress. Native-root support is a separate,
-        // tracked decision rather than an omission.
-        // DECISION (2026-09-08, C1 sync): fail-closed (webpki-only) is KEPT and
-        // confirmed by the owner; upstream #10491 adds rustls-native-certs.
-        // Port it only under an explicit owner decision; monitor upstream #9653.
-        let root_cert_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-        };
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_cert_store)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
         let domain = ServerName::try_from(server_name).map_err(|_| ErrorCode::TlsProtocolError)?;
         // The stage that most needs the deadline: the TCP connect has already
         // succeeded, so a peer that never sends a `ServerHello` is indistinguishable
@@ -1010,5 +1272,335 @@ mod tests {
         };
         assert!(message.contains("egress policy"), "{message}");
         assert!(!message.contains("127.0.0.1"), "{message}");
+    }
+
+    // ── trust anchors (#10491) ─────────────────────────────
+
+    /// Serializes the tests that set the trust environment.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Sets an environment variable and restores the previous value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&std::path::Path>) -> Self {
+            let original = std::env::var_os(key);
+            match value {
+                Some(path) => unsafe { std::env::set_var(key, path) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// A private CA and one leaf it signed, PEM for the store and DER for
+    /// verification, plus a server config for the real-handshake test.
+    struct TlsFixture {
+        ca_pem: String,
+        leaf_der: rustls::pki_types::CertificateDer<'static>,
+        server_config: rustls::ServerConfig,
+    }
+
+    fn tls_fixture(server_san: &str) -> TlsFixture {
+        tls_fixture_signed_by(server_san, &rcgen::KeyPair::generate().expect("a CA key"))
+    }
+
+    fn tls_fixture_signed_by(server_san: &str, ca_key: &rcgen::KeyPair) -> TlsFixture {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+
+        let mut ca_params = CertificateParams::new(vec!["OmnesAgent plugin egress test CA".into()])
+            .expect("CA params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(ca_key).expect("a self-signed CA");
+
+        let server_key = KeyPair::generate().expect("a leaf key");
+        let mut server_params =
+            CertificateParams::new(vec![server_san.to_string()]).expect("leaf params");
+        server_params.is_ca = IsCa::NoCa;
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, ca_key)
+            .expect("a leaf signed by the CA");
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .expect("a server configuration");
+
+        TlsFixture {
+            ca_pem: ca_cert.pem(),
+            leaf_der: server_cert.der().clone(),
+            server_config,
+        }
+    }
+
+    /// Verify one leaf against the assembled trust anchors without a socket.
+    fn verify_leaf(
+        anchors: TrustAnchors,
+        leaf: &rustls::pki_types::CertificateDer<'_>,
+        server_name: &str,
+    ) -> Result<(), rustls::Error> {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(anchors.store))
+            .build()
+            .expect("a verifier over a non-empty trust store");
+        let name = ServerName::try_from(server_name)
+            .expect("a fixture server name")
+            .to_owned();
+        verifier
+            .verify_server_cert(leaf, &[], &name, &[], UnixTime::now())
+            .map(|_| ())
+    }
+
+    /// Point the machine store at a temporary file holding a CA.
+    fn machine_store(ca_pem: &str) -> (tempfile::NamedTempFile, EnvGuard, EnvGuard) {
+        let file = tempfile::NamedTempFile::new().expect("a temporary CA file");
+        std::fs::write(file.path(), ca_pem).expect("write the CA");
+        let dir = EnvGuard::set("SSL_CERT_DIR", None);
+        let path = EnvGuard::set("SSL_CERT_FILE", Some(file.path()));
+        (file, path, dir)
+    }
+
+    /// A TLS peer that answers one request per connection with a bare 200.
+    fn tls_listener(server_config: rustls::ServerConfig) -> (SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::TlsAcceptor;
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&completed);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a listener runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback peer");
+                sender
+                    .send(listener.local_addr().expect("loopback address"))
+                    .expect("hand the address back");
+                let acceptor = TlsAcceptor::from(Arc::new(server_config));
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let Ok(mut stream) = acceptor.accept(socket).await else {
+                        continue;
+                    };
+                    let mut buffer = [0_u8; 1024];
+                    if stream.read(&mut buffer).await.is_err() {
+                        continue;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+        });
+        let address = receiver.recv().expect("the listener must publish its address");
+        (address, completed)
+    }
+
+    fn tls_config() -> OutgoingRequestConfig {
+        OutgoingRequestConfig {
+            use_tls: true,
+            connect_timeout: Duration::from_secs(5),
+            first_byte_timeout: Duration::from_secs(5),
+            between_bytes_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Drive one authorized HTTPS request to a loopback port.
+    fn https_outcome(port: u16) -> Result<IncomingResponse, ErrorCode> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
+        runtime.block_on(async move {
+            let mut hooks = hooks(Some(loopback_service()));
+            let response = hooks
+                .send_request(request(&format!("https://127.0.0.1:{port}/")), tls_config())
+                .expect("an authorized destination is dialed asynchronously");
+            let HostFutureIncomingResponse::Pending(handle) = response else {
+                panic!("an authorized destination is dialed asynchronously");
+            };
+            handle.await.expect("the send task must not trap")
+        })
+    }
+
+    fn root_subjects(store: &rustls::RootCertStore) -> std::collections::HashSet<Vec<u8>> {
+        store
+            .roots
+            .iter()
+            .map(|root| root.subject.as_ref().to_vec())
+            .collect()
+    }
+
+    /// Adding the machine's roots must not cost the bundled ones.
+    #[test]
+    fn the_bundled_root_program_stays_in_the_trust_store() {
+        let _lock = env_lock();
+        let anchors = build_trust_anchors();
+
+        assert!(
+            !webpki_roots::TLS_SERVER_ROOTS.is_empty(),
+            "the bundled root program must not be empty, or this test proves nothing"
+        );
+        let subjects = root_subjects(&anchors.store);
+        for root in webpki_roots::TLS_SERVER_ROOTS {
+            assert!(
+                subjects.contains(root.subject.as_ref()),
+                "a bundled root was dropped from the trust store"
+            );
+        }
+    }
+
+    /// The operator's own certificate authority reaches the plugin path.
+    #[test]
+    fn a_root_from_the_machine_store_joins_the_bundled_program() {
+        let _lock = env_lock();
+        let fixture = tls_fixture("127.0.0.1");
+        let (_file, _path, _dir) = machine_store(&fixture.ca_pem);
+
+        let anchors = build_trust_anchors();
+
+        assert_eq!(anchors.read_errors, 0);
+        assert_eq!(anchors.native_added, 1);
+        assert_eq!(anchors.native_rejected, 0);
+        assert_eq!(
+            anchors.store.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len() + 1,
+            "the store must hold the bundled program plus the machine's root"
+        );
+    }
+
+    /// An unreadable machine store must not cost the reach the host already has.
+    #[test]
+    fn an_unreadable_machine_store_leaves_the_bundled_program_intact() {
+        let _lock = env_lock();
+        let missing = std::path::Path::new("/nonexistent/omnesagent-plugin-egress-roots.pem");
+        let _dir = EnvGuard::set("SSL_CERT_DIR", None);
+        let _path = EnvGuard::set("SSL_CERT_FILE", Some(missing));
+
+        let anchors = build_trust_anchors();
+
+        assert!(anchors.read_errors > 0);
+        assert_eq!(anchors.native_added, 0);
+        assert_eq!(
+            anchors.store.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "the bundled program must survive an unreadable machine store"
+        );
+    }
+
+    /// The other half of the same contract: trusting machine roots is not
+    /// trusting anything else.
+    #[test]
+    fn a_certificate_from_an_untrusted_authority_is_still_refused() {
+        let _lock = env_lock();
+        let trusted = tls_fixture("127.0.0.1");
+        let stranger = tls_fixture("127.0.0.1");
+        let (_file, _path, _dir) = machine_store(&trusted.ca_pem);
+
+        let verdict = verify_leaf(build_trust_anchors(), &stranger.leaf_der, "127.0.0.1");
+
+        assert!(verdict.is_err(), "a leaf from an unknown issuer must not verify");
+    }
+
+    /// Hostname verification stays in force.
+    #[test]
+    fn a_certificate_for_another_name_is_still_refused() {
+        let _lock = env_lock();
+        let ca_key = rcgen::KeyPair::generate().expect("a CA key");
+        let trusted = tls_fixture_signed_by("127.0.0.1", &ca_key);
+        let mismatched = tls_fixture_signed_by("other.example.com", &ca_key);
+        let (_file, _path, _dir) = machine_store(&trusted.ca_pem);
+
+        let matching = verify_leaf(build_trust_anchors(), &trusted.leaf_der, "127.0.0.1");
+        let mismatch = verify_leaf(build_trust_anchors(), &mismatched.leaf_der, "127.0.0.1");
+
+        assert!(matching.is_ok(), "the control must verify: {matching:?}");
+        assert!(mismatch.is_err(), "a name mismatch must not verify");
+    }
+
+    /// The whole point: a leaf from a machine-trusted CA verifies, while the
+    /// bundled program alone refuses it.
+    #[test]
+    fn a_certificate_from_a_machine_root_verifies_against_the_assembled_anchors() {
+        let _lock = env_lock();
+        let fixture = tls_fixture("127.0.0.1");
+
+        let bundled_only = {
+            let _dir = EnvGuard::set("SSL_CERT_DIR", None);
+            let empty = tempfile::NamedTempFile::new().expect("an empty store");
+            let _path = EnvGuard::set("SSL_CERT_FILE", Some(empty.path()));
+            verify_leaf(build_trust_anchors(), &fixture.leaf_der, "127.0.0.1")
+        };
+        let with_machine_root = {
+            let (_file, _path, _dir) = machine_store(&fixture.ca_pem);
+            verify_leaf(build_trust_anchors(), &fixture.leaf_der, "127.0.0.1")
+        };
+
+        assert!(bundled_only.is_err(), "the bundled program alone must not know this private CA");
+        assert!(
+            with_machine_root.is_ok(),
+            "a leaf from a root this machine trusts must verify: {with_machine_root:?}"
+        );
+    }
+
+    /// End to end: the same certificate through a socket and a handshake.
+    #[test]
+    fn a_certificate_from_a_machine_root_completes_a_real_handshake() {
+        let _lock = env_lock();
+        let fixture = tls_fixture("127.0.0.1");
+        let (_file, _path, _dir) = machine_store(&fixture.ca_pem);
+        let (address, handshakes) = tls_listener(fixture.server_config);
+
+        let outcome = https_outcome(address.port());
+
+        assert!(outcome.is_ok(), "a machine-root cert must verify: {outcome:?}");
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A partly-read platform store is not "bundled only".
+    #[test]
+    fn a_partly_read_platform_store_is_not_reported_as_bundled_only() {
+        let anchors = |native_added, read_errors| TrustAnchors {
+            store: rustls::RootCertStore::empty(),
+            native_added,
+            native_rejected: 0,
+            read_errors,
+        };
+
+        assert_eq!(trust_verdict(&anchors(7, 1)), TrustVerdict::Partial);
+        assert_eq!(trust_verdict(&anchors(0, 1)), TrustVerdict::BundledOnly);
+        assert_eq!(trust_verdict(&anchors(0, 0)), TrustVerdict::BundledOnly);
+        assert_eq!(trust_verdict(&anchors(3, 0)), TrustVerdict::Complete);
     }
 }
