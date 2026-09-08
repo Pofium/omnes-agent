@@ -1060,14 +1060,15 @@ impl TtsManager {
                     }
                 }
                 Err(e) => {
+                    let config_path = format!("[providers.tts.{dotted}]");
                     ::omnesagent_log::record!(
                         WARN,
                         ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
                             .with_outcome(::omnesagent_log::EventOutcome::Unknown)
                             .with_attrs(
-                                ::serde_json::json!({"error": format!("{}", e), "dotted": dotted})
+                                ::serde_json::json!({"error": e.to_string(), "config_path": config_path})
                             ),
-                        "Skipping TTS provider"
+                        "typed TTS provider skipped (config error)"
                     );
                 }
             }
@@ -1818,6 +1819,53 @@ mod tests {
         let provider = OpenAiTtsProvider::new("test", &cfg).unwrap();
         assert_eq!(provider.base_url, "https://api.openai.com/v1/audio/speech");
         assert_eq!(provider.response_format, "opus");
+    }
+
+    #[test]
+    fn typed_registration_logs_config_path_for_keyless_uri_only_provider() {
+        let _writer_guard = omnesagent_log::__private_test_writer_lock();
+        let _hook_guard = omnesagent_log::__private_test_hook_lock();
+        omnesagent_log::try_install_capture_subscriber();
+        let mut rx = omnesagent_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // The exact real-world failure mode this diagnostic exists for: a
+        // local, keyless endpoint (e.g. Kokoro) configured via `uri` alone,
+        // with no `api_key`. `OpenAiTtsProvider::new` bails before it ever
+        // reads `uri`, so the provider never registers.
+        let mut cfg = Config::default();
+        cfg.providers.tts.openai.insert(
+            "stoa".to_string(),
+            omnesagent_config::schema::OpenAITtsProviderConfig {
+                base: omnesagent_config::schema::TtsProviderConfig {
+                    uri: Some("http://localhost:8880/v1/audio/speech".to_string()),
+                    ..omnesagent_config::schema::TtsProviderConfig::default()
+                },
+            },
+        );
+
+        let manager = TtsManager::from_config(&cfg).unwrap();
+        assert!(
+            manager.available_providers().is_empty(),
+            "keyless openai provider must not register: {:?}",
+            manager.available_providers()
+        );
+
+        let events: Vec<serde_json::Value> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let event = events
+            .iter()
+            .find(|value| value["attributes"]["config_path"] == "[providers.tts.openai.stoa]")
+            .unwrap_or_else(|| panic!("expected a skip record for openai.stoa: {events:?}"));
+        assert_eq!(
+            event["message"], "typed TTS provider skipped (config error)",
+            "event: {event:?}"
+        );
+        assert!(
+            event["attributes"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("api_key")),
+            "error should name the missing api_key: {event:?}"
+        );
     }
 
     #[cfg(unix)]
