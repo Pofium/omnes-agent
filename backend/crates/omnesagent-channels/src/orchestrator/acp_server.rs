@@ -1573,7 +1573,12 @@ impl AcpServer {
                         cost_context,
                         session
                             .agent
-                            .turn_streamed(&prompt, event_tx, Some(cancel_token))
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_token),
+                                None,
+                            )
                             .instrument(span),
                     ),
                 )
@@ -1682,7 +1687,7 @@ impl AcpServer {
         // Per ACP spec: a cancelled turn must respond with stopReason "cancelled",
         // not an error. Detect via ToolLoopCancelled propagated through anyhow.
         let was_cancelled = match &turn_result {
-            Err(e) => omnesagent_runtime::agent::loop_::is_tool_loop_cancelled(e),
+            Err(e) => omnesagent_runtime::agent::loop_::is_tool_loop_cancelled(&e.error),
             Ok(_) => false,
         };
 
@@ -1702,19 +1707,49 @@ impl AcpServer {
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
-        let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
-            let (diagnostic, rpc_error) = acp_turn_failure(&e);
-            ::omnesagent_log::record!(
-                ERROR,
-                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail).with_category(::omnesagent_log::EventCategory::Channel)
-                .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error": diagnostic,
-                })),
-                "ACP session/prompt turn failed"
-            );
-            rpc_error
-        })?;
+        // Resolve the result, persisting any committed messages durably even
+        // when the turn failed (bug #9333/#10673): a failed turn previously
+        // lived only in memory and vanished after switching sessions.
+        let (result_text, new_turn_msgs) = match turn_result {
+            Ok(ok) => (ok.response, ok.new_messages),
+            Err(e) => {
+                // The agent committed assistant/tool messages before failing;
+                // persist them so the partial turn survives session switches.
+                if !e.new_messages.is_empty()
+                    && let Some(store) = &self.store
+                {
+                    let store = store.clone();
+                    let sid = session_id.clone();
+                    let msgs = e.new_messages;
+                    let persisted =
+                        tokio::task::spawn_blocking(move || store.append_turn(&sid, &msgs)).await;
+                    if let Some(detail) = match persisted {
+                        Ok(Ok(())) => None,
+                        Ok(Err(pe)) => Some(pe.to_string()),
+                        Err(join) => Some(join.to_string()),
+                    } {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_category(::omnesagent_log::EventCategory::Channel)
+                                .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({ "error": detail })),
+                            "Failed to persist failed-turn messages; partial turn stays in memory"
+                        );
+                    }
+                }
+                let (diagnostic, rpc_error) = acp_turn_failure(&e.error);
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail).with_category(::omnesagent_log::EventCategory::Channel)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": diagnostic,
+                        })),
+                    "ACP session/prompt turn failed"
+                );
+                return Err(rpc_error);
+            }
+        };
 
         // Persist new messages on successful, non-cancelled turns.
         if let Some(store) = &self.store

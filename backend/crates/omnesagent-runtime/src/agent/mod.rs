@@ -69,6 +69,6 @@ impl ::omnesagent_api::attribution::Attributable for AgentAttribution<'_> {
 mod tests;
 
 #[allow(unused_imports)]
-pub use agent::{Agent, AgentBuilder, TurnEvent};
+pub use agent::{Agent, AgentBuilder, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
 #[allow(unused_imports)]
 pub use loop_::{process_message, run};
