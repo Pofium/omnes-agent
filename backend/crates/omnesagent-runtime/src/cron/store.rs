@@ -798,11 +798,15 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
         })
     } else {
         // Recurring job — advance next_run to the next future occurrence.
+        // Record the skip in last_status/last_output so the missed run is
+        // observable (bug #10594: recurring startup-skip previously only
+        // advanced next_run, leaving no trace that the job did not run).
         let next_run = next_run_for_schedule(&job.schedule, now)?;
+        let bounded_output = truncate_cron_output("skipped — startup catch-up not due (advanced next_run)");
         with_initialized_connection(config, |conn| {
             conn.execute(
-                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
-                params![next_run.to_rfc3339(), job.id],
+                "UPDATE cron_jobs SET next_run = ?1, last_run = ?2, last_status = 'skipped', last_output = ?3 WHERE id = ?4",
+                params![next_run.to_rfc3339(), now.to_rfc3339(), bounded_output, job.id],
             )
             .context("Failed to advance next_run on startup skip")?;
             Ok(())
@@ -3656,6 +3660,58 @@ schedule = { kind = "every", every_ms = 300000 }
             updated.last_status.as_deref(),
             Some("skipped"),
             "one-shot job last_status must be 'skipped'"
+        );
+    }
+
+    #[test]
+    fn skip_missed_run_recurring_records_skip_status() {
+        // bug #10594: recurring startup-skip previously only advanced next_run,
+        // leaving no trace that the job did not run. It must now stamp
+        // last_run/last_status/last_output.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job_with_schedule(
+            &config,
+            "test-agent",
+            &Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo recurring",
+        )
+        .unwrap();
+
+        let reference = Utc::now();
+        let reloaded = get_job(&config, &job.id).unwrap();
+        let old_last_run = reloaded.last_run;
+
+        skip_missed_run(&config, &reloaded, reference).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(
+            updated.last_status.as_deref(),
+            Some("skipped"),
+            "recurring job must record 'skipped' last_status"
+        );
+        assert!(
+            updated.last_run.is_some(),
+            "recurring job must have last_run stamped after skip"
+        );
+        assert!(
+            updated.last_run != old_last_run,
+            "last_run must change after a skip"
+        );
+        assert!(
+            updated.last_output.as_deref().unwrap_or_default().contains("skipped"),
+            "last_output should describe the skip, got: {:?}",
+            updated.last_output
+        );
+        // next_run must be advanced past the reference time.
+        assert!(
+            updated.next_run > reference,
+            "next_run must be advanced past now, got {:?}",
+            updated.next_run
         );
     }
 

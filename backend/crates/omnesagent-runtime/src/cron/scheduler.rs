@@ -1,6 +1,6 @@
 use crate::cron::store::{
     RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
-    persist_run_result,
+    persist_run_result, record_run,
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
@@ -22,6 +22,11 @@ use omnesagent_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+/// Wall-clock timeout for an agent cron job's turn. Prevents a single turn
+/// from pinning the scheduler indefinitely (bug #9191). Agent turns can legit
+/// take several minutes (tool calls, retrieval), so the default is generous
+/// relative to shell jobs; a timeout is a hard cancellation of the turn.
+const AGENT_JOB_TIMEOUT_SECS: u64 = 600;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -692,6 +697,23 @@ async fn process_due_jobs(
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
             ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
+            // Make the skipped run observable and stop re-selecting the same
+            // job every cycle (bug #10594): persist a 'skipped' run record and
+            // advance a recurring schedule so it does not stay overdue forever.
+            let now = Utc::now();
+            let output = "skipped — no owning agent (add cron_jobs alias to an [agents.<x>] section)";
+            let _ = record_run(
+                config,
+                &job.id,
+                now,
+                now,
+                "skipped",
+                Some(output),
+                0,
+            );
+            // `skip_missed_run` advances a recurring job's next_run (and, for
+            // one-shot, disables it) plus stamps last_status/last_output.
+            let _ = skip_missed_run(config, &job, now);
             let _ = release_job(config, &job.id);
             return None;
         };
@@ -864,7 +886,7 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
+            let run_fut = Box::pin(
                 crate::agent::run(
                     cron_config,
                     agent_alias,
@@ -882,8 +904,33 @@ async fn run_agent_job(
                     run_overrides,
                 )
                 .instrument(subagent_span),
-            )
-            .await
+            );
+            // Wall-clock deadline so an agent turn cannot pin the scheduler
+            // indefinitely (bug #9191). On timeout the future is cancelled —
+            // the run fails, its in-flight lock is released and last_status
+            // records the failure through the normal outcome path.
+            match time::timeout(Duration::from_secs(AGENT_JOB_TIMEOUT_SECS), run_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Note
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "job_id": job.id,
+                            "timeout_secs": AGENT_JOB_TIMEOUT_SECS,
+                        })),
+                        "Cron agent job timed out; cancelling turn"
+                    );
+                    return (
+                        false,
+                        format!("agent job timed out after {}s", AGENT_JOB_TIMEOUT_SECS),
+                    );
+                }
+            }
         }
     };
 
