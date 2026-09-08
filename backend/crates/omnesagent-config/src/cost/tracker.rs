@@ -285,6 +285,30 @@ impl CostTracker {
         self.get_summary_filtered(None)
     }
 
+    /// Per-model rollup over every record in the current UTC month.
+    ///
+    /// [`CostSummary::by_model`] stays daily-scoped for dashboard and RPC
+    /// consumers. Operator surfaces that qualify the monthly total, such as
+    /// the `status` pricing-unavailable warning, need the whole month's
+    /// recorded provenance so unpriced usage from an earlier day does not
+    /// disappear at UTC day rollover while the monthly spend still omits its
+    /// cost (upstream #9939). Derived from the persisted ledger on demand;
+    /// nothing is cached or duplicated.
+    pub fn get_current_month_model_stats(&self) -> Result<HashMap<String, ModelStats>> {
+        self.get_current_month_model_stats_at_period(ReportingPeriod::current())
+    }
+
+    fn get_current_month_model_stats_at_period(
+        &self,
+        period: ReportingPeriod,
+    ) -> Result<HashMap<String, ModelStats>> {
+        let mut storage = self.lock_storage();
+        storage.ensure_period_cache_current_at(period)?;
+        let period = storage.reporting_period();
+        let records = storage.current_month_records(period)?;
+        Ok(build_model_stats(records.iter()))
+    }
+
     pub fn get_summary_in_bounds(
         &self,
         from: Option<DateTime<Utc>>,
@@ -590,6 +614,7 @@ fn add_model_stats(by_model: &mut HashMap<String, ModelStats>, record: &CostReco
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
+            unpriced_tokens: 0,
             request_count: 0,
         });
     add_usage_to_model_stats(entry, record);
@@ -601,6 +626,18 @@ fn add_usage_to_model_stats(entry: &mut ModelStats, record: &CostRecord) {
     entry.input_tokens += record.usage.input_tokens;
     entry.output_tokens += record.usage.output_tokens;
     entry.cached_input_tokens += record.usage.cached_input_tokens;
+    if record.usage.unpriced_tokens > 0 {
+        entry.unpriced_tokens = entry
+            .unpriced_tokens
+            .saturating_add(record.usage.unpriced_tokens);
+    } else if !record.usage.pricing_available {
+        // Compatibility with rows written by the first provenance format,
+        // which had only a record-level boolean. Rows older than that omit the
+        // boolean too and deserialize as priced by the existing default.
+        entry.unpriced_tokens = entry
+            .unpriced_tokens
+            .saturating_add(record.usage.total_tokens);
+    }
     entry.request_count += 1;
 }
 
@@ -1066,6 +1103,7 @@ mod tests {
             cached_input_tokens: 0,
             total_tokens: 20,
             cost_usd,
+            unpriced_tokens: 0,
             pricing_available: true,
             timestamp,
         };
@@ -1186,6 +1224,7 @@ mod tests {
             cached_input_tokens: 0,
             total_tokens: 20,
             cost_usd: 1.0,
+            unpriced_tokens: 0,
             pricing_available: true,
             timestamp: Utc::now(),
         };
@@ -1260,6 +1299,40 @@ mod tests {
         let summary = tracker.get_summary().unwrap();
         assert!((summary.daily_cost_usd - expected_cost).abs() < 1e-9);
         assert!((summary.monthly_cost_usd - expected_cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_summary_counts_only_explicitly_unpriced_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let configured_free = TokenUsage::new("test/model", 100, 50, 0, 0.0, 0.0, 0.0);
+        let mut unpriced = TokenUsage::new("test/model", 200, 75, 0, 0.0, 0.0, 0.0);
+        unpriced.pricing_available = false;
+
+        tracker.record_usage(configured_free).unwrap();
+        tracker.record_usage(unpriced).unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        let model = summary.by_model.get("test/model").unwrap();
+        assert_eq!(model.total_tokens, 425);
+        assert_eq!(model.unpriced_tokens, 275);
+        assert_eq!(model.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn model_summary_prefers_dimension_level_unpriced_count() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let mut partial = TokenUsage::new("test/model", 100, 20, 0, 2.0, 0.0, 0.0);
+        partial.unpriced_tokens = 20;
+        partial.pricing_available = false;
+
+        tracker.record_usage(partial).unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        let model = summary.by_model.get("test/model").unwrap();
+        assert_eq!(model.total_tokens, 120);
+        assert_eq!(model.unpriced_tokens, 20);
     }
 
     #[test]

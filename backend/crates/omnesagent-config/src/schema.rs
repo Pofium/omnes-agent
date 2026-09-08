@@ -6838,6 +6838,65 @@ impl CostRatesConfig {
     pub fn tool_rates(&self, tool_name: &str) -> Option<&ToolCostRates> {
         self.tools.get(tool_name)
     }
+
+    /// Validate that every configured cost rate is finite, non-negative and
+    /// within the shared sanity bound (upstream #9939). Zero remains valid so
+    /// a deliberately free resource is distinguishable from unavailable
+    /// pricing.
+    pub fn validate(&self) -> Result<()> {
+        fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
+            if let Some(value) = value
+                && !crate::cost::is_sane_usd_rate(value)
+            {
+                let max = crate::cost::MAX_SANE_USD_RATE;
+                validation_bail!(
+                    InvalidNumericRange,
+                    path.clone(),
+                    "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
+                );
+            }
+            Ok(())
+        }
+
+        let mut model_rates: Vec<_> = self.providers.models.iter_entries().collect();
+        model_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in model_rates {
+            let prefix = format!("cost.rates.providers.models.{provider}.{model}");
+            validate_rate(format!("{prefix}.input_per_mtok"), rates.input_per_mtok)?;
+            validate_rate(format!("{prefix}.output_per_mtok"), rates.output_per_mtok)?;
+            validate_rate(
+                format!("{prefix}.cached_input_per_mtok"),
+                rates.cached_input_per_mtok,
+            )?;
+        }
+
+        let mut tts_rates: Vec<_> = self.providers.tts.iter_entries().collect();
+        tts_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, voice, rates) in tts_rates {
+            validate_rate(
+                format!("cost.rates.providers.tts.{provider}.{voice}.per_mchar"),
+                rates.per_mchar,
+            )?;
+        }
+
+        let mut transcription_rates: Vec<_> = self.providers.transcription.iter_entries().collect();
+        transcription_rates
+            .sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in transcription_rates {
+            validate_rate(
+                format!("cost.rates.providers.transcription.{provider}.{model}.per_minute"),
+                rates.per_minute,
+            )?;
+        }
+
+        let mut tool_rates: Vec<_> = self.tools.iter().collect();
+        tool_rates.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        for (tool, rates) in tool_rates {
+            validate_rate(format!("cost.rates.tools.{tool}.per_call"), rates.per_call)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// `[cost.rates.providers.*]` — provider-shaped rate sheets. Each field
@@ -21414,6 +21473,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        self.cost.rates.validate()?;
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
