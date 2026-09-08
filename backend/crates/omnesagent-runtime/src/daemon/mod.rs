@@ -1,9 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
+use omnesagent_config::schema::Config;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
-use omnesagent_config::schema::Config;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StartupReadiness {
@@ -582,7 +582,7 @@ pub async fn run(
     }
 
     if crate::control_plane::control_plane().is_none()
-        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+        && let Err(e) = crate::control_plane::ControlPlaneRecoveryOwner::start(&config.data_dir)
             .await
             .map(crate::control_plane::init_control_plane)
     {
@@ -596,8 +596,8 @@ pub async fn run(
     }
     // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
     // boot_id matches what producers stamp via `control_plane()`.
-    if let Some(handle) = crate::control_plane::control_plane() {
-        handle.spawn_reaper(
+    if crate::control_plane::control_plane().is_some() {
+        let _ = crate::control_plane::spawn_control_plane_reaper(
             crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
             channels_cancel.clone(),
         );
@@ -698,24 +698,25 @@ pub async fn run(
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
-        let rpc_memory: Option<std::sync::Arc<dyn omnesagent_api::memory_traits::Memory>> = if config
-            .agents
-            .is_empty()
-        {
-            None
-        } else {
-            match omnesagent_memory::create_memory_from_config(&config, None) {
-                Ok(mem) => Some(std::sync::Arc::from(mem)),
-                Err(_e) => {
-                    ::omnesagent_log::record!(
-                        WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
-                        "RPC memory subsystem unavailable"
-                    );
-                    None
+        let rpc_memory: Option<std::sync::Arc<dyn omnesagent_api::memory_traits::Memory>> =
+            if config.agents.is_empty() {
+                None
+            } else {
+                match omnesagent_memory::create_memory_from_config(&config, None) {
+                    Ok(mem) => Some(std::sync::Arc::from(mem)),
+                    Err(_e) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(
+                                module_path!(),
+                                ::omnesagent_log::Action::Note
+                            ),
+                            "RPC memory subsystem unavailable"
+                        );
+                        None
+                    }
                 }
-            }
-        };
+            };
 
         // Open the ACP session DB at boot so the file exists from the
         // moment the daemon is up, not when (if ever) `omnesagent acp`
@@ -756,9 +757,12 @@ pub async fn run(
                 Err(e) => {
                     ::omnesagent_log::record!(
                         ERROR,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
-                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Fail
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                         "certificate audit logger unavailable: enrollment and certificate \
                          renewal will refuse to issue"
                     );
@@ -1284,12 +1288,15 @@ where
                     crate::health::mark_component_error(name, "component exited unexpectedly");
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
-                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "name": name,
-                                "ran_for_secs": ran_for.as_secs(),
-                            })),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Note
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "name": name,
+                            "ran_for_secs": ran_for.as_secs(),
+                        })),
                         &format!("Daemon component '{name}' exited unexpectedly")
                     );
                     if ran_for >= stable_run {
@@ -1300,13 +1307,16 @@ where
                     crate::health::mark_component_error(name, e.to_string());
                     ::omnesagent_log::record!(
                         ERROR,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
-                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "error": format!("{}", e),
-                                "name": name,
-                                "ran_for_secs": ran_for.as_secs(),
-                            })),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Fail
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{}", e),
+                            "name": name,
+                            "ran_for_secs": ran_for.as_secs(),
+                        })),
                         &format!("Daemon component '{name}' failed: {e}")
                     );
                     // A long-lived run that eventually errors is not a
@@ -2001,7 +2011,17 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         metrics.lock().record_success(elapsed);
                         continue;
                     }
-                    ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_attrs(::serde_json::json!({"selected": indices.len(), "total": tasks.len()})), "heartbeat phase 1: running task subset");
+                    ::omnesagent_log::record!(
+                        INFO,
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Note
+                        )
+                        .with_attrs(
+                            ::serde_json::json!({"selected": indices.len(), "total": tasks.len()})
+                        ),
+                        "heartbeat phase 1: running task subset"
+                    );
                     indices
                         .into_iter()
                         .filter_map(|i| tasks.get(i).cloned())
@@ -2010,9 +2030,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Err(e) => {
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
-                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Note
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "heartbeat phase 1 failed; running all tasks"
                     );
                     tasks
@@ -2236,9 +2259,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     crate::health::mark_component_error("heartbeat", e.to_string());
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
-                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Note
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "Heartbeat task failed"
                     );
                 }
@@ -2479,7 +2505,8 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<omnesagent_providers::trai
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(msg) = serde_json::from_str::<omnesagent_providers::traits::ChatMessage>(trimmed) {
+        if let Ok(msg) = serde_json::from_str::<omnesagent_providers::traits::ChatMessage>(trimmed)
+        {
             window.push_back(msg);
             if window.len() > HEARTBEAT_SESSION_CONTEXT_MESSAGES {
                 window.pop_front();
@@ -2546,8 +2573,8 @@ fn has_supervised_channels(config: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use omnesagent_config::schema::MattermostListenMode;
+    use tempfile::TempDir;
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
 
@@ -4200,8 +4227,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "spawns a real stdio MCP server via npx @modelcontextprotocol/server-filesystem; needs node/npx on PATH so it does not run in normal CI. Run: cargo test -p omnesagent-runtime --lib heartbeat_mcp_registry_reuses_one_stdio_child_across_ticks -- --ignored"]
     async fn heartbeat_mcp_registry_reuses_one_stdio_child_across_ticks() {
-        use std::sync::Arc;
         use omnesagent_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
+        use std::sync::Arc;
 
         let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
 
