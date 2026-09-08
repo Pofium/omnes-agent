@@ -1446,6 +1446,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_default_materializes_dotted_custom_slot() {
+        // bug #10533 (model_routing_config): dotted `custom.*` slots must be
+        // accepted instead of being fed to `ensure()` as a single family
+        // string (which would hit `None` → "unknown model_provider type").
+        // set_default splits `model_provider` on '.' before ensuring the slot.
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "custom.myprov",
+                "model": "whatever/model",
+                "api_key": "dummy-key"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let entry = read_saved_provider_entry(&cfg_path, "custom", "myprov")
+            .expect("dotted custom.<alias> set_default must materialize the custom.<alias> slot");
+        assert_eq!(entry.model.as_deref(), Some("whatever/model"));
+    }
+
+    #[tokio::test]
     async fn set_default_skips_probe_without_api_key() {
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
