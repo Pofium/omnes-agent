@@ -350,6 +350,9 @@ async fn send(
         // enterprise or private CA installed on the host does not silently
         // become trusted for plugin egress. Native-root support is a separate,
         // tracked decision rather than an omission.
+        // DECISION (2026-09-08, C1 sync): fail-closed (webpki-only) is KEPT and
+        // confirmed by the owner; upstream #10491 adds rustls-native-certs.
+        // Port it only under an explicit owner decision; monitor upstream #9653.
         let root_cert_store = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.into(),
         };
@@ -416,6 +419,12 @@ async fn dial_pinned(addresses: &[SocketAddr], deadline: Instant) -> Result<TcpS
     let mut attempted = false;
     for address in addresses {
         attempted = true;
+        // A ready loopback connect can win timeout_at's first poll even after
+        // its deadline has elapsed. Do not let that fast path fund another
+        // attempt from the shared budget (upstream #10658).
+        if deadline <= Instant::now() {
+            return Err(ErrorCode::ConnectionTimeout);
+        }
         match timeout_at(deadline, TcpStream::connect(*address)).await {
             Ok(Ok(stream)) => return Ok(stream),
             // Refused or unreachable: try the next validated address.
