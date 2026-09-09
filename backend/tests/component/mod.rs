@@ -12,6 +12,7 @@ mod daemon_startup_feedback;
 #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
+mod hardware_probe_feature_graph;
 mod dockerignore_test;
 mod gateway;
 mod gemini_capabilities;
