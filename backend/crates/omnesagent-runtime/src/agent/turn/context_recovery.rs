@@ -168,11 +168,142 @@ pub(crate) async fn try_recover_context_overflow(
     false
 }
 
+/// Heuristic: did the provider reject the request over an image payload?
+/// There is no structured error kind across providers, so this matches the
+/// documented rejection phrasings conservatively: a request-shape rejection
+/// (4xx status, invalid/unsupported/policy wording) that also blames
+/// image/media content. Transient 5xx transport failures never match.
+pub(crate) fn looks_like_image_rejection(e: &anyhow::Error) -> bool {
+    let text = e.to_string().to_ascii_lowercase();
+    let request_shape = ["400", "413", "415", "422", "invalid", "rejected", "unsupported", "policy", "violat"]
+        .iter()
+        .any(|needle| text.contains(needle));
+    let blames_media = ["image", "photo", "picture", "media", "attachment", "vision"]
+        .iter()
+        .any(|needle| text.contains(needle));
+    request_shape && blames_media
+}
+
+/// Quarantine images a provider rejected (issue: one rejected image poisoning
+/// the whole session). The user turn carrying the marker is committed to
+/// history before the provider call, so a provider that refuses the payload
+/// (content policy, unsupported format, oversized media) rejects every later
+/// turn that re-prepares the same marker — the session can never move past
+/// it. Mirror the context-overflow recovery: rewrite the offending markers to
+/// the same `[media attachment]` placeholder the non-vision degrade path uses
+/// (surrounding text survives) and let the caller retry. Returns whether any
+/// marker was actually removed; `false` leaves the history untouched so the
+/// turn fails exactly as it would have before.
+pub(crate) fn try_recover_image_rejection(
+    history: &mut Vec<ChatMessage>,
+    e: &anyhow::Error,
+    iteration: usize,
+) -> bool {
+    if !looks_like_image_rejection(e) {
+        return false;
+    }
+    let mut stripped_messages = 0usize;
+    for message in history.iter_mut() {
+        let stripped = omnesagent_providers::multimodal::strip_media_markers(&message.content);
+        if stripped != message.content {
+            stripped_messages += 1;
+            message.content = stripped;
+        }
+    }
+    if stripped_messages == 0 {
+        return false;
+    }
+    ::omnesagent_log::record!(
+        WARN,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Retry)
+            .with_category(::omnesagent_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "iteration": iteration + 1,
+                "stripped_messages": stripped_messages,
+            })),
+        "Provider rejected image payload; quarantining media markers and retrying"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::observability::NoopObserver;
     use omnesagent_providers::ChatMessage;
+
+    #[test]
+    fn image_rejection_detected_for_policy_and_format_errors() {
+        assert!(looks_like_image_rejection(&anyhow::Error::msg(
+            "HTTP 400: Invalid image: the requested image could not be processed"
+        )));
+        assert!(looks_like_image_rejection(&anyhow::Error::msg(
+            "400 content_policy_violation: the image was rejected by the safety system"
+        )));
+        assert!(looks_like_image_rejection(&anyhow::Error::msg(
+            "415 unsupported media type: image/webp not supported"
+        )));
+    }
+
+    #[test]
+    fn image_rejection_not_detected_for_transport_and_unrelated_errors() {
+        // Transient transport failures never match — retrying after stripping
+        // images would silently destroy recoverable media.
+        assert!(!looks_like_image_rejection(&anyhow::Error::msg(
+            "HTTP 502: bad gateway from upstream"
+        )));
+        assert!(!looks_like_image_rejection(&anyhow::Error::msg(
+            "connection reset by peer"
+        )));
+        // Request-shape rejections that do not blame media stay untouched.
+        assert!(!looks_like_image_rejection(&anyhow::Error::msg(
+            "HTTP 400: tools.0.function.parameters must be an object"
+        )));
+        // Media wording without a rejection shape (e.g. rate limits on vision
+        // models) must not trigger quarantine.
+        assert!(!looks_like_image_rejection(&anyhow::Error::msg(
+            "HTTP 429: rate limit exceeded for image model, retry later"
+        )));
+    }
+
+    #[tokio::test]
+    async fn image_rejection_recovery_strips_markers_and_keeps_text() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("look at this [IMAGE:/tmp/photo.png] please"),
+            ChatMessage::assistant("cannot see it yet"),
+            ChatMessage::user("and this one [IMAGE:data:image/jpeg;base64,QUJD] too"),
+        ];
+        let err = anyhow::Error::msg(
+            "HTTP 400: Invalid image: the requested image could not be processed",
+        );
+
+        assert!(try_recover_image_rejection(&mut history, &err, 0));
+        assert_eq!(history.len(), 4);
+        assert_eq!(
+            history[1].content,
+            "look at this [media attachment] please"
+        );
+        assert!(!history[1].content.contains("[IMAGE:"));
+        assert!(!history[3].content.contains("[IMAGE:"));
+        assert!(history[3].content.contains("and this one"));
+        assert!(history[3].content.contains("too"));
+    }
+
+    #[tokio::test]
+    async fn image_recovery_untouched_for_unrelated_errors_and_marker_free_history() {
+        // Unrelated error: history must not be modified.
+        let mut history = vec![ChatMessage::user("look [IMAGE:/tmp/photo.png]")];
+        let err = anyhow::Error::msg("HTTP 502: bad gateway");
+        assert!(!try_recover_image_rejection(&mut history, &err, 0));
+        assert!(history[0].content.contains("[IMAGE:/tmp/photo.png]"));
+
+        // Image-shaped error but nothing to quarantine: report no recovery.
+        let mut clean = vec![ChatMessage::user("plain text only")];
+        let image_err = anyhow::Error::msg("HTTP 400: invalid image payload");
+        assert!(!try_recover_image_rejection(&mut clean, &image_err, 0));
+        assert_eq!(clean[0].content, "plain text only");
+    }
 
     fn overflowing_history() -> Vec<ChatMessage> {
         let big = "x".repeat(4000);

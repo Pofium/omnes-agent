@@ -27,7 +27,9 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
+pub(crate) use context_recovery::{
+    record_llm_failure, try_recover_context_overflow, try_recover_image_rejection,
+};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
@@ -975,6 +977,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
                 .await;
                 if recovered {
+                    continue;
+                }
+                if try_recover_image_rejection(turn_state.history, &e, iteration) {
                     continue;
                 }
                 // A stream that died after caller-visible output: persist the
