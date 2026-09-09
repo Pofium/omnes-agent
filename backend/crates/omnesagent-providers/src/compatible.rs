@@ -24,6 +24,12 @@ use omnesagent_config::schema::ToolResultImagePolicy;
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
+/// Appended to a tool result whose image payloads were moved out of the
+/// `tool` message (OpenAI-compatible APIs only accept `image_url` parts on
+/// `user` messages) into a follow-up `user` message.
+const TOOL_RESULT_IMAGE_RELOCATED_NOTICE: &str =
+    "[tool-result image attached in the following user message]";
+
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
 /// Synthetic, `OpenCode` Zen, `OpenCode` Go, `Z.AI`, `GLM`, `MiniMax`, Bedrock, Qianfan, Groq, Mistral, `xAI`, etc.
@@ -2438,6 +2444,126 @@ impl OpenAiCompatibleModelProvider {
         Self::sanitize_tool_result_content(content)
     }
 
+    /// Split image markers out of a tool-result string: returns the cleaned
+    /// text (with a relocation notice) plus the extracted image references,
+    /// or `None` when the result carries no `[IMAGE:...]` markers.
+    fn relocate_tool_result_images(content: &str) -> Option<(String, Vec<String>)> {
+        let mut cleaned = String::with_capacity(content.len());
+        let mut image_refs = Vec::new();
+        let mut cursor = 0;
+
+        while let Some(relative_start) = content[cursor..].find("[IMAGE:") {
+            let start = cursor + relative_start;
+            cleaned.push_str(&content[cursor..start]);
+
+            let after_prefix = start + "[IMAGE:".len();
+            let end = content[after_prefix..]
+                .find(']')
+                .map(|relative_end| after_prefix + relative_end)
+                .unwrap_or(content.len());
+            image_refs.push(content[after_prefix..end].to_string());
+            cursor = (end + 1).min(content.len());
+            if cursor == content.len() {
+                break;
+            }
+        }
+
+        if image_refs.is_empty() {
+            return None;
+        }
+
+        cleaned.push_str(&content[cursor..]);
+        if !cleaned.is_empty() {
+            cleaned.push_str("\n\n");
+        }
+        cleaned.push_str(TOOL_RESULT_IMAGE_RELOCATED_NOTICE);
+        Some((cleaned, image_refs))
+    }
+
+    /// Build the follow-up `user` message that carries images relocated out
+    /// of a `tool` message. OpenAI-compatible APIs accept `image_url` parts
+    /// only on `user` messages, so this is the sole valid carrier that keeps
+    /// the image available to vision backends.
+    fn relocated_tool_image_user_message(image_refs: Vec<String>) -> NativeMessage {
+        let parts = image_refs
+            .into_iter()
+            .map(|image_ref| MessagePart::ImageUrl {
+                image_url: ImageUrlPart { url: image_ref },
+            })
+            .collect();
+        NativeMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Parts(parts)),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            name: None,
+        }
+    }
+
+    /// Move tool-result images out of `role:"tool"` native messages into a
+    /// follow-up `role:"user"` message. OpenAI-compatible APIs reject the
+    /// whole request with HTTP 400 when a `tool` message carries
+    /// `image_url` content parts (only `user` messages may), so keeping the
+    /// parts in place turned every vision-tool round trip into a hard
+    /// failure. The tool message keeps its text with a relocation notice so
+    /// the model can connect the image to its source.
+    fn relocate_tool_result_images_in_native(
+        &self,
+        originals: &[ChatMessage],
+        converted: Vec<NativeMessage>,
+        allow_user_image_parts: bool,
+    ) -> Vec<NativeMessage> {
+        if !allow_user_image_parts
+            || self.tool_result_image_policy == ToolResultImagePolicy::Omit
+            || !converted
+                .iter()
+                .any(|native| native.role == "tool")
+        {
+            return converted;
+        }
+
+        let mut relocated = Vec::with_capacity(converted.len() + 2);
+        for (mut native, original) in converted.into_iter().zip(originals.iter()) {
+            if native.role != "tool" {
+                relocated.push(native);
+                continue;
+            }
+
+            // The conversion path feeds `message_content_for_role` either the
+            // inner `content` string of a JSON-encoded tool result or the raw
+            // content itself; mirror that split here so the cleaned text and
+            // the extracted references always describe the same payload.
+            let payload = if let Ok(value) =
+                serde_json::from_str::<serde_json::Value>(&original.content)
+                && let Some(inner) = value.get("content")
+                && let Some(inner) = inner.as_str()
+            {
+                inner.to_string()
+            } else {
+                original.content.clone()
+            };
+            let Some((cleaned, image_refs)) = Self::relocate_tool_result_images(&payload) else {
+                relocated.push(native);
+                continue;
+            };
+
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&original.content)
+                && let Some(inner) = value.get_mut("content")
+                && inner.is_string()
+            {
+                *inner = serde_json::Value::String(cleaned);
+                native.content = Some(MessageContent::Text(value.to_string()));
+            } else {
+                native.content = Some(MessageContent::Text(cleaned));
+            }
+            relocated.push(native);
+            relocated.push(Self::relocated_tool_image_user_message(image_refs));
+        }
+        relocated
+    }
+
     fn message_content_for_role(
         &self,
         role: &str,
@@ -2469,7 +2595,7 @@ impl OpenAiCompatibleModelProvider {
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
         let mut tool_name_map = std::collections::HashMap::new();
 
-        messages
+        let converted = messages
             .iter()
             .map(|message| {
                 if message.role == "assistant"
@@ -2646,7 +2772,9 @@ impl OpenAiCompatibleModelProvider {
                     name: None,
                 }
             })
-            .collect()
+            .collect();
+
+        self.relocate_tool_result_images_in_native(messages, converted, allow_user_image_parts)
     }
 
     fn strip_native_tool_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -6290,11 +6418,13 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_promotes_tool_result_image_markers() {
+    fn convert_messages_for_native_relocates_tool_result_image_markers_to_user_message() {
         // A tool result carrying an inline base64 image marker (e.g. a snapshot
-        // tool) must serialize as structured `image_url` parts, not one large
-        // text blob — vision backends count base64 bytes as text tokens and
-        // reject the request as over-context otherwise
+        // tool) must keep the image available to vision backends WITHOUT
+        // placing `image_url` parts on the `tool` message itself —
+        // OpenAI-compatible APIs reject that shape with HTTP 400 (only
+        // `user` messages may carry `image_url` parts). The image moves to a
+        // follow-up user message and the tool message keeps its text.
         let input = vec![ChatMessage::tool(
             r#"{"tool_call_id":"call_img","content":"snapshot captured\n\n[IMAGE:data:image/jpeg;base64,/9j/4AAQ]"}"#,
         )];
@@ -6305,28 +6435,64 @@ mod tests {
             ToolResultImagePolicy::ImageUrl
         );
         let converted = provider.convert_messages_for_native(&input, true);
-        assert_eq!(converted.len(), 1);
+        assert_eq!(converted.len(), 2);
+
         assert_eq!(converted[0].role, "tool");
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_img"));
+        let Some(MessageContent::Text(tool_text)) = converted[0].content.as_ref() else {
+            panic!("tool message must carry plain text content, got {:?}", converted[0].content);
+        };
+        assert!(tool_text.contains("snapshot captured"));
+        assert!(tool_text.contains(TOOL_RESULT_IMAGE_RELOCATED_NOTICE));
+        assert!(!tool_text.contains("[IMAGE:"));
+        assert!(!tool_text.contains("base64"));
 
-        let value = serde_json::to_value(
-            converted[0]
-                .content
-                .as_ref()
-                .expect("tool message should carry content"),
-        )
-        .unwrap();
-        let parts = value
-            .as_array()
-            .expect("tool image content should serialize as a parts array");
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[0]["text"], "snapshot captured");
-        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(converted[1].role, "user");
+        let Some(MessageContent::Parts(parts)) = converted[1].content.as_ref() else {
+            panic!("relocated user message must carry parts, got {:?}", converted[1].content);
+        };
+        assert_eq!(parts.len(), 1);
         assert_eq!(
-            parts[1]["image_url"]["url"],
-            "data:image/jpeg;base64,/9j/4AAQ"
+            serde_json::to_value(&parts[0]).unwrap(),
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/jpeg;base64,/9j/4AAQ" }
+            })
         );
+    }
+
+    #[test]
+    fn convert_messages_for_native_relocates_plain_tool_result_images_and_keeps_non_vision_fallback() {
+        // Raw (non-JSON-encoded) tool content with an image marker takes the
+        // same relocation path for vision providers…
+        let input = vec![ChatMessage::tool(
+            "scan finished\n\n[IMAGE:data:image/png;base64,iVBOR]".to_string(),
+        )];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "tool");
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(text)) if text.contains(TOOL_RESULT_IMAGE_RELOCATED_NOTICE)
+        ));
+        assert!(matches!(
+            converted[1].content.as_ref(),
+            Some(MessageContent::Parts(_))
+        ));
+
+        // …while non-vision providers keep the raw marker inline: there is no
+        // valid image carrier for them, and rewriting history silently would
+        // drop information the text-only model can still describe.
+        let raw_only = vec![ChatMessage::tool(
+            "scan finished\n\n[IMAGE:data:image/png;base64,iVBOR]".to_string(),
+        )];
+        let converted = provider.convert_messages_for_native(&raw_only, false);
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(
+            converted[0].content.as_ref(),
+            Some(MessageContent::Text(text)) if text.contains("[IMAGE:data:image/png;base64,iVBOR]")
+        ));
     }
 
     #[test]
