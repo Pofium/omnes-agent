@@ -484,6 +484,12 @@ const MEDIA_MARKER_KINDS: &[&str] = &[
 /// document and file delivery.
 const AUDIO_MARKER_KINDS: &[&str] = &["VOICE", "AUDIO"];
 
+/// The internal placeholder media markers degrade to when the serving
+/// provider cannot carry them (non-vision models, omitted policies). Model
+/// replies may echo it verbatim, so outbound channel sanitizers scrub it;
+/// keep the literal in one place so both sides stay in sync.
+pub const MEDIA_ATTACHMENT_PLACEHOLDER: &str = "[media attachment]";
+
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(&format!(
@@ -492,7 +498,7 @@ pub fn strip_media_markers(text: &str) -> String {
         ))
         .expect("static media-marker regex must compile")
     });
-    RE.replace_all(text, "[media attachment]").into_owned()
+    RE.replace_all(text, MEDIA_ATTACHMENT_PLACEHOLDER).into_owned()
 }
 
 /// Matches the audio-kind markers ([`AUDIO_MARKER_KINDS`]), capturing the
@@ -523,7 +529,7 @@ fn strip_unplayable_audio_markers(text: &str) -> (String, usize) {
         let payload = collapse_wrapped_marker(&caps[1]);
         if !payload.is_empty() && is_loadable_image_reference(&payload) {
             stripped += 1;
-            "[media attachment]".to_string()
+            MEDIA_ATTACHMENT_PLACEHOLDER.to_string()
         } else {
             // Preserve placeholder/prose markers verbatim.
             caps[0].to_string()
