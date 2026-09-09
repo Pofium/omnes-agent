@@ -220,6 +220,9 @@ _(код форка идентичен апстриму → баг наслед�
 - **D4. ✅** #9777 signal.rs — поле `sourceUuid` + 3-фоллбек sender (sourceNumber→source→sourceUuid), фильтр пустых, лог скрытия. Коммит `bbc3dce`; 96+/10- точный порт; 52/52 (channel-signal).
 - **D5. ✅** #10692 WhatsApp [D] (канал есть — транскрипция к провайдеру агента): `configure_whatsapp_transcription` зеркалит discord, `with_transcription_manager`, cfg-gate. Коммит `7053551`; 155+/4-; оба теста passed (whatsapp-web).
 - **D6. ✅** #10628 tts/doctor [D]: skip-запись с `config_path` + doctor api_key-диагностики (TTS gated-семейства + transcription). Коммит `9db4928`; doctor 71/71 (6 новых) + tts/transcription тесты.
+- **D8. ✅ (дополнение — пропущен при разбиении на этапы, средний приоритет)** #10671 daemon: heartbeat.target
+  принимает составной ключ `<type>.<alias>` — валидировать сегмент типа, alias резолвит deliver_announcement.
+  Коммит `83c5e1e` (71+/5- точный порт); resolve_delivery 12/12 (3 новых).
 - **D7. ⏸ ВЫНЕСЕН в отдельную задачу** — локальные фиксы открытых багов (НЕ порты upstream): #10061 (карантин отвергнутого изображения в `vision_route.rs:139-163` — маркеры переподготавливаются каждый ход без карантина), #10625 (не пускать литерал `[media attachment]` пользователю при non-vision — `multimodal.rs:487-495`, `vision_route.rs:154-163`), #10501 (image из tool-результата релоцировать в `role:"user"` — `compatible.rs:2437-2454,2588/2596`; сейчас собирает image-parts в tool-сообщении → 400 на OpenAI). Исследованы, реализации нет.
 
 ### Этап E — Низкий приоритет / опционально
