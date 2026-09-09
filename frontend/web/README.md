@@ -1,16 +1,23 @@
-# desktop
+# OmnesAgent Web ADE
 
-A new Flutter project.
+Desktop Web Application (Autonomous Agent Development Environment) for OmnesAgent.
 
-## Getting Started
+## Features
+- **Desktop-First & Responsive**: Full 3-panel ADE on desktop, adaptive 2-panel on tablet, and optimized 1-panel layout with bottom navigation bar and project drawer on mobile.
+- **PTY-over-WebSocket Terminal**: Browser terminal connected directly to the gateway PTY stream.
+- **Live Browser & Inspector**: Sandboxed iframe preview with developer tools and automation hooks.
+- **Admin Authentication**: Argon2id password authentication, session management, and first-login password rotation.
+- **PWA Ready**: Offline-capable service worker, manifest, and fast CanvasKit rendering.
 
-This project is a starting point for a Flutter application.
+## Development
 
-A few resources to get you started if this is your first Flutter project:
+```bash
+# Analyze code
+flutter analyze --no-pub
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+# Run locally in Chrome
+flutter run -d chrome
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+# Build production bundle
+flutter build web --release --web-renderer canvaskit
+```

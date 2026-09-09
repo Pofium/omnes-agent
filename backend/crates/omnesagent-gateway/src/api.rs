@@ -2303,6 +2303,7 @@ pub(crate) mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: crate::admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),

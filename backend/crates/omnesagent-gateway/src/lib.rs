@@ -7,6 +7,7 @@
 #[cfg(feature = "a2a")]
 pub mod a2a;
 pub mod acp;
+pub mod admin_auth;
 pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
@@ -478,6 +479,7 @@ pub struct AppState {
     pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
     pub pairing: Arc<PairingGuard>,
+    pub admin_auth: Arc<admin_auth::AdminAuthManager>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
@@ -1523,6 +1525,16 @@ pub async fn run_gateway(
         None
     };
 
+    let (admin_auth, initial_admin_password) =
+        admin_auth::AdminAuthManager::load_or_init(&config.data_dir)?;
+    if let Some(temp_pw) = initial_admin_password {
+        ::omnesagent_log::record!(
+            INFO,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+            format!("Initial administrator account initialized with temporary password: {temp_pw}")
+        );
+    }
+
     let state = AppState {
         config: config_state,
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1533,6 +1545,7 @@ pub async fn run_gateway(
         memory_strategy,
         auto_save: config.memory.auto_save,
         pairing,
+        admin_auth,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
         auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
@@ -1949,11 +1962,23 @@ pub async fn run_gateway(
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── WebSocket terminal PTY ──
         .route("/ws/terminal/{id}", get(ws_terminal::handle_ws_terminal))
+        // ── Administrator Authentication ──
+        .route("/api/auth/login", post(admin_auth::handle_auth_login))
+        .route("/api/auth/logout", post(admin_auth::handle_auth_logout))
+        .route(
+            "/api/auth/change-password",
+            post(admin_auth::handle_auth_change_password),
+        )
+        .route("/api/auth/me", get(admin_auth::handle_auth_me))
         // ── Static assets (web dashboard) ──
         .merge(static_file_routes())
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth::require_web_auth,
+        ))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -4354,6 +4379,7 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -5263,6 +5289,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -5349,6 +5376,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -6022,6 +6050,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -6928,6 +6957,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7047,6 +7077,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7146,6 +7177,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7351,6 +7383,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7437,6 +7470,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7528,6 +7562,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7624,6 +7659,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7718,6 +7754,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7818,6 +7855,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -7958,6 +7996,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -8845,6 +8884,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -8930,6 +8970,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),
@@ -9540,6 +9581,7 @@ path = "{trigger_path}"
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            admin_auth: admin_auth::AdminAuthManager::mock(),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
             whatsapp: HashMap::new(),

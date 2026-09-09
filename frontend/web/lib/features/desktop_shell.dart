@@ -171,89 +171,368 @@ class _DesktopShellState extends State<DesktopShell> {
     setState(() => selectedNavIndex = -1);
   }
 
+  int mobileNavIndex = 0; // 0: Chat/Workspace, 1: Inspector, 2: Terminal, 3: Automations, 4: Settings
+
   @override
   Widget build(BuildContext context) {
-    return KeyboardListener(
-      focusNode: FocusNode(),
-      autofocus: true,
-      onKeyEvent: (event) {
-        if (event is KeyDownEvent && HardwareKeyboard.instance.isControlPressed) {
-          // Global Ctrl + K: Command Palette
-          if (event.logicalKey == LogicalKeyboardKey.keyK) {
-            _openCommandPalette();
-          }
-          // Global Ctrl + J: Open Terminal in Inspector
-          else if (event.logicalKey == LogicalKeyboardKey.keyJ) {
-            _openInspectorWithTab(1); // Terminal tab
-          }
-          // Global Ctrl + B: Toggle Inspector Panel
-          else if (event.logicalKey == LogicalKeyboardKey.keyB) {
-            _toggleInspector();
-          }
-          // Global Ctrl + N: New Task
-          else if (event.logicalKey == LogicalKeyboardKey.keyN) {
-            _onNewTask();
-          }
-          // Global Ctrl + ,: Open Settings
-          else if (event.logicalKey == LogicalKeyboardKey.comma) {
-            _openSettingsDialog();
-          }
-        }
-      },
-      child: Obx(() => Scaffold(
-        backgroundColor: DesktopTheme.bgCanvas,
-        body: SafeArea(
-          child: Row(
-            children: [
-              // 1. Left Sidebar (Projects / Groups)
-              if (isSidebarVisible)
-                DesktopSidebar(
-                  selectedIndex: selectedNavIndex,
-                  userProfile: userProfile,
-                  onSelectTask: (id, title, project) {
-                    setState(() => selectedNavIndex = 0);
-                    workspaceController.switchToSession(id, title: title, project: project);
-                  },
-                  onNewTask: _onNewTask,
-                  onOpenSearch: _openCommandPalette,
-                  onOpenSettings: () => _openSettingsDialog('Общие'),
-                  onOpenSkills: () => _openSettingsDialog('Навыки'),
-                  onOpenAutomations: () {
-                    setState(() => selectedNavIndex = -3);
-                  },
-                  onOpenProfile: _openOnboardingDialog,
-                  onToggleSidebar: () {
-                    setState(() => isSidebarVisible = !isSidebarVisible);
-                  },
-                ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final isTablet = width >= 768 && width < 1280;
+        final isMobile = width < 768;
 
-              // 2. Central Task Canvas & Composer or Automations Screen (Screenshot 1 Match)
-              Expanded(
-                child: selectedNavIndex == -3
-                    ? AutomationsView(
-                        onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
-                      )
-                    : DesktopTaskWorkspaceView(
-                        controller: workspaceController,
-                        isToolsOpen: isInspectorOpen,
-                        onToggleTools: _toggleInspector,
-                        onToggleTerminal: () => _openInspectorWithTab(1),
-                        onOpenSettings: () => _openSettingsDialog('Провайдеры'),
-                      ),
+        return KeyboardListener(
+          focusNode: FocusNode(),
+          autofocus: true,
+          onKeyEvent: (event) {
+            if (event is KeyDownEvent && HardwareKeyboard.instance.isControlPressed) {
+              // Global Ctrl + K: Command Palette
+              if (event.logicalKey == LogicalKeyboardKey.keyK) {
+                _openCommandPalette();
+              }
+              // Global Ctrl + J: Open Terminal in Inspector
+              else if (event.logicalKey == LogicalKeyboardKey.keyJ) {
+                if (isMobile) {
+                  setState(() => mobileNavIndex = 2);
+                } else {
+                  _openInspectorWithTab(1); // Terminal tab
+                }
+              }
+              // Global Ctrl + B: Toggle Inspector Panel
+              else if (event.logicalKey == LogicalKeyboardKey.keyB) {
+                _toggleInspector();
+              }
+              // Global Ctrl + N: New Task
+              else if (event.logicalKey == LogicalKeyboardKey.keyN) {
+                _onNewTask();
+              }
+              // Global Ctrl + ,: Open Settings
+              else if (event.logicalKey == LogicalKeyboardKey.comma) {
+                _openSettingsDialog();
+              }
+            }
+          },
+          child: Obx(() {
+            if (isMobile) {
+              return _buildMobileScaffold();
+            } else if (isTablet) {
+              return _buildTabletScaffold();
+            } else {
+              return _buildDesktopScaffold();
+            }
+          }),
+        );
+      },
+    );
+  }
+
+  /// 1. Mobile Layout (< 768px): One view at a time with BottomNavigationBar & Drawer
+  Widget _buildMobileScaffold() {
+    Widget currentBody;
+    switch (mobileNavIndex) {
+      case 1:
+        // Inspector (Browser / Tools)
+        currentBody = DesktopInspectorPanel(
+          key: inspectorKey,
+          controller: workspaceController,
+          initialTabIndex: inspectorTabIndex == -1 ? 0 : inspectorTabIndex,
+          onClose: () => setState(() => mobileNavIndex = 0),
+        );
+        break;
+      case 2:
+        // Terminal in Inspector
+        currentBody = DesktopInspectorPanel(
+          key: inspectorKey,
+          controller: workspaceController,
+          initialTabIndex: 1, // Terminal tab
+          onClose: () => setState(() => mobileNavIndex = 0),
+        );
+        break;
+      case 3:
+        // Automations
+        currentBody = AutomationsView(
+          onBackToWorkspace: () => setState(() => mobileNavIndex = 0),
+        );
+        break;
+      case 4:
+        // Settings embedded view
+        currentBody = Container(
+          color: DesktopTheme.bgSurface,
+          child: DesktopSettingsDialog(
+            initialSection: 'Общие',
+            userProfile: userProfile,
+            onUpdateProfile: (updated) => setState(() => userProfile = updated),
+            onBackToWorkspace: () => setState(() => mobileNavIndex = 0),
+          ),
+        );
+        break;
+      case 0:
+      default:
+        currentBody = DesktopTaskWorkspaceView(
+          controller: workspaceController,
+          isToolsOpen: isInspectorOpen,
+          onToggleTools: () => setState(() => mobileNavIndex = 1),
+          onToggleTerminal: () => setState(() => mobileNavIndex = 2),
+          onOpenSettings: () => setState(() => mobileNavIndex = 4),
+        );
+        break;
+    }
+
+    return Scaffold(
+      backgroundColor: DesktopTheme.bgCanvas,
+      appBar: AppBar(
+        backgroundColor: DesktopTheme.bgSidebar,
+        elevation: 0,
+        titleSpacing: 0,
+        leading: Builder(
+          builder: (ctx) => IconButton(
+            icon: const Icon(Icons.menu, size: 20, color: Color(0xFF00D2FF)),
+            onPressed: () => Scaffold.of(ctx).openDrawer(),
+          ),
+        ),
+        title: Row(
+          children: [
+            Text(
+              'OmnesAgent',
+              style: TextStyle(
+                color: DesktopTheme.textPrimary,
+                fontWeight: FontWeight.bold,
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+              decoration: BoxDecoration(
+                color: DesktopTheme.accentSky.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: const Text(
+                'WEB',
+                style: TextStyle(
+                  color: DesktopTheme.accentSky,
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Палитра команд (Ctrl+K)',
+            icon: const Icon(Icons.search, size: 20, color: Color(0xFF94A3B8)),
+            onPressed: _openCommandPalette,
+          ),
+          IconButton(
+            tooltip: 'Новая задача',
+            icon: const Icon(Icons.add, size: 20, color: Color(0xFF00D2FF)),
+            onPressed: _onNewTask,
+          ),
+        ],
+      ),
+      drawer: Drawer(
+        width: 280,
+        backgroundColor: DesktopTheme.bgSidebar,
+        child: SafeArea(
+          child: DesktopSidebar(
+            selectedIndex: selectedNavIndex,
+            userProfile: userProfile,
+            onSelectTask: (id, title, project) {
+              setState(() {
+                selectedNavIndex = 0;
+                mobileNavIndex = 0;
+              });
+              Navigator.of(context).pop(); // close drawer
+              workspaceController.switchToSession(id, title: title, project: project);
+            },
+            onNewTask: () {
+              Navigator.of(context).pop();
+              _onNewTask();
+            },
+            onOpenSearch: () {
+              Navigator.of(context).pop();
+              _openCommandPalette();
+            },
+            onOpenSettings: () {
+              Navigator.of(context).pop();
+              setState(() => mobileNavIndex = 4);
+            },
+            onOpenSkills: () {
+              Navigator.of(context).pop();
+              _openSettingsDialog('Навыки');
+            },
+            onOpenAutomations: () {
+              Navigator.of(context).pop();
+              setState(() => mobileNavIndex = 3);
+            },
+            onOpenProfile: () {
+              Navigator.of(context).pop();
+              _openOnboardingDialog();
+            },
+            onToggleSidebar: () => Navigator.of(context).pop(),
+          ),
+        ),
+      ),
+      body: SafeArea(child: currentBody),
+      bottomNavigationBar: BottomNavigationBar(
+        backgroundColor: DesktopTheme.bgSidebar,
+        selectedItemColor: const Color(0xFF00D2FF),
+        unselectedItemColor: const Color(0xFF64748B),
+        currentIndex: mobileNavIndex,
+        type: BottomNavigationBarType.fixed,
+        selectedFontSize: 11,
+        unselectedFontSize: 11,
+        onTap: (idx) {
+          setState(() => mobileNavIndex = idx);
+        },
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.chat_bubble_outline, size: 18),
+            activeIcon: Icon(Icons.chat_bubble, size: 18),
+            label: 'Чат',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.travel_explore, size: 18),
+            activeIcon: Icon(Icons.travel_explore, size: 18),
+            label: 'Инспектор',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.terminal, size: 18),
+            activeIcon: Icon(Icons.terminal, size: 18),
+            label: 'Терминал',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.auto_mode, size: 18),
+            activeIcon: Icon(Icons.auto_mode, size: 18),
+            label: 'Авто',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings_outlined, size: 18),
+            activeIcon: Icon(Icons.settings, size: 18),
+            label: 'Настройки',
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 2. Tablet Layout (768px – 1279px): Two-panel layout with adaptive sidebar/inspector
+  Widget _buildTabletScaffold() {
+    return Scaffold(
+      backgroundColor: DesktopTheme.bgCanvas,
+      body: SafeArea(
+        child: Row(
+          children: [
+            // If inspector is closed, sidebar is visible by default. If inspector opens, sidebar auto-collapses unless forced
+            if (isSidebarVisible && !isInspectorOpen)
+              DesktopSidebar(
+                selectedIndex: selectedNavIndex,
+                userProfile: userProfile,
+                onSelectTask: (id, title, project) {
+                  setState(() => selectedNavIndex = 0);
+                  workspaceController.switchToSession(id, title: title, project: project);
+                },
+                onNewTask: _onNewTask,
+                onOpenSearch: _openCommandPalette,
+                onOpenSettings: () => _openSettingsDialog('Общие'),
+                onOpenSkills: () => _openSettingsDialog('Навыки'),
+                onOpenAutomations: () {
+                  setState(() => selectedNavIndex = -3);
+                },
+                onOpenProfile: _openOnboardingDialog,
+                onToggleSidebar: () {
+                  setState(() => isSidebarVisible = !isSidebarVisible);
+                },
               ),
 
-              // 3. Right Tool Canvas / Inspector (Open tab: Side conversation, Review, Terminal, Browser)
-              if (isInspectorOpen)
-                DesktopInspectorPanel(
+            // Central Area
+            Expanded(
+              child: selectedNavIndex == -3
+                  ? AutomationsView(
+                      onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
+                    )
+                  : DesktopTaskWorkspaceView(
+                      controller: workspaceController,
+                      isToolsOpen: isInspectorOpen,
+                      onToggleTools: _toggleInspector,
+                      onToggleTerminal: () => _openInspectorWithTab(1),
+                      onOpenSettings: () => _openSettingsDialog('Провайдеры'),
+                    ),
+            ),
+
+            // Inspector Panel
+            if (isInspectorOpen)
+              SizedBox(
+                width: 440,
+                child: DesktopInspectorPanel(
                   key: inspectorKey,
                   controller: workspaceController,
                   initialTabIndex: inspectorTabIndex,
                   onClose: () => setState(() => isInspectorOpen = false),
                 ),
-            ],
-          ),
+              ),
+          ],
         ),
-      )),
+      ),
+    );
+  }
+
+  /// 3. Desktop Layout (≥ 1280px): Full 3-panel ADE (Sidebar + Composer/Workspace + Inspector)
+  Widget _buildDesktopScaffold() {
+    return Scaffold(
+      backgroundColor: DesktopTheme.bgCanvas,
+      body: SafeArea(
+        child: Row(
+          children: [
+            // 1. Left Sidebar (Projects / Groups)
+            if (isSidebarVisible)
+              DesktopSidebar(
+                selectedIndex: selectedNavIndex,
+                userProfile: userProfile,
+                onSelectTask: (id, title, project) {
+                  setState(() => selectedNavIndex = 0);
+                  workspaceController.switchToSession(id, title: title, project: project);
+                },
+                onNewTask: _onNewTask,
+                onOpenSearch: _openCommandPalette,
+                onOpenSettings: () => _openSettingsDialog('Общие'),
+                onOpenSkills: () => _openSettingsDialog('Навыки'),
+                onOpenAutomations: () {
+                  setState(() => selectedNavIndex = -3);
+                },
+                onOpenProfile: _openOnboardingDialog,
+                onToggleSidebar: () {
+                  setState(() => isSidebarVisible = !isSidebarVisible);
+                },
+              ),
+
+            // 2. Central Task Canvas & Composer or Automations Screen
+            Expanded(
+              child: selectedNavIndex == -3
+                  ? AutomationsView(
+                      onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
+                    )
+                  : DesktopTaskWorkspaceView(
+                      controller: workspaceController,
+                      isToolsOpen: isInspectorOpen,
+                      onToggleTools: _toggleInspector,
+                      onToggleTerminal: () => _openInspectorWithTab(1),
+                      onOpenSettings: () => _openSettingsDialog('Провайдеры'),
+                    ),
+            ),
+
+            // 3. Right Tool Canvas / Inspector
+            if (isInspectorOpen)
+              DesktopInspectorPanel(
+                key: inspectorKey,
+                controller: workspaceController,
+                initialTabIndex: inspectorTabIndex,
+                onClose: () => setState(() => isInspectorOpen = false),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }

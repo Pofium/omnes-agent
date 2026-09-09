@@ -1,4 +1,5 @@
 // Configuration management for OmnesAgent Gateway connection.
+import 'package:flutter/foundation.dart';
 import 'package:get_storage/get_storage.dart';
 
 class GatewayConfig {
@@ -23,14 +24,27 @@ class GatewayConfig {
 
   static GetStorage get _box => GetStorage();
 
-  /// Returns configured HTTP base URL (e.g. http://127.0.0.1:42617).
+  /// Returns configured HTTP base URL (e.g. http://127.0.0.1:42617 or origin in browser).
   static String getBaseUrl() {
     if (_overrideHttpUrl != null) return _overrideHttpUrl!;
-    try {
-      return _box.read<String>(_urlKey) ?? defaultHttpUrl;
-    } catch (_) {
-      return defaultHttpUrl;
+    const envUrl = String.fromEnvironment('GATEWAY_BASE_URL', defaultValue: '');
+    if (envUrl.isNotEmpty) {
+      return envUrl.endsWith('/') ? envUrl.substring(0, envUrl.length - 1) : envUrl;
     }
+    try {
+      final stored = _box.read<String>(_urlKey);
+      if (stored != null && stored.isNotEmpty) return stored;
+    } catch (_) {}
+
+    if (kIsWeb) {
+      try {
+        final origin = Uri.base.origin;
+        if (origin.isNotEmpty && origin != 'null') {
+          return origin;
+        }
+      } catch (_) {}
+    }
+    return defaultHttpUrl;
   }
 
   /// Sets HTTP base URL.

@@ -48,9 +48,29 @@ if (Test-Path $WebDir) {
 
 $frontAnalyzeCode = $frontAnalyzeDesktop + $frontAnalyzeShared + $frontAnalyzeWeb
 
-# 3. Frontend Tests
+# 3. Web Platform-Isolation Check (no dart:io, no webview_windows)
 Write-Host ""
-Write-Host "[3/3] Frontend: flutter test (desktop & web)..." -ForegroundColor Yellow
+Write-Host "[3/4] Frontend: Web platform purity assertions..." -ForegroundColor Yellow
+$driftErrors = 0
+if (Test-Path $WebDir) {
+    $dartIoFound = Get-ChildItem -Path (Join-Path $WebDir "lib") -Recurse -Filter "*.dart" | Select-String -Pattern "import\s+['""]dart:io['""]"
+    if ($dartIoFound) {
+        Write-Host "  ERROR: dart:io detected in frontend/web/lib!" -ForegroundColor Red
+        $driftErrors++
+    }
+    $webviewWindowsFound = Get-ChildItem -Path (Join-Path $WebDir "lib") -Recurse -Filter "*.dart" | Select-String -Pattern "webview_windows"
+    if ($webviewWindowsFound) {
+        Write-Host "  ERROR: webview_windows detected in frontend/web/lib!" -ForegroundColor Red
+        $driftErrors++
+    }
+    if ($driftErrors -eq 0) {
+        Write-Host "  Web platform isolation clean (0 dart:io, 0 webview_windows)." -ForegroundColor Green
+    }
+}
+
+# 4. Frontend Tests
+Write-Host ""
+Write-Host "[4/4] Frontend: flutter test (desktop & web)..." -ForegroundColor Yellow
 $frontTestCode = 0
 if (Test-Path (Join-Path $DesktopDir "test")) {
     Push-Location $DesktopDir
@@ -67,7 +87,7 @@ if (Test-Path (Join-Path $WebDir "test")) {
 
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Cyan
-$totalErrors = $backExitCode + $frontAnalyzeCode + $frontTestCode
+$totalErrors = $backExitCode + $frontAnalyzeCode + $driftErrors + $frontTestCode
 if ($totalErrors -eq 0) {
     Write-Host "  RESULT: ALL SYSTEMS HEALTHY (0 ISSUES)! " -ForegroundColor Green
 } else {

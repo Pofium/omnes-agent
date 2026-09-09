@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
+import 'package:omnes_shared/omnes_shared.dart';
 import '../theme/desktop_theme.dart';
 
 class DesktopTitleBar extends StatelessWidget {
@@ -281,7 +282,7 @@ class DesktopTitleBar extends StatelessWidget {
           ),
           const SizedBox(width: 6),
           Text(
-            '127.0.0.1:42617',
+            GatewayConfig.getBaseUrl().replaceFirst('http://', '').replaceFirst('https://', ''),
             style: TextStyle(
               fontSize: 11,
               fontFamily: 'Consolas',

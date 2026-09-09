@@ -59,13 +59,13 @@ pub async fn handle_spa_fallback(State(state): State<AppState>, uri: Uri) -> Res
     let html = String::from_utf8_lossy(&bytes);
 
     // Inject path prefix for the SPA and rewrite asset paths in the HTML
+    let pfx = &state.path_prefix;
+    let json_pfx = serde_json::to_string(pfx).unwrap_or_else(|_| "\"\"".to_string());
+    let script = format!("<script>window.__OMNESAGENT_BASE__={json_pfx};</script>");
+
     let html = if state.path_prefix.is_empty() {
-        html.into_owned()
+        html.replace("<head>", &format!("<head>{script}"))
     } else {
-        let pfx = &state.path_prefix;
-        // JSON-encode the prefix to safely embed in a <script> block
-        let json_pfx = serde_json::to_string(pfx).unwrap_or_else(|_| "\"\"".to_string());
-        let script = format!("<script>window.__OMNESAGENT_BASE__={json_pfx};</script>");
         // Rewrite absolute /_app/ references so the browser requests {prefix}/_app/...
         html.replace("/_app/", &format!("{pfx}/_app/"))
             .replace("<head>", &format!("<head>{script}"))

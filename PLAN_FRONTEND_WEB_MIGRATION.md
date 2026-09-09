@@ -1,7 +1,7 @@
 # План: Frontend Web Migration — Обогащённая версия с самопроверками
 
 > **Источник**: `PLAN_FRONTEND_WEB_MIGRATION.md` — обогащён анализом кодовой базы через CodeGraph, ob2h и grep.
-> **Дата**: 08.09.2026 · **Статус**: В ПРОЦЕССЕ (Этапы 1.1 — 2.1.3 ВЫПОЛНЕНЫ ✅)
+> **Дата**: 09.09.2026 · **Статус**: ВЫПОЛНЕНО (Все этапы 1.1 — 4.5 ВЫПОЛНЕНЫ ✅)
 
 ---
 
@@ -438,10 +438,10 @@ flutter build web --release --web-renderer canvaskit
 
 #### 2.3.4 PWA
 
-- [ ] `frontend/web/web/manifest.json` — настроить: `name`, `short_name`, `icons`, `start_url`, `display: standalone`
-- [ ] Service Worker: Flutter генерирует `flutter_service_worker.js` автоматически при `flutter build web`
-- [ ] Иконки: 192×192 и 512×512 PNG в `frontend/web/web/icons/`
-- [ ] `theme_color` и `background_color` — из DesktopTheme: `#16181D` (dark canvas)
+- [x] `frontend/web/web/manifest.json` — настроить: `name`, `short_name`, `icons`, `start_url`, `display: standalone`
+- [x] Service Worker: Flutter генерирует `flutter_service_worker.js` автоматически при `flutter build web`
+- [x] Иконки: 192×192 и 512×512 PNG в `frontend/web/web/icons/`
+- [x] `theme_color` и `background_color` — из DesktopTheme: `#16181D` (dark canvas)
 
 > [!TIP]
 > **Самопроверка**:
@@ -826,12 +826,12 @@ echo "=== All checks passed ==="
 ```
 
 ### 4.5 Идемпотентность и обновления
-
-- [ ] Повторный запуск = режим обновления: `git pull` → пересборка → swap артефактов → `systemctl restart`
-- [ ] **Не** пересоздавать пароль при повторном запуске
-- [ ] **Не** затирать данные/конфиг
-- [ ] nginx: `nginx -t` перед reload; при ошибке — откат конфига
-- [ ] Роллбэк: `/opt/omnesagent/releases/{sha}/` + симлинка `current`
+ 
+- [x] Повторный запуск = режим обновления: `git pull` → пересборка → swap артефактов → `systemctl restart`
+- [x] **Не** пересоздавать пароль при повторном запуске
+- [x] **Не** затирать данные/конфиг
+- [x] nginx: `nginx -t` перед reload; при ошибке — откат конфига
+- [x] Роллбэк: `/opt/omnesagent/releases/{sha}/` + симлинка `current`
 
 ```bash
 # Скрипт обновления: /opt/omnesagent/omnesagent-update.sh
