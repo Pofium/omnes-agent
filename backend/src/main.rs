@@ -1145,6 +1145,53 @@ Examples:
         #[command(subcommand)]
         locales_command: LocalesCommands,
     },
+
+    /// Ralph Orchestrator — autonomous test-driven development loop
+    Ralph {
+        #[command(subcommand)]
+        ralph_command: RalphCliCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RalphCliCommands {
+    /// Start or resume an autonomous cycle for a change slug
+    Run {
+        /// Feature slug under openspec/changes/<slug>/
+        slug: String,
+
+        /// Autonomy level override (L0, L1, L2)
+        #[arg(long)]
+        autonomy: Option<String>,
+
+        /// Execution mode (full, quick, review_only)
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// Working repository directory (default: current dir)
+        #[arg(long)]
+        repo: Option<String>,
+    },
+
+    /// Show current state and iteration status for a feature slug
+    Status {
+        /// Feature slug under openspec/changes/<slug>/
+        slug: String,
+
+        /// Working repository directory (default: current dir)
+        #[arg(long)]
+        repo: Option<String>,
+    },
+
+    /// List harvested technical debt markers for a feature slug
+    Debt {
+        /// Feature slug under openspec/changes/<slug>/
+        slug: String,
+
+        /// Working repository directory (default: current dir)
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -4011,6 +4058,119 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
         )
     );
     Ok(())
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn handle_ralph_command(
+    cmd: RalphCliCommands,
+    config: &omnesagent_config::schema::Config,
+) -> Result<()> {
+    let repo_root = match &cmd {
+        RalphCliCommands::Run { repo, .. }
+        | RalphCliCommands::Status { repo, .. }
+        | RalphCliCommands::Debt { repo, .. } => repo
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+    };
+
+    match cmd {
+        RalphCliCommands::Run {
+            slug,
+            autonomy,
+            mode,
+            ..
+        } => {
+            let mut ralph_cfg = config.ralph.clone();
+            if let Some(a) = autonomy {
+                match a.to_uppercase().as_str() {
+                    "L0" => ralph_cfg.default_autonomy = omnesagent_config::ralph::RalphAutonomy::L0,
+                    "L1" => ralph_cfg.default_autonomy = omnesagent_config::ralph::RalphAutonomy::L1,
+                    "L2" => ralph_cfg.default_autonomy = omnesagent_config::ralph::RalphAutonomy::L2,
+                    _ => eprintln!("Warning: unknown autonomy level '{a}', using config default"),
+                }
+            }
+            if let Some(m) = mode {
+                match m.to_lowercase().as_str() {
+                    "full" => ralph_cfg.mode = omnesagent_config::ralph::RalphMode::Full,
+                    "lite" => ralph_cfg.mode = omnesagent_config::ralph::RalphMode::Lite,
+                    "off" => ralph_cfg.mode = omnesagent_config::ralph::RalphMode::Off,
+                    _ => eprintln!("Warning: unknown mode '{m}', using config default"),
+                }
+            }
+
+            println!("Starting Ralph Orchestrator for slug: {slug}");
+            let knowledge = omnesagent_ralph::knowledge::RalphKnowledgeService::new(None, None);
+            let orchestrator = omnesagent_ralph::RalphOrchestrator::new(repo_root.clone(), ralph_cfg, knowledge);
+            let mut rx = orchestrator.subscribe();
+            let run_id = orchestrator.start_run(&slug, None).await
+                .map_err(|e| anyhow::anyhow!("Failed to start Ralph run: {e}"))?;
+
+            println!("Run started with id: {run_id}. Subscribing to events...");
+            while let Ok(evt) = rx.recv().await {
+                match evt {
+                    omnesagent_ralph::events::RalphEvent::IterationCompleted { task, n, verdict, ladder_rung, duration_ms } => {
+                        println!("[{task}] iteration {n}: {verdict} (ladder: {ladder_rung}, {duration_ms}ms)");
+                    }
+                    omnesagent_ralph::events::RalphEvent::IterationFailed { task, n, fingerprint, exit_code } => {
+                        println!("[{task}] iteration {n} FAILED (code: {exit_code}, fp: {fingerprint})");
+                    }
+                    omnesagent_ralph::events::RalphEvent::ReviewDeleteList { count, files_affected } => {
+                        println!("Minimality review: deleted {count} items across {files_affected:?}");
+                    }
+                    omnesagent_ralph::events::RalphEvent::DebtHarvested { count, no_trigger_count } => {
+                        println!("Debt harvested: {count} items ({no_trigger_count} without trigger)");
+                    }
+                    omnesagent_ralph::events::RalphEvent::RunStopped { reason, .. } => {
+                        println!("Run STOPPED: {reason}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        RalphCliCommands::Status { slug, .. } => {
+            let state_path = repo_root.join("openspec").join("changes").join(&slug).join("state.json");
+            if !state_path.exists() {
+                println!("No state found for feature slug '{slug}' at {}", state_path.display());
+            } else {
+                let state = omnesagent_ralph::state::RalphState::read_from(&state_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read state: {e}"))?;
+                println!("Feature:      {}", state.feature_slug);
+                println!("Run ID:       {}", state.run_id);
+                println!("Phase:        {:?}", state.phase);
+                println!("Autonomy:     {}", state.autonomy);
+                println!("Mode:         {}", state.mode);
+                println!("Completed:    {:?}", state.done);
+                println!("Blocked:      {:?}", state.blocked);
+                println!("Last Head:    {:?}", state.last_known_head);
+                println!("Updated At:   {}", state.updated_at);
+            }
+        }
+        RalphCliCommands::Debt { slug, .. } => {
+            let git = omnesagent_ralph::git::GitRepo::new(&repo_root);
+            match git.diff(None) {
+                Ok(diff) => {
+                    let ledger = omnesagent_ralph::debt::DebtLedger::harvest_from_diff(&diff);
+                    println!("Harvested {} debt items for {slug}:", ledger.items.len());
+                    for item in &ledger.items {
+                        println!("- {} (line {}): ceiling='{}', upgrade_trigger={:?}",
+                            item.file, item.line, item.ceiling, item.upgrade_trigger);
+                    }
+                }
+                Err(e) => eprintln!("Failed to inspect git diff: {e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "agent-runtime"))]
+async fn handle_ralph_command(
+    _cmd: RalphCliCommands,
+    _config: &omnesagent_config::schema::Config,
+) -> Result<()> {
+    anyhow::bail!("Ralph Orchestrator is not enabled in this build. Rebuild with default features.");
 }
 
 fn main() -> Result<()> {
@@ -6900,6 +7060,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Locales { locales_command } => {
             let LocalesCommands::Fetch { locale, catalog } = locales_command;
             fetch_locales(&locale, catalog.as_deref()).await?;
+            Ok(())
+        }
+
+        Commands::Ralph { ralph_command } => {
+            handle_ralph_command(ralph_command, &config).await?;
             Ok(())
         }
 

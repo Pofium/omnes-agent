@@ -2,6 +2,7 @@
 # Rust (Backend)
 # ==========================================
 backend/target/
+backend/target*/
 **/Cargo.lock.orig
 **/*.rs.bk
 

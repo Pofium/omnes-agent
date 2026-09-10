@@ -7584,6 +7584,7 @@ dependencies = [
  "omnesagent-memory",
  "omnesagent-plugins",
  "omnesagent-providers",
+ "omnesagent-ralph",
  "omnesagent-runtime",
  "omnesagent-spawn",
  "omnesagent-tls",
@@ -8111,6 +8112,27 @@ dependencies = [
  "tokio-util",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "omnesagent-ralph"
+version = "0.8.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "omnesagent-api",
+ "omnesagent-config",
+ "omnesagent-kag",
+ "omnesagent-log",
+ "omnesagent-memory",
+ "omnesagent-spawn",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

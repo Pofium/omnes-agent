@@ -280,6 +280,18 @@ pub struct Config {
     #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
 
+    /// Ralph autonomous development cycle orchestrator (`[ralph]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub ralph: crate::ralph::RalphConfig,
+
+    /// External knowledge bridge to ob2h (`[ob2h_bridge]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub ob2h_bridge: crate::ralph::Ob2hBridgeConfig,
+
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
     ///
     /// Each entry is a named scheduled job synced into the database at
@@ -19324,6 +19336,8 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            ralph: crate::ralph::RalphConfig::default(),
+            ob2h_bridge: crate::ralph::Ob2hBridgeConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),

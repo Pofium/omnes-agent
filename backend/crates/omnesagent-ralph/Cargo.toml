@@ -1,0 +1,28 @@
+[package]
+name = "omnesagent-ralph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ralph autonomous development cycle orchestrator (Ralph Loop x OpenSpec x Ponytail) for OmnesAgent"
+publish = false
+
+[dependencies]
+omnesagent-config = { workspace = true, default-features = false }
+omnesagent-log.workspace = true
+omnesagent-spawn.workspace = true
+omnesagent-api.workspace = true
+omnesagent-memory.workspace = true
+omnesagent-kag.workspace = true
+
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "macros", "process", "sync", "time", "rt"] }
+
+[dev-dependencies]
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

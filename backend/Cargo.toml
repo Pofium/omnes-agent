@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/omnesagent-api", "crates/omnesagent-infra", "crates/omnesagent-config", "crates/omnesagent-log", "crates/omnesagent-log/tests/fixtures/attribution-macro-support", "crates/omnesagent-log/tests/fixtures/attribution-macro-consumer", "crates/omnesagent-tls", "crates/omnesagent-relay-proto", "apps/omnesrelay", "crates/omnesagent-spawn", "crates/omnesagent-commands", "crates/omnesagent-providers", "crates/omnesagent-memory", "crates/omnesagent-kag", "crates/omnesagent-channels", "crates/omnesagent-tools", "crates/omnesagent-sop-graph", "crates/omnesagent-runtime", "crates/omnesagent-eval", "apps/omnescode", "crates/omnesagent-plugins", "crates/omnesagent-plugins/tests/fixtures/channel-fixture", "crates/omnesagent-plugins/tests/fixtures/egress-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-timeout-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-secret-fixture", "crates/omnesagent-gateway", "crates/omnesagent-hardware", "crates/omnesagent-tool-call-parser", "crates/omnesagent-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/omnesagent-api", "crates/omnesagent-infra", "crates/omnesagent-config", "crates/omnesagent-log", "crates/omnesagent-log/tests/fixtures/attribution-macro-support", "crates/omnesagent-log/tests/fixtures/attribution-macro-consumer", "crates/omnesagent-tls", "crates/omnesagent-relay-proto", "apps/omnesrelay", "crates/omnesagent-spawn", "crates/omnesagent-commands", "crates/omnesagent-providers", "crates/omnesagent-memory", "crates/omnesagent-kag", "crates/omnesagent-channels", "crates/omnesagent-tools", "crates/omnesagent-sop-graph", "crates/omnesagent-runtime", "crates/omnesagent-eval", "crates/omnesagent-ralph", "apps/omnescode", "crates/omnesagent-plugins", "crates/omnesagent-plugins/tests/fixtures/channel-fixture", "crates/omnesagent-plugins/tests/fixtures/egress-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-timeout-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-secret-fixture", "crates/omnesagent-gateway", "crates/omnesagent-hardware", "crates/omnesagent-tool-call-parser", "crates/omnesagent-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -26,6 +26,7 @@ omnesagent-channels = { path = "crates/omnesagent-channels", version = "0.8.4", 
 omnesagent-tools = { path = "crates/omnesagent-tools", version = "0.8.4" }
 omnesagent-sop-graph = { path = "crates/omnesagent-sop-graph", version = "0.8.4", default-features = false }
 omnesagent-runtime = { path = "crates/omnesagent-runtime", version = "0.8.4", default-features = false }
+omnesagent-ralph = { path = "crates/omnesagent-ralph", version = "0.8.4" }
 omnesagent-eval = { path = "crates/omnesagent-eval", version = "0.8.4" }
 omnesagent-plugins = { path = "crates/omnesagent-plugins", version = "0.8.4" }
 omnesagent-gateway = { path = "crates/omnesagent-gateway", version = "0.8.4" }
@@ -90,6 +91,7 @@ omnesagent-tools = { workspace = true, optional = true }
 omnesagent-runtime = { workspace = true, optional = true }
 omnesagent-tls = { workspace = true }
 omnesagent-eval = { workspace = true, optional = true }
+omnesagent-ralph = { workspace = true, optional = true }
 omnesagent-plugins = { workspace = true, optional = true }
 omnesagent-gateway = { workspace = true, optional = true }
 omnesagent-hardware = { workspace = true, optional = true }
@@ -237,6 +239,7 @@ default = [
 # or individual `channel-*` features.
 agent-runtime = [
     "dep:omnesagent-runtime", "dep:omnesagent-eval", "dep:omnesagent-channels", "dep:omnesagent-tools",
+    "dep:omnesagent-ralph",
     "dep:rusqlite",
     "dep:which",
     "dep:tokio-tungstenite",
