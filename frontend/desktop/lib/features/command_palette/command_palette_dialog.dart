@@ -190,7 +190,30 @@ class _DesktopCommandPaletteDialogState
           title: DesktopI18n.tr('Диагностика окружения и шлюза Gateway', 'Run Diagnostic Doctor & Gateway Health'),
           shortcut: 'F5',
           icon: FontAwesomeIcons.stethoscope,
-          onExecute: () {},
+          onExecute: () async {
+            try {
+              final http = GatewayHttpClient();
+              final isHealthy = await http.checkHealth();
+              Get.snackbar(
+                DesktopI18n.tr('Диагностика системы', 'System Diagnostic'),
+                isHealthy
+                    ? DesktopI18n.tr('Шлюз Gateway активен и отвечает штатно (200 OK)', 'Gateway is online and operational (200 OK)')
+                    : DesktopI18n.tr('Шлюз Gateway недоступен (проверьте порт 3000)', 'Gateway is unreachable (check port 3000)'),
+                backgroundColor: const Color(0xFF1E293B),
+                colorText: isHealthy ? const Color(0xFF10B981) : const Color(0xFFEF4444),
+                snackPosition: SnackPosition.BOTTOM,
+                duration: const Duration(seconds: 4),
+              );
+            } catch (e) {
+              Get.snackbar(
+                DesktopI18n.tr('Диагностика системы', 'System Diagnostic'),
+                DesktopI18n.tr('Ошибка соединения со шлюзом: $e', 'Connection error to gateway: $e'),
+                backgroundColor: const Color(0xFF1E293B),
+                colorText: const Color(0xFFEF4444),
+                snackPosition: SnackPosition.BOTTOM,
+              );
+            }
+          },
         ),
       ];
 

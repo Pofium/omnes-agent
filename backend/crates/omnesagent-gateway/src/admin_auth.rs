@@ -431,8 +431,8 @@ pub async fn require_web_auth(
 ) -> Response {
     let path = request.uri().path();
 
-    // 1. Always permit public endpoints
-    if is_public_path(path) {
+    // 1. Always permit public endpoints and WebSocket endpoints (which handle their own transport handshake and auth)
+    if is_public_path(path) || path.starts_with("/ws/") {
         return next.run(request).await;
     }
 
@@ -484,9 +484,27 @@ fn is_public_path(path: &str) -> bool {
             | "/api/auth/me"
             | "/favicon.png"
             | "/manifest.json"
+            | "/version.json"
+            | "/flutter.js"
+            | "/flutter_bootstrap.js"
+            | "/flutter_service_worker.js"
+            | "/main.dart.js"
     ) || path.starts_with("/_app/")
+        || path.starts_with("/assets/")
+        || path.starts_with("/canvaskit/")
+        || path.starts_with("/icons/")
         || path == "/"
         || path == "/index.html"
+        || (!path.starts_with("/api/")
+            && !path.starts_with("/ws/")
+            && (path.ends_with(".js")
+                || path.ends_with(".wasm")
+                || path.ends_with(".json")
+                || path.ends_with(".png")
+                || path.ends_with(".ttf")
+                || path.ends_with(".otf")
+                || path.ends_with(".css")
+                || path.ends_with(".html")))
 }
 
 fn is_auth_mgmt_path(path: &str) -> bool {

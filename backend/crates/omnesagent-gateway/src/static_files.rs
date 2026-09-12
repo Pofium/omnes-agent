@@ -44,6 +44,16 @@ pub async fn handle_spa_fallback(State(state): State<AppState>, uri: Uri) -> Res
         return (StatusCode::NOT_FOUND, Json(body)).into_response();
     }
 
+    let req_path = strip_path_prefix(uri.path(), &state.path_prefix);
+    let rel_path = req_path.trim_start_matches('/');
+    if !rel_path.is_empty() && is_valid_relative_path(rel_path) {
+        if let Some(dir) = state.web_dist_dir.as_ref() {
+            if dir.join(rel_path).is_file() {
+                return serve_fs_file(state.web_dist_dir.as_ref(), rel_path).await;
+            }
+        }
+    }
+
     let Some(bytes) = load_index_html_bytes(state.web_dist_dir.as_ref()).await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

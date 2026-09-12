@@ -137,6 +137,18 @@ class GatewayWsClient {
     return true;
   }
 
+  /// Sends operator approval or denial decision for a pending tool execution.
+  bool sendApprovalResponse(String requestId, String decision) {
+    if (!isConnected) return false;
+    final payload = jsonEncode({
+      'type': 'approval_response',
+      'request_id': requestId,
+      'decision': decision,
+    });
+    _channel!.sink.add(payload);
+    return true;
+  }
+
   void _scheduleReconnect() {
     if (_intentionallyClosed) return;
     _cancelReconnect();

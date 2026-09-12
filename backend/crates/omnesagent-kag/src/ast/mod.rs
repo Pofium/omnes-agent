@@ -156,13 +156,11 @@ impl AstCodeExtractor {
                 let file_size = bytes.len();
                 result.file_hashes.insert(rel_path.clone(), hash.clone());
 
-                if let Some(known) = known_hashes {
-                    if let Some(prev_hash) = known.get(&rel_path) {
-                        if prev_hash == &hash {
+                if let Some(known) = known_hashes
+                    && let Some(prev_hash) = known.get(&rel_path)
+                        && prev_hash == &hash {
                             continue; // Файл не изменился
                         }
-                    }
-                }
 
                 if let Ok(content) = String::from_utf8(bytes) {
                     let lines_count = content.lines().count();
@@ -199,13 +197,13 @@ impl AstCodeExtractor {
                 continue;
             }
 
-            if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            if entry.file_type().is_some_and(|ft| ft.is_file())
+                && let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                     let ext_lower = ext.to_lowercase();
                     if matches!(ext_lower.as_str(), 
                         "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "sql" | "c" | "cpp" | "h" | "hpp" | "php" | "dart" | "java"
-                    ) {
-                        if let Ok(rel) = path.strip_prefix(root) {
+                    )
+                        && let Ok(rel) = path.strip_prefix(root) {
                             let rel_str = rel.to_string_lossy().replace('\\', "/");
                             if !rel_str.contains("/target/") && !rel_str.contains("/node_modules/") 
                                 && !rel_str.contains("/venv/") && !rel_str.contains("/.venv/") 
@@ -213,9 +211,7 @@ impl AstCodeExtractor {
                                 out.push((rel_str, path.to_path_buf()));
                             }
                         }
-                    }
                 }
-            }
         }
     }
 
@@ -269,8 +265,8 @@ impl AstCodeExtractor {
 
         // 2. Извлечение struct/enum
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.rust_struct_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            if let Some(cap) = self.rust_struct_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let struct_name = name_match.as_str();
                     let node_id = format!("struct:{}:{}", rel_path, struct_name);
                     out.nodes.push(AstNode {
@@ -290,13 +286,12 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
 
         // 3. Извлечение traits
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.rust_trait_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            if let Some(cap) = self.rust_trait_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let trait_name = name_match.as_str();
                     let node_id = format!("trait:{}:{}", rel_path, trait_name);
                     out.nodes.push(AstNode {
@@ -316,13 +311,12 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
 
         // 4. Извлечение functions
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.rust_fn_re.captures(line) {
-                if let Some(fn_match) = cap.get(1) {
+            if let Some(cap) = self.rust_fn_re.captures(line)
+                && let Some(fn_match) = cap.get(1) {
                     let fn_name = fn_match.as_str();
                     let node_id = format!("fn:{}:{}", rel_path, fn_name);
                     let sig = line.trim().trim_end_matches('{').trim();
@@ -343,7 +337,6 @@ impl AstCodeExtractor {
                         context: sig.to_string(),
                     });
                 }
-            }
         }
     }
 
@@ -366,8 +359,8 @@ impl AstCodeExtractor {
 
         // 2. Извлечение classes
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.py_class_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            if let Some(cap) = self.py_class_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let class_name = name_match.as_str();
                     let node_id = format!("class:{}:{}", rel_path, class_name);
                     out.nodes.push(AstNode {
@@ -403,13 +396,12 @@ impl AstCodeExtractor {
                         }
                     }
                 }
-            }
         }
 
         // 3. Извлечение functions
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.py_fn_re.captures(line) {
-                if let Some(fn_match) = cap.get(1) {
+            if let Some(cap) = self.py_fn_re.captures(line)
+                && let Some(fn_match) = cap.get(1) {
                     let fn_name = fn_match.as_str();
                     let node_id = format!("fn:{}:{}", rel_path, fn_name);
                     out.nodes.push(AstNode {
@@ -429,7 +421,6 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
     }
 
@@ -473,8 +464,8 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            } else if let Some(cap) = self.ts_interface_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            } else if let Some(cap) = self.ts_interface_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let iface_name = name_match.as_str();
                     let node_id = format!("interface:{}:{}", rel_path, iface_name);
                     out.nodes.push(AstNode {
@@ -494,7 +485,6 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
 
         // 3. Functions
@@ -529,8 +519,8 @@ impl AstCodeExtractor {
 
         // 1. Structs
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.go_struct_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            if let Some(cap) = self.go_struct_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let struct_name = name_match.as_str();
                     let node_id = format!("struct:{}:{}", rel_path, struct_name);
                     out.nodes.push(AstNode {
@@ -550,13 +540,12 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
 
         // 2. Functions
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.go_fn_re.captures(line) {
-                if let Some(fn_match) = cap.get(1) {
+            if let Some(cap) = self.go_fn_re.captures(line)
+                && let Some(fn_match) = cap.get(1) {
                     let fn_name = fn_match.as_str();
                     let node_id = format!("fn:{}:{}", rel_path, fn_name);
                     out.nodes.push(AstNode {
@@ -576,7 +565,6 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
     }
 
@@ -717,8 +705,8 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            } else if let Some(cap) = self.php_trait_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            } else if let Some(cap) = self.php_trait_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let trait_name = name_match.as_str();
                     let node_id = format!("trait:{}:{}", rel_path, trait_name);
                     out.nodes.push(AstNode {
@@ -738,13 +726,12 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
 
         // 3. Functions & Methods
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.php_fn_re.captures(line) {
-                if let Some(fn_match) = cap.get(1) {
+            if let Some(cap) = self.php_fn_re.captures(line)
+                && let Some(fn_match) = cap.get(1) {
                     let fn_name = fn_match.as_str();
                     let node_id = format!("fn:{}:{}", rel_path, fn_name);
                     out.nodes.push(AstNode {
@@ -764,7 +751,6 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
     }
 
@@ -854,8 +840,8 @@ impl AstCodeExtractor {
                         }
                     }
                 }
-            } else if let Some(cap) = self.dart_mixin_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            } else if let Some(cap) = self.dart_mixin_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let mixin_name = name_match.as_str();
                     let node_id = format!("trait:{}:{}", rel_path, mixin_name);
                     out.nodes.push(AstNode {
@@ -875,13 +861,12 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
 
         // 3. Functions & Methods
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.dart_fn_re.captures(line) {
-                if let Some(fn_match) = cap.get(1) {
+            if let Some(cap) = self.dart_fn_re.captures(line)
+                && let Some(fn_match) = cap.get(1) {
                     let fn_name = fn_match.as_str();
                     if matches!(fn_name, "if" | "for" | "while" | "switch" | "catch") {
                         continue;
@@ -904,7 +889,6 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
     }
 
@@ -990,8 +974,8 @@ impl AstCodeExtractor {
                         }
                     }
                 }
-            } else if let Some(cap) = self.java_interface_re.captures(line) {
-                if let Some(name_match) = cap.get(1) {
+            } else if let Some(cap) = self.java_interface_re.captures(line)
+                && let Some(name_match) = cap.get(1) {
                     let iface_name = name_match.as_str();
                     let node_id = format!("interface:{}:{}", rel_path, iface_name);
                     out.nodes.push(AstNode {
@@ -1011,13 +995,12 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
 
         // 3. Methods
         for (i, line) in lines.iter().enumerate() {
-            if let Some(cap) = self.java_fn_re.captures(line) {
-                if let Some(fn_match) = cap.get(2) {
+            if let Some(cap) = self.java_fn_re.captures(line)
+                && let Some(fn_match) = cap.get(2) {
                     let fn_name = fn_match.as_str();
                     if matches!(fn_name, "if" | "for" | "while" | "switch" | "catch") {
                         continue;
@@ -1040,7 +1023,6 @@ impl AstCodeExtractor {
                         context: line.trim().to_string(),
                     });
                 }
-            }
         }
     }
 }

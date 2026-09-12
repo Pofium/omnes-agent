@@ -40,7 +40,7 @@ class DesktopI18n {
   // ============================================================
   // SIDEBAR TRANSLATIONS
   // ============================================================
-  static String get newTask => tr('Новая задача', 'New task');
+  static String get newTask => tr('Новая сессия', 'New session');
   static String get search => tr('Поиск', 'Search');
   static String get automations => tr('Автоматизации', 'Automations');
   static String get group => tr('Группа', 'Group');
@@ -57,6 +57,7 @@ class DesktopI18n {
   static String get created => tr('По созданию', 'Created');
   static String get remoteControl => tr('Удалённое управление (Mobile Remote)', 'Remote control (Mobile Remote)');
   static String get settings => tr('Настройки (Провайдеры, MCP, Память, Язык)', 'Settings (Providers, MCP, Memory, Language)');
+  static String get copy => tr('Копировать', 'Copy');
 
   // ============================================================
   // WORKSPACE TRANSLATIONS
@@ -64,14 +65,14 @@ class DesktopI18n {
   static String get terminalConsole => tr('Терминал (bash / pwsh) — OmnesAgent Daemon', 'Terminal (bash / pwsh) — OmnesAgent Daemon');
   static String get terminalTooltip => tr('Встроенный терминал', 'Built-in terminal');
   static String get toolsTooltip => tr('Боковая панель инструментов', 'Side tools panel');
-  static String get promptPlaceholder => tr('Задайте вопрос или уточните задачу...', 'Ask for follow-up changes...');
+  static String get promptPlaceholder => tr('Задайте вопрос или продолжите диалог...', 'Ask for follow-up changes...');
   static String get addContextTooltip => tr('Добавить контекст (@файл, #чат, /команда)', 'Add context (@file, #chat, /command)');
   static String get copiedToClipboard => tr('Скопировано в буфер обмена', 'Copied to clipboard');
   static String get done => tr('выполнено', 'done');
   static String get undo => tr('Отменить', 'Undo');
   static String get gitTools => tr('Инструменты Git', 'Git tools');
   static String get branch => tr('Ветка', 'Branch');
-  static String get startNewTaskTitle => tr('Начните новую задачу в проекте omnes-agent', 'Start a new task in the omnes-agent project');
+  static String get startNewTaskTitle => tr('Начните новую сессию в проекте omnes-agent', 'Start a new session in the omnes-agent project');
   static String get runSnippet => tr('Запустить в терминале', 'Run in terminal');
   static String get copySnippet => tr('Копировать сниппет', 'Copy snippet');
 
@@ -160,7 +161,7 @@ class DesktopI18n {
   static String get mobileMode => tr('Мобильный', 'Mobile');
   static String get refresh => tr('Обновить', 'Refresh');
   static String get openNewTab => tr('Открыть вкладку', 'Open Tab');
-  static String get sendSideChat => tr('Спросить без изменения контекста основной задачи...', 'Ask without modifying main task context...');
+  static String get sendSideChat => tr('Спросить без изменения контекста основной сессии...', 'Ask without modifying main session context...');
 
   // ============================================================
   // WORKSPACE TEMPLATES, COMPOSER & MENUS
@@ -183,9 +184,9 @@ class DesktopI18n {
     'Отчёт о последних падениях тестов компиляции и интеграционных проверок.',
     'Scan recent CI runs, list failing and flaky tests with likely causes, and propose fixes.',
   );
-  static String get customizeTitle => tr('Своя задача', 'Customize');
+  static String get customizeTitle => tr('Своя сессия', 'Customize');
   static String get customizeDesc => tr(
-    'Прямой ввод свободной задачи без использования готовых шаблонов.',
+    'Прямой ввод свободной сессии без использования готовых шаблонов.',
     'Direct prompt input for custom workflows without preset templates.',
   );
   static String get standupPrompt => tr(
@@ -200,7 +201,7 @@ class DesktopI18n {
   // Composer Add Menu
   static String get attachFileItem => tr('Прикрепить файл (Attachment)', 'Attach file (Attachment)');
   static String get mentionFileItem => tr('Упомянуть файл (@ mention)', 'Mention file (@ mention)');
-  static String get linkChatItem => tr('Связать с задачей (# chat)', 'Link to task (# chat)');
+  static String get linkChatItem => tr('Связать с сессией (# chat)', 'Link to session (# chat)');
   static String get insertCommandItem => tr('Вставить команду (/ command)', 'Insert command (/ command)');
 
   // Permission Mode Items
@@ -221,16 +222,17 @@ class DesktopI18n {
   static String get thoughtLevelTooltip => tr('Уровень рассуждений (Thought Level)', 'Thought Level');
   static String get commandCopied => tr('Команда скопирована', 'Command copied');
   static String get oneFileChanged => tr('1 файл изменён', '1 file changed');
+  static String get changesLabel => tr('Изменения', 'Changes');
 
   // ============================================================
   // COMMAND PALETTE TRANSLATIONS
   // ============================================================
-  static String get searchCommandsOrFiles => tr('Поиск команд, задач, файлов (Ctrl+P)...', 'Search commands, tasks, files (Ctrl+P)...');
+  static String get searchCommandsOrFiles => tr('Поиск команд, сессий, файлов (Ctrl+P)...', 'Search commands, sessions, files (Ctrl+P)...');
   static String get categoryActions => tr('ДЕЙСТВИЯ', 'ACTIONS');
   static String get categoryPermissionModes => tr('РЕЖИМЫ РАЗРЕШЕНИЙ', 'PERMISSION MODES');
   static String get categoryNavigation => tr('НАВИГАЦИЯ', 'NAVIGATION');
   static String get categorySystem => tr('СИСТЕМА', 'SYSTEM');
-  static String get cmdNewTask => tr('Создать новую задачу', 'Create new task');
+  static String get cmdNewTask => tr('Создать новую сессию', 'Create new session');
   static String get cmdToggleTerminal => tr('Открыть / закрыть терминал', 'Toggle terminal');
   static String get cmdCyclePermission => tr('Переключить режим разрешений', 'Cycle permission mode');
   static String get cmdModeAsk => tr('Режим: Ask before changes', 'Mode: Ask before changes');

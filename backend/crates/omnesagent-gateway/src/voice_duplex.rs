@@ -64,10 +64,12 @@ pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
             ::omnesagent_log::record!(
                 DEBUG,
                 ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
-                "voice duplex: barge_in received"
+                "voice duplex: barge_in received, emitting tts_cancel"
             );
-            // TODO: wire into session abort mechanism (ref upstream
-            None
+            Some(serde_json::json!({
+                "type": "tts_cancel",
+                "reason": "barge_in"
+            }))
         }
         VoiceEvent::TtsCancel | VoiceEvent::TtsChunk { .. } => {
             ::omnesagent_log::record!(
@@ -186,9 +188,17 @@ mod tests {
     }
 
     #[test]
-    fn client_events_return_no_error() {
+    fn client_events_speech_start_and_end_return_none() {
         assert!(handle_voice_event(VoiceEvent::SpeechStart).is_none());
         assert!(handle_voice_event(VoiceEvent::SpeechEnd { transcript: None }).is_none());
-        assert!(handle_voice_event(VoiceEvent::BargeIn).is_none());
+    }
+
+    #[test]
+    fn barge_in_returns_tts_cancel() {
+        let res = handle_voice_event(VoiceEvent::BargeIn);
+        assert!(res.is_some());
+        let payload = res.unwrap();
+        assert_eq!(payload["type"], "tts_cancel");
+        assert_eq!(payload["reason"], "barge_in");
     }
 }

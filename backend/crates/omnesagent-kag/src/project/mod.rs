@@ -366,8 +366,8 @@ impl ProjectService {
 
         // Активная ветка git
         let head_file = root.join(".git").join("HEAD");
-        if head_file.exists() {
-            if let Ok(head_content) = std::fs::read_to_string(&head_file) {
+        if head_file.exists()
+            && let Ok(head_content) = std::fs::read_to_string(&head_file) {
                 let branch = head_content.trim().trim_start_matches("ref: refs/heads/").to_string();
                 if !branch.is_empty() {
                     let conn = self.conn.lock();
@@ -378,7 +378,6 @@ impl ProjectService {
                     project.active_branch = Some(branch);
                 }
             }
-        }
 
         info!("Zero-Config: зарегистрирован проект '{}' ({}) по пути {}", name, project.id, abs_root);
         Ok(project)
@@ -634,9 +633,9 @@ impl ProjectService {
         }
 
         // 2. Векторный семантический поиск
-        if let Some(embedder) = &self.embedder {
-            if let Ok(q_embs) = embedder.embed(&[query.to_string()]).await {
-                if let Some(q_vec) = q_embs.first() {
+        if let Some(embedder) = &self.embedder
+            && let Ok(q_embs) = embedder.embed(&[query.to_string()]).await
+                && let Some(q_vec) = q_embs.first() {
                     let cand_blobs = {
                         let conn = self.conn.lock();
                         let mut stmt = conn.prepare(
@@ -663,8 +662,6 @@ impl ProjectService {
                         *entry += (vscore as f64) * 25.0;
                     }
                 }
-            }
-        }
 
         let mut sorted_ids: Vec<i64> = scored.keys().copied().collect();
         sorted_ids.sort_by(|a, b| scored[b].partial_cmp(&scored[a]).unwrap_or(std::cmp::Ordering::Equal));
@@ -827,13 +824,12 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
         if root.join("tsconfig.json").exists() && !tech_stack.contains(&"typescript".to_string()) {
             tech_stack.push("typescript".to_string());
         }
-        if let Ok(content) = std::fs::read_to_string(&package_json) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(n) = v.get("name").and_then(|x| x.as_str()) {
-                    if !n.is_empty() && name == default_name {
+        if let Ok(content) = std::fs::read_to_string(&package_json)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(n) = v.get("name").and_then(|x| x.as_str())
+                    && !n.is_empty() && name == default_name {
                         name = n.to_string();
                     }
-                }
                 if description.is_none() {
                     description = v.get("description").and_then(|x| x.as_str()).map(|s| s.to_string());
                 }
@@ -841,7 +837,6 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
                     tech_stack.push("react".to_string());
                 }
             }
-        }
     }
 
     // 3. Python: pyproject.toml / requirements.txt
@@ -868,16 +863,14 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
         if !tech_stack.contains(&"php".to_string()) {
             tech_stack.push("php".to_string());
         }
-        if let Ok(content) = std::fs::read_to_string(&composer_json) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(n) = v.get("name").and_then(|x| x.as_str()) {
-                    let short_name = n.split('/').last().unwrap_or(n);
+        if let Ok(content) = std::fs::read_to_string(&composer_json)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(n) = v.get("name").and_then(|x| x.as_str()) {
+                    let short_name = n.split('/').next_back().unwrap_or(n);
                     if !short_name.is_empty() && name == default_name {
                         name = short_name.to_string();
                     }
                 }
-            }
-        }
     }
 
     // 5. Go: go.mod
@@ -891,7 +884,7 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
                 let trimmed = line.trim();
                 if trimmed.starts_with("module ") {
                     let mod_path = trimmed.trim_start_matches("module ").trim();
-                    let short_name = mod_path.split('/').last().unwrap_or(mod_path);
+                    let short_name = mod_path.split('/').next_back().unwrap_or(mod_path);
                     if !short_name.is_empty() && name == default_name {
                         name = short_name.to_string();
                     }
@@ -912,8 +905,8 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
     }
 
     // README fallback
-    if description.is_none() {
-        if let Ok(content) = std::fs::read_to_string(root.join("README.md")) {
+    if description.is_none()
+        && let Ok(content) = std::fs::read_to_string(root.join("README.md")) {
             for line in content.lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() && !trimmed.starts_with('#') {
@@ -922,7 +915,6 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
                 }
             }
         }
-    }
 
     (name, tech_stack, description)
 }

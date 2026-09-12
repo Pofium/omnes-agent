@@ -22,6 +22,9 @@ dependencies:
   universal_io: ^2.2.2
   flutter_svg: ^2.1.0
   webview_windows: ^0.4.0
+  window_manager: 0.4.3
+  tray_manager: ^0.5.3
+  path: ^1.9.0
 
 dev_dependencies:
   flutter_test:

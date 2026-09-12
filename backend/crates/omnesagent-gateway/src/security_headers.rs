@@ -11,14 +11,14 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     (
         "content-security-policy",
         "default-src 'self'; \
-         script-src 'self' 'unsafe-inline'; \
-         style-src 'self' 'unsafe-inline'; \
-         img-src 'self' data:; \
-         font-src 'self'; \
-         connect-src 'self' ws: wss:; \
+         script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://www.gstatic.com https://unpkg.com; \
+         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+         font-src 'self' data: https://fonts.gstatic.com; \
+         img-src 'self' data: blob: https:; \
+         connect-src 'self' ws: wss: http: https: blob: data: https://www.gstatic.com; \
          object-src 'none'; \
          frame-ancestors 'none'; \
-         base-uri 'none'; \
+         base-uri 'self'; \
          form-action 'self'",
     ),
     ("cross-origin-opener-policy", "same-origin"),

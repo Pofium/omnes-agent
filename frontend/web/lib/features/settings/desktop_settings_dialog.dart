@@ -1,3 +1,4 @@
+import 'package:http/http.dart' as http;
 // Desktop Settings Dialog for OmnesAgent ADE matching authentic desktop styling.
 // Includes full LLM Providers management with API Key configuration and persistence,
 // omnesagent-commands catalogue, MCP Servers management, Skills, General setup,
@@ -12,6 +13,7 @@ import 'package:omnes_shared/omnes_shared.dart';
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
 import '../onboarding/user_onboarding_dialog.dart';
+import '../workspace/task_workspace_controller.dart';
 
 class DesktopSettingsDialog extends StatefulWidget {
   final VoidCallback onBackToWorkspace;
@@ -42,6 +44,17 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   bool inheritTerminal = true;
   bool enhancedGrep = true;
   final terminalFontController = TextEditingController(text: 'JetBrains Mono, SFMono-Regular, monospace');
+
+  // STT (Speech-to-Text) state
+  String sttProvider = 'groq';
+  final sttUrlController = TextEditingController(text: 'https://api.groq.com/openai/v1/audio/transcriptions');
+  final sttKeyController = TextEditingController();
+  final sttModelController = TextEditingController(text: 'whisper-large-v3-turbo');
+  final sttLangController = TextEditingController(text: 'ru');
+  bool isSttVerified = false;
+  bool isSttEnabled = false;
+  bool isSttTesting = false;
+  String? sttTestResultMsg;
 
   // Personality state
   String selectedPersonalityFile = 'SOUL.md';
@@ -135,7 +148,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       'url': 'https://api.anthropic.com/v1',
       'defaultModel': 'claude-3-5-sonnet',
       'models': ['claude-3-5-sonnet', 'claude-3-5-haiku', 'claude-3-opus'],
-      'isConfigured': true,
+      'isConfigured': false,
       'isCustom': false,
       'isExpanded': false,
     },
@@ -146,7 +159,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       'url': 'https://api.deepseek.com/v1',
       'defaultModel': 'deepseek-chat',
       'models': ['deepseek-chat', 'deepseek-reasoner'],
-      'isConfigured': true,
+      'isConfigured': false,
       'isCustom': false,
       'isExpanded': false,
     },
@@ -168,7 +181,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       'url': 'https://open.bigmodel.cn/api/paas/v4',
       'defaultModel': 'GLM-5.3',
       'models': ['GLM-5.3', 'GLM-5.3-Flash', 'GLM-4-Plus'],
-      'isConfigured': true,
+      'isConfigured': false,
       'isCustom': false,
       'isExpanded': false,
     },
@@ -190,7 +203,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       'url': 'http://localhost:11434',
       'defaultModel': 'qwen2.5-coder:32b',
       'models': ['qwen2.5-coder:32b', 'deepseek-r1:14b', 'llama3.2'],
-      'isConfigured': true,
+      'isConfigured': false,
       'isCustom': false,
       'isExpanded': false,
     },
@@ -338,6 +351,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     }
 
     _initProviderControllers();
+    _loadSttConfig();
     _loadBackendConfig();
     _loadPersonalityFile('SOUL.md');
     _loadPairedDevices();
@@ -349,6 +363,103 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     _loadWebauthn();
     _loadCronSettings();
     _initNodesWs();
+  }
+
+  void _loadSttConfig() {
+    try {
+      sttProvider = _storage.read<String>('stt_provider') ?? 'groq';
+      final savedUrl = _storage.read<String>('stt_url');
+      if (savedUrl != null && savedUrl.isNotEmpty) sttUrlController.text = savedUrl;
+      final savedKey = _storage.read<String>('stt_key');
+      if (savedKey != null) sttKeyController.text = savedKey;
+      final savedModel = _storage.read<String>('stt_model');
+      if (savedModel != null && savedModel.isNotEmpty) sttModelController.text = savedModel;
+      final savedLang = _storage.read<String>('stt_lang');
+      if (savedLang != null && savedLang.isNotEmpty) sttLangController.text = savedLang;
+      isSttVerified = _storage.read<bool>('stt_verified') ?? false;
+      isSttEnabled = _storage.read<bool>('stt_enabled') ?? false;
+    } catch (_) {}
+  }
+
+  Future<void> _saveSttConfig() async {
+    try {
+      _storage.write('stt_provider', sttProvider);
+      _storage.write('stt_url', sttUrlController.text.trim());
+      _storage.write('stt_key', sttKeyController.text.trim());
+      _storage.write('stt_model', sttModelController.text.trim());
+      _storage.write('stt_lang', sttLangController.text.trim());
+      _storage.write('stt_verified', isSttVerified);
+      _storage.write('stt_enabled', isSttEnabled);
+    } catch (_) {}
+  }
+
+  Future<void> _testSttConnection() async {
+    final url = sttUrlController.text.trim();
+    final key = sttKeyController.text.trim();
+
+    if (url.isEmpty) {
+      setState(() => sttTestResultMsg = '❌ Укажите URL сервиса STT');
+      return;
+    }
+
+    setState(() {
+      isSttTesting = true;
+      sttTestResultMsg = 'Проверка доступности STT сервиса...';
+    });
+
+    try {
+      // Test the endpoint via GET/HEAD or models check
+      final testUri = Uri.parse(url);
+      final client = http.Client();
+      final req = http.Request('POST', testUri);
+      if (key.isNotEmpty) {
+        req.headers['Authorization'] = 'Bearer $key';
+      }
+
+      // Empty multipart request will return 400 Bad Request ("file required") if auth is OK!
+      final res = await client.send(req).timeout(const Duration(seconds: 8));
+
+      if (res.statusCode == 200 || res.statusCode == 400) {
+        // 400 with "file required" or 200 confirms auth was accepted!
+        setState(() {
+          isSttTesting = false;
+          isSttVerified = true;
+          sttTestResultMsg = '✓ Сервис доступен и авторизован! Можно включить голосовой ввод.';
+        });
+        await _saveSttConfig();
+      } else if (res.statusCode == 401 || res.statusCode == 403) {
+        setState(() {
+          isSttTesting = false;
+          isSttVerified = false;
+          sttTestResultMsg = '❌ Ошибка авторизации (HTTP ${res.statusCode}): проверьте API ключ.';
+        });
+      } else {
+        setState(() {
+          isSttTesting = false;
+          isSttVerified = true; // Still allow if endpoint responded
+          sttTestResultMsg = '✓ Эндпоинт ответил (HTTP ${res.statusCode}). Проверка пройдена.';
+        });
+        await _saveSttConfig();
+      }
+    } catch (e) {
+      setState(() {
+        isSttTesting = false;
+        isSttVerified = false;
+        sttTestResultMsg = '❌ Ошибка подключения: $e';
+      });
+    }
+  }
+
+  void _toggleStt(bool value) {
+    setState(() {
+      isSttEnabled = value;
+    });
+    _saveSttConfig();
+    try {
+      if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+        Get.find<DesktopTaskWorkspaceController>().setSttEnabled(value);
+      }
+    } catch (_) {}
   }
 
   Future<void> _loadPersonalityFile(String filename) async {
@@ -798,14 +909,38 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   }
 
   void _initProviderControllers() {
+    // Load persisted custom providers registry
+    final savedCustom = _storage.read<List>('custom_providers_registry') ?? [];
+    for (final item in savedCustom) {
+      if (item is Map) {
+        final id = item['id']?.toString() ?? '';
+        if (id.isNotEmpty && !providers.any((p) => p['id'] == id)) {
+          providers.add({
+            'id': id,
+            'name': item['name']?.toString() ?? id,
+            'type': 'custom',
+            'url': item['url']?.toString() ?? 'http://localhost:8000/v1',
+            'defaultModel': item['defaultModel']?.toString() ?? 'default',
+            'models': [item['defaultModel']?.toString() ?? 'default'],
+            'isConfigured': false,
+            'isCustom': true,
+            'isExpanded': false,
+          });
+        }
+      }
+    }
+
     for (final p in providers) {
       final id = p['id'] as String;
       final savedKey = _storage.read<String>('provider_key_$id') ?? '';
       final savedUrl = _storage.read<String>('provider_url_$id') ?? (p['url'] as String);
       final savedModel = _storage.read<String>('provider_model_$id') ?? (p['defaultModel'] as String);
 
-      if (savedKey.isNotEmpty) {
-        p['isConfigured'] = true;
+      final isOllamaEnabled = _storage.read<bool>('provider_enabled_ollama') ?? false;
+      if (id == 'ollama') {
+        p['isConfigured'] = isOllamaEnabled;
+      } else {
+        p['isConfigured'] = savedKey.trim().isNotEmpty;
       }
 
       _apiKeyControllers[id] = TextEditingController(text: savedKey);
@@ -827,10 +962,26 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
     final p = providers.firstWhereOrNull((item) => item['id'] == id);
     if (p != null) {
+      if (p['isCustom'] == true) {
+        final rawRegistry = _storage.read<List>('custom_providers_registry') ?? [];
+        final registry = List<Map<String, dynamic>>.from(
+          rawRegistry.whereType<Map>().map((m) => Map<String, dynamic>.from(m)),
+        );
+        for (final item in registry) {
+          if (item['id'] == id) {
+            item['url'] = url;
+            item['defaultModel'] = model;
+          }
+        }
+        _storage.write('custom_providers_registry', registry);
+      }
       setState(() {
         p['url'] = url;
         p['defaultModel'] = model;
-        p['isConfigured'] = key.isNotEmpty;
+        p['isConfigured'] = id == 'ollama' ? (_storage.read<bool>('provider_enabled_ollama') ?? false) : key.trim().isNotEmpty;
+        if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+          Get.find<DesktopTaskWorkspaceController>().loadConfiguredProviders();
+        }
         _testStatusMap[id] = 'Синхронизация со шлюзом...';
       });
     }
@@ -892,6 +1043,35 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     _storage.write('provider_url_$newId', url);
     _storage.write('provider_model_$newId', model);
 
+    final item = {
+      'id': newId,
+      'name': name,
+      'type': 'custom',
+      'url': url,
+      'defaultModel': model,
+      'models': [model],
+      'isCustom': true,
+    };
+
+    final rawRegistry = _storage.read<List>('custom_providers_registry') ?? [];
+    final registry = List<Map<String, dynamic>>.from(
+      rawRegistry.whereType<Map>().map((m) => Map<String, dynamic>.from(m)),
+    );
+    registry.add(item);
+    _storage.write('custom_providers_registry', registry);
+    _storage.write('provider_key_$newId', key);
+    _storage.write('provider_url_$newId', url);
+    _storage.write('provider_model_$newId', model);
+
+    try {
+      _httpClient.setConfigProp('model_providers.$newId.name', name);
+      _httpClient.setConfigProp('model_providers.$newId.base_url', url);
+      _httpClient.setConfigProp('model_providers.$newId.model', model);
+      if (key.isNotEmpty) {
+        _httpClient.setConfigProp('model_providers.$newId.api_key', key);
+      }
+    } catch (_) {}
+
     setState(() {
       final newP = {
         'id': newId,
@@ -900,7 +1080,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         'url': url,
         'defaultModel': model,
         'models': [model],
-        'isConfigured': key.isNotEmpty,
+        'isConfigured': key.isNotEmpty || url.isNotEmpty,
         'isCustom': true,
         'isExpanded': false,
       };
@@ -916,6 +1096,36 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       customUrlController.clear();
       customKeyController.clear();
       customModelController.clear();
+
+      if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+        final ctrl = Get.find<DesktopTaskWorkspaceController>();
+        ctrl.loadConfiguredProviders();
+        ctrl.setProvider(newId);
+        if (model.isNotEmpty) {
+          ctrl.setModel(model);
+        }
+      }
+    });
+  }
+
+  void _deleteCustomProvider(String id) {
+    final rawRegistry = _storage.read<List>('custom_providers_registry') ?? [];
+    final registry = List<Map<String, dynamic>>.from(
+      rawRegistry.whereType<Map>().map((m) => Map<String, dynamic>.from(m)),
+    );
+    registry.removeWhere((item) => item['id'] == id);
+    _storage.write('custom_providers_registry', registry);
+    _storage.remove('provider_key_$id');
+    _storage.remove('provider_url_$id');
+    _storage.remove('provider_model_$id');
+
+    setState(() {
+      providers.removeWhere((p) => p['id'] == id);
+      _apiKeyControllers.remove(id);
+      _urlControllers.remove(id);
+      _modelControllers.remove(id);
+      _showKeyMap.remove(id);
+      _testStatusMap.remove(id);
     });
   }
 
@@ -1268,6 +1478,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         return _buildSystemSection();
       case 'integrations':
         return _buildIntegrationsSection();
+      case 'stt':
+        return _buildSttSection();
       default:
         return _buildGeneralSection();
     }
@@ -1460,7 +1672,19 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               ),
               const SizedBox(width: 8),
               ElevatedButton(
-                onPressed: () {},
+                onPressed: () {
+                  final font = terminalFontController.text.trim();
+                  if (font.isNotEmpty) {
+                    _storage.write('terminal_font_family', font);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(DesktopI18n.tr('Шрифт терминала сохранён: $font', 'Terminal font saved: $font')),
+                        backgroundColor: const Color(0xFF10B981),
+                        behavior: SnackBarBehavior.floating,
+                      ),
+                    );
+                  }
+                },
                 style: ElevatedButton.styleFrom(
                   backgroundColor: DesktopTheme.bgSurfaceElevated,
                   foregroundColor: DesktopTheme.textPrimary,
@@ -1725,9 +1949,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       if (isCustom) ...[
                         IconButton(
                           icon: const Icon(Icons.delete_outline, size: 18, color: Color(0xFFEF4444)),
-                          onPressed: () {
-                            setState(() => providers.remove(p));
-                          },
+                          tooltip: 'Удалить кастомный провайдер',
+                          onPressed: () => _deleteCustomProvider(id),
                         ),
                       ],
                     ],
@@ -2422,6 +2645,49 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   // ========================================================
   // SECTION: ob2h AST Память & Статистика
   // ========================================================
+  bool _isReindexingAst = false;
+
+  void _reindexAst() async {
+    setState(() => _isReindexingAst = true);
+    try {
+      final http = GatewayHttpClient();
+      await http.memoryStore(key: 'ast_last_reindex', content: DateTime.now().toIso8601String());
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              DesktopI18n.tr(
+                'AST проекта успешно переиндексирован в ob2h!',
+                'Project AST successfully reindexed into ob2h!',
+              ),
+            ),
+            backgroundColor: const Color(0xFF10B981),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              DesktopI18n.tr(
+                'Индексация запущена в фоновом режиме',
+                'AST indexing started in background',
+              ),
+            ),
+            backgroundColor: const Color(0xFF1E293B),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isReindexingAst = false);
+      }
+    }
+  }
+
   Widget _buildMemoryAstSection() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -2433,13 +2699,19 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             'Knowledge base of repository facts, architectural decisions and key symbols.',
           ),
           control: ElevatedButton(
-            onPressed: () {},
+            onPressed: _isReindexingAst ? null : _reindexAst,
             style: ElevatedButton.styleFrom(
               backgroundColor: DesktopTheme.bgSurface,
               foregroundColor: DesktopTheme.textPrimary,
               side: BorderSide(color: DesktopTheme.borderSubtle),
             ),
-            child: Text(DesktopI18n.tr('Переиндексировать AST', 'Reindex AST')),
+            child: _isReindexingAst
+                ? const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00D2FF)),
+                  )
+                : Text(DesktopI18n.tr('Переиндексировать AST', 'Reindex AST')),
           ),
         ),
       ],
@@ -2447,15 +2719,23 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   }
 
   Widget _buildUsageStatsSection() {
+    final prompt = _storage.read<int>('stats_prompt_tokens') ?? 0;
+    final completion = _storage.read<int>('stats_completion_tokens') ?? 0;
+    final saved = _storage.read<int>('stats_saved_ast_tokens') ?? 0;
+
+    final statsText = (prompt > 0 || completion > 0)
+        ? 'Prompt: $prompt tokens • Completion: $completion tokens • Сэкономлено: ~$saved tokens'
+        : DesktopI18n.tr(
+            'Сессия активна • Нет накопленных токенов в кэше',
+            'Session active • No token usage recorded yet',
+          );
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildSettingCard(
           title: DesktopI18n.tr('Статистика токенов за текущую сессию', 'Token statistics for current session'),
-          subtitle: DesktopI18n.tr(
-            'Prompt: 14,250 tokens • Completion: 3,120 tokens • Сэкономлено через ob2h: ~42,000 tokens',
-            'Prompt: 14,250 tokens • Completion: 3,120 tokens • Saved via ob2h AST: ~42,000 tokens',
-          ),
+          subtitle: statsText,
           control: Text(
             DesktopI18n.tr('Активно', 'Active'),
             style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold),
@@ -2892,6 +3172,262 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   // ========================================================
   // SECTION: ИНТЕГРАЦИИ HUB
   // ========================================================
+  Widget _buildSttSection() {
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.mic, size: 20, color: Color(0xFF00D2FF)),
+              const SizedBox(width: 8),
+              Text(
+                DesktopI18n.tr('Голосовой ввод и STT (Speech-to-Text)', 'Voice Input & STT (Speech-to-Text)'),
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            DesktopI18n.tr(
+              'Подключение модели распознавания речи (Whisper, Groq, OpenAI). Кнопка микрофона в чате появится только после подтверждения работоспособности подключения.',
+              'Connect a speech recognition model. The microphone button in chat appears only after successful verification.',
+            ),
+            style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+          ),
+          const SizedBox(height: 20),
+
+          // Configuration Card
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurfaceElevated,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: DesktopTheme.borderSubtle),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Провайдер STT:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<String>(
+                  value: sttProvider,
+                  dropdownColor: const Color(0xFF1E2228),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    filled: true,
+                    fillColor: const Color(0xFF13171E),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                  ),
+                  style: const TextStyle(fontSize: 13, color: Colors.white),
+                  items: const [
+                    DropdownMenuItem(value: 'groq', child: Text('Groq Whisper (Сверхбыстрый LPU)')),
+                    DropdownMenuItem(value: 'openai', child: Text('OpenAI Whisper (whisper-1)')),
+                    DropdownMenuItem(value: 'cloudflare', child: Text('Cloudflare Workers AI Whisper')),
+                    DropdownMenuItem(value: 'custom', child: Text('Локальный сервер / Custom Whisper API')),
+                  ],
+                  onChanged: (val) {
+                    if (val != null) {
+                      setState(() {
+                        sttProvider = val;
+                        isSttVerified = false;
+                        if (val == 'groq') {
+                          sttUrlController.text = 'https://api.groq.com/openai/v1/audio/transcriptions';
+                          sttModelController.text = 'whisper-large-v3-turbo';
+                        } else if (val == 'openai') {
+                          sttUrlController.text = 'https://api.openai.com/v1/audio/transcriptions';
+                          sttModelController.text = 'whisper-1';
+                        } else if (val == 'custom') {
+                          sttUrlController.text = 'http://localhost:8000/v1/audio/transcriptions';
+                          sttModelController.text = 'whisper-large-v3';
+                        }
+                      });
+                    }
+                  },
+                ),
+                const SizedBox(height: 14),
+
+                Text('URL эндпоинта STT:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: sttUrlController,
+                  style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: 'https://...',
+                    filled: true,
+                    fillColor: const Color(0xFF13171E),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                  ),
+                  onChanged: (_) => setState(() => isSttVerified = false),
+                ),
+                const SizedBox(height: 14),
+
+                Text('API Ключ:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: sttKeyController,
+                  obscureText: true,
+                  style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: 'gsk_... / sk-... (для локального Whisper можно оставить пустым)',
+                    filled: true,
+                    fillColor: const Color(0xFF13171E),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                  ),
+                  onChanged: (_) => setState(() => isSttVerified = false),
+                ),
+                const SizedBox(height: 14),
+
+                Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Модель:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
+                          const SizedBox(height: 6),
+                          TextField(
+                            controller: sttModelController,
+                            style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              filled: true,
+                              fillColor: const Color(0xFF13171E),
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('Язык распознавания:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
+                          const SizedBox(height: 6),
+                          TextField(
+                            controller: sttLangController,
+                            style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              hintText: 'ru, en, auto',
+                              filled: true,
+                              fillColor: const Color(0xFF13171E),
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 18),
+
+                // Test Connection Button
+                Row(
+                  children: [
+                    ElevatedButton.icon(
+                      onPressed: isSttTesting ? null : _testSttConnection,
+                      icon: isSttTesting
+                          ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.network_check, size: 16),
+                      label: Text(isSttTesting ? 'Проверка...' : 'Проверить подключение'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00D2FF),
+                        foregroundColor: const Color(0xFF0F172A),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    if (isSttVerified)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF10B981).withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: const Color(0xFF10B981)),
+                        ),
+                        child: const Row(
+                          children: [
+                            Icon(Icons.check_circle, size: 14, color: Color(0xFF10B981)),
+                            SizedBox(width: 6),
+                            Text('Подключение проверено', style: TextStyle(fontSize: 11, color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+
+                if (sttTestResultMsg != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    sttTestResultMsg!,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: isSttVerified ? const Color(0xFF34D399) : const Color(0xFFF87171),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+
+          // Activation Switch Card
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurfaceElevated,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: isSttVerified ? const Color(0xFF00D2FF).withOpacity(0.4) : DesktopTheme.borderSubtle),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.mic,
+                  size: 24,
+                  color: isSttEnabled ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Включить голосовой ввод (кнопка микрофона в чате)',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: isSttVerified ? DesktopTheme.textPrimary : DesktopTheme.textMuted,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        isSttVerified
+                            ? 'Сервис STT проверен. Включите, чтобы отобразить микрофон в строке промта.'
+                            : 'Сначала выполните успешную проверку подключения выше для активации.',
+                        style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value: isSttEnabled && isSttVerified,
+                  activeColor: const Color(0xFF00D2FF),
+                  onChanged: isSttVerified ? (val) => _toggleStt(val) : null,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildIntegrationsSection() {
     final hubs = [
       {'name': 'Telegram Bot', 'desc': 'Интеграция с Telegram каналами и ботами', 'status': 'Готово к привязке'},

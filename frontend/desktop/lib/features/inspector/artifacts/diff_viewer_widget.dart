@@ -25,8 +25,13 @@ class DiffViewerWidget extends StatelessWidget {
                 Icon(FontAwesomeIcons.fileCode, size: 36, color: DesktopTheme.textMuted.withOpacity(0.5)),
                 const SizedBox(height: 12),
                 Text(
-                  'Нет доступных артефактов',
+                  'Нет сгенерированных артефактов и diff-изменений',
                   style: TextStyle(fontSize: 13, color: DesktopTheme.textSecondary),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Изменения и созданные файлы появятся здесь во время работы агента',
+                  style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
                 ),
               ],
             ),
@@ -86,6 +91,19 @@ class DiffViewerWidget extends StatelessWidget {
                                         color: isSelected ? DesktopTheme.accentSky : DesktopTheme.textPrimary,
                                       ),
                                     ),
+                                    const SizedBox(width: 6),
+                                    InkWell(
+                                      onTap: () => controller.removeArtifact(idx),
+                                      borderRadius: BorderRadius.circular(3),
+                                      child: Padding(
+                                        padding: const EdgeInsets.all(2),
+                                        child: Icon(
+                                          Icons.close,
+                                          size: 11,
+                                          color: isSelected ? DesktopTheme.textSecondary : DesktopTheme.textMuted,
+                                        ),
+                                      ),
+                                    ),
                                   ],
                                 ),
                               ),
@@ -96,7 +114,13 @@ class DiffViewerWidget extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  // Action buttons: Copy / Apply / Rollback
+                  // Action buttons: Copy / Apply / Rollback / Clear
+                  IconButton(
+                    icon: const Icon(Icons.clear_all, size: 16),
+                    tooltip: 'Очистить все артефакты',
+                    color: DesktopTheme.textMuted,
+                    onPressed: controller.clearArtifacts,
+                  ),
                   IconButton(
                     icon: const Icon(Icons.copy, size: 14),
                     tooltip: 'Скопировать содержимое',

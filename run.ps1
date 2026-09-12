@@ -15,18 +15,31 @@ param(
     [ValidateSet("All", "Backend", "Frontend")]
     [string]$Service = "All",
 
+    [ValidateSet("", "web", "desktop", "windows", "chrome")]
+    [string]$Target = "desktop",
+
     [string]$Device = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
 $BackendDir = Join-Path $ProjectRoot "backend"
-$FrontendDir = Join-Path $ProjectRoot "frontend"
+
+# Select frontend project folder based on target
+$resolvedTarget = if ($Target -ne "") { $Target } elseif ($Device -eq "windows") { "desktop" } else { "web" }
+if ($resolvedTarget -eq "desktop" -or $Device -eq "windows") {
+    $FrontendDir = Join-Path $ProjectRoot "frontend\desktop"
+    if (-not $Device) { $Device = "windows" }
+} else {
+    $FrontendDir = Join-Path $ProjectRoot "frontend\web"
+    if (-not $Device) { $Device = "chrome" }
+}
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  Omnes Agent - Unified Service Launcher  " -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "Service: $Service" -ForegroundColor DarkGray
+Write-Host "Service:  $Service" -ForegroundColor DarkGray
+Write-Host "Target:   $resolvedTarget ($FrontendDir)" -ForegroundColor DarkGray
 Write-Host ""
 
 # -------------------------------------------------------------
@@ -61,9 +74,9 @@ if ($Service -eq "All" -or $Service -eq "Backend") {
         Write-Host "  [OK] Gateway is already running at http://127.0.0.1:42617" -ForegroundColor Green
     } else {
         Write-Host "  Starting Gateway in background: $binPath gateway start..." -ForegroundColor Cyan
-        Start-Process -FilePath $binPath -ArgumentList "gateway", "start" -WorkingDirectory $BackendDir -WindowStyle Hidden
+        Start-Process -FilePath $binPath -ArgumentList "gateway", "start" -WorkingDirectory $ProjectRoot -WindowStyle Hidden
         Start-Sleep -Seconds 2
-        Write-Host "  [OK] Gateway started at http://127.0.0.1:42617" -ForegroundColor Green
+        Write-Host "  [OK] Gateway started at http://127.0.0.1:42617 (Web Dashboard available)" -ForegroundColor Green
     }
     Write-Host ""
 }
@@ -72,7 +85,7 @@ if ($Service -eq "All" -or $Service -eq "Backend") {
 # 2. Start Frontend App
 # -------------------------------------------------------------
 if ($Service -eq "All" -or $Service -eq "Frontend") {
-    Write-Host "[2] Launching Flutter Frontend Client..." -ForegroundColor Yellow
+    Write-Host "[2] Launching Flutter Frontend Client ($resolvedTarget)..." -ForegroundColor Yellow
     Push-Location $FrontendDir
     try {
         if ($Device -ne "") {

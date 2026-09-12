@@ -21,13 +21,18 @@ class GatewayHttpClient {
   }
 
   /// Checks whether gateway is reachable and responsive.
+  /// Safely decodes UTF-8 JSON response, avoiding Latin-1 mojibake.
+  dynamic _decodeBody(http.Response res) {
+    return jsonDecode(utf8.decode(res.bodyBytes));
+  }
+
   Future<bool> checkHealth() async {
     try {
       final base = GatewayConfig.getBaseUrl();
       final uri = Uri.parse('$base/health');
       final res = await _client.get(uri).timeout(const Duration(seconds: 5));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         return data['status'] == 'ok';
       }
       return false;
@@ -44,7 +49,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -58,7 +63,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['keys'] is List) {
           final list = (data['keys'] as List).map((e) => e.toString()).toList();
           if (list.isNotEmpty) return list;
@@ -76,7 +81,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         List? rawList;
         if (data is List) {
           rawList = data;
@@ -105,7 +110,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['messages'] is List) {
           final list = (data['messages'] as List)
               .whereType<Map<String, dynamic>>()
@@ -166,7 +171,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -180,7 +185,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['sessions'] is List) {
           return (data['sessions'] as List).whereType<Map<String, dynamic>>().toList();
         } else if (data is List) {
@@ -213,7 +218,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -229,7 +234,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['entries'] is List) {
           final parentPath = (data['path'] ?? cleanPath).toString();
           return (data['entries'] as List)
@@ -251,7 +256,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map<String, dynamic>) {
           return WorkspaceFileContent.fromJson(data);
         }
@@ -351,7 +356,7 @@ class GatewayHttpClient {
       final streamed = await _client.send(req).timeout(const Duration(seconds: 30));
       final res = await http.Response.fromStream(streamed);
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map) {
           return data['path']?.toString() ?? data['marker']?.toString();
         }
@@ -382,7 +387,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['entries'] is List) {
           return (data['entries'] as List).whereType<Map<String, dynamic>>().toList();
         }
@@ -441,7 +446,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['jobs'] is List) {
           return (data['jobs'] as List).whereType<Map<String, dynamic>>().toList();
         } else if (data is List) {
@@ -512,7 +517,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['runs'] is List) {
           return (data['runs'] as List).whereType<Map<String, dynamic>>().toList();
         } else if (data is List) {
@@ -546,7 +551,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['cost'] is Map) {
           return data['cost'] as Map<String, dynamic>;
         } else if (data is Map<String, dynamic>) {
@@ -570,7 +575,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['tools'] is List) {
@@ -591,7 +596,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['bundles'] is List) {
           return (data['bundles'] as List).whereType<Map<String, dynamic>>().toList();
         } else if (data is List) {
@@ -612,7 +617,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 15));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['results'] is List) {
@@ -640,7 +645,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['entries'] is List) {
           return (data['entries'] as List).whereType<Map<String, dynamic>>().toList();
         } else if (data is List) {
@@ -661,7 +666,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['channels'] is List) {
@@ -690,7 +695,7 @@ class GatewayHttpClient {
         body: body,
       ).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['token'] != null) {
           final token = data['token'].toString();
           await GatewayConfig.setToken(token);
@@ -711,7 +716,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -725,7 +730,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -752,7 +757,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -793,7 +798,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['keys'] is List) {
           return (data['keys'] as List).map((e) => e.toString()).toList();
         }
@@ -853,7 +858,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['models'] is List) {
@@ -872,7 +877,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['sections'] is List) {
@@ -891,7 +896,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -905,7 +910,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['drifted'] is List) {
@@ -926,7 +931,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['canvases'] is List) {
@@ -945,7 +950,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -985,7 +990,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['history'] is List) {
@@ -1006,7 +1011,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['sops'] is List) {
@@ -1025,7 +1030,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1053,7 +1058,7 @@ class GatewayHttpClient {
       final body = jsonEncode(inputs ?? {});
       final res = await _client.post(uri, headers: headers, body: body).timeout(const Duration(seconds: 30));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1067,7 +1072,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['runs'] is List) {
@@ -1086,7 +1091,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['pending'] is List) {
@@ -1160,7 +1165,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers, body: jsonEncode(spec)).timeout(const Duration(seconds: 20));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1174,7 +1179,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers, body: jsonEncode(spec)).timeout(const Duration(seconds: 20));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1191,7 +1196,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1205,7 +1210,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers, body: jsonEncode(fields)).timeout(const Duration(seconds: 15));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1234,7 +1239,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['templates'] is List) {
@@ -1253,7 +1258,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['content'] != null) {
           return data['content'].toString();
         }
@@ -1287,7 +1292,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1316,7 +1321,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['devices'] is List) {
@@ -1379,7 +1384,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['skills'] is List) {
@@ -1412,7 +1417,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['body'] != null) {
           return data['body'].toString();
         }
@@ -1457,7 +1462,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.map((e) => e.toString()).toList();
         }
@@ -1474,7 +1479,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         }
@@ -1495,7 +1500,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['entries'] is List) {
@@ -1570,7 +1575,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['code'] != null) {
           return data['code'].toString();
         }
@@ -1588,7 +1593,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 5));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is Map && data['code'] != null) {
           return data['code'].toString();
         }
@@ -1608,7 +1613,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1635,7 +1640,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1649,7 +1654,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1689,7 +1694,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1703,7 +1708,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) return data;
         if (data is Map && data['items'] is List) return data['items'] as List;
       }
@@ -1735,7 +1740,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1749,7 +1754,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1778,7 +1783,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1792,7 +1797,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1821,7 +1826,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['tools'] is List) {
@@ -1840,7 +1845,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['sessions'] is List) {
@@ -1873,7 +1878,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers, body: jsonEncode(body)).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1889,7 +1894,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers, body: jsonEncode({'username': username})).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1916,7 +1921,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.post(uri, headers: headers, body: '{}').timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        return jsonDecode(res.body) as Map<String, dynamic>;
+        return _decodeBody(res) as Map<String, dynamic>;
       }
     } catch (_) {}
     return null;
@@ -1943,7 +1948,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         }
@@ -1975,7 +1980,7 @@ class GatewayHttpClient {
       final headers = await _authHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
+        final data = _decodeBody(res);
         if (data is List) {
           return data.whereType<Map<String, dynamic>>().toList();
         } else if (data is Map && data['plugins'] is List) {

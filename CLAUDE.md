@@ -1,7 +1,7 @@
 # CLAUDE.md — OmnesAgent Monorepo
 
 > **Core instructions live in [`AGENTS.md`](./AGENTS.md) and [`backend/AGENTS.md`](./backend/AGENTS.md).**
-> **UI style guidelines live in [`.gemini/style-guide.md`](./.gemini/style-guide.md).**
+> **UI style guidelines & dropdown standards live in [`DESIGN_SYSTEM.md`](./DESIGN_SYSTEM.md) and [`.gemini/style-guide.md`](./.gemini/style-guide.md).**
 
 ## Monorepo Architecture
 

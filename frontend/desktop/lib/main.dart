@@ -4,18 +4,40 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:omnes_shared/omnes_shared.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'features/desktop_shell.dart';
 import 'theme/desktop_theme.dart';
+import 'utils/desktop_backend_manager.dart';
 import 'utils/desktop_i18n.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await windowManager.ensureInitialized();
   await GetStorage.init();
   DesktopI18n.init();
   Get.put(DesktopThemeController());
 
+  // Automatically start backend gateway if not running
+  DesktopBackendManager.startBackendIfNeeded();
+
   runApp(const OmnesDesktopApp());
+
+  const windowOptions = WindowOptions(
+    size: Size(1360, 860),
+    minimumSize: Size(1024, 640),
+    center: true,
+    backgroundColor: Colors.transparent,
+    skipTaskbar: false,
+    titleBarStyle: TitleBarStyle.normal,
+    title: 'OmnesAgent Desktop ADE',
+  );
+
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
+    await windowManager.show();
+    await windowManager.focus();
+    await windowManager.setPreventClose(true);
+  });
 }
 
 class OmnesDesktopApp extends StatelessWidget {

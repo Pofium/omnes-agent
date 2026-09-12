@@ -8,6 +8,7 @@
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
+import 'package:get_storage/get_storage.dart';
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
 import 'sop_studio_controller.dart';
@@ -36,6 +37,27 @@ class _AutomationsViewState extends State<AutomationsView> {
   void initState() {
     super.initState();
     sopController = Get.put(SopStudioController());
+    _loadPersistedTasks();
+  }
+
+  void _loadPersistedTasks() {
+    try {
+      final saved = GetStorage().read<List>('scheduled_tasks');
+      if (saved != null) {
+        for (final item in saved) {
+          if (item is Map) {
+            scheduledTasks.add(Map<String, dynamic>.from(item));
+          }
+        }
+      }
+      isKeepAwakeEnabled = GetStorage().read<bool>('keep_awake_enabled') ?? true;
+    } catch (_) {}
+  }
+
+  void _saveScheduledTasks() {
+    try {
+      GetStorage().write('scheduled_tasks', scheduledTasks);
+    } catch (_) {}
   }
 
   void _showCreateTaskDialog({
@@ -170,6 +192,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                               'active': true,
                             });
                           });
+                          _saveScheduledTasks();
                           Navigator.of(ctx).pop();
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(
@@ -294,9 +317,9 @@ class _AutomationsViewState extends State<AutomationsView> {
                 const SizedBox(height: 14),
                 Row(
                   children: [
-                    _buildTabButton(0, '⚡ Студия SOP (Workflow Studio)', FontAwesomeIcons.diagramProject),
+                    _buildTabButton(0, 'Студия SOP (Workflow Studio)', FontAwesomeIcons.diagramProject),
                     const SizedBox(width: 8),
-                    _buildTabButton(1, '🕒 Задачи по расписанию (Cron)', FontAwesomeIcons.clock),
+                    _buildTabButton(1, 'Задачи по расписанию (Cron)', FontAwesomeIcons.clock),
                   ],
                 ),
               ],
@@ -1100,6 +1123,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                       icon: const Icon(Icons.delete_outline, size: 15, color: Color(0xFF64748B)),
                       onPressed: () {
                         setState(() => scheduledTasks.remove(t));
+                        _saveScheduledTasks();
                       },
                       padding: EdgeInsets.zero,
                       constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
@@ -1218,7 +1242,12 @@ class _AutomationsViewState extends State<AutomationsView> {
           ),
           Switch(
             value: isKeepAwakeEnabled,
-            onChanged: (val) => setState(() => isKeepAwakeEnabled = val),
+            onChanged: (val) {
+              setState(() => isKeepAwakeEnabled = val);
+              try {
+                GetStorage().write('keep_awake_enabled', val);
+              } catch (_) {}
+            },
             activeColor: const Color(0xFF00D2FF),
             activeTrackColor: const Color(0xFF00D2FF).withOpacity(0.3),
             inactiveThumbColor: const Color(0xFF64748B),

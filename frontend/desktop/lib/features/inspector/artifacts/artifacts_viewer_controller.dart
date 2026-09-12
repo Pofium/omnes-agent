@@ -32,7 +32,6 @@ class ArtifactsViewerController extends ChangeNotifier {
   StreamSubscription? _sseSub;
 
   ArtifactsViewerController({required this.httpClient}) {
-    _initSampleArtifacts();
     _subscribeSse();
   }
 
@@ -49,56 +48,22 @@ class ArtifactsViewerController extends ChangeNotifier {
     }
   }
 
-  void _initSampleArtifacts() {
-    _artifacts.addAll([
-      AgentArtifact(
-        id: '1',
-        name: 'task_workspace_controller.dart',
-        path: 'frontend/desktop/lib/features/workspace/task_workspace_controller.dart',
-        type: 'diff',
-        content: '''// Controller managing multi-session workspaces with real-time SSE & WebSocket.''',
-        diff: '''--- a/task_workspace_controller.dart
-+++ b/task_workspace_controller.dart
-@@ -105,6 +105,12 @@
-       // Start global SSE stream
-       GatewaySseClient.instance.connect();
-+      // Connect real-time WebSocket for active session
-+      _connectWebSocket(activeSessionId.value);
-+      // Add DOM selector chip to context
-+      addDomSelectorChip(selector);
-''',
-      ),
-      AgentArtifact(
-        id: '2',
-        name: 'architecture_diagram.svg',
-        path: 'docs/assets/architecture.svg',
-        type: 'svg',
-        content: '''<svg width="400" height="160" xmlns="http://www.w3.org/2000/svg">
-  <rect width="400" height="160" rx="10" fill="#0F172A" stroke="#00D2FF" stroke-width="2"/>
-  <text x="20" y="40" fill="#00D2FF" font-size="16" font-family="Consolas" font-weight="bold">OmnesAgent ADE Architecture</text>
-  <rect x="20" y="60" width="160" height="70" rx="6" fill="#1E293B" stroke="#334155"/>
-  <text x="35" y="95" fill="#F8FAFC" font-size="12" font-family="Consolas">Gateway :42617</text>
-  <text x="35" y="115" fill="#94A3B8" font-size="10" font-family="Consolas">REST &amp; WS Engine</text>
-  <path d="M 180 95 L 230 95" stroke="#00D2FF" stroke-width="2" marker-end="url(#arrow)"/>
-  <rect x="230" y="60" width="150" height="70" rx="6" fill="#1E293B" stroke="#00D2FF"/>
-  <text x="245" y="95" fill="#00D2FF" font-size="12" font-family="Consolas">Desktop ADE</text>
-  <text x="245" y="115" fill="#94A3B8" font-size="10" font-family="Consolas">Flutter + Edge WV2</text>
-</svg>''',
-      ),
-      AgentArtifact(
-        id: '3',
-        name: 'release_report.md',
-        path: 'reports/release_report.md',
-        type: 'markdown',
-        content: '''# OmnesAgent Release Verification Report
+  /// Removes a single artifact by index.
+  void removeArtifact(int index) {
+    if (index >= 0 && index < _artifacts.length) {
+      _artifacts.removeAt(index);
+      if (_selectedIndex >= _artifacts.length) {
+        _selectedIndex = (_artifacts.length - 1).clamp(0, 9999);
+      }
+      notifyListeners();
+    }
+  }
 
-## Status Summary
-- **Gateway Health**: 100% Operational (Port 42617)
-- **Active Protocols**: WebSocket Chat, A2UI Canvas, SSE Stream
-- **UI Architecture**: Cyber-ADE Theme, Adaptive Light Mode
-''',
-      ),
-    ]);
+  /// Clears all artifacts.
+  void clearArtifacts() {
+    _artifacts.clear();
+    _selectedIndex = 0;
+    notifyListeners();
   }
 
   void _subscribeSse() {

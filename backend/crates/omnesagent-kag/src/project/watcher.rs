@@ -54,11 +54,10 @@ impl ProjectWatcher {
     /// Начать наблюдение за проектом. Если уже наблюдался другой проект, старый останавливается.
     pub async fn switch_project(&self, project_id: &str, root_path: &Path) -> anyhow::Result<()> {
         let mut cur = self.current_watch.lock().await;
-        if let Some((cur_id, cur_path, _)) = cur.as_ref() {
-            if cur_id == project_id && cur_path == root_path {
+        if let Some((cur_id, cur_path, _)) = cur.as_ref()
+            && cur_id == project_id && cur_path == root_path {
                 return Ok(());
             }
-        }
 
         if let Some((old_id, _, stop_tx)) = cur.take() {
             let _ = stop_tx.send(());

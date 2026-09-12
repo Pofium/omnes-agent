@@ -183,17 +183,15 @@ pub fn schema_version(conn: &Connection) -> i64 {
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     let query = format!("PRAGMA table_info({})", table);
-    if let Ok(mut stmt) = conn.prepare(&query) {
-        if let Ok(mut rows) = stmt.query([]) {
+    if let Ok(mut stmt) = conn.prepare(&query)
+        && let Ok(mut rows) = stmt.query([]) {
             while let Ok(Some(row)) = rows.next() {
-                if let Ok(name) = row.get::<_, String>(1) {
-                    if name.eq_ignore_ascii_case(column) {
+                if let Ok(name) = row.get::<_, String>(1)
+                    && name.eq_ignore_ascii_case(column) {
                         return true;
                     }
-                }
             }
         }
-    }
     false
 }
 

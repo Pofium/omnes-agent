@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:get_storage/get_storage.dart';
+import 'package:http/http.dart' as http;
 import 'package:omnes_shared/omnes_shared.dart';
 
 /// Message in the isolated Side Chat session.
@@ -61,17 +64,90 @@ class SideChatController extends ChangeNotifier {
   }
 
   Future<String> _queryIsolatedResponse(String query) async {
-    // Check if query starts with slash commands
-    if (query.startsWith('/explain')) {
-      return 'Объяснение фрагмента: Выбранный код использует реактивные потоки SSE и изолированное управление состоянием GetX/ChangeNotifier для нулевой нагрузки на основную память.';
-    } else if (query.startsWith('/test')) {
-      return 'Сгенерированный юнит-тест:\n```dart\ntest("Side chat isolated test", () async {\n  final controller = SideChatController(httpClient: mockClient);\n  await controller.sendMessage("ping");\n  expect(controller.messages.length, greaterThan(1));\n});\n```';
-    } else if (query.startsWith('/refactor')) {
-      return 'Рекомендация по рефакторингу: Вынесите обработку событий в отдельный сервис или расширьте класс через Extension Methods для повышения модульности.';
-    }
+    try {
+      final storage = GetStorage();
+      final activeProvId = storage.read<String>('selected_active_provider') ?? 'deepseek';
+      final activeModel = storage.read<String>('selected_active_model') ?? 'deepseek-chat';
 
-    // Default fast answer for /btw side questions
-    return 'Ответ на вопрос "$query":\nКонтекст задачи сохранён в изоляции. Шлюз OmnesAgent (порт 42617) обработал запрос без увеличения счетчика токенов основного пайплайна.';
+      String key = (storage.read<String>('provider_key_$activeProvId') ?? '').trim();
+      String url = (storage.read<String>('provider_url_$activeProvId') ?? '').trim();
+
+      if (key.isEmpty) {
+        final savedCustom = storage.read<List>('custom_providers_registry') ?? [];
+        for (final item in savedCustom) {
+          if (item is Map && item['id'] == activeProvId) {
+            key = (item['key']?.toString() ?? '').trim();
+            if (url.isEmpty) url = (item['url']?.toString() ?? '').trim();
+          }
+        }
+      }
+
+      if (url.isEmpty) {
+        if (activeProvId == 'deepseek') {
+          url = 'https://api.deepseek.com/v1';
+        } else if (activeProvId == 'openai') {
+          url = 'https://api.openai.com/v1';
+        } else if (activeProvId == 'ollama') {
+          url = 'http://localhost:11434/v1';
+        } else {
+          url = 'https://api.deepseek.com/v1';
+        }
+      }
+
+      if (key.isEmpty && activeProvId != 'ollama') {
+        return 'Ответ на вопрос "$query":\nПровайдер не настроен. Укажите API ключ в настройках для получения ответов в Side Chat.';
+      }
+
+      final sanitizedBase = url.endsWith('/') ? url.substring(0, url.length - 1) : url;
+      final endpoint = sanitizedBase.endsWith('/chat/completions') ? sanitizedBase : '$sanitizedBase/chat/completions';
+
+      final history = <Map<String, String>>[
+        {
+          'role': 'system',
+          'content': 'Ты — изолированный Side Chat в OmnesAgent. Отвечай кратко, ёмко, по существу на русском языке. Ответ должен быть лаконичным.',
+        },
+      ];
+
+      for (final m in _messages.take(6)) {
+        history.add({
+          'role': m.isUser ? 'user' : 'assistant',
+          'content': m.text,
+        });
+      }
+
+      final resp = await http.post(
+        Uri.parse(endpoint),
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          if (key.isNotEmpty) 'Authorization': 'Bearer $key',
+        },
+        body: jsonEncode({
+          'model': activeModel.isNotEmpty ? activeModel : 'default',
+          'messages': history,
+          'stream': false,
+        }),
+      ).timeout(const Duration(seconds: 15));
+
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(resp.bodyBytes));
+        final content = data['choices']?[0]?['message']?['content']?.toString() ?? '';
+        return content.replaceAll(RegExp(r'<think>[\s\S]*?</think>'), '').trim();
+      } else {
+        return 'Ошибка шлюза (${resp.statusCode}): ${resp.body}';
+      }
+    } catch (e) {
+      return 'Не удалось связаться с моделью: $e';
+    }
+  }
+
+  /// Adds a branch context message from the main chat.
+  void addBranchContext(String contextText) {
+    final snippet = contextText.length > 300 ? '${contextText.substring(0, 300)}...' : contextText;
+    _messages.add(SideChatMessage(
+      text: 'Ветка ответа ассистента:\n"$snippet"\n\nКонтекст перенесен в Side Chat. Задайте вопрос или команду по этой ветке.',
+      isUser: false,
+    ));
+    notifyListeners();
   }
 
   /// Clears side chat history.

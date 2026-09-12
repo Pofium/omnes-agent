@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
+import 'package:get_storage/get_storage.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
@@ -27,6 +28,26 @@ class UserProfileData {
 
   String get fullName => '$firstName $lastName'.trim();
   String get initials => '${firstName.isNotEmpty ? firstName[0] : ''}${lastName.isNotEmpty ? lastName[0] : ''}'.toUpperCase();
+
+  Map<String, dynamic> toJson() => {
+    'firstName': firstName,
+    'lastName': lastName,
+    'role': role,
+    'primaryStack': primaryStack,
+    'autonomyStyle': autonomyStyle,
+    'language': language,
+    'enableAstMemory': enableAstMemory,
+  };
+
+  factory UserProfileData.fromJson(Map<String, dynamic> json) => UserProfileData(
+    firstName: json['firstName'] as String? ?? 'Илья',
+    lastName: json['lastName'] as String? ?? 'Пресняков',
+    role: json['role'] as String? ?? 'Tech Lead / AI Engineer',
+    primaryStack: json['primaryStack'] as String? ?? 'Rust / Dart / Python',
+    autonomyStyle: json['autonomyStyle'] as String? ?? 'Full access (максимальная автономность)',
+    language: json['language'] as String? ?? 'Русский',
+    enableAstMemory: json['enableAstMemory'] as bool? ?? true,
+  );
 }
 
 class UserOnboardingDialog extends StatefulWidget {
@@ -144,6 +165,9 @@ class _UserOnboardingDialogState extends State<UserOnboardingDialog> {
       enableAstMemory: enableAstMemory,
     );
     widget.onSave(updated);
+    try {
+      GetStorage().write('user_profile', updated.toJson());
+    } catch (_) {}
 
     // Sync profile to gateway memory & quickstart in background
     try {

@@ -156,8 +156,8 @@ impl GraphService {
         }
 
         // 2. Векторный скоринг
-        if let Ok(q_embs) = self.embedder.embed(&[query.to_string()]).await {
-            if let Some(q_vec) = q_embs.first() {
+        if let Ok(q_embs) = self.embedder.embed(&[query.to_string()]).await
+            && let Some(q_vec) = q_embs.first() {
                 let candidates = {
                     let conn = self.conn.lock();
                     let mut stmt = conn.prepare(
@@ -191,7 +191,6 @@ impl GraphService {
                     *entry += (vscore as f64) * 10.0;
                 }
             }
-        }
 
         let mut sorted_ids: Vec<i64> = scored.keys().copied().collect();
         sorted_ids.sort_by(|a, b| scored[b].partial_cmp(&scored[a]).unwrap_or(std::cmp::Ordering::Equal));
@@ -279,8 +278,8 @@ impl GraphService {
             let conn = self.conn.lock();
             for edge in &edges {
                 for nid in [edge.source_id, edge.target_id] {
-                    if !nodes_map.contains_key(&nid) {
-                        if let Ok(neighbor) = conn.query_row(
+                    if !nodes_map.contains_key(&nid)
+                        && let Ok(neighbor) = conn.query_row(
                             r#"
                             SELECT id, node_id, label, node_type, description, val, file_path, provenance, confidence, is_god_node 
                             FROM graph_nodes 
@@ -304,7 +303,6 @@ impl GraphService {
                         ) {
                             nodes_map.insert(nid, neighbor);
                         }
-                    }
                 }
             }
         }

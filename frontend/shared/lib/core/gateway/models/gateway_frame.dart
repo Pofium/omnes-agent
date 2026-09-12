@@ -51,6 +51,13 @@ sealed class GatewayFrame {
           message: json['message'] as String? ?? json['error'] as String? ?? 'Unknown error',
           code: json['code'] as String?,
         );
+      case 'approval_request':
+        return ApprovalRequestFrame(
+          requestId: json['request_id'] as String? ?? '',
+          toolName: (json['tool'] ?? json['tool_name']) as String? ?? 'tool',
+          argumentsSummary: json['arguments_summary'] as String? ?? json['arguments']?.toString() ?? '',
+          timeoutSecs: json['timeout_secs'] as int?,
+        );
       case 'session_start':
       case 'connected':
         return ConnectedFrame(
@@ -135,4 +142,19 @@ class ConnectedFrame extends GatewayFrame {
 class UnknownFrame extends GatewayFrame {
   final Map<String, dynamic> raw;
   const UnknownFrame(super.type, this.raw);
+}
+
+/// A human-in-the-loop approval request for tool execution.
+class ApprovalRequestFrame extends GatewayFrame {
+  final String requestId;
+  final String toolName;
+  final String argumentsSummary;
+  final int? timeoutSecs;
+
+  const ApprovalRequestFrame({
+    required this.requestId,
+    required this.toolName,
+    required this.argumentsSummary,
+    this.timeoutSecs,
+  }) : super('approval_request');
 }

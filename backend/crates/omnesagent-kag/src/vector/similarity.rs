@@ -11,7 +11,7 @@ pub fn serialize(vec: &[f32]) -> Vec<u8> {
 
 /// Десериализация бинарного BLOB в вектор f32.
 pub fn deserialize(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.is_empty() || blob.len() % 4 != 0 {
+    if blob.is_empty() || !blob.len().is_multiple_of(4) {
         return None;
     }
     let floats: Vec<f32> = blob
@@ -64,16 +64,14 @@ pub fn top_k(
     let mut scored: Vec<(i64, f32)> = Vec::new();
 
     for &(id, blob_opt) in candidates {
-        if let Some(blob) = blob_opt {
-            if let Some(vec) = deserialize(blob) {
-                if vec.len() == query.len() {
+        if let Some(blob) = blob_opt
+            && let Some(vec) = deserialize(blob)
+                && vec.len() == query.len() {
                     let score = cosine(query, &vec);
                     if score >= min_score {
                         scored.push((id, score));
                     }
                 }
-            }
-        }
     }
 
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

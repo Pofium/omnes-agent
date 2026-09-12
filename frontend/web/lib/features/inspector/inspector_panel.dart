@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -13,14 +14,18 @@ import 'artifacts/diff_viewer_widget.dart';
 import 'side_chat/side_chat_controller.dart';
 
 class DesktopInspectorPanel extends StatefulWidget {
+  final double width;
   final DesktopTaskWorkspaceController controller;
   final int initialTabIndex;
+  final String? initialSideChatText;
   final VoidCallback? onClose;
 
   const DesktopInspectorPanel({
     super.key,
+    this.width = 420.0,
     required this.controller,
     this.initialTabIndex = 0,
+    this.initialSideChatText,
     this.onClose,
   });
 
@@ -65,7 +70,10 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   final sideChatController = TextEditingController();
   late final SideChatController sideChatLogicController;
 
-  bool showTabChooser = false;
+  bool showTabChooser = true;
+  final List<String> openTabKeys = [];
+  String activeTabKey = '';
+  bool isCanvasRawMode = false;
 
   @override
   void initState() {
@@ -96,14 +104,47 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
     // Initialize Artifacts & Side Chat
     artifactsController = ArtifactsViewerController(httpClient: httpClient);
     sideChatLogicController = SideChatController(httpClient: httpClient);
+    if (widget.initialSideChatText != null && widget.initialSideChatText!.trim().isNotEmpty) {
+      sideChatLogicController.addBranchContext(widget.initialSideChatText!);
+    }
 
-    final effectiveIndex = widget.initialTabIndex < 0 ? 0 : widget.initialTabIndex.clamp(0, 4);
-    showTabChooser = widget.initialTabIndex < 0;
+    if (widget.initialTabIndex == 5) {
+      if (!openTabKeys.contains('file')) openTabKeys.add('file');
+      activeTabKey = 'file';
+      showTabChooser = false;
+    } else if (widget.initialTabIndex >= 0 && widget.initialTabIndex < 5) {
+      final defaultKeys = ['browser', 'terminal', 'canvas', 'preview', 'side_chat'];
+      final targetKey = defaultKeys[widget.initialTabIndex];
+      if (!openTabKeys.contains(targetKey)) openTabKeys.add(targetKey);
+      activeTabKey = targetKey;
+      showTabChooser = false;
+    } else {
+      showTabChooser = true;
+    }
     tabController = TabController(
       length: 5,
       vsync: this,
-      initialIndex: effectiveIndex,
+      initialIndex: 0,
     );
+  }
+
+  @override
+  void didUpdateWidget(DesktopInspectorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.initialTabIndex != oldWidget.initialTabIndex) {
+      if (widget.initialTabIndex == 5) {
+        if (!openTabKeys.contains('file')) openTabKeys.add('file');
+        activeTabKey = 'file';
+        showTabChooser = false;
+      } else if (widget.initialTabIndex >= 0 && widget.initialTabIndex < 5) {
+        final defaultKeys = ['browser', 'terminal', 'canvas', 'preview', 'side_chat'];
+        final targetKey = defaultKeys[widget.initialTabIndex];
+        if (!openTabKeys.contains(targetKey)) openTabKeys.add(targetKey);
+        activeTabKey = targetKey;
+        showTabChooser = false;
+      }
+      setState(() {});
+    }
   }
 
   Future<void> _initCanvas() async {
@@ -155,7 +196,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 460,
+      width: widget.width,
       decoration: BoxDecoration(
         color: DesktopTheme.bgSidebar,
         border: Border(
@@ -164,7 +205,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       ),
       child: Column(
         children: [
-          // Inspector Header with 4 ADE Tabs and Close button
+          // Inspector Header with dynamic lazy tabs and close [x] buttons
           Container(
             height: 44,
             decoration: BoxDecoration(
@@ -176,41 +217,16 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
             child: Row(
               children: [
                 Expanded(
-                  child: TabBar(
-                    controller: tabController,
-                    labelColor: DesktopTheme.accentSky,
-                    unselectedLabelColor: DesktopTheme.textMuted,
-                    indicatorColor: DesktopTheme.accentSky,
-                    indicatorWeight: 2.5,
-                    indicatorSize: TabBarIndicatorSize.tab,
-                    labelStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
-                    tabs: const [
-                      Tab(
-                        iconMargin: EdgeInsets.only(bottom: 2),
-                        icon: Icon(FontAwesomeIcons.globe, size: 13),
-                        text: 'Live Browser',
-                      ),
-                      Tab(
-                        iconMargin: EdgeInsets.only(bottom: 2),
-                        icon: Icon(FontAwesomeIcons.terminal, size: 13),
-                        text: 'Terminal',
-                      ),
-                      Tab(
-                        iconMargin: EdgeInsets.only(bottom: 2),
-                        icon: Icon(FontAwesomeIcons.wandMagicSparkles, size: 13),
-                        text: 'Canvas',
-                      ),
-                      Tab(
-                        iconMargin: EdgeInsets.only(bottom: 2),
-                        icon: Icon(FontAwesomeIcons.eye, size: 13),
-                        text: 'Preview',
-                      ),
-                      Tab(
-                        iconMargin: EdgeInsets.only(bottom: 2),
-                        icon: Icon(FontAwesomeIcons.comments, size: 13),
-                        text: 'Side Chat',
-                      ),
-                    ],
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const SizedBox(width: 8),
+                        for (final tabKey in openTabKeys)
+                          _buildInspectorTabHeader(tabKey),
+                      ],
+                    ),
                   ),
                 ),
                 IconButton(
@@ -230,22 +246,219 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
 
           // Tab Views or Open Tab Chooser
           Expanded(
-            child: showTabChooser
+            child: (showTabChooser || openTabKeys.isEmpty)
                 ? _buildOpenTabChooser()
-                : TabBarView(
-                    controller: tabController,
-                    children: [
-                      _buildLiveBrowserTab(),
-                      _buildTerminalTab(),
-                      _buildCanvasTab(),
-                      _buildPreviewTab(),
-                      _buildSideChatTab(),
-                    ],
-                  ),
+                : _buildActiveTabContent(),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildActiveTabContent() {
+    switch (activeTabKey) {
+      case 'browser':
+        return _buildLiveBrowserTab();
+      case 'terminal':
+        return _buildTerminalTab();
+      case 'canvas':
+        return _buildCanvasTab();
+      case 'preview':
+        return _buildPreviewTab();
+      case 'side_chat':
+        return _buildSideChatTab();
+      case 'file':
+        return _buildFileViewerTab();
+      default:
+        return _buildOpenTabChooser();
+    }
+  }
+
+  Widget _buildInspectorTabHeader(String tabKey) {
+    final isSelected = activeTabKey == tabKey && !showTabChooser;
+    final (label, icon) = _getTabMeta(tabKey);
+
+    return InkWell(
+      onTap: () {
+        setState(() {
+          activeTabKey = tabKey;
+          showTabChooser = false;
+        });
+      },
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        height: 32,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        margin: const EdgeInsets.only(right: 4),
+        decoration: BoxDecoration(
+          color: isSelected ? DesktopTheme.bgSurfaceElevated : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: isSelected ? DesktopTheme.borderSubtle : Colors.transparent,
+            width: 0.8,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 12,
+              color: isSelected ? DesktopTheme.accentSky : DesktopTheme.textMuted,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                color: isSelected ? DesktopTheme.textPrimary : DesktopTheme.textMuted,
+              ),
+            ),
+            const SizedBox(width: 6),
+            InkWell(
+              onTap: () {
+                setState(() {
+                  openTabKeys.remove(tabKey);
+                  if (activeTabKey == tabKey) {
+                    if (openTabKeys.isNotEmpty) {
+                      activeTabKey = openTabKeys.last;
+                    } else {
+                      showTabChooser = true;
+                    }
+                  }
+                });
+              },
+              borderRadius: BorderRadius.circular(3),
+              child: Padding(
+                padding: const EdgeInsets.all(2),
+                child: Icon(
+                  Icons.close,
+                  size: 11,
+                  color: isSelected ? DesktopTheme.textSecondary : DesktopTheme.textMuted,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  (String, IconData) _getTabMeta(String key) {
+    switch (key) {
+      case 'browser':
+        return ('Браузер', FontAwesomeIcons.globe);
+      case 'terminal':
+        return ('Терминал', FontAwesomeIcons.terminal);
+      case 'canvas':
+        return ('Холст', FontAwesomeIcons.wandMagicSparkles);
+      case 'preview':
+        return ('Превью', FontAwesomeIcons.eye);
+      case 'side_chat':
+        return ('Боковой чат', FontAwesomeIcons.comments);
+      case 'file':
+        final path = widget.controller.selectedFilePath.value;
+        final name = path != null ? path.split(RegExp(r'[\\/]')).last : 'Файл';
+        return (name, Icons.code);
+      default:
+        return (key, Icons.tab);
+    }
+  }
+
+  Widget _buildFileViewerTab() {
+    return Obx(() {
+      final path = widget.controller.selectedFilePath.value;
+      final content = widget.controller.selectedFileContent.value;
+      if (path == null || content == null) {
+        return Center(
+          child: Text(
+            'Файл не выбран\nВыберите файл в дереве проекта',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: DesktopTheme.textMuted, fontSize: 13),
+          ),
+        );
+      }
+
+      final lines = content.split('\n');
+
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // File Breadcrumb Bar
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurface,
+              border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 0.8)),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.insert_drive_file_outlined, size: 14, color: DesktopTheme.accentSky),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    path,
+                    style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textSecondary),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Text(
+                  '${lines.length} строк',
+                  style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted),
+                ),
+              ],
+            ),
+          ),
+
+          // Code Viewer with line numbers
+          Expanded(
+            child: Container(
+              color: DesktopTheme.bgCanvas,
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Line numbers
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        for (int i = 1; i <= lines.length; i++)
+                          Text(
+                            '$i ',
+                            style: const TextStyle(
+                              fontFamily: 'Consolas',
+                              fontSize: 11,
+                              color: Color(0xFF64748B),
+                              height: 1.4,
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(width: 12),
+                    Container(width: 1, height: lines.length * 15.4, color: DesktopTheme.borderSubtle),
+                    const SizedBox(width: 12),
+                    // Code content
+                    Expanded(
+                      child: SelectableText(
+                        content,
+                        style: TextStyle(
+                          fontFamily: 'Consolas',
+                          fontSize: 11,
+                          color: DesktopTheme.textPrimary,
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
+    });
   }
 
   // ==========================================
@@ -253,82 +466,108 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   // ==========================================
   Widget _buildOpenTabChooser() {
     return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 36),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             const Text(
-              'Open tab',
+              'Выбор вкладки',
               style: TextStyle(
-                fontSize: 22,
+                fontSize: 20,
                 fontWeight: FontWeight.bold,
                 color: Colors.white,
               ),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 6),
             const Text(
-              'Choose a tab to open in the side pane.',
+              'Выберите инструмент для открытия в правой панели:',
+              textAlign: TextAlign.center,
               style: TextStyle(
-                fontSize: 13,
+                fontSize: 12,
                 color: Color(0xFF94A3B8),
               ),
             ),
-            const SizedBox(height: 32),
+            const SizedBox(height: 24),
             _buildChooserCard(
               icon: Icons.chat_bubble_outline,
-              label: 'Side conversation',
+              label: 'Боковой чат',
+              subtitle: 'Ветки диалога и контекстные уточнения',
               onTap: () {
                 setState(() {
+                  if (!openTabKeys.contains('side_chat')) openTabKeys.add('side_chat');
+                  activeTabKey = 'side_chat';
                   showTabChooser = false;
-                  tabController.animateTo(4); // Side Chat
                 });
               },
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             _buildChooserCard(
               icon: Icons.assignment_outlined,
-              label: 'Review & Diff',
+              label: 'Превью и Диффы',
+              subtitle: 'Просмотр артефактов и изменений кода',
               onTap: () {
                 setState(() {
+                  if (!openTabKeys.contains('preview')) openTabKeys.add('preview');
+                  activeTabKey = 'preview';
                   showTabChooser = false;
-                  tabController.animateTo(3); // Preview / Review
                 });
               },
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             _buildChooserCard(
               icon: FontAwesomeIcons.wandMagicSparkles,
-              label: 'Live Canvas (A2UI)',
+              label: 'Интерактивный Холст',
+              subtitle: 'Рендеринг Markdown, HTML и интерфейсов',
               onTap: () {
                 setState(() {
+                  if (!openTabKeys.contains('canvas')) openTabKeys.add('canvas');
+                  activeTabKey = 'canvas';
                   showTabChooser = false;
-                  tabController.animateTo(2); // Canvas
                 });
               },
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             _buildChooserCard(
               icon: FontAwesomeIcons.terminal,
-              label: 'Terminal',
+              label: 'Терминал',
+              subtitle: 'Встроенная системная консоль PowerShell',
               onTap: () {
                 setState(() {
+                  if (!openTabKeys.contains('terminal')) openTabKeys.add('terminal');
+                  activeTabKey = 'terminal';
                   showTabChooser = false;
-                  tabController.animateTo(1); // Terminal
                 });
               },
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             _buildChooserCard(
               icon: FontAwesomeIcons.globe,
-              label: 'Browser',
+              label: 'Браузер',
+              subtitle: 'Живой предпросмотр веб-страниц и инспекция DOM',
               onTap: () {
                 setState(() {
+                  if (!openTabKeys.contains('browser')) openTabKeys.add('browser');
+                  activeTabKey = 'browser';
                   showTabChooser = false;
-                  tabController.animateTo(0); // Browser
                 });
               },
             ),
+            if (widget.controller.selectedFilePath.value != null) ...[
+              const SizedBox(height: 10),
+              _buildChooserCard(
+                icon: Icons.code,
+                label: 'Файл: ${widget.controller.selectedFilePath.value!.split(RegExp(r"[\\/]")).last}',
+                subtitle: widget.controller.selectedFilePath.value!,
+                onTap: () {
+                  setState(() {
+                    if (!openTabKeys.contains('file')) openTabKeys.add('file');
+                    activeTabKey = 'file';
+                    showTabChooser = false;
+                  });
+                },
+              ),
+            ],
           ],
         ),
       ),
@@ -338,6 +577,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   Widget _buildChooserCard({
     required IconData icon,
     required String label,
+    String? subtitle,
     required VoidCallback onTap,
   }) {
     return InkWell(
@@ -345,24 +585,51 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       borderRadius: BorderRadius.circular(8),
       child: Container(
         width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
         decoration: BoxDecoration(
-          color: const Color(0xFF1E222A),
+          color: const Color(0xFF161A22),
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: const Color(0xFF2B3240)),
+          border: Border.all(color: const Color(0xFF2B3240), width: 0.8),
         ),
         child: Row(
           children: [
-            Icon(icon, size: 16, color: const Color(0xFF94A3B8)),
-            const SizedBox(width: 14),
-            Text(
-              label,
-              style: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-                color: Colors.white,
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0F131A),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Icon(icon, size: 15, color: const Color(0xFF00D2FF)),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                  ),
+                  if (subtitle != null) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        fontSize: 10.5,
+                        color: Color(0xFF94A3B8),
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ],
               ),
             ),
+            const Icon(Icons.chevron_right, size: 16, color: Color(0xFF64748B)),
           ],
         ),
       ),
@@ -534,8 +801,8 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                               const SizedBox(width: 6),
                               Text(
                                 (isPickerActive || isElementPickerActive)
-                                    ? 'Element Picker Active'
-                                    : 'Pick Element',
+                                    ? 'Выбор элемента активен'
+                                    : 'Выбрать элемент',
                                 style: TextStyle(
                                   fontSize: 11,
                                   fontWeight: FontWeight.bold,
@@ -647,7 +914,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                               const Icon(Icons.check_circle, size: 13, color: DesktopTheme.accentSky),
                               const SizedBox(width: 6),
                               Text(
-                                'Element Selected:',
+                                'Выбранный элемент:',
                                 style: TextStyle(
                                   fontSize: 11,
                                   fontWeight: FontWeight.bold,
@@ -693,7 +960,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                         );
                       },
                       icon: const Icon(Icons.add, size: 14),
-                      label: const Text('Add to Composer', style: TextStyle(fontSize: 11)),
+                      label: const Text('Добавить в чат', style: TextStyle(fontSize: 11)),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: DesktopTheme.accentSky,
                         foregroundColor: const Color(0xFF090D12),
@@ -948,11 +1215,18 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   }
 
   // ==========================================
-  // TAB 3: LIVE CANVAS (A2UI & Artifacts)
+  // TAB 3: LIVE CANVAS (Markdown & Artifacts)
   // ==========================================
   Widget _buildCanvasTab() {
     final frame = currentCanvasFrame;
     final isWsConnected = canvasWsClient?.isConnected == true;
+    final selectedFile = widget.controller.selectedFilePath.value;
+    final isMarkdownFile = selectedFile != null && selectedFile.toLowerCase().endsWith('.md');
+    final selectedContent = widget.controller.selectedFileContent.value;
+
+    final String? markdownToRender = isMarkdownFile && selectedContent != null && selectedContent.isNotEmpty
+        ? selectedContent
+        : (frame?.contentType == 'markdown' ? frame?.content : null);
 
     return Container(
       color: DesktopTheme.bgCanvas,
@@ -971,13 +1245,15 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                   width: 8,
                   height: 8,
                   decoration: BoxDecoration(
-                    color: isWsConnected ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                    color: isWsConnected ? const Color(0xFF10B981) : const Color(0xFF00D2FF),
                     shape: BoxShape.circle,
                   ),
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  'Canvas: $activeCanvasId',
+                  selectedFile != null
+                      ? 'Холст: ${selectedFile.replaceAll(r'\', '/').split('/').last}'
+                      : 'Холст: $activeCanvasId',
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.bold,
@@ -985,31 +1261,58 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                     color: DesktopTheme.textPrimary,
                   ),
                 ),
-                if (frame != null) ...[
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: DesktopTheme.accentCyan.withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Text(
-                      '${frame.contentType} v${frame.version}',
-                      style: const TextStyle(fontSize: 10, fontFamily: 'Consolas', color: DesktopTheme.accentCyan),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.accentCyan.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    isMarkdownFile ? 'Markdown документ' : '${frame?.contentType ?? "interactive"} v${frame?.version ?? 1}',
+                    style: const TextStyle(fontSize: 10, fontFamily: 'Consolas', color: DesktopTheme.accentCyan),
+                  ),
+                ),
+                const Spacer(),
+                if (markdownToRender != null)
+                  InkWell(
+                    onTap: () => setState(() => isCanvasRawMode = !isCanvasRawMode),
+                    borderRadius: BorderRadius.circular(4),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      margin: const EdgeInsets.only(right: 6),
+                      decoration: BoxDecoration(
+                        color: isCanvasRawMode ? DesktopTheme.accentCyan.withOpacity(0.2) : DesktopTheme.bgSurfaceElevated,
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(color: DesktopTheme.borderSubtle),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(isCanvasRawMode ? Icons.code : Icons.visibility, size: 11, color: DesktopTheme.accentCyan),
+                          const SizedBox(width: 4),
+                          Text(
+                            isCanvasRawMode ? 'Исходник' : 'Предпросмотр',
+                            style: TextStyle(fontSize: 10, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ],
-                const Spacer(),
                 IconButton(
                   icon: const Icon(Icons.refresh, size: 14),
                   color: DesktopTheme.textMuted,
                   tooltip: 'Обновить холст',
                   onPressed: () async {
-                    final res = await httpClient.getCanvas(activeCanvasId);
-                    if (res != null && res['frame'] != null && mounted) {
-                      setState(() {
-                        currentCanvasFrame = CanvasFrame.fromJson(res['frame'] as Map<String, dynamic>);
-                      });
+                    if (isMarkdownFile) {
+                      widget.controller.openProjectFile(selectedFile);
+                    } else {
+                      final res = await httpClient.getCanvas(activeCanvasId);
+                      if (res != null && res['frame'] != null && mounted) {
+                        setState(() {
+                          currentCanvasFrame = CanvasFrame.fromJson(res['frame'] as Map<String, dynamic>);
+                        });
+                      }
                     }
                   },
                 ),
@@ -1018,8 +1321,16 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                   color: DesktopTheme.textMuted,
                   tooltip: 'Очистить холст',
                   onPressed: () async {
-                    await httpClient.clearCanvas(activeCanvasId);
-                    if (mounted) setState(() => currentCanvasFrame = null);
+                    widget.controller.selectedFilePath.value = null;
+                    widget.controller.selectedFileContent.value = null;
+                    if (mounted) {
+                      setState(() {
+                        currentCanvasFrame = null;
+                      });
+                    }
+                    try {
+                      await httpClient.clearCanvas(activeCanvasId);
+                    } catch (_) {}
                   },
                 ),
               ],
@@ -1028,122 +1339,487 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
 
           // Canvas Content View
           Expanded(
-            child: frame == null
-                ? Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(FontAwesomeIcons.wandMagicSparkles, size: 36, color: DesktopTheme.accentCyan.withOpacity(0.6)),
-                          const SizedBox(height: 14),
-                          Text(
-                            'Live Canvas пуст',
-                            style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            'Агент может транслировать сюда интерактивные A2UI формы, графики, HTML и диаграммы через /ws/canvas.',
-                            textAlign: TextAlign.center,
-                            style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
-                          ),
-                          const SizedBox(height: 20),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              OutlinedButton.icon(
-                                icon: const Icon(FontAwesomeIcons.code, size: 11),
-                                label: const Text('Демо HTML формы', style: TextStyle(fontSize: 11)),
-                                onPressed: () async {
-                                  await httpClient.postCanvas(activeCanvasId, {
-                                    'content_type': 'html',
-                                    'content': '<form class="omnes-a2ui"><label>Параметры деплоя:</label><input type="text" value="v1.0.0-rc2" /><button>Подтвердить</button></form>',
-                                  });
-                                },
-                              ),
-                              OutlinedButton.icon(
-                                icon: const Icon(FontAwesomeIcons.diagramProject, size: 11),
-                                label: const Text('Демо Mermaid схемы', style: TextStyle(fontSize: 11)),
-                                onPressed: () async {
-                                  await httpClient.postCanvas(activeCanvasId, {
-                                    'content_type': 'markdown',
-                                    'content': '```mermaid\ngraph LR\nClient[Omnes Desktop ADE] -->|WS/chat| Gateway\nGateway --> Runtime\nGateway --> Canvas\n```',
-                                  });
-                                },
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  )
-                : SingleChildScrollView(
-                    padding: const EdgeInsets.all(16),
-                    child: Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: DesktopTheme.bgSurfaceElevated,
-                        borderRadius: BorderRadius.circular(10),
-                        border: Border.all(color: DesktopTheme.borderSubtle),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Icon(
-                                frame.contentType == 'html' ? FontAwesomeIcons.code : FontAwesomeIcons.diagramProject,
-                                size: 14,
-                                color: DesktopTheme.accentCyan,
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                'A2UI Live Artifact (${frame.contentType})',
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.bold,
-                                  color: DesktopTheme.textPrimary,
-                                ),
-                              ),
-                            ],
-                          ),
-                          const Divider(height: 20),
-                          SelectableText(
-                            frame.content,
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontFamily: 'Consolas',
-                              color: DesktopTheme.textPrimary,
-                              height: 1.45,
-                            ),
-                          ),
-                          const SizedBox(height: 16),
-                          Row(
-                            children: [
-                              ElevatedButton.icon(
-                                icon: const Icon(Icons.touch_app, size: 13),
-                                label: const Text('Отправить действие (Action callback)', style: TextStyle(fontSize: 11)),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: DesktopTheme.accentCyan,
-                                  foregroundColor: Colors.black,
-                                ),
-                                onPressed: () {
-                                  canvasWsClient?.sendAction('submit', {'canvas_id': activeCanvasId});
-                                  Get.snackbar('Canvas Action', 'Действие отправлено в шлюз через WS');
-                                },
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+            child: _buildCanvasContent(markdownToRender, selectedFile, selectedContent, frame),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildCanvasContent(
+    String? markdownToRender,
+    String? selectedFile,
+    String? selectedContent,
+    CanvasFrame? frame,
+  ) {
+    if (markdownToRender != null) {
+      if (isCanvasRawMode) {
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(14),
+          child: SelectableText(
+            markdownToRender,
+            style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary, height: 1.4),
+          ),
+        );
+      }
+      return _buildFormattedMarkdownView(markdownToRender);
+    }
+
+    if (selectedContent != null && selectedContent.isNotEmpty) {
+      return _buildFileContentInCanvas(selectedFile ?? 'code', selectedContent);
+    }
+
+    if (frame == null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(FontAwesomeIcons.wandMagicSparkles, size: 36, color: DesktopTheme.accentCyan.withOpacity(0.6)),
+              const SizedBox(height: 14),
+              Text(
+                'Холст пуст',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Агент может транслировать сюда Markdown-документы, интерактивные формы, графики и диаграммы через /ws/canvas.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+              ),
+              const SizedBox(height: 20),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    icon: const Icon(FontAwesomeIcons.code, size: 11),
+                    label: const Text('Демо HTML формы', style: TextStyle(fontSize: 11)),
+                    onPressed: () async {
+                      await httpClient.postCanvas(activeCanvasId, {
+                        'content_type': 'html',
+                        'content': '<form class="omnes-canvas"><label>Параметры деплоя:</label><input type="text" value="v1.0.0-rc2" /><button>Подтвердить</button></form>',
+                      });
+                    },
+                  ),
+                  OutlinedButton.icon(
+                    icon: const Icon(FontAwesomeIcons.diagramProject, size: 11),
+                    label: const Text('Демо Mermaid схемы', style: TextStyle(fontSize: 11)),
+                    onPressed: () async {
+                      await httpClient.postCanvas(activeCanvasId, {
+                        'content_type': 'markdown',
+                        '''content''': '''```mermaid\ngraph LR\nClient[Omnes Desktop ADE] -->|WS/chat| Gateway\nGateway --> Runtime\nGateway --> Canvas\n```''',
+                      });
+                    },
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: DesktopTheme.bgSurfaceElevated,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: DesktopTheme.borderSubtle),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  frame.contentType == 'html' ? FontAwesomeIcons.code : FontAwesomeIcons.diagramProject,
+                  size: 14,
+                  color: DesktopTheme.accentCyan,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Артефакт холста (${frame.contentType})',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                    color: DesktopTheme.textPrimary,
+                  ),
+                ),
+              ],
+            ),
+            const Divider(height: 20),
+            SelectableText(
+              frame.content,
+              style: TextStyle(
+                fontSize: 12,
+                fontFamily: 'Consolas',
+                color: DesktopTheme.textPrimary,
+                height: 1.45,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.touch_app, size: 13),
+                  label: const Text('Отправить действие (Action callback)', style: TextStyle(fontSize: 11)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: DesktopTheme.accentCyan,
+                    foregroundColor: Colors.black,
+                  ),
+                  onPressed: () {
+                    canvasWsClient?.sendAction('submit', {'canvas_id': activeCanvasId});
+                    Get.snackbar('Холст', 'Действие отправлено в шлюз через WS');
+                  },
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFileContentInCanvas(String path, String content) {
+    final fileName = path.replaceAll(r'\', '/').split('/').last;
+    final lines = content.split('\n');
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgSurfaceElevated,
+            border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.code, size: 14, color: Color(0xFF00D2FF)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  fileName,
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, fontFamily: 'Consolas', color: Colors.white),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Text(
+                '${lines.length} строк',
+                style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+              ),
+              const SizedBox(width: 10),
+              InkWell(
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: content));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Код скопирован в буфер'), duration: Duration(seconds: 1)),
+                  );
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: Padding(
+                  padding: const EdgeInsets.all(4),
+                  child: Icon(Icons.copy, size: 13, color: DesktopTheme.textMuted),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(12),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    for (int i = 1; i <= lines.length; i++)
+                      Text(
+                        '$i ',
+                        style: const TextStyle(
+                          fontFamily: 'Consolas',
+                          fontSize: 11,
+                          color: Color(0xFF64748B),
+                          height: 1.4,
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(width: 10),
+                Container(width: 1, height: lines.length * 15.4, color: DesktopTheme.borderSubtle),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: SelectableText(
+                    content,
+                    style: TextStyle(
+                      fontFamily: 'Consolas',
+                      fontSize: 11,
+                      color: DesktopTheme.textPrimary,
+                      height: 1.4,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFormattedMarkdownView(String text) {
+    final lines = text.split('\n');
+    final widgets = <Widget>[];
+
+    for (int i = 0; i < lines.length; i++) {
+      final line = lines[i];
+      final trimmed = line.trim();
+
+      // Markdown Table Detection in Inspector
+      if ((trimmed.startsWith('|') || (trimmed.contains('|') && !trimmed.startsWith('#'))) && i + 1 < lines.length) {
+        final nextTrimmed = lines[i + 1].trim();
+        if (RegExp(r'^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$').hasMatch(nextTrimmed)) {
+          final tableLines = <String>[line, lines[i + 1]];
+          i += 2;
+          while (i < lines.length) {
+            final rowTrim = lines[i].trim();
+            if (rowTrim.contains('|') && !rowTrim.startsWith('#') && rowTrim.isNotEmpty) {
+              tableLines.add(lines[i]);
+              i++;
+            } else {
+              break;
+            }
+          }
+          i--;
+          widgets.add(_buildInspectorMarkdownTable(tableLines));
+          continue;
+        }
+      }
+
+      widgets.add(_buildMarkdownLine(line));
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: widgets,
+      ),
+    );
+  }
+
+  /// Builds a cyber table for Inspector Canvas
+  Widget _buildInspectorMarkdownTable(List<String> tableLines) {
+    if (tableLines.length < 2) return const SizedBox.shrink();
+
+    List<String> parseRow(String l) {
+      String t = l.trim();
+      if (t.startsWith('|')) t = t.substring(1);
+      if (t.endsWith('|')) t = t.substring(0, t.length - 1);
+      return t.split('|').map((c) => c.trim()).toList();
+    }
+
+    final headerCells = parseRow(tableLines[0]);
+    if (headerCells.isEmpty) return const SizedBox.shrink();
+
+    final dataRows = <List<String>>[];
+    for (int r = 2; r < tableLines.length; r++) {
+      final cells = parseRow(tableLines[r]);
+      if (cells.isNotEmpty) dataRows.add(cells);
+    }
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: DesktopTheme.borderSubtle, width: 1.0),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Table(
+          defaultColumnWidth: const IntrinsicColumnWidth(),
+          children: [
+            TableRow(
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurfaceElevated,
+                border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 1.0)),
+              ),
+              children: [
+                for (final h in headerCells)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    child: Text(
+                      h,
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: DesktopTheme.textPrimary),
+                    ),
+                  ),
+              ],
+            ),
+            for (int r = 0; r < dataRows.length; r++)
+              TableRow(
+                decoration: BoxDecoration(
+                  color: r % 2 == 1 ? DesktopTheme.bgSurfaceElevated.withOpacity(0.35) : Colors.transparent,
+                  border: Border(
+                    bottom: r < dataRows.length - 1
+                        ? BorderSide(color: DesktopTheme.borderSubtle.withOpacity(0.5), width: 0.8)
+                        : BorderSide.none,
+                  ),
+                ),
+                children: [
+                  for (int c = 0; c < headerCells.length; c++)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                      child: Text(
+                        c < dataRows[r].length ? dataRows[r][c] : '',
+                        style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
+                      ),
+                    ),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMarkdownLine(String rawLine) {
+    final line = rawLine.trimRight();
+    if (line.startsWith('# ')) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 6),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SelectableText(
+              line.substring(2),
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF00D2FF), letterSpacing: 0.3),
+            ),
+            const SizedBox(height: 4),
+            const Divider(color: Color(0xFF334155), height: 1),
+          ],
+        ),
+      );
+    } else if (line.startsWith('## ')) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 12, bottom: 4),
+        child: SelectableText(
+          line.substring(3),
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+        ),
+      );
+    } else if (line.startsWith('### ')) {
+      return Padding(
+        padding: const EdgeInsets.only(top: 10, bottom: 3),
+        child: SelectableText(
+          line.substring(4),
+          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF38BDF8)),
+        ),
+      );
+    } else if (line.startsWith('- [ ] ') || line.startsWith('* [ ] ')) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.check_box_outline_blank, size: 14, color: Color(0xFF94A3B8)),
+            const SizedBox(width: 8),
+            Expanded(
+              child: SelectableText(
+                line.substring(6),
+                style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0)),
+              ),
+            ),
+          ],
+        ),
+      );
+    } else if (line.startsWith('- [x] ') || line.startsWith('* [x] ')) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.check_box, size: 14, color: Color(0xFF10B981)),
+            const SizedBox(width: 8),
+            Expanded(
+              child: SelectableText(
+                line.substring(6),
+                style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8), decoration: TextDecoration.lineThrough),
+              ),
+            ),
+          ],
+        ),
+      );
+    } else if (line.startsWith('- ') || line.startsWith('* ')) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 6, right: 8),
+              child: Icon(Icons.circle, size: 5, color: Color(0xFF00D2FF)),
+            ),
+            Expanded(
+              child: SelectableText(
+                line.substring(2),
+                style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0), height: 1.4),
+              ),
+            ),
+          ],
+        ),
+      );
+    } else if (line.startsWith('> ')) {
+      return Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: const BoxDecoration(
+          border: Border(left: BorderSide(color: Color(0xFF00D2FF), width: 3)),
+          color: Color(0xFF0F172A),
+        ),
+        child: SelectableText(
+          line.substring(2),
+          style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: Color(0xFF94A3B8)),
+        ),
+      );
+    } else if (line.startsWith('```')) {
+      return Container(
+        width: double.infinity,
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: const Color(0xFF050811),
+          borderRadius: BorderRadius.circular(5),
+          border: Border.all(color: const Color(0xFF1E293B)),
+        ),
+        child: SelectableText(
+          line,
+          style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF38BDF8)),
+        ),
+      );
+    } else if (line == '---' || line == '***') {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: Divider(color: Color(0xFF334155), height: 1),
+      );
+    } else if (line.isEmpty) {
+      return const SizedBox(height: 6);
+    } else {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 1.5),
+        child: SelectableText(
+          line,
+          style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0), height: 1.45),
+        ),
+      );
+    }
   }
 
   Widget _buildQuickCommandChip(String label, VoidCallback onTap) {

@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
+import 'package:get_storage/get_storage.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 
 import '../theme/desktop_theme.dart';
@@ -41,13 +42,22 @@ class _DesktopShellState extends State<DesktopShell> {
 
   int selectedNavIndex = 0;
   bool isSidebarVisible = true;
+  double sidebarWidth = 260.0;
+  double inspectorWidth = 420.0;
   bool isInspectorOpen = false; // Closed by default
   int inspectorTabIndex = -1; // -1 opens the 'Open tab' chooser from Screenshot 2
+  String? sideChatInitialText;
   Key inspectorKey = UniqueKey();
 
   @override
   void initState() {
     super.initState();
+    try {
+      final saved = GetStorage().read<Map<String, dynamic>>('user_profile');
+      if (saved != null) {
+        userProfile = UserProfileData.fromJson(saved);
+      }
+    } catch (_) {}
     _checkInitialState();
   }
 
@@ -84,10 +94,11 @@ class _DesktopShellState extends State<DesktopShell> {
     } catch (_) {}
   }
 
-  void _openInspectorWithTab(int index) {
+  void _openInspectorWithTab(int index, {String? sideChatText}) {
     setState(() {
       isInspectorOpen = true;
       inspectorTabIndex = index;
+      sideChatInitialText = sideChatText;
       inspectorKey = UniqueKey();
     });
   }
@@ -444,6 +455,15 @@ class _DesktopShellState extends State<DesktopShell> {
                 onToggleSidebar: () {
                   setState(() => isSidebarVisible = !isSidebarVisible);
                 },
+                onOpenFile: (filePath) {
+                  workspaceController.openProjectFile(filePath);
+                  if (filePath.toLowerCase().endsWith('.md')) {
+                    _openInspectorWithTab(2); // Canvas tab
+                  } else {
+                    _openInspectorWithTab(5); // File Viewer tab
+                  }
+                },
+                onSelectInspectorTab: (tabIdx) => _openInspectorWithTab(tabIdx),
               ),
 
             // Central Area
@@ -457,6 +477,8 @@ class _DesktopShellState extends State<DesktopShell> {
                       isToolsOpen: isInspectorOpen,
                       onToggleTools: _toggleInspector,
                       onToggleTerminal: () => _openInspectorWithTab(1),
+                      onOpenCanvas: () => _openInspectorWithTab(2),
+                      onBranchSideChat: (text) => _openInspectorWithTab(4, sideChatText: text),
                       onOpenSettings: () => _openSettingsDialog('Провайдеры'),
                     ),
             ),
@@ -469,10 +491,30 @@ class _DesktopShellState extends State<DesktopShell> {
                   key: inspectorKey,
                   controller: workspaceController,
                   initialTabIndex: inspectorTabIndex,
+                  initialSideChatText: sideChatInitialText,
                   onClose: () => setState(() => isInspectorOpen = false),
                 ),
               ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVerticalResizer({required Function(double delta) onDrag}) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onHorizontalDragUpdate: (details) => onDrag(details.delta.dx),
+        child: Container(
+          width: 5,
+          color: Colors.transparent,
+          alignment: Alignment.center,
+          child: Container(
+            width: 1,
+            color: DesktopTheme.borderSubtle,
+          ),
         ),
       ),
     );
@@ -483,54 +525,90 @@ class _DesktopShellState extends State<DesktopShell> {
     return Scaffold(
       backgroundColor: DesktopTheme.bgCanvas,
       body: SafeArea(
-        child: Row(
-          children: [
-            // 1. Left Sidebar (Projects / Groups)
-            if (isSidebarVisible)
-              DesktopSidebar(
-                selectedIndex: selectedNavIndex,
-                userProfile: userProfile,
-                onSelectTask: (id, title, project) {
-                  setState(() => selectedNavIndex = 0);
-                  workspaceController.switchToSession(id, title: title, project: project);
-                },
-                onNewTask: _onNewTask,
-                onOpenSearch: _openCommandPalette,
-                onOpenSettings: () => _openSettingsDialog('Общие'),
-                onOpenSkills: () => _openSettingsDialog('Навыки'),
-                onOpenAutomations: () {
-                  setState(() => selectedNavIndex = -3);
-                },
-                onOpenProfile: _openOnboardingDialog,
-                onToggleSidebar: () {
-                  setState(() => isSidebarVisible = !isSidebarVisible);
-                },
-              ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final totalWidth = constraints.maxWidth;
+            const minCenterWidth = 845.0;
 
-            // 2. Central Task Canvas & Composer or Automations Screen
-            Expanded(
-              child: selectedNavIndex == -3
-                  ? AutomationsView(
-                      onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
-                    )
-                  : DesktopTaskWorkspaceView(
-                      controller: workspaceController,
-                      isToolsOpen: isInspectorOpen,
-                      onToggleTools: _toggleInspector,
-                      onToggleTerminal: () => _openInspectorWithTab(1),
-                      onOpenSettings: () => _openSettingsDialog('Провайдеры'),
-                    ),
-            ),
+            return Row(
+              children: [
+                // 1. Left Sidebar (Projects / Groups)
+                if (isSidebarVisible) ...[
+                  DesktopSidebar(
+                    width: sidebarWidth,
+                    selectedIndex: selectedNavIndex,
+                    userProfile: userProfile,
+                    onSelectTask: (id, title, project) {
+                      setState(() => selectedNavIndex = 0);
+                      workspaceController.switchToSession(id, title: title, project: project);
+                    },
+                    onNewTask: _onNewTask,
+                    onOpenSearch: _openCommandPalette,
+                    onOpenSettings: () => _openSettingsDialog('Общие'),
+                    onOpenSkills: () => _openSettingsDialog('Навыки'),
+                    onOpenAutomations: () {
+                      setState(() => selectedNavIndex = -3);
+                    },
+                    onOpenProfile: _openOnboardingDialog,
+                    onToggleSidebar: () {
+                      setState(() => isSidebarVisible = !isSidebarVisible);
+                    },
+                    onOpenFile: (filePath) {
+                      workspaceController.openProjectFile(filePath);
+                      _openInspectorWithTab(5); // File Viewer tab
+                    },
+                  ),
+                  _buildVerticalResizer(
+                    onDrag: (dx) {
+                      final currentRight = isInspectorOpen ? inspectorWidth : 0.0;
+                      final maxAllowedSidebar = (totalWidth - currentRight - minCenterWidth).clamp(200.0, 440.0);
+                      setState(() {
+                        sidebarWidth = (sidebarWidth + dx).clamp(200.0, maxAllowedSidebar >= 200.0 ? maxAllowedSidebar : 200.0);
+                      });
+                    },
+                  ),
+                ],
 
-            // 3. Right Tool Canvas / Inspector
-            if (isInspectorOpen)
-              DesktopInspectorPanel(
-                key: inspectorKey,
-                controller: workspaceController,
-                initialTabIndex: inspectorTabIndex,
-                onClose: () => setState(() => isInspectorOpen = false),
-              ),
-          ],
+                // 2. Central Task Canvas & Composer (Min Width: 845px)
+                Expanded(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minWidth: minCenterWidth),
+                    child: selectedNavIndex == -3
+                        ? AutomationsView(
+                            onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
+                          )
+                        : DesktopTaskWorkspaceView(
+                            controller: workspaceController,
+                            isToolsOpen: isInspectorOpen,
+                            onToggleTools: _toggleInspector,
+                            onToggleTerminal: () => _openInspectorWithTab(1),
+                            onOpenSettings: () => _openSettingsDialog('Провайдеры'),
+                          ),
+                  ),
+                ),
+
+                // 3. Right Tool Canvas / Inspector
+                if (isInspectorOpen) ...[
+                  _buildVerticalResizer(
+                    onDrag: (dx) {
+                      final currentLeft = isSidebarVisible ? sidebarWidth : 0.0;
+                      final maxAllowedInspector = (totalWidth - currentLeft - minCenterWidth).clamp(280.0, 650.0);
+                      setState(() {
+                        inspectorWidth = (inspectorWidth - dx).clamp(280.0, maxAllowedInspector >= 280.0 ? maxAllowedInspector : 280.0);
+                      });
+                    },
+                  ),
+                  DesktopInspectorPanel(
+                    key: inspectorKey,
+                    width: inspectorWidth,
+                    controller: workspaceController,
+                    initialTabIndex: inspectorTabIndex,
+                    onClose: () => setState(() => isInspectorOpen = false),
+                  ),
+                ],
+              ],
+            );
+          },
         ),
       ),
     );

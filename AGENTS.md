@@ -2,7 +2,7 @@
 
 Core instructions for AI coding assistants working across the OmnesAgent monorepo.
 Backend-specific constraints and crate architecture are detailed in [`backend/AGENTS.md`](./backend/AGENTS.md).
-UI Design System and styling rules are detailed in [`.gemini/style-guide.md`](./.gemini/style-guide.md).
+UI Design System, dropdown/popover geometry standards, and styling rules are detailed in [`DESIGN_SYSTEM.md`](./DESIGN_SYSTEM.md) and [`.gemini/style-guide.md`](./.gemini/style-guide.md).
 
 ## Monorepo Layout
 

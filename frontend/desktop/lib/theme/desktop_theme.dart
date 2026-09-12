@@ -78,6 +78,10 @@ class DesktopTheme {
       isDark ? textSecondaryDark : textSecondaryLight;
   static Color get textMuted => isDark ? textMutedDark : textMutedLight;
 
+  // Button styling (shadcn/ui style: solid black in light mode, elevated surface in dark mode)
+  static Color get btnPrimaryBg => isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A);
+  static Color get btnPrimaryFg => Colors.white;
+
   static ThemeData get darkTheme {
     return ThemeData(
       brightness: Brightness.dark,
@@ -91,6 +95,15 @@ class DesktopTheme {
       ),
       fontFamily: 'Segoe UI',
       dividerColor: borderSubtleDark,
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFF282D37),
+          foregroundColor: Colors.white,
+          elevation: 0,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+          textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+        ),
+      ),
       cardTheme: CardTheme(
         color: bgSurfaceDark,
         elevation: 0,
@@ -115,15 +128,24 @@ class DesktopTheme {
     return ThemeData(
       brightness: Brightness.light,
       scaffoldBackgroundColor: bgCanvasLight,
-      primaryColor: accentSapphire,
+      primaryColor: const Color(0xFF0F172A),
       colorScheme: const ColorScheme.light(
-        primary: accentSapphire,
+        primary: Color(0xFF0F172A),
         secondary: accentSky,
         surface: bgSurfaceLight,
         error: statusError,
       ),
       fontFamily: 'Segoe UI',
       dividerColor: borderSubtleLight,
+      elevatedButtonTheme: ElevatedButtonThemeData(
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFF0F172A),
+          foregroundColor: Colors.white,
+          elevation: 0,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+          textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+        ),
+      ),
       cardTheme: CardTheme(
         color: bgSurfaceLight,
         elevation: 0,
