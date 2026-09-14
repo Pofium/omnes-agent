@@ -18,7 +18,9 @@ use omnesagent_log::Instrument as _;
 use omnesagent_memory::Memory;
 use omnesagent_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use omnesagent_tools::memory_export::MemoryExportTool;
+use omnesagent_tools::memory_feedback::MemoryFeedbackTool;
 use omnesagent_tools::memory_forget::MemoryForgetTool;
+use omnesagent_tools::memory_merge::MemoryMergeTool;
 use omnesagent_tools::memory_purge::MemoryPurgeTool;
 use omnesagent_tools::memory_recall::MemoryRecallTool;
 use omnesagent_tools::memory_store::MemoryStoreTool;
@@ -776,8 +778,10 @@ impl DelegateTool {
             Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
             Box::new(MemoryRecallTool::new(memory.clone())),
             Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+            Box::new(MemoryMergeTool::new(memory.clone(), security.clone())),
             Box::new(MemoryExportTool::new(memory.clone())),
-            Box::new(MemoryPurgeTool::new(memory, security)),
+            Box::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
+            Box::new(MemoryFeedbackTool::new(memory, security)),
         ]
     }
 

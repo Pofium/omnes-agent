@@ -203,6 +203,8 @@ impl QdrantMemory {
                     tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
+                    trust: None,
+                    last_feedback_at: None,
                 })
             })
             .collect();
@@ -461,6 +463,8 @@ impl QdrantMemory {
                 tenant_id: None,
                 agent_alias: payload.agent_id.clone(),
                 agent_id: payload.agent_id,
+                trust: None,
+                last_feedback_at: None,
             })
         });
         Ok(entry)
@@ -674,6 +678,8 @@ impl Memory for QdrantMemory {
                     tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
+                    trust: None,
+                    last_feedback_at: None,
                 })
             })
             .collect();
@@ -777,6 +783,8 @@ impl Memory for QdrantMemory {
                     tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
+                    trust: None,
+                    last_feedback_at: None,
                 })
             })
             .collect();
@@ -1087,6 +1095,8 @@ impl Memory for QdrantMemory {
                     tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
+                    trust: None,
+                    last_feedback_at: None,
                 })
             })
             .collect();

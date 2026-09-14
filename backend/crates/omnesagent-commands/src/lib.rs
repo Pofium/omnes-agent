@@ -118,7 +118,11 @@ pub struct ParsedCommandToken {
 }
 
 const CHANNEL_ONLY: &[CommandSurface] = &[CommandSurface::Channel, CommandSurface::Desktop];
-const CHANNEL_AND_TUI: &[CommandSurface] = &[CommandSurface::Channel, CommandSurface::Tui, CommandSurface::Desktop];
+const CHANNEL_AND_TUI: &[CommandSurface] = &[
+    CommandSurface::Channel,
+    CommandSurface::Tui,
+    CommandSurface::Desktop,
+];
 
 static BUILTIN_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
@@ -349,6 +353,103 @@ mod tests {
         assert!(
             goal.usage.contains("objective <objective>"),
             "goal command usage must advertise objective amendment syntax"
+        );
+    }
+
+    #[test]
+    fn every_builtin_id_and_surface_maps_to_stable_strings() {
+        for (id, s) in [
+            (BuiltinCommandId::Help, "help"),
+            (BuiltinCommandId::Clear, "clear"),
+            (BuiltinCommandId::New, "new"),
+            (BuiltinCommandId::Stop, "stop"),
+            (BuiltinCommandId::Model, "model"),
+            (BuiltinCommandId::Models, "models"),
+            (BuiltinCommandId::Config, "config"),
+            (BuiltinCommandId::Thinking, "thinking"),
+            (BuiltinCommandId::Goal, "goal"),
+        ] {
+            assert_eq!(id.as_str(), s);
+            assert_eq!(serde_json::to_value(id).unwrap(), s);
+        }
+        for (surface, s) in [
+            (CommandSurface::Cli, "cli"),
+            (CommandSurface::Web, "web"),
+            (CommandSurface::Tui, "tui"),
+            (CommandSurface::Channel, "channel"),
+            (CommandSurface::Desktop, "desktop"),
+        ] {
+            assert_eq!(surface.as_str(), s);
+            assert_eq!(serde_json::to_value(surface).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn cli_surface_has_no_builtin_commands_yet() {
+        assert_eq!(commands_for_surface(CommandSurface::Cli).count(), 0);
+        assert!(parse_command_token("/help", CommandSurface::Cli).is_none());
+        assert!(usage_for_surface(CommandSurface::Cli).is_empty());
+    }
+
+    #[test]
+    fn usage_for_surface_lists_exactly_the_supported_commands() {
+        let channel = usage_for_surface(CommandSurface::Channel);
+        assert_eq!(
+            channel.len(),
+            commands_for_surface(CommandSurface::Channel).count()
+        );
+        assert!(channel.iter().any(|u| u.starts_with("/goal")));
+        assert!(channel.iter().any(|u| u.starts_with("/config")));
+        assert!(usage_for_surface(CommandSurface::Web).is_empty());
+    }
+
+    #[test]
+    fn builtin_catalogue_names_are_unique_and_metadata_present() {
+        let all = builtin_commands();
+        assert!(!all.is_empty());
+        let mut names: Vec<&str> = all.iter().map(|spec| spec.name).collect();
+        names.sort_unstable();
+        let before_dedup = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before_dedup, "duplicate canonical names");
+        for spec in all {
+            for alias in spec.aliases {
+                assert_ne!(*alias, spec.name);
+            }
+            assert!(!spec.description_key.is_empty());
+            assert!(spec.usage.starts_with('/'));
+            assert!(!spec.surfaces.is_empty());
+        }
+    }
+
+    #[test]
+    fn token_matches_accepts_name_and_aliases_only() {
+        let goal = command_by_name("goal").expect("goal registered");
+        assert!(goal.token_matches("goal"));
+        assert!(!goal.token_matches("goals"));
+        assert!(!goal.token_matches(""));
+        let thinking = command_by_name("thinking").expect("thinking registered");
+        assert!(thinking.token_matches("thinking"));
+        assert!(thinking.token_matches("think"));
+        assert!(!thinking.token_matches("thinking-off"));
+        assert!(goal.supports(CommandSurface::Channel));
+        assert!(goal.supports(CommandSurface::Desktop));
+        assert!(!goal.supports(CommandSurface::Tui));
+    }
+
+    #[test]
+    fn execution_ownership_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(CommandExecution::ClientLocal).unwrap(),
+            "client_local"
+        );
+        assert_eq!(
+            serde_json::to_value(CommandExecution::RuntimeCommand).unwrap(),
+            "runtime_command"
+        );
+        assert_eq!(
+            serde_json::to_value(CommandExecution::GoalAdmission).unwrap(),
+            "goal_admission"
         );
     }
 }

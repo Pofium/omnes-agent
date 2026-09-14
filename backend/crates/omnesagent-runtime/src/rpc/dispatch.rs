@@ -3307,6 +3307,12 @@ impl RpcDispatcher {
         if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
             return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
         }
+        if let Err(e) = config.validate() {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!("Validation failed for `{}`: {e}", req.prop),
+            ));
+        }
         self.save_and_swap_config(*config, &config_write_guard)
             .await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {

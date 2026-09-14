@@ -227,6 +227,8 @@ impl LucidMemory {
                 tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
+                trust: None,
+                last_feedback_at: None,
             });
         }
 

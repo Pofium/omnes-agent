@@ -299,6 +299,8 @@ impl PostgresMemory {
             tenant_id: None,
             agent_alias: row.try_get("agent_alias").ok(),
             agent_id: row.try_get("agent_id").ok(),
+            trust: row.try_get("trust").ok(),
+            last_feedback_at: row.try_get("last_feedback_at").ok(),
         })
     }
 }

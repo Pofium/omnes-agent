@@ -134,6 +134,20 @@ cargo test -p omnesagent-kag --lib
 cargo test -p omnesagent-memory --lib factory_candle
 ```
 
+### 4. Развертывание в Docker (Сервер / VPS)
+Для автономной работы шлюза с веб-панелью управления, KAG-памятью и каналами связи:
+```bash
+# 1. Запустить контейнер в фоновом режиме:
+docker compose up -d --build
+
+# 2. Просмотреть логи работы шлюза:
+docker compose logs -f
+
+# 3. Открыть веб-интерфейс ADE в браузере:
+# http://localhost:42617
+```
+Все данные (база знаний SQLite `brain.db`, векторные индексы и конфигурация) сохраняются в постоянном томе `omnesagent-data`.
+
 ---
 
 ## 🛠️ Встроенные инструменты агента

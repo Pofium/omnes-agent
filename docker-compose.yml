@@ -1,0 +1,51 @@
+# Omnes Agent - Production Docker Compose Configuration
+# 
+# Quick Start:
+#   1. Set your LLM keys in .env (or environment variables)
+#   2. Run: docker compose up -d
+#   3. Open Web ADE Dashboard at: http://localhost:42617
+#
+services:
+  omnesagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: omnesagent:latest
+    container_name: omnesagent
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-42617}:42617"
+    environment:
+      - OMNESAGENT_GATEWAY_HOST=0.0.0.0
+      - OMNESAGENT_GATEWAY_PORT=42617
+      - OMNESAGENT_GATEWAY_ALLOW_PUBLIC_BIND=true
+      - OMNESAGENT_DATA_DIR=/data
+      - RUST_LOG=info
+      # LLM Provider API Keys (configured via environment / .env):
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      # Channel credentials (optional):
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+    volumes:
+      # Persistent storage for brain.db, KAG vector index, and user workspace
+      - omnesagent-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+        reservations:
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:42617/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  omnesagent-data:
+    name: omnesagent-data

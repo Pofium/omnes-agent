@@ -121,6 +121,25 @@ impl Tool for MemoryRecallTool {
                         entry.category, entry.key, entry.content
                     );
                 }
+
+                // Ф32.2: conflict-разметка — если среди найденных записей есть конфликтующие/замещённые
+                let mut conflict_lines = Vec::new();
+                for entry in &entries {
+                    if let Some(ref target) = entry.superseded_by {
+                        if let Some(target_entry) = entries.iter().find(|e| e.key == *target || e.id == *target) {
+                            let ta = entry.trust.unwrap_or(0.5);
+                            let tb = target_entry.trust.unwrap_or(0.5);
+                            conflict_lines.push(format!("[conflict] {} (trust {ta:.2}) ↔ {} (trust {tb:.2})", entry.key, target_entry.key));
+                        }
+                    }
+                }
+                if !conflict_lines.is_empty() {
+                    let _ = writeln!(output, "\n[conflicts]");
+                    for c in conflict_lines {
+                        let _ = writeln!(output, "{c}");
+                    }
+                }
+
                 Ok(ToolResult {
                     success: true,
                     output: output.into(),
@@ -195,6 +214,8 @@ mod tests {
                     tenant_id: None,
                     agent_alias: None,
                     agent_id: None,
+                    trust: None,
+                    last_feedback_at: None,
                 }])
             } else {
                 Ok(Vec::new())
@@ -420,5 +441,136 @@ mod tests {
         assert!(enum_values.contains(&json!("bm25")));
         assert!(enum_values.contains(&json!("embedding")));
         assert!(enum_values.contains(&json!("hybrid")));
+    }
+
+    #[tokio::test]
+    async fn recall_formats_conflict_block() {
+        struct ConflictMemory;
+        #[async_trait]
+        impl Memory for ConflictMemory {
+            fn name(&self) -> &str {
+                "conflict"
+            }
+            async fn store(
+                &self,
+                _key: &str,
+                _content: &str,
+                _category: MemoryCategory,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall(
+                &self,
+                _query: &str,
+                _limit: usize,
+                _session_id: Option<&str>,
+                _since: Option<&str>,
+                _until: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(vec![
+                    MemoryEntry {
+                        id: "old-1".into(),
+                        key: "deploy-target".into(),
+                        content: "Deploy to AWS".into(),
+                        category: MemoryCategory::Core,
+                        timestamp: "2026-01-01T00:00:00Z".into(),
+                        session_id: None,
+                        score: Some(0.85),
+                        namespace: "default".into(),
+                        importance: Some(0.7),
+                        superseded_by: Some("deploy-k8s".into()),
+                        kind: None,
+                        pinned: false,
+                        tenant_id: None,
+                        agent_alias: None,
+                        agent_id: None,
+                        trust: Some(0.35),
+                        last_feedback_at: None,
+                    },
+                    MemoryEntry {
+                        id: "new-1".into(),
+                        key: "deploy-k8s".into(),
+                        content: "Deploy to Kubernetes".into(),
+                        category: MemoryCategory::Core,
+                        timestamp: "2026-03-01T00:00:00Z".into(),
+                        session_id: None,
+                        score: Some(0.95),
+                        namespace: "default".into(),
+                        importance: Some(0.9),
+                        superseded_by: None,
+                        kind: None,
+                        pinned: false,
+                        tenant_id: None,
+                        agent_alias: None,
+                        agent_id: None,
+                        trust: Some(0.85),
+                        last_feedback_at: None,
+                    },
+                ])
+            }
+            async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+                Ok(None)
+            }
+            async fn list(
+                &self,
+                _category: Option<&MemoryCategory>,
+                _session_id: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                Ok(Vec::new())
+            }
+            async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn count(&self) -> anyhow::Result<usize> {
+                Ok(0)
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn store_with_agent(
+                &self,
+                _key: &str,
+                _content: &str,
+                _category: MemoryCategory,
+                _session_id: Option<&str>,
+                _namespace: Option<&str>,
+                _importance: Option<f64>,
+                _agent_id: Option<&str>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn recall_for_agents(
+                &self,
+                _allowed_agent_ids: &[&str],
+                query: &str,
+                limit: usize,
+                session_id: Option<&str>,
+                since: Option<&str>,
+                until: Option<&str>,
+            ) -> anyhow::Result<Vec<MemoryEntry>> {
+                self.recall(query, limit, session_id, since, until).await
+            }
+        }
+        impl ::omnesagent_api::attribution::Attributable for ConflictMemory {
+            fn role(&self) -> ::omnesagent_api::attribution::Role {
+                ::omnesagent_api::attribution::Role::Memory(
+                    ::omnesagent_api::attribution::MemoryKind::InMemory,
+                )
+            }
+            fn alias(&self) -> &str {
+                "ConflictMemory"
+            }
+        }
+
+        let tool = MemoryRecallTool::new(Arc::new(ConflictMemory));
+        let res = tool.execute(json!({"query": "deploy"})).await.unwrap();
+        assert!(res.success);
+        let out = res.output.as_str();
+        assert!(out.contains("[conflicts]"));
+        assert!(out.contains("[conflict] deploy-target (trust 0.35) ↔ deploy-k8s (trust 0.85)"));
     }
 }

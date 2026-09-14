@@ -89,7 +89,9 @@ pub use omnesagent_tools::mcp_prompts_tool::McpPromptsTool;
 pub use omnesagent_tools::mcp_resources_tool::McpResourcesTool;
 pub use omnesagent_tools::mcp_tool::McpToolWrapper;
 pub use omnesagent_tools::memory_export::MemoryExportTool;
+pub use omnesagent_tools::memory_feedback::MemoryFeedbackTool;
 pub use omnesagent_tools::memory_forget::MemoryForgetTool;
+pub use omnesagent_tools::memory_merge::MemoryMergeTool;
 pub use omnesagent_tools::memory_purge::MemoryPurgeTool;
 pub use omnesagent_tools::memory_recall::MemoryRecallTool;
 pub use omnesagent_tools::memory_store::MemoryStoreTool;
@@ -926,8 +928,10 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryMergeTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryFeedbackTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
             root_config.clone(),

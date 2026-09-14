@@ -1,11 +1,11 @@
 //! Сервис графа знаний: дедупликация, поиск и KAG-рассуждение.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::embedding::EmbeddingProvider;
 use crate::vector::top_k;
@@ -157,43 +157,48 @@ impl GraphService {
 
         // 2. Векторный скоринг
         if let Ok(q_embs) = self.embedder.embed(&[query.to_string()]).await
-            && let Some(q_vec) = q_embs.first() {
-                let candidates = {
-                    let conn = self.conn.lock();
-                    let mut stmt = conn.prepare(
-                        r#"
+            && let Some(q_vec) = q_embs.first()
+        {
+            let candidates = {
+                let conn = self.conn.lock();
+                let mut stmt = conn.prepare(
+                    r#"
                         SELECT id, embedding 
                         FROM graph_nodes 
                         WHERE embedding IS NOT NULL 
                           AND (deleted_at IS NULL OR deleted_at = '')
                           AND (?1 IS NULL OR project_id = ?1)
                         "#,
-                    )?;
-                    let rows = stmt.query_map(params![project_id_filter], |row| {
-                        let id: i64 = row.get(0)?;
-                        let blob: Vec<u8> = row.get(1)?;
-                        Ok((id, blob))
-                    })?;
-                    let mut list = Vec::new();
-                    for r in rows.flatten() {
-                        list.push(r);
-                    }
-                    list
-                };
-
-                let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
-                    .iter()
-                    .map(|(id, b)| (*id, Some(b.as_slice())))
-                    .collect();
-
-                for (nid, vscore) in top_k(q_vec, &cand_refs, limit, 0.0) {
-                    let entry = scored.entry(nid).or_insert(0.0);
-                    *entry += (vscore as f64) * 10.0;
+                )?;
+                let rows = stmt.query_map(params![project_id_filter], |row| {
+                    let id: i64 = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    Ok((id, blob))
+                })?;
+                let mut list = Vec::new();
+                for r in rows.flatten() {
+                    list.push(r);
                 }
+                list
+            };
+
+            let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
+                .iter()
+                .map(|(id, b)| (*id, Some(b.as_slice())))
+                .collect();
+
+            for (nid, vscore) in top_k(q_vec, &cand_refs, limit, 0.0) {
+                let entry = scored.entry(nid).or_insert(0.0);
+                *entry += (vscore as f64) * 10.0;
             }
+        }
 
         let mut sorted_ids: Vec<i64> = scored.keys().copied().collect();
-        sorted_ids.sort_by(|a, b| scored[b].partial_cmp(&scored[a]).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_ids.sort_by(|a, b| {
+            scored[b]
+                .partial_cmp(&scored[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         if sorted_ids.len() > limit {
             sorted_ids.truncate(limit);
         }
@@ -326,15 +331,29 @@ impl GraphService {
 
         let mut facts = vec!["### Извлеченные сущности графа знаний:".to_string()];
         for n in &found.nodes {
-            let desc = n.description.as_deref().map(|d| format!(" — {d}")).unwrap_or_default();
-            let loc = n.file_path.as_deref().map(|f| format!(" [{f}]")).unwrap_or_default();
+            let desc = n
+                .description
+                .as_deref()
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default();
+            let loc = n
+                .file_path
+                .as_deref()
+                .map(|f| format!(" [{f}]"))
+                .unwrap_or_default();
             let god = if n.is_god_node { " [👑 GodNode]" } else { "" };
-            facts.push(format!("- `{}` ({}){}{}{}", n.label, n.node_type, loc, desc, god));
+            facts.push(format!(
+                "- `{}` ({}){}{}{}",
+                n.label, n.node_type, loc, desc, god
+            ));
         }
 
         facts.push("\n### Связи и отношения:".to_string());
         for e in found.edges.iter().take(40) {
-            facts.push(format!("- `{}` --[{}]--> `{}`", e.source_label, e.label, e.target_label));
+            facts.push(format!(
+                "- `{}` --[{}]--> `{}`",
+                e.source_label, e.label, e.target_label
+            ));
         }
 
         let nodes_count = found.nodes.len();
@@ -378,5 +397,222 @@ impl GraphService {
             chunks,
             god_nodes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedding::FakeEmbedding;
+    use crate::schema::migrate;
+    use crate::vector::serialize;
+
+    fn test_service() -> (GraphService, Arc<Mutex<Connection>>) {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let service = GraphService::new(conn.clone(), Arc::new(FakeEmbedding::new(384)));
+        (service, conn)
+    }
+
+    /// Live nodes: A(p1, god), B(p1), C(p2); D(p1) is soft-deleted.
+    /// Edges: A-[uses]->B (p1), A-[imports]->C (NULL project).
+    fn seed_graph(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            INSERT INTO projects (id, name, root_path, created_at, updated_at)
+            VALUES ('p1', 'proj1', 'C:/p1', 't', 't'), ('p2', 'proj2', 'C:/p2', 't', 't');
+
+            INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, is_god_node, created_at, updated_at)
+            VALUES ('aaa', 'schema.rs', 'File', 'config schema hub', 'p1', 1, 't', 't');
+            INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, created_at, updated_at)
+            VALUES ('bbb', 'runtime loop', 'File', 'agent loop', 'p1', 't', 't');
+            INSERT INTO graph_nodes (node_id, label, node_type, project_id, created_at, updated_at)
+            VALUES ('ccc', 'finance report', 'Document', 'p2', 't', 't');
+            INSERT INTO graph_nodes (node_id, label, node_type, project_id, deleted_at, created_at, updated_at)
+            VALUES ('ddd', 'schema draft', 'File', 'p1', '2026-01-01', 't', 't');
+
+            INSERT INTO graph_edges (source_id, target_id, label, weight, contexts, project_id, created_at, updated_at)
+            VALUES (1, 2, 'uses', 1.5, '["ctx1","ctx2"]', 'p1', 't', 't');
+            INSERT INTO graph_edges (source_id, target_id, label, weight, project_id, created_at, updated_at)
+            VALUES (1, 3, 'imports', 1.0, NULL, 't', 't');
+
+            INSERT INTO documents (title, project_id, created_at) VALUES ('plan', 'p1', 't');
+            INSERT INTO chunks (doc_id, ordinal, text, project_id, created_at) VALUES (1, 0, 'text', 'p1', 't');
+            "#,
+        )
+        .unwrap();
+    }
+
+    fn seeded_service() -> GraphService {
+        let (service, conn) = test_service();
+        seed_graph(&conn.lock());
+        service
+    }
+
+    #[test]
+    fn make_node_id_is_deterministic_24_hex_and_type_sensitive() {
+        let a = make_node_id("schema.rs", "File");
+        let b = make_node_id("schema.rs", "File");
+        let c = make_node_id("schema.rs", "Function");
+        assert_eq!(a, b, "same label+type must hash identically");
+        assert_ne!(a, c, "node_type participates in the hash");
+        assert_eq!(a.len(), 24);
+        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn stats_counts_live_rows_and_respects_project_filter() {
+        let service = seeded_service();
+
+        let all = service.stats(None).unwrap();
+        assert_eq!(all.nodes, 3, "soft-deleted node must not count");
+        assert_eq!(all.edges, 2);
+        assert_eq!(all.documents, 1);
+        assert_eq!(all.chunks, 1);
+        assert_eq!(all.god_nodes, 1);
+
+        let p2 = service.stats(Some("p2")).unwrap();
+        assert_eq!(p2.nodes, 1);
+        assert_eq!(
+            p2.edges, 0,
+            "edge with NULL project_id belongs to no project"
+        );
+        assert_eq!(p2.documents, 0);
+        assert_eq!(p2.god_nodes, 0);
+    }
+
+    #[tokio::test]
+    async fn search_finds_lexical_matches_and_hides_deleted_and_foreign_projects() {
+        let service = seeded_service();
+
+        let hit = service.search("schema", 10, false, None).await.unwrap();
+        assert!(hit.nodes.iter().any(|n| n.label == "schema.rs"));
+        assert!(
+            hit.nodes.iter().all(|n| n.label != "schema draft"),
+            "soft-deleted node must not surface"
+        );
+        let god = hit.nodes.iter().find(|n| n.label == "schema.rs").unwrap();
+        assert!(god.is_god_node);
+        assert_eq!(god.provenance, "manual");
+        assert!((god.confidence - 1.0).abs() < 1e-9);
+
+        let description_hit = service.search("hub", 10, false, None).await.unwrap();
+        assert!(
+            description_hit.nodes.iter().any(|n| n.label == "schema.rs"),
+            "description-only match must be found"
+        );
+
+        let foreign = service
+            .search("schema", 10, false, Some("p2"))
+            .await
+            .unwrap();
+        assert!(foreign.nodes.is_empty(), "project filter must apply");
+    }
+
+    #[tokio::test]
+    async fn search_expand_hops_pulls_edge_neighbors_into_result() {
+        let service = seeded_service();
+
+        let flat = service.search("schema.rs", 10, false, None).await.unwrap();
+        assert!(flat.nodes.iter().any(|n| n.label == "schema.rs"));
+        assert!(!flat.nodes.iter().any(|n| n.label == "runtime loop"));
+
+        let expanded = service.search("schema.rs", 10, true, None).await.unwrap();
+        let labels = labels_of(&expanded);
+        assert!(labels.contains(&"schema.rs".to_string()));
+        assert!(labels.contains(&"runtime loop".to_string()));
+        assert!(
+            labels.contains(&"finance report".to_string()),
+            "1-hop must pull A-C neighbor"
+        );
+        assert_eq!(
+            expanded.edges.len(),
+            2,
+            "both edges of the hub are returned"
+        );
+        let uses = expanded
+            .edges
+            .iter()
+            .find(|e| e.label == "uses")
+            .expect("uses edge present");
+        assert_eq!(uses_contexts(uses), &["ctx1", "ctx2"]);
+        assert_eq!(uses.source_label, "schema.rs");
+        assert_eq!(uses.target_label, "runtime loop");
+    }
+
+    #[tokio::test]
+    async fn search_returns_default_when_graph_has_no_match() {
+        let service = seeded_service();
+        let none = service
+            .search("totally-unknown-term", 10, true, None)
+            .await
+            .unwrap();
+        assert!(none.nodes.is_empty());
+        assert!(none.edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_vector_scoring_finds_node_without_lexical_overlap() {
+        let (service, conn) = test_service();
+        let embedder = FakeEmbedding::new(384);
+        let qvec = embedder
+            .embed(&["zzquantumzz".to_string()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO graph_nodes (node_id, label, node_type, project_id, embedding, created_at, updated_at)
+                 VALUES ('fff', 'xq9', 'File', NULL, ?1, 't', 't')",
+                params![serialize(&qvec)],
+            )
+            .unwrap();
+        }
+
+        let hit = service
+            .search("zzquantumzz", 10, false, None)
+            .await
+            .unwrap();
+        assert!(
+            hit.nodes.iter().any(|n| n.label == "xq9"),
+            "vector-only match must surface via embedding scoring"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_evidence_context_formats_facts_and_reports_counts() {
+        let service = seeded_service();
+
+        let (context, nodes_used, edges_used) = service
+            .collect_evidence_context("schema.rs", None)
+            .await
+            .unwrap();
+        assert!(nodes_used >= 1);
+        assert!(edges_used >= 1);
+        assert!(context.contains("Извлеченные сущности"));
+        assert!(context.contains("schema.rs"));
+        assert!(context.contains("GodNode"), "god node must be flagged");
+        assert!(context.contains("--[uses]-->"));
+
+        let empty_service = test_service().0;
+        let (context, nodes, edges) = empty_service
+            .collect_evidence_context("anything", None)
+            .await
+            .unwrap();
+        assert_eq!((nodes, edges), (0, 0));
+        assert!(context.contains("нет данных"));
+    }
+
+    // -- helpers ---------------------------------------------------------
+
+    fn labels_of(result: &GraphSearchResult) -> Vec<String> {
+        result.nodes.iter().map(|n| n.label.clone()).collect()
+    }
+
+    fn uses_contexts(edge: &EdgeWithLabels) -> &[String] {
+        &edge.contexts
     }
 }

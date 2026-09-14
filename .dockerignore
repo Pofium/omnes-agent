@@ -1,0 +1,33 @@
+# Git and IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+.codegraph/
+.gemini/
+.claude/
+.hermes/
+.playwright-mcp/
+
+# Rust build artifacts
+backend/target/
+**/target/
+
+# Flutter / Dart build artifacts
+**/build/
+**/.dart_tool/
+frontend/desktop/
+frontend/shared/
+frontend/web/
+
+# Local databases and logs
+data/
+logs/
+dist/
+*.apk
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal

@@ -42,6 +42,7 @@ fn entry_in_window(
 pub struct MarkdownMemory {
     alias: String,
     workspace_dir: PathBuf,
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl MarkdownMemory {
@@ -49,6 +50,7 @@ impl MarkdownMemory {
         Self {
             alias: alias.to_string(),
             workspace_dir: workspace_dir.to_path_buf(),
+            write_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -71,27 +73,35 @@ impl MarkdownMemory {
     }
 
     async fn append_to_file(&self, path: &Path, content: &str) -> anyhow::Result<()> {
+        let _guard = self.write_lock.lock().await;
         self.ensure_dirs().await?;
 
-        let existing = if path.exists() {
-            fs::read_to_string(path).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let needs_header = !path.exists()
+            || fs::metadata(path)
+                .await
+                .map(|m| m.len() == 0)
+                .unwrap_or(true);
 
-        let updated = if existing.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+
+        if needs_header {
             let header = if path == self.core_path() {
                 "# Long-Term Memory\n\n"
             } else {
                 let date = Local::now().format("%Y-%m-%d").to_string();
                 &format!("# Daily Log — {date}\n\n")
             };
-            format!("{header}{content}\n")
+            file.write_all(format!("{header}{content}\n").as_bytes())
+                .await?;
         } else {
-            format!("{existing}\n{content}\n")
-        };
-
-        fs::write(path, updated).await?;
+            file.write_all(format!("{content}\n").as_bytes()).await?;
+        }
+        file.flush().await?;
         Ok(())
     }
 
@@ -131,6 +141,8 @@ impl MarkdownMemory {
                     tenant_id: None,
                     agent_alias: None,
                     agent_id: None,
+                    trust: None,
+                    last_feedback_at: None,
                 }
             })
             .collect()

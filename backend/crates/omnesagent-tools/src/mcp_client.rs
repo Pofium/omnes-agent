@@ -184,6 +184,8 @@ struct RecoveryBarrier {
     needed_epoch: std::sync::Mutex<Option<u64>>,
     /// Set once recovery has permanently failed; the connection is unusable.
     poisoned: std::sync::atomic::AtomicBool,
+    /// Timestamp of when recovery last failed and poisoned the connection.
+    last_poison_time: std::sync::Mutex<Option<std::time::Instant>>,
     /// Pulsed whenever the recovery-needed state changes (cleared or poisoned)
     /// so writers waiting in `wait_ready` wake up.
     notify: tokio::sync::Notify,
@@ -194,6 +196,7 @@ impl RecoveryBarrier {
         Self {
             needed_epoch: std::sync::Mutex::new(None),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            last_poison_time: std::sync::Mutex::new(None),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -229,10 +232,32 @@ impl RecoveryBarrier {
         self.notify.notify_waiters();
     }
 
-    /// Mark recovery as permanently failed. Subsequent writers fail closed.
+    /// Mark recovery as failed. Subsequent writers fail closed until cooldown elapses.
     fn poison(&self) {
         self.poisoned
             .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut lock) = self.last_poison_time.lock() {
+            *lock = Some(std::time::Instant::now());
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Check if enough time has passed to attempt a healing reconnect.
+    fn should_retry_poisoned(&self, cooldown: std::time::Duration) -> bool {
+        let lock = match self.last_poison_time.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match *lock {
+            Some(time) => time.elapsed() >= cooldown,
+            None => true,
+        }
+    }
+
+    /// Clear the poisoned state so a fresh recovery handshake can be attempted.
+    fn unpoison(&self) {
+        self.poisoned
+            .store(false, std::sync::atomic::Ordering::Release);
         self.notify.notify_waiters();
     }
 
@@ -496,10 +521,21 @@ impl McpServer {
     async fn wait_recovery_ready(&self) -> Result<()> {
         loop {
             if self.recovery.is_poisoned() {
+                // Bug #10807: Do not permanently brick the connection after a single failed
+                // recovery attempt. After a 5-second cooldown, attempt to auto-heal when a tool is called.
+                if self
+                    .recovery
+                    .should_retry_poisoned(std::time::Duration::from_secs(5))
+                {
+                    let epoch = *self.epoch_gate.read().await;
+                    self.recovery.unpoison();
+                    self.spawn_recovery(epoch, "auto_heal_after_poison".into());
+                    continue;
+                }
+
                 let server_name = self.inner.lock().await.config.name.clone();
                 bail!(
-                    "MCP server `{server_name}` is unavailable: a prior request's outcome became \
-                     unknown and recovery failed; not writing on an unrecovered session"
+                    "MCP server `{server_name}` is temporarily unavailable: prior recovery attempt failed (cooling down); not writing on an unrecovered session"
                 );
             }
             if !self.recovery.recovery_pending() {

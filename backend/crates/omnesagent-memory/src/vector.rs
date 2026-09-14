@@ -34,6 +34,23 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     sim
 }
 
+/// Magic byte for format v2: [0x01][scale f32 LE][i8 x dim]
+pub const Q_MAGIC: u8 = 0x01;
+
+/// Serialize f32 vector to quantized int8 bytes: [0x01][scale f32 LE][i8 x dim] (~4x compression)
+pub fn vec_to_bytes_q(v: &[f32]) -> Vec<u8> {
+    let max_abs = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+    let mut out = Vec::with_capacity(v.len() + 5);
+    out.push(Q_MAGIC);
+    out.extend_from_slice(&scale.to_le_bytes());
+    for &x in v {
+        let q = (x / scale).round().clamp(-127.0, 127.0) as i8;
+        out.push(q as u8);
+    }
+    out
+}
+
 /// Serialize f32 vector to bytes (little-endian)
 pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(v.len() * 4);
@@ -43,8 +60,17 @@ pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Deserialize bytes to f32 vector (little-endian)
+/// Deserialize bytes to f32 vector (supports both quantized int8 v2 and legacy f32)
 pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
+    if bytes.first() == Some(&Q_MAGIC) && bytes.len() >= 5 {
+        if let Ok(scale_bytes) = bytes[1..5].try_into() {
+            let scale = f32::from_le_bytes(scale_bytes);
+            return bytes[5..]
+                .iter()
+                .map(|&b| (b as i8) as f32 * scale)
+                .collect();
+        }
+    }
     bytes
         .as_chunks::<4>()
         .0
@@ -412,5 +438,23 @@ mod tests {
         let merged = hybrid_merge(&[("only".into(), 0.8)], &[], 0.7, 0.3, 10);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "only");
+    }
+
+    #[test]
+    fn vec_bytes_q_roundtrip_preserves_similarity() {
+        let v1 = vec![0.1f32, -0.4, 0.8, -0.2, 0.05, 0.95];
+        let v2 = vec![0.12f32, -0.38, 0.79, -0.18, 0.04, 0.91];
+        let orig_sim = cosine_similarity(&v1, &v2);
+
+        let q1 = vec_to_bytes_q(&v1);
+        let q2 = vec_to_bytes_q(&v2);
+        assert_eq!(q1[0], Q_MAGIC);
+        assert_eq!(q1.len(), v1.len() + 5);
+
+        let d1 = bytes_to_vec(&q1);
+        let d2 = bytes_to_vec(&q2);
+        let quant_sim = cosine_similarity(&d1, &d2);
+
+        assert!((orig_sim - quant_sim).abs() < 0.005, "cosine similarity difference must be < 0.005");
     }
 }

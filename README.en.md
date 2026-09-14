@@ -134,6 +134,20 @@ cargo test -p omnesagent-kag --lib
 cargo test -p omnesagent-memory --lib factory_candle
 ```
 
+### 4. Docker Deployment (Server / VPS)
+To run headless OmnesAgent Gateway with built-in Web Dashboard, KAG memory, and communication channels:
+```bash
+# 1. Build and run in background:
+docker compose up -d --build
+
+# 2. View runtime logs:
+docker compose logs -f
+
+# 3. Access Web ADE Dashboard:
+# http://localhost:42617
+```
+Persistent storage (SQLite `brain.db`, KAG indices, configuration) is automatically maintained in the `omnesagent-data` Docker volume.
+
 ---
 
 ## 🛠️ Built-in Tool Arsenal

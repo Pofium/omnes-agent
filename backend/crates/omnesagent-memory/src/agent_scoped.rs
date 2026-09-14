@@ -403,6 +403,19 @@ impl Memory for AgentScopedMemory {
         self.inner.store_procedural(messages, session_id).await
     }
 
+    async fn record_feedback(
+        &self,
+        key: &str,
+        verdict: &str,
+        note: Option<&str>,
+    ) -> Result<Option<f64>> {
+        self.inner.record_feedback(key, verdict, note).await
+    }
+
+    async fn touch_access(&self, keys: &[String]) -> Result<()> {
+        self.inner.touch_access(keys).await
+    }
+
     async fn recall_namespaced(
         &self,
         namespace: &str,

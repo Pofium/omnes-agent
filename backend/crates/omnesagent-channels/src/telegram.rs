@@ -5113,6 +5113,74 @@ Ensure only one `omnesagent` process is using this bot token."
 
         Ok(result)
     }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let (chat_id, _) = Self::parse_reply_target(channel_id);
+        let msg_id = message_id
+            .parse::<i64>()
+            .map_err(|e| anyhow::anyhow!("Invalid message_id for Telegram reaction: {e}"))?;
+
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "reaction": [{
+                "type": "emoji",
+                "emoji": emoji,
+            }],
+        });
+
+        let resp = self
+            .http_client()
+            .post(self.api_url("setMessageReaction"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMessageReaction failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        let (chat_id, _) = Self::parse_reply_target(channel_id);
+        let msg_id = message_id
+            .parse::<i64>()
+            .map_err(|e| anyhow::anyhow!("Invalid message_id for Telegram reaction: {e}"))?;
+
+        // An empty reaction array removes reactions in Telegram Bot API
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": msg_id,
+            "reaction": [],
+        });
+
+        let resp = self
+            .http_client()
+            .post(self.api_url("setMessageReaction"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram setMessageReaction (remove) failed: {err}");
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

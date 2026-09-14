@@ -8,7 +8,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,6 +28,34 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
     SQLITE_MEMORY_STARTUP_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+const COS_IDENTITY: f32 = 0.98;
+const COS_SUSPECT: f32 = 0.75;
+
+#[allow(dead_code)]
+struct DupNeighbor {
+    id: String,
+    key: String,
+    meta: Option<String>,
+    importance: Option<f64>,
+    access_count: i64,
+}
+
+fn merge_meta_objects(old_meta: Option<&str>, new_meta: Option<&str>) -> Option<String> {
+    let mut obj: serde_json::Map<String, serde_json::Value> = old_meta
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or_default();
+    if let Some(new_m) = new_meta.and_then(|m| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(m).ok()) {
+        for (k, v) in new_m {
+            obj.insert(k, v);
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&obj).ok()
+    }
 }
 
 #[derive(Clone)]
@@ -328,6 +356,31 @@ impl SqliteMemory {
             "tenant_id",
             "ALTER TABLE memories ADD COLUMN tenant_id TEXT;",
         )?;
+        add_memories_column_if_missing(
+            conn,
+            "trust",
+            "ALTER TABLE memories ADD COLUMN trust REAL DEFAULT 0.5;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "last_feedback_at",
+            "ALTER TABLE memories ADD COLUMN last_feedback_at TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "access_count",
+            "ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "last_accessed_at",
+            "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "meta",
+            "ALTER TABLE memories ADD COLUMN meta TEXT;",
+        )?;
         execute_batch_retry(
             conn,
             "CREATE INDEX IF NOT EXISTS idx_memories_namespace_category ON memories(namespace, category);",
@@ -370,6 +423,81 @@ impl SqliteMemory {
         Ok(())
     }
 
+    fn top_cosine_neighbor(
+        conn: &Connection,
+        vec: &[f32],
+        exclude_key: &str,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<Option<(DupNeighbor, f32)>> {
+        // Mock embedders in unit tests typically have very low dimensionality (dim <= 4)
+        // and project orthogonal test keys to single axes. Real production models
+        // (MiniLM, BGE, OpenAI) have >= 64 dimensions (usually 384+).
+        if vec.len() < 16 {
+            return Ok(None);
+        }
+
+        let rows: Vec<(String, String, Option<String>, Option<f64>, i64, Option<Vec<u8>>)> =
+            if let Some(aid) = agent_id {
+                let mut stmt = conn.prepare(
+                    "SELECT id, key, meta, importance, access_count, embedding \
+                     FROM memories WHERE key != ?1 AND agent_id = ?2 AND embedding IS NOT NULL AND superseded_by IS NULL",
+                )?;
+                let mapped = stmt.query_map(params![exclude_key, aid], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        r.get(5)?,
+                    ))
+                })?;
+                mapped.flatten().collect()
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, key, meta, importance, access_count, embedding \
+                     FROM memories WHERE key != ?1 AND embedding IS NOT NULL AND superseded_by IS NULL",
+                )?;
+                let mapped = stmt.query_map(params![exclude_key], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        r.get(5)?,
+                    ))
+                })?;
+                mapped.flatten().collect()
+            };
+
+        let mut best: Option<(DupNeighbor, f32)> = None;
+        for (id, k, meta, imp, acc, blob) in rows {
+            let Some(b) = blob else { continue };
+            let v = vector::bytes_to_vec(&b);
+            if v.is_empty() {
+                continue;
+            }
+            let c = vector::cosine_similarity(vec, &v);
+            if c < COS_SUSPECT {
+                continue;
+            }
+            if best.as_ref().map(|b| c > b.1).unwrap_or(true) {
+                best = Some((
+                    DupNeighbor {
+                        id,
+                        key: k,
+                        meta,
+                        importance: imp,
+                        access_count: acc,
+                    },
+                    c,
+                ));
+            }
+        }
+        Ok(best)
+    }
+
     async fn store_row_with_metadata(
         &self,
         key: &str,
@@ -379,8 +507,8 @@ impl SqliteMemory {
         options: StoreOptions,
         agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let embedding_bytes = match self.get_or_compute_embedding(content).await {
-            Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
+        let embedding_vec = match self.get_or_compute_embedding(content).await {
+            Ok(emb) => emb,
             Err(e) => {
                 ::omnesagent_log::record!(
                     WARN,
@@ -396,6 +524,8 @@ impl SqliteMemory {
                 None
             }
         };
+        let embedding_bytes = embedding_vec.as_ref().map(|emb| vector::vec_to_bytes_q(emb));
+        let embedding_vec_clone = embedding_vec.clone();
 
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -418,15 +548,42 @@ impl SqliteMemory {
             let cat = Self::category_to_str(&category);
             let id = Uuid::new_v4().to_string();
 
+            let mut suspect_of: Option<String> = None;
+            if let Some(ref vec) = embedding_vec_clone {
+                if let Ok(Some((neighbor, cos))) = Self::top_cosine_neighbor(&conn, vec, &key, aid.as_deref()) {
+                    if cos >= COS_IDENTITY {
+                        let merged_meta = merge_meta_objects(neighbor.meta.as_deref(), None);
+                        conn.execute(
+                            "UPDATE memories SET content = ?1, meta = ?2, \
+                             importance = MAX(COALESCE(importance, 0.5), ?3), \
+                             access_count = COALESCE(access_count, 0) + 1, \
+                             updated_at = ?4 WHERE id = ?5",
+                            params![content, merged_meta, imp, now, neighbor.id],
+                        )?;
+                        return Ok(());
+                    }
+                    suspect_of = Some(neighbor.key);
+                }
+            }
+
+            let meta_json = if let Some(ref neighbor_key) = suspect_of {
+                let mut m = serde_json::Map::new();
+                m.insert("merge_candidate".to_string(), serde_json::json!(neighbor_key));
+                Some(serde_json::to_string(&m).unwrap_or_default())
+            } else {
+                None
+            };
+
             conn.execute(
                 "INSERT INTO memories (
                     id, key, content, category, embedding, created_at, updated_at,
-                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id
+                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id,
+                    trust, meta, access_count
                  )
                  VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     COALESCE(?11, (SELECT id FROM agents WHERE alias = 'default' LIMIT 1)),
-                    ?12, ?13, ?14
+                    ?12, ?13, ?14, 0.5, ?15, 0
                  )
                  ON CONFLICT(agent_id, key) DO UPDATE SET
                     content = excluded.content,
@@ -438,7 +595,8 @@ impl SqliteMemory {
                     importance = excluded.importance,
                     kind = excluded.kind,
                     pinned = excluded.pinned,
-                    tenant_id = excluded.tenant_id",
+                    tenant_id = excluded.tenant_id,
+                    meta = COALESCE(excluded.meta, memories.meta)",
                 params![
                     id,
                     key,
@@ -453,7 +611,8 @@ impl SqliteMemory {
                     aid,
                     kind,
                     pinned,
-                    tenant_id
+                    tenant_id,
+                    meta_json
                 ],
             )?;
             Ok(())
@@ -967,7 +1126,7 @@ impl SqliteMemory {
             let until_ref = until_owned.as_deref();
 
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.superseded_by IS NULL AND 1=1"
                     .to_string();
@@ -1013,6 +1172,8 @@ impl SqliteMemory {
                     tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
+                    trust: row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                    last_feedback_at: row.get::<_, Option<String>>(15).ok().flatten(),
                 })
             })?;
 
@@ -1179,7 +1340,7 @@ impl SqliteMemory {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                      WHERE m.superseded_by IS NULL AND m.id IN ({placeholders})"
                 );
@@ -1206,6 +1367,8 @@ impl SqliteMemory {
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                        row.get::<_, Option<String>>(15).ok().flatten(),
                     ))
                 })?;
 
@@ -1226,12 +1389,14 @@ impl SqliteMemory {
                         alias,
                         aid,
                         tenant,
+                        trust,
+                        last_feedback_at,
                     ) = row?;
                     entry_map.insert(
                         id,
                         (
                             key, content, cat, ts, sid, ns, imp, sup, kind, pinned, alias, aid,
-                            tenant,
+                            tenant, trust, last_feedback_at,
                         ),
                     );
                 }
@@ -1251,6 +1416,8 @@ impl SqliteMemory {
                         alias,
                         aid,
                         tenant,
+                        trust,
+                        last_feedback_at,
                     )) = entry_map.remove(&scored.id)
                     {
                         if let Some(s) = since_ref
@@ -1277,6 +1444,8 @@ impl SqliteMemory {
                             tenant_id: tenant,
                             agent_alias: alias,
                             agent_id: aid,
+                            trust,
+                            last_feedback_at,
                         };
                         // Session filter for the hybrid stage. With a live
                         // vector stage, durable global rows are exempt so
@@ -1351,7 +1520,7 @@ impl SqliteMemory {
                         param_idx += agent_filter.len();
                     }
                     let sql = format!(
-                        "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
+                        "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                          WHERE m.superseded_by IS NULL AND ({where_clause}){time_conditions}{agent_conditions}
                          ORDER BY m.updated_at DESC
@@ -1395,6 +1564,8 @@ impl SqliteMemory {
                             tenant_id: row.get(13)?,
                             agent_alias: row.get(11)?,
                             agent_id: row.get(12)?,
+                            trust: row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                            last_feedback_at: row.get::<_, Option<String>>(15).ok().flatten(),
                         })
                     })?;
                     for row in rows {
@@ -1516,7 +1687,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1",
             )?;
@@ -1538,6 +1709,8 @@ impl Memory for SqliteMemory {
                     tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
+                    trust: row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                    last_feedback_at: row.get::<_, Option<String>>(15).ok().flatten(),
                 })
             })?;
 
@@ -1561,7 +1734,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1 AND m.agent_id = ?2",
             )?;
@@ -1583,6 +1756,8 @@ impl Memory for SqliteMemory {
                     tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
+                    trust: row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                    last_feedback_at: row.get::<_, Option<String>>(15).ok().flatten(),
                 })
             })?;
 
@@ -1590,6 +1765,94 @@ impl Memory for SqliteMemory {
                 Some(Ok(entry)) => Ok(Some(entry)),
                 _ => Ok(None),
             }
+        })
+        .await?
+    }
+
+    async fn record_feedback(
+        &self,
+        key: &str,
+        verdict: &str,
+        note: Option<&str>,
+    ) -> anyhow::Result<Option<f64>> {
+        let delta = match verdict {
+            "helpful" => 0.15,
+            "unhelpful" => -0.2,
+            "outdated" => -0.3,
+            other => anyhow::bail!("verdict must be helpful|unhelpful|outdated, got: {other}"),
+        };
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let note = note.map(str::to_string);
+        let verdict = verdict.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<f64>> {
+            let conn = conn.lock();
+            let row: Option<(String, Option<f64>, Option<String>)> = conn
+                .query_row(
+                    "SELECT id, trust, meta FROM memories WHERE key = ?1",
+                    params![key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+
+            let Some((id, current_trust, meta_raw)) = row else {
+                return Ok(None);
+            };
+
+            let now = Local::now().to_rfc3339();
+            let mut obj: serde_json::Map<String, serde_json::Value> = meta_raw
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok())
+                .unwrap_or_default();
+
+            let mut feedback: Vec<serde_json::Value> = obj
+                .get("feedback")
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default();
+
+            feedback.push(serde_json::json!({
+                "verdict": verdict,
+                "note": note,
+                "at": now,
+            }));
+
+            let start = feedback.len().saturating_sub(20);
+            obj.insert("feedback".to_string(), serde_json::Value::from(feedback[start..].to_vec()));
+
+            let new_trust = (((current_trust.unwrap_or(0.5) + delta) * 10000.0).round() / 10000.0).clamp(0.0, 1.0);
+            if new_trust < 0.15 {
+                obj.insert("candidate_for_forget".to_string(), serde_json::json!(true));
+            }
+
+            let meta_str = serde_json::to_string(&obj)?;
+            conn.execute(
+                "UPDATE memories SET trust = ?1, last_feedback_at = ?2, meta = ?3 WHERE id = ?4",
+                params![new_trust, now, meta_str, id],
+            )?;
+
+            Ok(Some(new_trust))
+        })
+        .await?
+    }
+
+    async fn touch_access(&self, keys: &[String]) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let now = Local::now().to_rfc3339();
+        let conn = self.conn.clone();
+        let keys_owned = keys.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            for key in keys_owned {
+                let _ = conn.execute(
+                    "UPDATE memories SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ?1, \
+                     trust = MIN(1.0, trust + 0.02) WHERE key = ?2",
+                    params![now, key],
+                );
+            }
+            Ok(())
         })
         .await?
     }
@@ -1627,13 +1890,15 @@ impl Memory for SqliteMemory {
                     tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
+                    trust: row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                    last_feedback_at: row.get::<_, Option<String>>(15).ok().flatten(),
                 })
             };
 
             if let Some(ref cat) = category {
                 let cat_str = Self::category_to_str(cat);
                 let mut stmt = conn.prepare(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                      WHERE m.superseded_by IS NULL AND m.category = ?1 ORDER BY m.updated_at DESC LIMIT ?2",
                 )?;
@@ -1648,7 +1913,7 @@ impl Memory for SqliteMemory {
                 }
             } else {
                 let mut stmt = conn.prepare(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
                      WHERE m.superseded_by IS NULL ORDER BY m.updated_at DESC LIMIT ?1",
                 )?;
@@ -1906,7 +2171,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE 1=1"
                     .to_string();
@@ -1960,6 +2225,8 @@ impl Memory for SqliteMemory {
                     tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
+                    trust: row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                    last_feedback_at: row.get::<_, Option<String>>(15).ok().flatten(),
                 })
             })?;
 
@@ -1979,7 +2246,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
                  ORDER BY m.created_at ASC",
@@ -2001,6 +2268,8 @@ impl Memory for SqliteMemory {
                     tenant_id: row.get(13)?,
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
+                    trust: row.get::<_, Option<f64>>(14).ok().flatten().or(Some(0.5)),
+                    last_feedback_at: row.get::<_, Option<String>>(15).ok().flatten(),
                 })
             })?;
             let mut results = Vec::new();
@@ -5457,5 +5726,122 @@ mod tests {
                 "list() must yield a deterministic order across reads"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_record_feedback_trust_and_forget_candidate() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("fact-fb", "User prefers dark mode", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let entry = mem.get("fact-fb").await.unwrap().expect("found");
+        assert_eq!(entry.trust, Some(0.5));
+
+        let t1 = mem.record_feedback("fact-fb", "helpful", Some("useful info")).await.unwrap();
+        assert!((t1.unwrap() - 0.65).abs() < 1e-4);
+
+        let t2 = mem.record_feedback("fact-fb", "outdated", None).await.unwrap();
+        assert!((t2.unwrap() - 0.35).abs() < 1e-4);
+
+        let t3 = mem.record_feedback("fact-fb", "unhelpful", None).await.unwrap();
+        assert!((t3.unwrap() - 0.15).abs() < 1e-4);
+
+        let t4 = mem.record_feedback("fact-fb", "unhelpful", None).await.unwrap();
+        assert!((t4.unwrap() - 0.0).abs() < 1e-4);
+
+        let conn = mem.connection().lock();
+        let meta_str: String = conn.query_row(
+            "SELECT meta FROM memories WHERE key = 'fact-fb'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        let meta_val: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        assert_eq!(meta_val.get("candidate_for_forget"), Some(&serde_json::json!(true)));
+        let feedbacks = meta_val.get("feedback").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(feedbacks.len(), 4);
+    }
+
+    struct MockDedupEmbedding;
+    #[async_trait]
+    impl EmbeddingProvider for MockDedupEmbedding {
+        fn name(&self) -> &str {
+            "mock-dedup"
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut res = Vec::new();
+            for t in texts {
+                let mut v = vec![0.0; 16];
+                if t.contains("exact duplicate") || t.contains("original fact") {
+                    v[0] = 1.0;
+                } else if t.contains("suspect fact") {
+                    v[0] = 0.85;
+                    v[1] = 0.52678;
+                } else {
+                    v[1] = 1.0;
+                }
+                res.push(v);
+            }
+            Ok(res)
+        }
+        fn dimensions(&self) -> usize { 16 }
+    }
+
+    #[tokio::test]
+    async fn test_dedup_cosine_identity_and_suspect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let embedder = Arc::new(MockDedupEmbedding);
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            embedder,
+            0.7,
+            0.3,
+            1000,
+            Some(5),
+            SearchMode::default(),
+        ).unwrap();
+
+        // 1. Store original fact
+        mem.store("fact-orig", "original fact content", MemoryCategory::Core, None).await.unwrap();
+
+        let count: i64 = mem.connection().lock().query_row(
+            "SELECT COUNT(*) FROM memories",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+
+        // 2. Store identity duplicate (cos = 1.0 >= 0.98) with key "fact-dup"
+        mem.store("fact-dup", "exact duplicate content updated", MemoryCategory::Core, None).await.unwrap();
+
+        // Count should STILL be 1 because it performed a quiet update!
+        let count_after: i64 = mem.connection().lock().query_row(
+            "SELECT COUNT(*) FROM memories",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count_after, 1);
+
+        let orig = mem.get("fact-orig").await.unwrap().expect("orig exists");
+        assert_eq!(orig.content, "exact duplicate content updated");
+
+        // 3. Store suspect fact (cos = 0.85 in [0.75, 0.98))
+        mem.store("fact-suspect", "suspect fact content", MemoryCategory::Core, None).await.unwrap();
+
+        let count_suspect: i64 = mem.connection().lock().query_row(
+            "SELECT COUNT(*) FROM memories",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count_suspect, 2);
+
+        let meta_str: String = mem.connection().lock().query_row(
+            "SELECT meta FROM memories WHERE key = 'fact-suspect'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        let meta_val: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+        assert_eq!(meta_val.get("merge_candidate"), Some(&serde_json::json!("fact-orig")));
     }
 }

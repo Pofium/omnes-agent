@@ -32,6 +32,7 @@ pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
+pub mod prefetch;
 pub mod qdrant;
 pub mod redact;
 pub mod rerank;

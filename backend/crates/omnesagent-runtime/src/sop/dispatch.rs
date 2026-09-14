@@ -1586,6 +1586,8 @@ mod tests {
                 tenant_id: None,
                 agent_alias: agent_id.map(str::to_string),
                 agent_id: agent_id.map(str::to_string),
+                trust: None,
+                last_feedback_at: None,
             }
         }
     }

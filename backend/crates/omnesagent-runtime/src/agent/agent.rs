@@ -9484,6 +9484,8 @@ mod tests {
                     tenant_id: None,
                     agent_alias: None,
                     agent_id: None,
+                    trust: None,
+                    last_feedback_at: None,
                 }])
             }
             async fn get(&self, _: &str) -> anyhow::Result<Option<omnesagent_memory::MemoryEntry>> {

@@ -408,7 +408,7 @@ impl ProjectService {
             std::collections::HashMap::new()
         };
 
-        let scan_res = self.ast_extractor.scan_directory(path_obj, if incremental { Some(&known_hashes) } else { None });
+        let mut scan_res = self.ast_extractor.scan_directory(path_obj, if incremental { Some(&known_hashes) } else { None });
         let now = Utc::now().to_rfc3339();
 
         let deleted_files: Vec<String> = if incremental {
@@ -420,6 +420,12 @@ impl ProjectService {
         } else {
             Vec::new()
         };
+
+        // Type-pass: резолв простых вызовов (Rust/Python) по импортам и same-file
+        let resolved_calls = crate::ast::resolve_calls(&mut scan_res);
+        if resolved_calls > 0 {
+            info!("Type-pass: резолвлено {resolved_calls} вызовов (CALLS, provenance=RESOLVED)");
+        }
 
         if incremental && scan_res.files_scanned == 0 && deleted_files.is_empty() {
             info!("Инкрементальный скан: изменений не обнаружено для проекта '{}'", project_id);
@@ -526,14 +532,21 @@ impl ProjectService {
         {
             let mut insert_edge_stmt = tx.prepare(
                 r#"
-                INSERT OR IGNORE INTO graph_edges (source_id, target_id, label, weight, contexts, project_id, provenance, confidence, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ast', 1.0, ?7, ?7)
+                INSERT INTO graph_edges (source_id, target_id, label, weight, contexts, project_id, provenance, confidence, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?8)
+                ON CONFLICT(source_id, target_id, label) DO UPDATE SET
+                    weight = excluded.weight,
+                    contexts = excluded.contexts,
+                    provenance = excluded.provenance,
+                    confidence = excluded.confidence,
+                    updated_at = excluded.updated_at
                 "#,
             )?;
 
             for e in &scan_res.edges {
                 if let (Some(&src_pk), Some(&dst_pk)) = (node_id_to_pk.get(&e.source_node_id), node_id_to_pk.get(&e.target_node_id)) {
                     let ctx_json = serde_json::to_string(&vec![e.context.clone()]).unwrap_or_default();
+                    let prov = if e.provenance.is_empty() { "ast" } else { &e.provenance };
                     let _ = insert_edge_stmt.execute(params![
                         src_pk,
                         dst_pk,
@@ -541,6 +554,7 @@ impl ProjectService {
                         e.weight,
                         ctx_json,
                         project_id,
+                        prov,
                         now
                     ]);
                 }
@@ -744,6 +758,68 @@ impl ProjectService {
             god_nodes: god_nodes as usize,
             last_scanned_at: project.last_scanned_at,
         })
+    }
+
+    /// Построить компактную карту репозитория под заданный лимит токенов (PPR по file-dependency)
+    pub fn build_repo_map(
+        &self,
+        project_id: &str,
+        query: Option<&str>,
+        max_tokens: usize,
+        with_memory: bool,
+    ) -> anyhow::Result<String> {
+        let conn = self.conn.lock();
+        crate::graph::repomap::build_repo_map(&conn, project_id, query, max_tokens, with_memory)
+            .map_err(|e| anyhow::anyhow!("Ошибка построения repo_map: {e}"))
+    }
+
+    /// Поиск цепочки вызовов from -> to в графе проекта
+    pub fn call_path(
+        &self,
+        project_id: &str,
+        from_symbol: &str,
+        to_symbol: &str,
+        max_depth: usize,
+    ) -> anyhow::Result<Option<crate::graph::CallPathResult>> {
+        let conn = self.conn.lock();
+        let from = crate::graph::callpath::resolve_symbol(&conn, project_id, from_symbol)?
+            .ok_or_else(|| anyhow::anyhow!("Исходный символ '{from_symbol}' не найден"))?;
+        let to = crate::graph::callpath::resolve_symbol(&conn, project_id, to_symbol)?
+            .ok_or_else(|| anyhow::anyhow!("Целевой символ '{to_symbol}' не найден"))?;
+
+        crate::graph::callpath::call_path(&conn, project_id, &from, &to, max_depth)
+            .map_err(|e| anyhow::anyhow!("Ошибка вычисления call_path: {e}"))
+    }
+
+    /// Поиск вызывающих (callers) или вызываемых (callees) символов
+    pub fn callers_callees(
+        &self,
+        project_id: &str,
+        symbol: &str,
+        dir: crate::graph::Dir,
+        depth: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::graph::CallLink>> {
+        let conn = self.conn.lock();
+        let sym = crate::graph::callpath::resolve_symbol(&conn, project_id, symbol)?
+            .ok_or_else(|| anyhow::anyhow!("Символ '{symbol}' не найден"))?;
+
+        crate::graph::callpath::neighbors(&conn, project_id, sym.id, dir, depth, limit)
+            .map_err(|e| anyhow::anyhow!("Ошибка обхода графа вызовов: {e}"))
+    }
+
+    /// Детектирование кандидатов в мертвый код (in-degree 0)
+    pub fn dead_code(&self, project_id: &str) -> anyhow::Result<Vec<crate::graph::DeadSymbol>> {
+        let conn = self.conn.lock();
+        crate::graph::callpath::dead_code(&conn, project_id)
+            .map_err(|e| anyhow::anyhow!("Ошибка поиска мертвого кода: {e}"))
+    }
+
+    /// Получение актуальной подсказки радиуса поражения (blast radius hint)
+    pub fn blast_hint(&self, project_id: &str) -> anyhow::Result<Option<crate::graph::BlastHint>> {
+        let conn = self.conn.lock();
+        crate::graph::blast::latest_hint(&conn, project_id)
+            .map_err(|e| anyhow::anyhow!("Ошибка получения blast_hint: {e}"))
     }
 }
 

@@ -59,6 +59,16 @@ pub struct MemoryEntry {
     /// wrapper compares on this field so backend-kind doesn't matter.
     #[serde(default, alias = "agent_id")]
     pub agent_id: Option<String>,
+    /// Trust score (0.0–1.0) adjusted through agent feedback and revision.
+    #[serde(default = "default_trust")]
+    pub trust: Option<f64>,
+    /// Timestamp of last feedback received.
+    #[serde(default)]
+    pub last_feedback_at: Option<String>,
+}
+
+fn default_trust() -> Option<f64> {
+    Some(0.5)
 }
 
 fn default_namespace() -> String {
@@ -398,6 +408,23 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Default: no-op. SQL backends can override this with reversible
     /// soft-hide behavior; non-SQL backends remain source-compatible.
     async fn supersede(&self, _superseded_ids: &[String], _new_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Record agent feedback for a memory record, adjusting trust (helpful, unhelpful, outdated).
+    /// Default implementation is a no-op returning Ok(None).
+    async fn record_feedback(
+        &self,
+        _key: &str,
+        _verdict: &str,
+        _note: Option<&str>,
+    ) -> anyhow::Result<Option<f64>> {
+        Ok(None)
+    }
+
+    /// Increment access count and update trust (+0.02) for recalled entries used in context.
+    /// Default implementation is a no-op returning Ok(()).
+    async fn touch_access(&self, _keys: &[String]) -> anyhow::Result<()> {
         Ok(())
     }
 

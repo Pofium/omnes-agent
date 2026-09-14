@@ -43,7 +43,7 @@ pub const DEFAULT_MAX_ENTRIES: usize = 4;
 /// Default per-entry character cap before ellipsis truncation.
 pub const DEFAULT_ENTRY_MAX_CHARS: usize = 800;
 /// Default total character budget for the rendered block.
-pub const DEFAULT_MAX_TOTAL_CHARS: usize = 4_000;
+pub const DEFAULT_MAX_TOTAL_CHARS: usize = 8_000;
 
 /// The stable, per-agent-config half of the injection policy. Callers build
 /// it from the agent's resolved memory config; the per-turn half (origin,
@@ -337,6 +337,7 @@ pub async fn render_memory_context(
     let mut context = String::new();
     let mut included = 0usize;
     let mut used_chars = 0usize;
+    let mut included_keys = Vec::new();
 
     for entry in entries.iter().filter(|e| match e.score {
         Some(score) => score >= cfg.min_relevance_score,
@@ -372,11 +373,13 @@ pub async fn render_memory_context(
         context.push_str(&line);
         used_chars += line_chars;
         included += 1;
+        included_keys.push(entry.key.clone());
     }
 
     if included > 0 {
         context.push_str(MEMORY_CONTEXT_CLOSE);
         context.push_str("\n\n");
+        let _ = mem.touch_access(&included_keys).await;
     }
 
     context
@@ -435,6 +438,8 @@ mod tests {
             tenant_id: None,
             agent_alias: None,
             agent_id: None,
+            trust: None,
+            last_feedback_at: None,
         }
     }
 

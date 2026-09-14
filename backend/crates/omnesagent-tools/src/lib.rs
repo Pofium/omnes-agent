@@ -63,7 +63,9 @@ pub mod mcp_resources_tool;
 pub mod mcp_tool;
 pub mod mcp_transport;
 pub mod memory_export;
+pub mod memory_feedback;
 pub mod memory_forget;
+pub mod memory_merge;
 pub mod memory_purge;
 pub mod memory_recall;
 pub mod memory_store;
@@ -77,6 +79,7 @@ pub mod project_code;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod ralph_tool;
 pub mod reaction;
 pub mod report_template_tool;
 pub mod report_templates;
@@ -100,6 +103,8 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_forget",
     "memory_export",
     "memory_purge",
+    "memory_merge",
+    "memory_feedback",
 ];
 
 #[cfg(test)]
@@ -127,6 +132,14 @@ mod memory_tool_names_guard {
             )),
             Box::new(memory_export::MemoryExportTool::new(memory.clone())),
             Box::new(memory_purge::MemoryPurgeTool::new(
+                memory.clone(),
+                security.clone(),
+            )),
+            Box::new(memory_merge::MemoryMergeTool::new(
+                memory.clone(),
+                security.clone(),
+            )),
+            Box::new(memory_feedback::MemoryFeedbackTool::new(
                 memory.clone(),
                 security.clone(),
             )),

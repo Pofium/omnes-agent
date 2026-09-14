@@ -476,4 +476,140 @@ mod tests {
             ["pending", "active", "completed", "failed", "skipped"]
         );
     }
+
+    #[test]
+    fn layout_geometry_default_is_canonical_and_pitch_math_holds() {
+        let g = LayoutGeometry::default();
+        assert_eq!(g, LayoutGeometry::CANONICAL);
+        assert_eq!(g.node_w, LAYOUT_NODE_W);
+        assert_eq!(g.node_h, LAYOUT_NODE_H);
+        assert_eq!(g.col_gap, LAYOUT_COL_GAP);
+        assert_eq!(g.row_gap, LAYOUT_ROW_GAP);
+        assert_eq!(g.origin, LAYOUT_ORIGIN);
+        assert_eq!(g.col_pitch(), LAYOUT_NODE_W + LAYOUT_COL_GAP);
+        assert_eq!(g.row_pitch(), LAYOUT_NODE_H + LAYOUT_ROW_GAP);
+    }
+
+    #[test]
+    fn node_position_omits_absent_canvas_coordinates() {
+        let pos = NodePosition {
+            step: 3,
+            col: 1,
+            row: 2,
+            x: None,
+            y: Some(42.5),
+        };
+        let json = serde_json::to_value(pos).unwrap();
+        assert!(
+            json.get("x").is_none(),
+            "None x must be skipped on the wire"
+        );
+        assert_eq!(json["y"], 42.5);
+        let back: NodePosition = serde_json::from_value(json).unwrap();
+        assert_eq!(back, pos);
+
+        let plain = NodePosition {
+            step: 1,
+            col: 0,
+            row: 0,
+            x: None,
+            y: None,
+        };
+        let json = serde_json::to_value(plain).unwrap();
+        assert!(json.get("x").is_none() && json.get("y").is_none());
+        assert_eq!(json["step"], 1);
+        assert_eq!(json["col"], 0);
+    }
+
+    #[test]
+    fn trigger_node_round_trips_with_base_offset_and_index() {
+        let node = GraphNode {
+            step: TRIGGER_NODE_BASE + 7,
+            title: "webhook".into(),
+            kind: NodeKind::Trigger,
+            subtitle: Some("inbound".into()),
+            trigger_index: Some(7),
+            inputs: vec![],
+            outputs: vec![GraphPin {
+                class: PinClass::Flow,
+                name: "start".into(),
+                data_type: None,
+                required: false,
+            }],
+        };
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["kind"], "trigger");
+        assert_eq!(json["trigger_index"], 7);
+        assert_eq!(json["subtitle"], "inbound");
+        let back: GraphNode = serde_json::from_value(json).unwrap();
+        assert_eq!(back, node);
+        assert!(back.step >= TRIGGER_NODE_BASE);
+    }
+
+    #[test]
+    fn flow_wire_serializes_role_and_skips_absent_pins() {
+        let wire = GraphWire {
+            class: PinClass::Flow,
+            from_step: 1,
+            to_step: 2,
+            flow_role: Some(FlowRole::Failure),
+            from_pin: None,
+            to_pin: None,
+        };
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["flow_role"], "failure");
+        assert!(json.get("from_pin").is_none());
+        assert!(json.get("to_pin").is_none());
+        let back: GraphWire = serde_json::from_value(json).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    #[test]
+    fn pin_class_and_node_kind_serde_and_descriptions() {
+        assert_eq!(serde_json::to_value(PinClass::Flow).unwrap(), "flow");
+        assert_eq!(serde_json::to_value(PinClass::Data).unwrap(), "data");
+        assert_eq!(
+            PinClass::Flow.describe(),
+            "Execution-order edge: which step runs after which."
+        );
+        assert_eq!(
+            PinClass::Data.describe(),
+            "Typed data edge derived from a {{steps.N}} binding."
+        );
+        assert_eq!(PinClass::Flow.label(), "flow");
+        assert_eq!(PinClass::Data.label(), "data");
+        assert_eq!(serde_json::to_value(NodeKind::default()).unwrap(), "step");
+        assert_eq!(serde_json::to_value(NodeKind::Trigger).unwrap(), "trigger");
+    }
+
+    #[test]
+    fn run_state_label_describe_and_wire_key_cover_every_variant() {
+        // label() is the human legend text; the serde key and run_state_key
+        // are the wire value. They deliberately differ for Active ("running"
+        // vs "active") and Completed ("done" vs "completed") — lock both.
+        for (state, label, key) in [
+            (NodeRunState::Pending, "pending", "pending"),
+            (NodeRunState::Active, "running", "active"),
+            (NodeRunState::Completed, "done", "completed"),
+            (NodeRunState::Failed, "failed", "failed"),
+            (NodeRunState::Skipped, "skipped", "skipped"),
+        ] {
+            assert_eq!(state.label(), label);
+            assert!(!state.describe().is_empty());
+            assert_eq!(run_state_key(state), key);
+            assert_eq!(serde_json::to_value(state).unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn sop_graph_default_is_empty_with_canonical_geometry() {
+        let graph = SopGraph::default();
+        assert!(graph.nodes.is_empty());
+        assert!(graph.wires.is_empty());
+        assert!(graph.diagnostics.is_empty());
+        assert_eq!(graph.layout, GraphLayout::default());
+        assert_eq!(graph.layout.geometry, LayoutGeometry::CANONICAL);
+        assert_eq!(graph.layout.columns, 0);
+        assert_eq!(graph.layout.rows, 0);
+    }
 }
