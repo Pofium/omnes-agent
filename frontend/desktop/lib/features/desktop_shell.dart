@@ -17,7 +17,6 @@ import '../widgets/desktop_sidebar.dart';
 import 'automations/automations_view.dart';
 import 'command_palette/command_palette_dialog.dart';
 import 'inspector/inspector_panel.dart';
-import 'onboarding/user_onboarding_dialog.dart';
 import 'settings/desktop_settings_dialog.dart';
 import 'workspace/task_workspace_controller.dart';
 import 'workspace/task_workspace_view.dart';
@@ -32,16 +31,8 @@ class DesktopShell extends StatefulWidget {
 class _DesktopShellState extends State<DesktopShell> with WindowListener {
   final workspaceController = Get.put(DesktopTaskWorkspaceController());
 
-  // User Profile state (Screenshot 2: Ilya Presnyakov, Lite)
-  UserProfileData userProfile = UserProfileData(
-    firstName: 'Илья',
-    lastName: 'Пресняков',
-    role: 'Tech Lead / AI Engineer',
-    primaryStack: 'Rust / Dart / Python',
-    autonomyStyle: 'Full access (максимальная автономность)',
-    language: 'Русский',
-    enableAstMemory: true,
-  );
+  // User Profile state
+  UserProfileData userProfile = UserProfileData();
 
   int selectedNavIndex = 0;
   bool isSidebarVisible = true;
@@ -478,6 +469,8 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
                           : DesktopTaskWorkspaceView(
                               controller: workspaceController,
                               isToolsOpen: isInspectorOpen,
+                              isSidebarVisible: isSidebarVisible,
+                              onToggleSidebar: () => setState(() => isSidebarVisible = !isSidebarVisible),
                               onToggleTools: _toggleInspector,
                               onToggleTerminal: () => _openInspectorWithTab(1),
                               onOpenCanvas: () => _openInspectorWithTab(2),

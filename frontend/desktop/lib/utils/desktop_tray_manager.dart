@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
+import 'desktop_i18n.dart';
 
 class DesktopTrayManager with TrayListener {
   static final DesktopTrayManager instance = DesktopTrayManager._();
@@ -52,38 +53,46 @@ class DesktopTrayManager with TrayListener {
       }
       await trayManager.setToolTip('OmnesAgent (OA)');
 
+      await updateContextMenu();
+    } catch (_) {}
+  }
+
+  /// Updates or refreshes localized tray context menu.
+  Future<void> updateContextMenu() async {
+    try {
+      final isRu = DesktopI18n.isRu;
       final menu = Menu(
         items: [
           MenuItem(
             key: 'open_oa',
-            label: 'Open OA',
+            label: isRu ? 'Открыть OmnesAgent' : 'Open OA',
           ),
           MenuItem.separator(),
           MenuItem(
             key: 'new_task',
-            label: 'New task',
+            label: isRu ? 'Новая задача' : 'New task',
           ),
           MenuItem(
             key: 'open_workspace',
-            label: 'Open workspace',
+            label: isRu ? 'Открыть рабочую область' : 'Open workspace',
           ),
           MenuItem.separator(),
           MenuItem(
             key: 'check_updates',
-            label: 'Check for updates',
+            label: isRu ? 'Проверить обновления' : 'Check for updates',
           ),
           MenuItem(
             key: 'about_oa',
-            label: 'About OA',
+            label: isRu ? 'О программе OA' : 'About OA',
           ),
           MenuItem(
             key: 'clear_data',
-            label: 'Clear all data',
+            label: isRu ? 'Очистить все данные' : 'Clear all data',
           ),
           MenuItem.separator(),
           MenuItem(
             key: 'quit',
-            label: 'Quit',
+            label: isRu ? 'Выход' : 'Quit',
           ),
         ],
       );

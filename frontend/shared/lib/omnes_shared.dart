@@ -2,12 +2,16 @@
 
 export 'core/gateway/gateway_config.dart';
 export 'core/gateway/gateway_http.dart';
+export 'core/gateway/quickstart_submission.dart';
 export 'core/gateway/gateway_ws.dart';
 export 'core/gateway/models/gateway_frame.dart';
 export 'core/gateway/gateway_sse.dart';
 export 'core/gateway/canvas_ws.dart';
 export 'core/gateway/nodes_ws.dart';
 export 'core/gateway/sop_runs_ws.dart';
+export 'features/onboarding/personality_composer.dart';
+export 'features/onboarding/personality_templates.dart';
+export 'features/onboarding/user_onboarding_dialog.dart';
 
 export 'model/chat_model/chat_model.dart';
 export 'model/notification_model/notification_model.dart';

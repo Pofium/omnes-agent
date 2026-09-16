@@ -12,7 +12,6 @@ import 'package:omnes_shared/omnes_shared.dart';
 
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
-import '../onboarding/user_onboarding_dialog.dart';
 import '../workspace/task_workspace_controller.dart';
 
 class DesktopSettingsDialog extends StatefulWidget {
@@ -43,6 +42,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   bool memoryEnabled = true;
   bool inheritTerminal = true;
   bool enhancedGrep = true;
+  String startupSessionMode = 'last';
   final terminalFontController = TextEditingController(text: 'JetBrains Mono, SFMono-Regular, monospace');
 
   // STT (Speech-to-Text) state
@@ -352,6 +352,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
     _initProviderControllers();
     _loadSttConfig();
+    startupSessionMode = _storage.read<String>('startup_session_mode') ?? 'last';
     _loadBackendConfig();
     _loadPersonalityFile('SOUL.md');
     _loadPairedDevices();
@@ -1161,15 +1162,21 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Back to Workspace
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                  // Back to Workspace (exact height 56px matching right section header!)
+                  Container(
+                    height: 56,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    alignment: Alignment.centerLeft,
+                    decoration: BoxDecoration(
+                      border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
+                    ),
                     child: InkWell(
                       onTap: widget.onBackToWorkspace,
                       borderRadius: BorderRadius.circular(6),
                       child: Padding(
                         padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
                         child: Row(
+                          mainAxisSize: MainAxisSize.min,
                           children: [
                             Icon(Icons.arrow_back, size: 16, color: DesktopTheme.textMuted),
                             const SizedBox(width: 8),
@@ -1186,8 +1193,6 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       ),
                     ),
                   ),
-
-                  Divider(height: 1, color: DesktopTheme.borderSubtle),
 
                   Expanded(
                     child: ListView(
@@ -1643,6 +1648,52 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   style: TextStyle(fontSize: 11, color: Color(0xFF10B981), fontWeight: FontWeight.bold, fontFamily: 'Consolas'),
                 ),
               ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+
+        // Startup Session Mode
+        _buildSettingCard(
+          title: DesktopI18n.tr('Сессия при запуске', 'Startup session'),
+          subtitle: DesktopI18n.tr(
+            'Открывать последнюю активную сессию (или новую, если сессий нет) либо всегда начинать с новой сессии при каждом запуске приложения.',
+            'Open the last active session (or new if none exist) or always start with a new session upon application launch.',
+          ),
+          control: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurface,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: DesktopTheme.borderSubtle),
+            ),
+            child: DropdownButton<String>(
+              value: startupSessionMode,
+              underline: const SizedBox.shrink(),
+              dropdownColor: DesktopTheme.bgSurface,
+              style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
+              items: [
+                DropdownMenuItem(
+                  value: 'last',
+                  child: Text(
+                    DesktopI18n.tr('Последняя активная сессия', 'Last active session'),
+                    style: TextStyle(color: DesktopTheme.textPrimary),
+                  ),
+                ),
+                DropdownMenuItem(
+                  value: 'new',
+                  child: Text(
+                    DesktopI18n.tr('Всегда новая сессия', 'Always new session'),
+                    style: TextStyle(color: DesktopTheme.textPrimary),
+                  ),
+                ),
+              ],
+              onChanged: (val) {
+                if (val != null) {
+                  setState(() => startupSessionMode = val);
+                  _storage.write('startup_session_mode', val);
+                }
+              },
             ),
           ),
         ),
@@ -2998,8 +3049,17 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
           ),
           onPressed: () async {
-            await _httpClient.applyQuickstart({'completed': true});
-            Get.snackbar('Quickstart завершён', 'Конфигурация шлюза сохранена');
+            final res = await _httpClient.submitQuickstart(
+              BuilderSubmissionDto.withDefaults(
+                agentName: 'omnes',
+                systemPrompt: 'You are Omnes, a personal engineering assistant.',
+              ),
+            );
+            if (res.isApplied) {
+              Get.snackbar('Quickstart завершён', 'Конфигурация шлюза сохранена');
+            } else {
+              Get.snackbar('Ошибка Quickstart', res.errors.isNotEmpty ? res.errors.first.message : 'Не удалось применить конфигурацию');
+            }
           },
         ),
       ],

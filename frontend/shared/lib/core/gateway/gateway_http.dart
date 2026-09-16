@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import '../../model/workspace_entry.dart';
 import '../../model/session_info.dart';
 import 'gateway_config.dart';
+import 'quickstart_submission.dart';
 
 class GatewayHttpClient {
   final http.Client _client;
@@ -1203,30 +1204,126 @@ class GatewayHttpClient {
   }
 
   /// Validates quickstart configuration via POST /api/quickstart/validate.
-  Future<Map<String, dynamic>?> validateQuickstart(Map<String, dynamic> fields) async {
+  Future<ValidateResultDto> validateQuickstartSubmission(BuilderSubmissionDto submission) async {
     try {
       final base = GatewayConfig.getBaseUrl();
       final uri = Uri.parse('$base/api/quickstart/validate');
       final headers = await _authHeaders();
-      final res = await _client.post(uri, headers: headers, body: jsonEncode(fields)).timeout(const Duration(seconds: 15));
+      final res = await _client
+          .post(uri, headers: headers, body: jsonEncode(submission.toJson()))
+          .timeout(const Duration(seconds: 15));
       if (res.statusCode == 200) {
-        return _decodeBody(res) as Map<String, dynamic>;
+        final decoded = _decodeBody(res) as Map<String, dynamic>;
+        return ValidateResultDto.fromJson(decoded);
       }
-    } catch (_) {}
-    return null;
+      return ValidateResultDto(
+        isOk: false,
+        errors: [
+          QuickstartErrorDto(
+            step: 'transport',
+            field: 'network',
+            message: 'HTTP ${res.statusCode}: ${res.body}',
+          ),
+        ],
+      );
+    } catch (e) {
+      return ValidateResultDto(
+        isOk: false,
+        errors: [
+          QuickstartErrorDto(
+            step: 'transport',
+            field: 'network',
+            message: e.toString(),
+          ),
+        ],
+      );
+    }
   }
 
   /// Applies quickstart configuration via POST /api/quickstart/apply.
-  Future<bool> applyQuickstart(Map<String, dynamic> fields) async {
+  /// Atomically writes config.toml + staged personality files and signals daemon reload.
+  Future<ApplyResultDto> submitQuickstart(BuilderSubmissionDto submission) async {
     try {
       final base = GatewayConfig.getBaseUrl();
       final uri = Uri.parse('$base/api/quickstart/apply');
       final headers = await _authHeaders();
-      final res = await _client.post(uri, headers: headers, body: jsonEncode(fields)).timeout(const Duration(seconds: 20));
-      return res.statusCode == 200;
+      final res = await _client
+          .post(uri, headers: headers, body: jsonEncode(submission.toJson()))
+          .timeout(const Duration(seconds: 25));
+      if (res.statusCode == 200) {
+        final decoded = _decodeBody(res) as Map<String, dynamic>;
+        return ApplyResultDto.fromJson(decoded);
+      }
+      return ApplyResultDto(
+        isApplied: false,
+        errors: [
+          QuickstartErrorDto(
+            step: 'transport',
+            field: 'network',
+            message: 'HTTP ${res.statusCode}: ${res.body}',
+          ),
+        ],
+      );
+    } catch (e) {
+      return ApplyResultDto(
+        isApplied: false,
+        errors: [
+          QuickstartErrorDto(
+            step: 'transport',
+            field: 'network',
+            message: e.toString(),
+          ),
+        ],
+      );
+    }
+  }
+
+  /// Dismisses the quickstart wizard via POST /api/quickstart/dismiss.
+  Future<bool> dismissQuickstart({
+    required String runId,
+    String surface = 'web',
+    String? lastStep,
+  }) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/quickstart/dismiss');
+      final headers = await _authHeaders();
+      final body = <String, dynamic>{
+        'run_id': runId,
+        'surface': surface,
+        if (lastStep != null) 'last_step': lastStep,
+      };
+      final res = await _client
+          .post(uri, headers: headers, body: jsonEncode(body))
+          .timeout(const Duration(seconds: 10));
+      return res.statusCode == 200 || res.statusCode == 204;
     } catch (_) {
       return false;
     }
+  }
+
+  /// Fetches schema descriptor fields for a given section/type via POST /api/quickstart/fields.
+  Future<List<Map<String, dynamic>>> getQuickstartFields({
+    required String section,
+    required String typeKey,
+  }) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/quickstart/fields');
+      final headers = await _authHeaders();
+      final body = {'section': section, 'type_key': typeKey};
+      final res = await _client
+          .post(uri, headers: headers, body: jsonEncode(body))
+          .timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        final decoded = _decodeBody(res) as Map<String, dynamic>;
+        final rawFields = decoded['fields'] as List<dynamic>?;
+        if (rawFields != null) {
+          return rawFields.cast<Map<String, dynamic>>();
+        }
+      }
+    } catch (_) {}
+    return const [];
   }
 
   // ── Personality Editor API (/api/personality) ─────────────────────────────

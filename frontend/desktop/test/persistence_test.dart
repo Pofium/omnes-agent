@@ -5,10 +5,10 @@ void main() {
   group('UserProfileData Persistence & Serialization Tests', () {
     test('UserProfileData initializes with default values', () {
       final profile = UserProfileData();
-      expect(profile.firstName, equals('Илья'));
-      expect(profile.lastName, equals('Пресняков'));
-      expect(profile.fullName, equals('Илья Пресняков'));
-      expect(profile.initials, equals('ИП'));
+      expect(profile.firstName, equals(''));
+      expect(profile.lastName, equals(''));
+      expect(profile.fullName, equals(''));
+      expect(profile.initials, equals(''));
       expect(profile.role, contains('Tech Lead'));
       expect(profile.enableAstMemory, isTrue);
     });
@@ -48,7 +48,7 @@ void main() {
 
       final profile = UserProfileData.fromJson(partialJson);
       expect(profile.firstName, equals('Елена'));
-      expect(profile.lastName, equals('Пресняков')); // fallback default
+      expect(profile.lastName, equals('')); // neutral default
       expect(profile.enableAstMemory, isTrue);
     });
   });

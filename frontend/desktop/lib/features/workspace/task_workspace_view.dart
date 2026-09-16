@@ -22,6 +22,8 @@ class DesktopTaskWorkspaceView extends StatefulWidget {
   final void Function(String? text)? onBranchSideChat;
   final VoidCallback? onReviewChanges;
   final bool isToolsOpen;
+  final bool isSidebarVisible;
+  final VoidCallback? onToggleSidebar;
 
   const DesktopTaskWorkspaceView({
     super.key,
@@ -33,6 +35,8 @@ class DesktopTaskWorkspaceView extends StatefulWidget {
     this.onBranchSideChat,
     this.onReviewChanges,
     this.isToolsOpen = false,
+    this.isSidebarVisible = true,
+    this.onToggleSidebar,
   });
 
   @override
@@ -67,6 +71,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               children: [
                 // 1. Top Navigation Bar
                 _buildTopNavBar(hasMessages),
+
+                // Gateway connection status banner / loader
+                _buildGatewayStatusBar(),
 
                 // 1.1 Project & Branch Sub-Header with Git Changes (Shown if session is in project)
                 _buildProjectContextBar(),
@@ -631,6 +638,99 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   }
 
   // ==========================================
+  // GATEWAY STATUS & CONNECTION LOADER
+  // ==========================================
+  Widget _buildGatewayStatusBar() {
+    return Obx(() {
+      final status = widget.controller.wsStatus.value;
+      if (status == 'connecting') {
+        return Container(
+          height: 30,
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(
+            color: const Color(0xFF00D2FF).withOpacity(0.08),
+            border: Border(bottom: BorderSide(color: const Color(0xFF00D2FF).withOpacity(0.2), width: 0.8)),
+          ),
+          child: Row(
+            children: [
+              const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF00D2FF)),
+              ),
+              const SizedBox(width: 10),
+              Text(
+                DesktopI18n.tr(
+                  'Подключение к шлюзу OmnesAgent (127.0.0.1:42617)...',
+                  'Connecting to OmnesAgent Gateway (127.0.0.1:42617)...',
+                ),
+                style: const TextStyle(
+                  fontSize: 11.5,
+                  color: Color(0xFF00D2FF),
+                  fontFamily: 'Consolas',
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        );
+      } else if (status == 'error' && !isBannerDismissed) {
+        return Container(
+          height: 32,
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          decoration: BoxDecoration(
+            color: const Color(0xFFEF4444).withOpacity(0.12),
+            border: Border(bottom: BorderSide(color: const Color(0xFFEF4444).withOpacity(0.3), width: 0.8)),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.cloud_off_rounded, size: 14, color: Color(0xFFF87171)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  DesktopI18n.tr(
+                    'Шлюз OmnesAgent (127.0.0.1:42617) недоступен. Ожидание запуска демона...',
+                    'OmnesAgent Gateway (127.0.0.1:42617) is offline. Waiting for daemon...',
+                  ),
+                  style: const TextStyle(fontSize: 11.5, color: Color(0xFFFCA5A5)),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              InkWell(
+                onTap: () {
+                  widget.controller.initGatewayConnection();
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEF4444).withOpacity(0.2),
+                    border: Border.all(color: const Color(0xFFEF4444).withOpacity(0.4), width: 0.8),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    DesktopI18n.tr('Повторить', 'Retry'),
+                    style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              InkWell(
+                onTap: () => setState(() => isBannerDismissed = true),
+                child: const Icon(Icons.close, size: 13, color: Color(0xFF94A3B8)),
+              ),
+            ],
+          ),
+        );
+      }
+      return const SizedBox.shrink();
+    });
+  }
+
+  // ==========================================
   // TOP NAV BAR MATCHING AUTHENTIC WINDOWS ADE
   // ==========================================
   Widget _buildTopNavBar(bool hasMessages) {
@@ -645,6 +745,34 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       ),
       child: Row(
         children: [
+          // If sidebar is collapsed, show expand button
+          if (!widget.isSidebarVisible && widget.onToggleSidebar != null) ...[
+            Tooltip(
+              message: DesktopI18n.tr('Показать боковую панель', 'Show sidebar'),
+              child: InkWell(
+                onTap: widget.onToggleSidebar,
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  padding: const EdgeInsets.all(5),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.bgSurfaceElevated,
+                    borderRadius: BorderRadius.circular(5),
+                    border: Border.all(color: DesktopTheme.borderSubtle, width: 0.8),
+                  ),
+                  child: Transform.flip(
+                    flipX: true,
+                    child: Icon(
+                      Icons.view_sidebar_outlined,
+                      size: 14,
+                      color: DesktopTheme.textMuted,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+
           // Session Tabs / Title
           Expanded(
             child: Obx(() {

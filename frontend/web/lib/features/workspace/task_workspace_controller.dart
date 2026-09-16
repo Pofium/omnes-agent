@@ -264,13 +264,18 @@ class DesktopTaskWorkspaceController extends GetxController {
     if (savedTabs != null && savedTabs.isNotEmpty) {
       openSessionTabs.assignAll(savedTabs.map((e) => e.toString()));
     }
-    final savedActive = GetStorage().read<String>('desktop_active_session_id') ?? (sessions.isNotEmpty ? sessions.keys.first : 'omnes-core-arch');
-    if (sessions.containsKey(savedActive)) {
-      switchToSession(savedActive);
-    } else if (sessions.isNotEmpty) {
-      switchToSession(sessions.keys.first);
-    } else {
+    final startupMode = GetStorage().read<String>('startup_session_mode') ?? 'last';
+    if (startupMode == 'new') {
       createNewTask();
+    } else {
+      final savedActive = GetStorage().read<String>('desktop_active_session_id');
+      if (savedActive != null && sessions.containsKey(savedActive)) {
+        switchToSession(savedActive);
+      } else if (sessions.isNotEmpty) {
+        switchToSession(sessions.keys.first);
+      } else {
+        createNewTask();
+      }
     }
     refreshGitStatus();
     initGatewayConnection();
@@ -464,6 +469,11 @@ class DesktopTaskWorkspaceController extends GetxController {
     tokenCount.value = session.tokenCount;
     activeGoal.value = session.activeGoal;
     isTerminalOpen.value = session.isTerminalOpen;
+
+    session.messages.removeWhere((m) =>
+        m.isError &&
+        (m.text.contains('Connection failed: WebSocketChannelException') ||
+         m.text.contains('Удаленный компьютер отклонил это сетевое подключение')));
 
     // Restore persistent messages from local storage if available
     final hasLoaded = _loadSessionMessages(id);
@@ -816,7 +826,7 @@ class DesktopTaskWorkspaceController extends GetxController {
         messages.last.isThinkingExpanded = false;
         messages.last.text += '\n\n⚠️ Ошибка шлюза: ${frame.message}';
         messages.refresh();
-      } else {
+      } else if (isRunning.value) {
         messages.add(ChatMessage(
           text: '⚠️ Ошибка шлюза: ${frame.message}',
           chatMessageType: ChatMessageType.bot,
@@ -1635,6 +1645,14 @@ $goalsText
       if (raw != null && raw.isNotEmpty) {
         final loaded = raw.map((item) {
           return ChatMessage.fromJson(Map<String, dynamic>.from(item as Map));
+        }).where((m) {
+          // Filter out unwanted background socket connection errors that were previously saved
+          if (m.isError &&
+              (m.text.contains('Connection failed: WebSocketChannelException') ||
+               m.text.contains('Удаленный компьютер отклонил это сетевое подключение'))) {
+            return false;
+          }
+          return true;
         }).toList();
         messages.assignAll(loaded);
         final current = sessions[sessionId];

@@ -286,10 +286,16 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     ),
                   ),
                   const Spacer(),
-                  InkWell(
-                    onTap: widget.onToggleSidebar,
-                    borderRadius: BorderRadius.circular(4),
-                    child: Icon(Icons.view_sidebar_outlined, size: 15, color: DesktopTheme.textMuted),
+                  Tooltip(
+                    message: DesktopI18n.tr('Скрыть боковую панель', 'Collapse sidebar'),
+                    child: InkWell(
+                      onTap: widget.onToggleSidebar,
+                      borderRadius: BorderRadius.circular(4),
+                      child: Transform.flip(
+                        flipX: true,
+                        child: Icon(Icons.view_sidebar_outlined, size: 15, color: DesktopTheme.textMuted),
+                      ),
+                    ),
                   ),
                 ],
               ),
