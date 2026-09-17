@@ -60,6 +60,9 @@ webpki-roots = "1.0.6"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
 [features]
 default = []
 browser-native = ["dep:fantoccini"]

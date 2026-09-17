@@ -23,7 +23,7 @@ omnesagent-hardware.workspace = true
 omnesagent-plugins = { workspace = true, optional = true }
 
 # HTTP server
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros", "multipart"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }

@@ -19,7 +19,9 @@ void main() async {
   Get.put(DesktopThemeController());
 
   // Automatically start backend gateway if not running
-  DesktopBackendManager.startBackendIfNeeded();
+  try {
+    await DesktopBackendManager.startBackendIfNeeded().timeout(const Duration(seconds: 4));
+  } catch (_) {}
 
   runApp(const OmnesDesktopApp());
 
@@ -37,6 +39,7 @@ void main() async {
     await windowManager.show();
     await windowManager.focus();
     await windowManager.setPreventClose(true);
+    await windowManager.maximize();
   });
 }
 

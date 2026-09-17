@@ -9,6 +9,7 @@ import 'package:get/get.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 
 import '../../theme/desktop_theme.dart';
+import '../../utils/desktop_backend_manager.dart';
 import '../../utils/desktop_i18n.dart';
 import '../../widgets/interactive_question_card.dart';
 import 'task_workspace_controller.dart';
@@ -700,8 +701,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 ),
               ),
               InkWell(
-                onTap: () {
-                  widget.controller.initGatewayConnection();
+                onTap: () async {
+                  setState(() => isBannerDismissed = false);
+                  await DesktopBackendManager.startBackendIfNeeded();
+                  await widget.controller.initGatewayConnection();
                 },
                 borderRadius: BorderRadius.circular(4),
                 child: Container(
@@ -1610,18 +1613,24 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // 1. Top inside row: Project & Branch switchers (Hero mode)
-          if (isHero && widget.controller.activeProject.value != null && widget.controller.activeProject.value!.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(left: 14, top: 12, right: 14),
-              child: Row(
-                children: [
+          // 1. Top inside row: Project & Branch switchers (Hero mode) on the left, Rules & Context indicators on the top-right
+          Padding(
+            padding: const EdgeInsets.only(left: 14, top: 10, right: 14),
+            child: Row(
+              children: [
+                if (isHero && widget.controller.activeProject.value != null && widget.controller.activeProject.value!.isNotEmpty) ...[
                   _buildProjectChip(),
                   const SizedBox(width: 8),
                   _buildBranchChip(),
                 ],
-              ),
+                const Spacer(),
+                // Top-right corner: System file icon (AGENTS.md) + Circular progress context indicator
+                _buildProjectRulesIconButton(),
+                const SizedBox(width: 6),
+                _buildCircularContextIndicator(),
+              ],
             ),
+          ),
 
           // 2. Attachment chips if any
           Obx(() {
@@ -1704,16 +1713,8 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
                 // [🛡️ Permission Mode ⌵]
                 _buildPermissionModeMenuButton(),
-                const SizedBox(width: 8),
-
-                // [📋 Project Rules / AGENTS.md]
-                _buildProjectRulesButton(),
 
                 const Spacer(),
-
-                // [📊 Context Gauge & Compact]
-                _buildContextGaugeButton(),
-                const SizedBox(width: 8),
 
                 // [🏢 Provider ⌵]
                 _buildProviderMenuButton(),
@@ -1729,6 +1730,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
                 // [🎙️ Voice Duplex Button]
                 _buildVoiceDuplexButton(),
+                const SizedBox(width: 8),
+
+                // [🗣️ Handy Dictation Button]
+                _buildHandyDictationButton(),
                 const SizedBox(width: 8),
 
                 // [↑ Send Button]
@@ -3262,8 +3267,34 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
-  /// Context Gauge & Auto-Compact Button (Point 3)
-  Widget _buildContextGaugeButton() {
+  /// System file icon button for project rules (AGENTS.md)
+  Widget _buildProjectRulesIconButton() {
+    return Tooltip(
+      message: 'Правила агентов',
+      child: InkWell(
+        onTap: () => _showProjectRulesDialog(context),
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          width: 26,
+          height: 26,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgSurfaceElevated.withOpacity(0.6),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: DesktopTheme.borderSubtle, width: 0.8),
+          ),
+          child: const Icon(
+            Icons.description_outlined,
+            size: 14,
+            color: Color(0xFF00D2FF),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Circular Progress Indicator for context cache with hover tooltip
+  Widget _buildCircularContextIndicator() {
     return Obx(() {
       final used = widget.controller.usedTokens.value;
       final max = widget.controller.maxTokens.value;
@@ -3280,98 +3311,43 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         badgeColor = const Color(0xFFF59E0B);
       }
 
-      return Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Tooltip(
-            message: 'Контекст: $used / $max токенов ($pct%)\nОриентировочная стоимость: \$${cost.toStringAsFixed(4)}',
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-              decoration: BoxDecoration(
-                color: DesktopTheme.bgSurfaceElevated,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: badgeColor.withOpacity(0.4), width: 0.8),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 6,
-                    height: 6,
-                    decoration: BoxDecoration(color: badgeColor, shape: BoxShape.circle),
-                  ),
-                  const SizedBox(width: 5),
-                  Text(
-                    '${(used / 1000).toStringAsFixed(1)}k / ${(max / 1000).toStringAsFixed(0)}k ($pct%)',
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      fontFamily: 'Consolas',
-                      color: DesktopTheme.textSecondary,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (isHigh || widget.controller.messages.length > 4) ...[
-            const SizedBox(width: 6),
-            Tooltip(
-              message: 'Оптимизировать контекст сессии (Compact)',
-              child: InkWell(
-                onTap: () => widget.controller.compactContext(),
-                borderRadius: BorderRadius.circular(6),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF00D2FF).withOpacity(0.12),
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4), width: 0.8),
-                  ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(Icons.bolt, size: 12, color: Color(0xFF00D2FF)),
-                      SizedBox(width: 3),
-                      Text('Сжать', style: TextStyle(fontSize: 10, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold)),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ],
-      );
-    });
-  }
+      final tooltipMsg = 'Контекст: ${(used / 1000).toStringAsFixed(1)}k / ${(max / 1000).toStringAsFixed(0)}k ($pct%)\n'
+          'Токенов: $used / $max\n'
+          'Ориентировочная стоимость: \$${cost.toStringAsFixed(4)}'
+          '${isHigh || widget.controller.messages.length > 4 ? "\nНажмите для сжатия контекста" : ""}';
 
-  /// Project Rules Inspector Button (Point 6)
-  Widget _buildProjectRulesButton() {
-    return Tooltip(
-      message: 'Правила проекта (AGENTS.md)',
-      child: InkWell(
-        onTap: () => _showProjectRulesDialog(context),
-        borderRadius: BorderRadius.circular(6),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurfaceElevated,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: DesktopTheme.borderSubtle, width: 0.8),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.rule_folder_outlined, size: 13, color: Color(0xFF00D2FF)),
-              const SizedBox(width: 5),
-              Text(
-                'AGENTS.md',
-                style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textSecondary),
+      return Tooltip(
+        message: tooltipMsg,
+        child: InkWell(
+          onTap: () {
+            if (isHigh || widget.controller.messages.length > 4) {
+              widget.controller.compactContext();
+            }
+          },
+          borderRadius: BorderRadius.circular(6),
+          child: Container(
+            width: 26,
+            height: 26,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurfaceElevated.withOpacity(0.6),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: DesktopTheme.borderSubtle, width: 0.8),
+            ),
+            child: SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(
+                value: ratio == 0 ? 0.04 : ratio,
+                strokeWidth: 2.2,
+                backgroundColor: DesktopTheme.borderSubtle,
+                color: badgeColor,
               ),
-            ],
+            ),
           ),
         ),
-      ),
-    );
+      );
+    });
   }
 
   /// Dialog to view and edit AGENTS.md project rules
@@ -4004,6 +3980,40 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         splashRadius: 18,
       );
     });
+  }
+
+  Widget _buildHandyDictationButton() {
+    return IconButton(
+      icon: const Icon(
+        Icons.record_voice_over_outlined,
+        size: 18,
+        color: Color(0xFF00D2FF),
+      ),
+      tooltip: DesktopI18n.tr(
+        'Handy: Офлайн-диктовка (Ctrl+Space)',
+        'Handy: Offline dictation (Ctrl+Space)',
+      ),
+      onPressed: () async {
+        try {
+          final res = await GatewayHttpClient().toggleHandyTranscription();
+          if (!res && mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  DesktopI18n.tr(
+                    'Handy не запущен или не установлен. Проверьте Настройки → Голосовой ввод.',
+                    'Handy is not running or installed. Check Settings → Voice Input.',
+                  ),
+                ),
+                backgroundColor: const Color(0xFF1E2228),
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          }
+        } catch (_) {}
+      },
+      splashRadius: 18,
+    );
   }
 
   // Helpers

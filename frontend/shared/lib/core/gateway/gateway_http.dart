@@ -2088,6 +2088,126 @@ class GatewayHttpClient {
     return [];
   }
 
+  // ── Handy STT integration API ──────────────────────────────────────────────
+
+  /// Fetches current Handy status from /api/voice/handy/status.
+  Future<Map<String, dynamic>?> getHandyStatus() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/status');
+      final headers = await _authHeaders();
+      final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Triggers Handy installation or update via POST /api/voice/handy/install.
+  Future<String?> installHandy({String? version, bool allowDowngrade = false}) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/install');
+      final headers = await _authHeaders();
+      final body = jsonEncode({
+        if (version != null) 'version': version,
+        'allow_downgrade': allowDowngrade,
+      });
+      final res = await _client.post(uri, headers: headers, body: body).timeout(const Duration(seconds: 10));
+      if (res.statusCode == 202) {
+        final data = _decodeBody(res);
+        return data['job_id'] as String?;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Cancels active Handy install/update job via POST /api/voice/handy/install/cancel.
+  Future<bool> cancelHandyInstall() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/install/cancel');
+      final headers = await _authHeaders();
+      final res = await _client.post(uri, headers: headers).timeout(const Duration(seconds: 10));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Launches Handy desktop application via POST /api/voice/handy/launch.
+  Future<bool> launchHandy() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/launch');
+      final headers = await _authHeaders();
+      final res = await _client.post(uri, headers: headers).timeout(const Duration(seconds: 10));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Stops Handy desktop application via POST /api/voice/handy/stop.
+  Future<bool> stopHandy() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/stop');
+      final headers = await _authHeaders();
+      final res = await _client.post(uri, headers: headers).timeout(const Duration(seconds: 10));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Toggles speech-to-text dictation in Handy via POST /api/voice/handy/toggle.
+  Future<bool> toggleHandyTranscription() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/toggle');
+      final headers = await _authHeaders();
+      final res = await _client.post(uri, headers: headers).timeout(const Duration(seconds: 5));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Uninstalls Handy via POST /api/voice/handy/uninstall.
+  Future<String?> uninstallHandy({bool deleteAppData = false}) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/uninstall');
+      final headers = await _authHeaders();
+      final body = jsonEncode({'delete_app_data': deleteAppData});
+      final res = await _client.post(uri, headers: headers, body: body).timeout(const Duration(seconds: 10));
+      if (res.statusCode == 202) {
+        final data = _decodeBody(res);
+        return data['job_id'] as String?;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Lists speech models available in Handy via GET /api/voice/handy/models.
+  Future<List<Map<String, dynamic>>> getHandyModels() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/voice/handy/models');
+      final headers = await _authHeaders();
+      final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        final data = _decodeBody(res);
+        if (data is List) {
+          return data.whereType<Map<String, dynamic>>().toList();
+        }
+      }
+    } catch (_) {}
+    return [];
+  }
+
   void dispose() {
     _client.close();
   }

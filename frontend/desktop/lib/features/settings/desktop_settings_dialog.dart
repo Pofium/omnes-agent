@@ -1,4 +1,3 @@
-import 'package:http/http.dart' as http;
 // Desktop Settings Dialog for OmnesAgent ADE matching authentic desktop styling.
 // Includes full LLM Providers management with API Key configuration and persistence,
 // omnesagent-commands catalogue, MCP Servers management, Skills, General setup,
@@ -47,16 +46,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   String startupSessionMode = 'last';
   final terminalFontController = TextEditingController(text: 'JetBrains Mono, SFMono-Regular, monospace');
 
-  // STT (Speech-to-Text) state
-  String sttProvider = 'groq';
-  final sttUrlController = TextEditingController(text: 'https://api.groq.com/openai/v1/audio/transcriptions');
-  final sttKeyController = TextEditingController();
-  final sttModelController = TextEditingController(text: 'whisper-large-v3-turbo');
-  final sttLangController = TextEditingController(text: 'ru');
-  bool isSttVerified = false;
-  bool isSttEnabled = false;
-  bool isSttTesting = false;
-  String? sttTestResultMsg;
+
 
   // Personality state
   String selectedPersonalityFile = 'SOUL.md';
@@ -353,7 +343,6 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     }
 
     _initProviderControllers();
-    _loadSttConfig();
     minimizeToTray = _storage.read<bool>('minimize_to_tray') ?? true;
     startupSessionMode = _storage.read<String>('startup_session_mode') ?? 'last';
     _loadBackendConfig();
@@ -369,102 +358,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     _initNodesWs();
   }
 
-  void _loadSttConfig() {
-    try {
-      sttProvider = _storage.read<String>('stt_provider') ?? 'groq';
-      final savedUrl = _storage.read<String>('stt_url');
-      if (savedUrl != null && savedUrl.isNotEmpty) sttUrlController.text = savedUrl;
-      final savedKey = _storage.read<String>('stt_key');
-      if (savedKey != null) sttKeyController.text = savedKey;
-      final savedModel = _storage.read<String>('stt_model');
-      if (savedModel != null && savedModel.isNotEmpty) sttModelController.text = savedModel;
-      final savedLang = _storage.read<String>('stt_lang');
-      if (savedLang != null && savedLang.isNotEmpty) sttLangController.text = savedLang;
-      isSttVerified = _storage.read<bool>('stt_verified') ?? false;
-      isSttEnabled = _storage.read<bool>('stt_enabled') ?? false;
-    } catch (_) {}
-  }
 
-  Future<void> _saveSttConfig() async {
-    try {
-      _storage.write('stt_provider', sttProvider);
-      _storage.write('stt_url', sttUrlController.text.trim());
-      _storage.write('stt_key', sttKeyController.text.trim());
-      _storage.write('stt_model', sttModelController.text.trim());
-      _storage.write('stt_lang', sttLangController.text.trim());
-      _storage.write('stt_verified', isSttVerified);
-      _storage.write('stt_enabled', isSttEnabled);
-    } catch (_) {}
-  }
-
-  Future<void> _testSttConnection() async {
-    final url = sttUrlController.text.trim();
-    final key = sttKeyController.text.trim();
-
-    if (url.isEmpty) {
-      setState(() => sttTestResultMsg = '❌ Укажите URL сервиса STT');
-      return;
-    }
-
-    setState(() {
-      isSttTesting = true;
-      sttTestResultMsg = 'Проверка доступности STT сервиса...';
-    });
-
-    try {
-      // Test the endpoint via GET/HEAD or models check
-      final testUri = Uri.parse(url);
-      final client = http.Client();
-      final req = http.Request('POST', testUri);
-      if (key.isNotEmpty) {
-        req.headers['Authorization'] = 'Bearer $key';
-      }
-
-      // Empty multipart request will return 400 Bad Request ("file required") if auth is OK!
-      final res = await client.send(req).timeout(const Duration(seconds: 8));
-
-      if (res.statusCode == 200 || res.statusCode == 400) {
-        // 400 with "file required" or 200 confirms auth was accepted!
-        setState(() {
-          isSttTesting = false;
-          isSttVerified = true;
-          sttTestResultMsg = '✓ Сервис доступен и авторизован! Можно включить голосовой ввод.';
-        });
-        await _saveSttConfig();
-      } else if (res.statusCode == 401 || res.statusCode == 403) {
-        setState(() {
-          isSttTesting = false;
-          isSttVerified = false;
-          sttTestResultMsg = '❌ Ошибка авторизации (HTTP ${res.statusCode}): проверьте API ключ.';
-        });
-      } else {
-        setState(() {
-          isSttTesting = false;
-          isSttVerified = true; // Still allow if endpoint responded
-          sttTestResultMsg = '✓ Эндпоинт ответил (HTTP ${res.statusCode}). Проверка пройдена.';
-        });
-        await _saveSttConfig();
-      }
-    } catch (e) {
-      setState(() {
-        isSttTesting = false;
-        isSttVerified = false;
-        sttTestResultMsg = '❌ Ошибка подключения: $e';
-      });
-    }
-  }
-
-  void _toggleStt(bool value) {
-    setState(() {
-      isSttEnabled = value;
-    });
-    _saveSttConfig();
-    try {
-      if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
-        Get.find<DesktopTaskWorkspaceController>().setSttEnabled(value);
-      }
-    } catch (_) {}
-  }
 
   Future<void> _loadPersonalityFile(String filename) async {
     selectedPersonalityFile = filename;
@@ -1227,6 +1121,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                         _buildNavItem('security', 'Безопасность (WebAuthn)', Icons.security),
                         _buildNavItem('version', 'Версия и обновления', Icons.system_update_alt),
                         _buildNavItem('devices', 'Устройства (Pairing)', Icons.devices),
+                        _buildNavItem('stt', DesktopI18n.tr('Голосовой ввод', 'Voice input'), Icons.mic_none),
                         _buildNavItem('system', 'Система и Host FS', Icons.admin_panel_settings_outlined),
                         _buildNavItem('integrations', 'Интеграции Hub', Icons.hub_outlined),
                       ],
@@ -1382,6 +1277,8 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         return 'Версия и обновления шлюза';
       case 'devices':
         return 'Подключённые устройства (Pairing)';
+      case 'stt':
+        return DesktopI18n.tr('Голосовой ввод и STT (Handy / Whisper)', 'Voice Input & STT (Handy / Whisper)');
       case 'channels':
         return 'Каналы связи и мессенджеры (Channels Hub)';
       case 'system':
@@ -1487,7 +1384,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       case 'integrations':
         return _buildIntegrationsSection();
       case 'stt':
-        return _buildSttSection();
+        return VoiceSettingsSection(httpClient: _httpClient);
       default:
         return _buildGeneralSection();
     }
@@ -3251,264 +3148,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     );
   }
 
-  // ========================================================
-  // SECTION: ИНТЕГРАЦИИ HUB
-  // ========================================================
-  Widget _buildSttSection() {
-    return SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Icon(Icons.mic, size: 20, color: Color(0xFF00D2FF)),
-              const SizedBox(width: 8),
-              Text(
-                DesktopI18n.tr('Голосовой ввод и STT (Speech-to-Text)', 'Voice Input & STT (Speech-to-Text)'),
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          Text(
-            DesktopI18n.tr(
-              'Подключение модели распознавания речи (Whisper, Groq, OpenAI). Кнопка микрофона в чате появится только после подтверждения работоспособности подключения.',
-              'Connect a speech recognition model. The microphone button in chat appears only after successful verification.',
-            ),
-            style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
-          ),
-          const SizedBox(height: 20),
 
-          // Configuration Card
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: DesktopTheme.bgSurfaceElevated,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: DesktopTheme.borderSubtle),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Провайдер STT:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
-                const SizedBox(height: 8),
-                DropdownButtonFormField<String>(
-                  value: sttProvider,
-                  dropdownColor: const Color(0xFF1E2228),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    filled: true,
-                    fillColor: const Color(0xFF13171E),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
-                  ),
-                  style: const TextStyle(fontSize: 13, color: Colors.white),
-                  items: const [
-                    DropdownMenuItem(value: 'groq', child: Text('Groq Whisper (Сверхбыстрый LPU)')),
-                    DropdownMenuItem(value: 'openai', child: Text('OpenAI Whisper (whisper-1)')),
-                    DropdownMenuItem(value: 'cloudflare', child: Text('Cloudflare Workers AI Whisper')),
-                    DropdownMenuItem(value: 'custom', child: Text('Локальный сервер / Custom Whisper API')),
-                  ],
-                  onChanged: (val) {
-                    if (val != null) {
-                      setState(() {
-                        sttProvider = val;
-                        isSttVerified = false;
-                        if (val == 'groq') {
-                          sttUrlController.text = 'https://api.groq.com/openai/v1/audio/transcriptions';
-                          sttModelController.text = 'whisper-large-v3-turbo';
-                        } else if (val == 'openai') {
-                          sttUrlController.text = 'https://api.openai.com/v1/audio/transcriptions';
-                          sttModelController.text = 'whisper-1';
-                        } else if (val == 'custom') {
-                          sttUrlController.text = 'http://localhost:8000/v1/audio/transcriptions';
-                          sttModelController.text = 'whisper-large-v3';
-                        }
-                      });
-                    }
-                  },
-                ),
-                const SizedBox(height: 14),
-
-                Text('URL эндпоинта STT:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: sttUrlController,
-                  style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    hintText: 'https://...',
-                    filled: true,
-                    fillColor: const Color(0xFF13171E),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
-                  ),
-                  onChanged: (_) => setState(() => isSttVerified = false),
-                ),
-                const SizedBox(height: 14),
-
-                Text('API Ключ:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: sttKeyController,
-                  obscureText: true,
-                  style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    hintText: 'gsk_... / sk-... (для локального Whisper можно оставить пустым)',
-                    filled: true,
-                    fillColor: const Color(0xFF13171E),
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
-                  ),
-                  onChanged: (_) => setState(() => isSttVerified = false),
-                ),
-                const SizedBox(height: 14),
-
-                Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('Модель:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
-                          const SizedBox(height: 6),
-                          TextField(
-                            controller: sttModelController,
-                            style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
-                            decoration: InputDecoration(
-                              isDense: true,
-                              filled: true,
-                              fillColor: const Color(0xFF13171E),
-                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('Язык распознавания:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
-                          const SizedBox(height: 6),
-                          TextField(
-                            controller: sttLangController,
-                            style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
-                            decoration: InputDecoration(
-                              isDense: true,
-                              hintText: 'ru, en, auto',
-                              filled: true,
-                              fillColor: const Color(0xFF13171E),
-                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 18),
-
-                // Test Connection Button
-                Row(
-                  children: [
-                    ElevatedButton.icon(
-                      onPressed: isSttTesting ? null : _testSttConnection,
-                      icon: isSttTesting
-                          ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                          : const Icon(Icons.network_check, size: 16),
-                      label: Text(isSttTesting ? 'Проверка...' : 'Проверить подключение'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00D2FF),
-                        foregroundColor: const Color(0xFF0F172A),
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    if (isSttVerified)
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF10B981).withOpacity(0.15),
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: const Color(0xFF10B981)),
-                        ),
-                        child: const Row(
-                          children: [
-                            Icon(Icons.check_circle, size: 14, color: Color(0xFF10B981)),
-                            SizedBox(width: 6),
-                            Text('Подключение проверено', style: TextStyle(fontSize: 11, color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                      ),
-                  ],
-                ),
-
-                if (sttTestResultMsg != null) ...[
-                  const SizedBox(height: 12),
-                  Text(
-                    sttTestResultMsg!,
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: isSttVerified ? const Color(0xFF34D399) : const Color(0xFFF87171),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          const SizedBox(height: 20),
-
-          // Activation Switch Card
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: DesktopTheme.bgSurfaceElevated,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: isSttVerified ? const Color(0xFF00D2FF).withOpacity(0.4) : DesktopTheme.borderSubtle),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.mic,
-                  size: 24,
-                  color: isSttEnabled ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
-                ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Включить голосовой ввод (кнопка микрофона в чате)',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.bold,
-                          color: isSttVerified ? DesktopTheme.textPrimary : DesktopTheme.textMuted,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        isSttVerified
-                            ? 'Сервис STT проверен. Включите, чтобы отобразить микрофон в строке промта.'
-                            : 'Сначала выполните успешную проверку подключения выше для активации.',
-                        style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
-                      ),
-                    ],
-                  ),
-                ),
-                Switch(
-                  value: isSttEnabled && isSttVerified,
-                  activeColor: const Color(0xFF00D2FF),
-                  onChanged: isSttVerified ? (val) => _toggleStt(val) : null,
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 
   Widget _buildIntegrationsSection() {
     final hubs = [

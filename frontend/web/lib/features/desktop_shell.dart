@@ -34,8 +34,11 @@ class _DesktopShellState extends State<DesktopShell> {
   int selectedNavIndex = 0;
   bool isSidebarVisible = true;
   double sidebarWidth = 260.0;
+  double centerWidth = 856.0;
   double inspectorWidth = 420.0;
   bool isInspectorOpen = false; // Closed by default
+  bool isCenterCollapsed = false; // When true, inspector occupies the entire middle area
+  static const double targetCenterWidth = 856.0;
   int inspectorTabIndex = -1; // -1 opens the 'Open tab' chooser from Screenshot 2
   String? sideChatInitialText;
   Key inspectorKey = UniqueKey();
@@ -88,6 +91,8 @@ class _DesktopShellState extends State<DesktopShell> {
   void _openInspectorWithTab(int index, {String? sideChatText}) {
     setState(() {
       isInspectorOpen = true;
+      isCenterCollapsed = false;
+      centerWidth = targetCenterWidth;
       inspectorTabIndex = index;
       sideChatInitialText = sideChatText;
       inspectorKey = UniqueKey();
@@ -98,6 +103,8 @@ class _DesktopShellState extends State<DesktopShell> {
     setState(() {
       isInspectorOpen = !isInspectorOpen;
       if (isInspectorOpen) {
+        isCenterCollapsed = false;
+        centerWidth = targetCenterWidth;
         inspectorTabIndex = -1; // Show Open Tab Chooser
         inspectorKey = UniqueKey();
       }
@@ -519,7 +526,9 @@ class _DesktopShellState extends State<DesktopShell> {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final totalWidth = constraints.maxWidth;
-            const minCenterWidth = 845.0;
+            const minCenterWidth = targetCenterWidth;
+            final currentLeft = isSidebarVisible ? sidebarWidth : 0.0;
+            final availableSpace = totalWidth - currentLeft;
 
             return Row(
               children: [
@@ -546,13 +555,19 @@ class _DesktopShellState extends State<DesktopShell> {
                     },
                     onOpenFile: (filePath) {
                       workspaceController.openProjectFile(filePath);
-                      _openInspectorWithTab(5); // File Viewer tab
+                      if (filePath.toLowerCase().endsWith('.md')) {
+                        _openInspectorWithTab(2); // Canvas tab
+                      } else {
+                        _openInspectorWithTab(5); // File Viewer tab
+                      }
                     },
+                    onSelectInspectorTab: (tabIdx) => _openInspectorWithTab(tabIdx),
                   ),
                   _buildVerticalResizer(
                     onDrag: (dx) {
-                      final currentRight = isInspectorOpen ? inspectorWidth : 0.0;
-                      final maxAllowedSidebar = (totalWidth - currentRight - minCenterWidth).clamp(200.0, 440.0);
+                      final maxAllowedSidebar = isCenterCollapsed
+                          ? (totalWidth - 320.0).clamp(200.0, 440.0)
+                          : (totalWidth - (isInspectorOpen ? 280.0 : 0.0) - minCenterWidth).clamp(200.0, 440.0);
                       setState(() {
                         sidebarWidth = (sidebarWidth + dx).clamp(200.0, maxAllowedSidebar >= 200.0 ? maxAllowedSidebar : 200.0);
                       });
@@ -560,49 +575,158 @@ class _DesktopShellState extends State<DesktopShell> {
                   ),
                 ],
 
-                // 2. Central Task Canvas & Composer (Min Width: 845px)
-                Expanded(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(minWidth: minCenterWidth),
-                    child: selectedNavIndex == -3
-                        ? AutomationsView(
-                            onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
-                          )
-                        : DesktopTaskWorkspaceView(
-                            controller: workspaceController,
-                            isToolsOpen: isInspectorOpen,
-                            isSidebarVisible: isSidebarVisible,
-                            onToggleSidebar: () => setState(() => isSidebarVisible = !isSidebarVisible),
-                            onToggleTools: _toggleInspector,
-                            onToggleTerminal: () => _openInspectorWithTab(1),
-                            onOpenSettings: () => _openSettingsDialog('Провайдеры'),
+                // 2. Central Task Canvas & Composer (Width: 856px when inspector is open)
+                if (!isCenterCollapsed)
+                  isInspectorOpen
+                      ? SizedBox(
+                          width: centerWidth.clamp(320.0, (availableSpace - 280.0).clamp(320.0, double.infinity)),
+                          child: selectedNavIndex == -3
+                              ? AutomationsView(
+                                  onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
+                                )
+                              : DesktopTaskWorkspaceView(
+                                  controller: workspaceController,
+                                  isToolsOpen: isInspectorOpen,
+                                  isSidebarVisible: isSidebarVisible,
+                                  onToggleSidebar: () => setState(() => isSidebarVisible = !isSidebarVisible),
+                                  onToggleTools: _toggleInspector,
+                                  onToggleTerminal: () => _openInspectorWithTab(1),
+                                  onOpenCanvas: () => _openInspectorWithTab(2),
+                                  onBranchSideChat: (text) => _openInspectorWithTab(4, sideChatText: text),
+                                  onReviewChanges: () => _openInspectorWithTab(3),
+                                  onOpenSettings: () => _openSettingsDialog('Провайдеры'),
+                                ),
+                        )
+                      : Expanded(
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(minWidth: minCenterWidth),
+                            child: selectedNavIndex == -3
+                                ? AutomationsView(
+                                    onBackToWorkspace: () => setState(() => selectedNavIndex = 0),
+                                  )
+                                : DesktopTaskWorkspaceView(
+                                    controller: workspaceController,
+                                    isToolsOpen: isInspectorOpen,
+                                    isSidebarVisible: isSidebarVisible,
+                                    onToggleSidebar: () => setState(() => isSidebarVisible = !isSidebarVisible),
+                                    onToggleTools: _toggleInspector,
+                                    onToggleTerminal: () => _openInspectorWithTab(1),
+                                    onOpenCanvas: () => _openInspectorWithTab(2),
+                                    onBranchSideChat: (text) => _openInspectorWithTab(4, sideChatText: text),
+                                    onReviewChanges: () => _openInspectorWithTab(3),
+                                    onOpenSettings: () => _openSettingsDialog('Провайдеры'),
+                                  ),
                           ),
-                  ),
-                ),
+                        ),
 
                 // 3. Right Tool Canvas / Inspector
                 if (isInspectorOpen) ...[
-                  _buildVerticalResizer(
-                    onDrag: (dx) {
-                      final currentLeft = isSidebarVisible ? sidebarWidth : 0.0;
-                      final maxAllowedInspector = (totalWidth - currentLeft - minCenterWidth).clamp(280.0, 650.0);
-                      setState(() {
-                        inspectorWidth = (inspectorWidth - dx).clamp(280.0, maxAllowedInspector >= 280.0 ? maxAllowedInspector : 280.0);
-                      });
-                    },
-                  ),
-                  DesktopInspectorPanel(
-                    key: inspectorKey,
-                    width: inspectorWidth,
-                    controller: workspaceController,
-                    initialTabIndex: inspectorTabIndex,
-                    onClose: () => setState(() => isInspectorOpen = false),
+                  if (!isCenterCollapsed)
+                    _buildVerticalResizer(
+                      onDrag: (dx) {
+                        final newCenterWidth = centerWidth + dx;
+                        // If dragging inspector to the left reduces center width below 856px,
+                        // inspector snaps to occupy the entire middle area.
+                        if (newCenterWidth < targetCenterWidth) {
+                          setState(() {
+                            isCenterCollapsed = true;
+                            centerWidth = targetCenterWidth;
+                          });
+                        } else {
+                          setState(() {
+                            centerWidth = newCenterWidth.clamp(targetCenterWidth, availableSpace - 280.0);
+                          });
+                        }
+                      },
+                    ),
+                  Expanded(
+                    child: Column(
+                      children: [
+                        if (isCenterCollapsed)
+                          _buildCenterPanelRestoreBar(),
+                        Expanded(
+                          child: DesktopInspectorPanel(
+                            key: inspectorKey,
+                            width: inspectorWidth,
+                            controller: workspaceController,
+                            initialTabIndex: inspectorTabIndex,
+                            initialSideChatText: sideChatInitialText,
+                            onClose: () => setState(() {
+                              isInspectorOpen = false;
+                              isCenterCollapsed = false;
+                            }),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ],
             );
           },
         ),
+      ),
+    );
+  }
+
+  /// Compact header displayed at the top of the expanded inspector when the center
+  /// workspace panel is collapsed. Allows the user to restore the center panel to 856px.
+  Widget _buildCenterPanelRestoreBar() {
+    return Container(
+      height: 38,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurfaceElevated,
+        border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 1.0)),
+      ),
+      child: Row(
+        children: [
+          InkWell(
+            onTap: () {
+              setState(() {
+                isCenterCollapsed = false;
+                centerWidth = targetCenterWidth;
+              });
+            },
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF00D2FF).withOpacity(0.12),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5), width: 1),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.view_sidebar_outlined, size: 15, color: Color(0xFF00D2FF)),
+                  SizedBox(width: 8),
+                  Text(
+                    'Открыть рабочую область (856 px)',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF00D2FF),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const Spacer(),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurface,
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: DesktopTheme.borderSubtle, width: 0.8),
+            ),
+            child: Text(
+              'Инспектор на всю ширину',
+              style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+            ),
+          ),
+        ],
       ),
     );
   }

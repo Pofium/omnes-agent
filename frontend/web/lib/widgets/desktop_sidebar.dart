@@ -1509,11 +1509,124 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
   }
 
   // ==========================================
-  // ADD PROJECT POP-UP MODAL
+  // OS-AWARE FOLDER HELPERS & ADD PROJECT MODAL
   // ==========================================
+  /// Opens native OS directory picker dialog (Windows PowerShell/FolderBrowserDialog, macOS osascript, Linux zenity/kdialog).
+  Future<String?> _pickFolderNative({String? initialPath}) async {
+    try {
+      if (universal_io.Platform.isWindows) {
+        final initPathClean = (initialPath != null && initialPath.trim().isNotEmpty)
+            ? initialPath.trim().replaceAll("'", "''")
+            : '';
+        final script = '''
+Add-Type -AssemblyName System.Windows.Forms
+\$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+\$dlg.Description = "Выберите папку для проекта"
+\$dlg.ShowNewFolderButton = \$true
+if ('$initPathClean' -ne '' -and (Test-Path -LiteralPath '$initPathClean')) {
+    \$dlg.SelectedPath = '$initPathClean'
+}
+\$top = New-Object System.Windows.Forms.Form
+\$top.TopMost = \$true
+if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
+    Write-Output \$dlg.SelectedPath
+}
+\$top.Dispose()
+''';
+        final res = await universal_io.Process.run('powershell', ['-NoProfile', '-Command', script]);
+        if (res.exitCode == 0) {
+          final out = (res.stdout as String).trim();
+          if (out.isNotEmpty) return out;
+        }
+      } else if (universal_io.Platform.isMacOS) {
+        final res = await universal_io.Process.run('osascript', [
+          '-e',
+          'POSIX path of (choose folder with prompt "Выберите папку проекта")',
+        ]);
+        if (res.exitCode == 0) {
+          final out = (res.stdout as String).trim();
+          if (out.isNotEmpty) return out;
+        }
+      } else if (universal_io.Platform.isLinux) {
+        try {
+          final res = await universal_io.Process.run('zenity', [
+            '--file-selection',
+            '--directory',
+            '--title=Выберите папку проекта',
+          ]);
+          if (res.exitCode == 0) {
+            final out = (res.stdout as String).trim();
+            if (out.isNotEmpty) return out;
+          }
+        } catch (_) {
+          final res = await universal_io.Process.run('kdialog', [
+            '--getexistingdirectory',
+          ]);
+          if (res.exitCode == 0) {
+            final out = (res.stdout as String).trim();
+            if (out.isNotEmpty) return out;
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Error opening native folder picker: $e');
+    }
+    return null;
+  }
+
+  /// Creates directory recursively on disk (OS-aware) if it does not exist.
+  Future<String?> _createDirectory(String path) async {
+    final clean = path.trim();
+    if (clean.isEmpty) return 'Укажите путь к папке';
+    try {
+      final dir = universal_io.Directory(clean);
+      if (!dir.existsSync()) {
+        dir.createSync(recursive: true);
+      }
+      return null;
+    } catch (e) {
+      return 'Не удалось создать папку: $e';
+    }
+  }
+
+  /// Checks whether directory exists on disk.
+  bool _doesFolderExist(String path) {
+    final clean = path.trim();
+    if (clean.isEmpty) return false;
+    try {
+      return universal_io.Directory(clean).existsSync();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Returns OS-aware default initial path.
+  String _getDefaultInitialPath() {
+    try {
+      if (universal_io.Platform.isWindows) {
+        if (universal_io.Directory(r'C:\Projects').existsSync()) {
+          return r'C:\Projects\';
+        }
+        final userProfile = universal_io.Platform.environment['USERPROFILE'];
+        if (userProfile != null && userProfile.isNotEmpty) {
+          return '$userProfile\\Projects\\';
+        }
+        return r'C:\Projects\';
+      } else {
+        final home = universal_io.Platform.environment['HOME'] ?? '';
+        if (home.isNotEmpty) {
+          return '$home/Projects/';
+        }
+        return '/home/Projects/';
+      }
+    } catch (_) {
+      return r'C:\Projects\';
+    }
+  }
+
   void _showAddProjectDialog() {
     final nameCtrl = TextEditingController();
-    final pathCtrl = TextEditingController(text: r'C:\Projects\');
+    final pathCtrl = TextEditingController(text: _getDefaultInitialPath());
     String selectedDomain = 'Rust / Системная разработка';
 
     final Map<String, Map<String, List<String>>> domainRecommendations = {
@@ -1554,6 +1667,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDlgState) {
           final rec = domainRecommendations[selectedDomain] ?? domainRecommendations['Общее']!;
+          final folderExists = _doesFolderExist(pathCtrl.text);
 
           return AlertDialog(
             backgroundColor: DesktopTheme.bgSurface,
@@ -1569,7 +1683,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
               ],
             ),
             content: SizedBox(
-              width: 480,
+              width: 500,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1596,14 +1710,106 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     controller: pathCtrl,
                     style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
                     decoration: InputDecoration(
-                      hintText: r'C:\Projects\my-project',
+                      hintText: universal_io.Platform.isWindows ? r'C:\Projects\my-project' : '/home/user/projects/my-project',
                       hintStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
                       filled: true,
                       fillColor: DesktopTheme.bgSurfaceElevated,
                       contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                      suffixIcon: Tooltip(
+                        message: 'Выбрать папку через проводник',
+                        child: IconButton(
+                          icon: const Icon(Icons.folder_open_outlined, color: Color(0xFF00D2FF), size: 18),
+                          onPressed: () async {
+                            final picked = await _pickFolderNative(initialPath: pathCtrl.text);
+                            if (picked != null && picked.isNotEmpty) {
+                              pathCtrl.text = picked;
+                              if (nameCtrl.text.trim().isEmpty) {
+                                final normalized = picked.replaceAll(r'\', '/');
+                                final segments = normalized.split('/').where((s) => s.isNotEmpty).toList();
+                                if (segments.isNotEmpty) {
+                                  nameCtrl.text = segments.last;
+                                }
+                              }
+                              setDlgState(() {});
+                            }
+                          },
+                        ),
+                      ),
                     ),
+                    onChanged: (_) => setDlgState(() {}),
                   ),
+                  if (pathCtrl.text.trim().isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Icon(
+                          folderExists ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                          size: 14,
+                          color: folderExists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            folderExists
+                                ? 'Папка найдена на диске'
+                                : 'Папка не существует на диске',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: folderExists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                            ),
+                          ),
+                        ),
+                        if (!folderExists)
+                          InkWell(
+                            onTap: () async {
+                              final err = await _createDirectory(pathCtrl.text.trim());
+                              if (err == null) {
+                                setDlgState(() {});
+                                Get.snackbar(
+                                  'Папка создана',
+                                  'Папка успешно создана на диске',
+                                  backgroundColor: const Color(0xFF0F172A),
+                                  colorText: const Color(0xFF00D2FF),
+                                  snackPosition: SnackPosition.BOTTOM,
+                                );
+                              } else {
+                                Get.snackbar(
+                                  'Ошибка создания папки',
+                                  err,
+                                  backgroundColor: const Color(0xFF450A0A),
+                                  colorText: const Color(0xFFEF4444),
+                                  snackPosition: SnackPosition.BOTTOM,
+                                );
+                              }
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF00D2FF).withOpacity(0.15),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: const [
+                                  Icon(Icons.create_new_folder_outlined, size: 13, color: Color(0xFF00D2FF)),
+                                  SizedBox(width: 4),
+                                  Text(
+                                    'Создать папку',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: Color(0xFF00D2FF),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
                   const SizedBox(height: 12),
 
                   Text('Тематика проекта:', style: TextStyle(fontSize: 12, color: DesktopTheme.textSecondary)),
@@ -1672,10 +1878,60 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   backgroundColor: const Color(0xFF00D2FF),
                   foregroundColor: const Color(0xFF0F172A),
                 ),
-                onPressed: () {
+                onPressed: () async {
                   final name = nameCtrl.text.trim();
                   final path = pathCtrl.text.trim();
                   if (name.isNotEmpty && path.isNotEmpty) {
+                    if (!_doesFolderExist(path)) {
+                      final shouldCreate = await showDialog<bool>(
+                        context: ctx,
+                        builder: (confirmCtx) => AlertDialog(
+                          backgroundColor: DesktopTheme.bgSurface,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            side: BorderSide(color: DesktopTheme.borderSubtle),
+                          ),
+                          title: Row(
+                            children: [
+                              const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00D2FF), size: 18),
+                              const SizedBox(width: 8),
+                              Text('Создать папку?', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
+                            ],
+                          ),
+                          content: Text(
+                            'Папка «$path» не существует на диске.\nСоздать её автоматически?',
+                            style: TextStyle(color: DesktopTheme.textSecondary, fontSize: 13),
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.of(confirmCtx).pop(false),
+                              child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted)),
+                            ),
+                            ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF00D2FF),
+                                foregroundColor: const Color(0xFF0F172A),
+                              ),
+                              onPressed: () => Navigator.of(confirmCtx).pop(true),
+                              child: const Text('Создать и продолжить', style: TextStyle(fontWeight: FontWeight.bold)),
+                            ),
+                          ],
+                        ),
+                      );
+                      if (shouldCreate != true) return;
+                      final err = await _createDirectory(path);
+                      if (err != null) {
+                        Get.snackbar(
+                          'Ошибка создания папки',
+                          err,
+                          backgroundColor: const Color(0xFF450A0A),
+                          colorText: const Color(0xFFEF4444),
+                          snackPosition: SnackPosition.BOTTOM,
+                        );
+                        return;
+                      }
+                    }
+
                     final newP = DesktopProject(
                       id: 'proj_${DateTime.now().millisecondsSinceEpoch}',
                       name: name,
@@ -1685,12 +1941,24 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       suggestedTools: rec['tools']!,
                       suggestedSkills: rec['skills']!,
                     );
-                    setState(() {
-                      projects.add(newP);
-                      _saveProjects();
-                    });
+                    if (mounted) {
+                      setState(() {
+                        projects.add(newP);
+                        _saveProjects();
+                      });
+                    }
+                    if (ctx.mounted) {
+                      Navigator.of(ctx).pop();
+                    }
+                  } else {
+                    Get.snackbar(
+                      'Не все поля заполнены',
+                      'Укажите название проекта и путь к папке',
+                      backgroundColor: const Color(0xFF450A0A),
+                      colorText: const Color(0xFFEF4444),
+                      snackPosition: SnackPosition.BOTTOM,
+                    );
                   }
-                  Navigator.of(ctx).pop();
                 },
                 child: const Text('Создать проект', style: TextStyle(fontWeight: FontWeight.bold)),
               ),
@@ -2097,26 +2365,177 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     final ctrl = TextEditingController(text: proj.path);
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: DesktopTheme.bgSurface,
-        title: Text('Сменить путь к проекту', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 15)),
-        content: TextField(controller: ctrl, style: TextStyle(color: DesktopTheme.textPrimary, fontFamily: 'Consolas')),
-        actions: [
-          TextButton(onPressed: () => Navigator.of(ctx).pop(), child: Text(DesktopI18n.cancel)),
-          ElevatedButton(
-            onPressed: () {
-              final newPath = ctrl.text.trim();
-              if (newPath.isNotEmpty) {
-                setState(() {
-                  proj.path = newPath;
-                  _saveProjects();
-                });
-              }
-              Navigator.of(ctx).pop();
-            },
-            child: const Text('Сохранить'),
-          ),
-        ],
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlgState) {
+          final exists = _doesFolderExist(ctrl.text);
+          return AlertDialog(
+            backgroundColor: DesktopTheme.bgSurface,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: DesktopTheme.borderSubtle),
+            ),
+            title: Row(
+              children: [
+                const Icon(Icons.edit_location_alt_outlined, color: Color(0xFF00D2FF), size: 18),
+                const SizedBox(width: 8),
+                Text('Сменить путь к проекту', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
+              ],
+            ),
+            content: SizedBox(
+              width: 480,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: ctrl,
+                    style: TextStyle(color: DesktopTheme.textPrimary, fontFamily: 'Consolas', fontSize: 13),
+                    decoration: InputDecoration(
+                      filled: true,
+                      fillColor: DesktopTheme.bgSurfaceElevated,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                      suffixIcon: Tooltip(
+                        message: 'Выбрать папку через проводник',
+                        child: IconButton(
+                          icon: const Icon(Icons.folder_open_outlined, color: Color(0xFF00D2FF), size: 18),
+                          onPressed: () async {
+                            final picked = await _pickFolderNative(initialPath: ctrl.text);
+                            if (picked != null && picked.isNotEmpty) {
+                              ctrl.text = picked;
+                              setDlgState(() {});
+                            }
+                          },
+                        ),
+                      ),
+                    ),
+                    onChanged: (_) => setDlgState(() {}),
+                  ),
+                  if (ctrl.text.trim().isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Icon(
+                          exists ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                          size: 14,
+                          color: exists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            exists ? 'Папка найдена на диске' : 'Папка не существует на диске',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: exists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                            ),
+                          ),
+                        ),
+                        if (!exists)
+                          InkWell(
+                            onTap: () async {
+                              final err = await _createDirectory(ctrl.text.trim());
+                              if (err == null) {
+                                setDlgState(() {});
+                                Get.snackbar(
+                                  'Папка создана',
+                                  'Папка успешно создана на диске',
+                                  backgroundColor: const Color(0xFF0F172A),
+                                  colorText: const Color(0xFF00D2FF),
+                                  snackPosition: SnackPosition.BOTTOM,
+                                );
+                              } else {
+                                Get.snackbar('Ошибка создания папки', err,
+                                    backgroundColor: const Color(0xFF450A0A),
+                                    colorText: const Color(0xFFEF4444),
+                                    snackPosition: SnackPosition.BOTTOM);
+                              }
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF00D2FF).withOpacity(0.15),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: const [
+                                  Icon(Icons.create_new_folder_outlined, size: 12, color: Color(0xFF00D2FF)),
+                                  SizedBox(width: 4),
+                                  Text(
+                                    'Создать папку',
+                                    style: TextStyle(fontSize: 11, color: Color(0xFF00D2FF), fontWeight: FontWeight.w600),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.of(ctx).pop(), child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted))),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00D2FF), foregroundColor: const Color(0xFF0F172A)),
+                onPressed: () async {
+                  final newPath = ctrl.text.trim();
+                  if (newPath.isNotEmpty) {
+                    if (!_doesFolderExist(newPath)) {
+                      final confirm = await showDialog<bool>(
+                        context: ctx,
+                        builder: (c) => AlertDialog(
+                          backgroundColor: DesktopTheme.bgSurface,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            side: BorderSide(color: DesktopTheme.borderSubtle),
+                          ),
+                          title: Row(
+                            children: [
+                              const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00D2FF), size: 18),
+                              const SizedBox(width: 8),
+                              Text('Создать папку?', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 15)),
+                            ],
+                          ),
+                          content: Text('Папка «$newPath» не существует.\nСоздать её автоматически?', style: TextStyle(color: DesktopTheme.textSecondary, fontSize: 13)),
+                          actions: [
+                            TextButton(onPressed: () => Navigator.of(c).pop(false), child: Text(DesktopI18n.cancel)),
+                            ElevatedButton(
+                              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00D2FF), foregroundColor: const Color(0xFF0F172A)),
+                              onPressed: () => Navigator.of(c).pop(true),
+                              child: const Text('Создать и продолжить', style: TextStyle(fontWeight: FontWeight.bold)),
+                            ),
+                          ],
+                        ),
+                      );
+                      if (confirm != true) return;
+                      final err = await _createDirectory(newPath);
+                      if (err != null) {
+                        Get.snackbar('Ошибка', err,
+                            backgroundColor: const Color(0xFF450A0A),
+                            colorText: const Color(0xFFEF4444),
+                            snackPosition: SnackPosition.BOTTOM);
+                        return;
+                      }
+                    }
+                    if (mounted) {
+                      setState(() {
+                        proj.path = newPath;
+                        _saveProjects();
+                      });
+                    }
+                    if (ctx.mounted) {
+                      Navigator.of(ctx).pop();
+                    }
+                  }
+                },
+                child: const Text('Сохранить', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

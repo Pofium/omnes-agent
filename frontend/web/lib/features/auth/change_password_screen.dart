@@ -7,7 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:omnes_shared/omnes_shared.dart';
 
 import '../../theme/desktop_theme.dart';
-import '../desktop_shell.dart';
+import 'onboarding_gate_screen.dart';
 
 class ChangePasswordScreen extends StatefulWidget {
   final String? currentTempPassword;
@@ -80,9 +80,9 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
       if (!mounted) return;
 
       if (response.statusCode == 200) {
-        // Successfully changed password! Proceed to DesktopShell
+        // Successfully changed password! Proceed to user onboarding questionnaire first
         Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const DesktopShell()),
+          MaterialPageRoute(builder: (_) => const OnboardingGateScreen()),
         );
       } else {
         final data = jsonDecode(response.body) as Map<String, dynamic>;

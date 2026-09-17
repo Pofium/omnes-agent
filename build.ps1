@@ -104,13 +104,21 @@ if ($Target -eq "All" -or $Target -eq "Frontend") {
         $sw.Stop()
         $sec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 
-        $exePath = if ($Mode -eq "Release") {
-            Join-Path $DesktopDir "build\windows\x64\runner\Release\omnes_desktop.exe"
-        } else {
-            Join-Path $DesktopDir "build\windows\x64\runner\Debug\omnes_desktop.exe"
+        $possibleExeNames = @("OmnesAgent.exe", "omnes_desktop.exe")
+        $exePath = $null
+        foreach ($name in $possibleExeNames) {
+            $candidate = if ($Mode -eq "Release") {
+                Join-Path $DesktopDir "build\windows\x64\runner\Release\$name"
+            } else {
+                Join-Path $DesktopDir "build\windows\x64\runner\Debug\$name"
+            }
+            if (Test-Path $candidate) {
+                $exePath = $candidate
+                break
+            }
         }
 
-        if (Test-Path $exePath) {
+        if ($exePath -and (Test-Path $exePath)) {
             $f = Get-Item $exePath
             $size = [math]::Round($f.Length / 1MB, 2)
             Write-Host "  [OK] Frontend Desktop built successfully in $sec s!" -ForegroundColor Green

@@ -50,3 +50,4 @@ dist/
 Thumbs.db
 out.txt
 err.txt
+.mimosa/

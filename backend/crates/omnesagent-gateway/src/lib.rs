@@ -43,6 +43,7 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+pub mod handy;
 pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
@@ -1639,6 +1640,19 @@ pub async fn run_gateway(
         .route(
             "/api/version/upgrade/status",
             get(version::handle_version_upgrade_status),
+        )
+        // ── Handy STT integration routes ──
+        .route("/api/voice/handy/status", get(handy::handle_handy_status))
+        .route("/api/voice/handy/install", post(handy::handle_handy_install))
+        .route("/api/voice/handy/install/cancel", post(handy::handle_handy_install_cancel))
+        .route("/api/voice/handy/launch", post(handy::handle_handy_launch))
+        .route("/api/voice/handy/stop", post(handy::handle_handy_stop))
+        .route("/api/voice/handy/toggle", post(handy::handle_handy_toggle))
+        .route("/api/voice/handy/uninstall", post(handy::handle_handy_uninstall))
+        .route("/api/voice/handy/models", get(handy::handle_handy_models))
+        .route(
+            "/api/voice/handy/transcribe",
+            post(handy::handle_handy_transcribe).layer(axum::extract::DefaultBodyLimit::max(handy::HANDY_MAX_TRANSCRIBE_BYTES)),
         )
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(

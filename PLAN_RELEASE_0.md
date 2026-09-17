@@ -4,7 +4,7 @@
 
 **Goal:** Подготовить репозиторий `Pofium/omnes-agent` к первому собственному релизу «Релиз 0» (тег `v0.1.0`): чистый корень, актуальные README (ru/en) с призывом заводить issues, корневые CONTRIBUTING/CODE_OF_CONDUCT, шаблоны `.github/`, CHANGELOG, аннотированный тег и черновик GitHub Release, к которому Планы 1–2 прикрепят артефакты.
 
-**Architecture:** Репо — форк ZeroClaw (база ≈ v0.8.5). Инфраструктура релизов上游 частично унаследована (`backend/release-plz.toml`, `backend/scripts/release/*`), но на корне нет `.github/` вообще (ни workflows, ни шаблонов issues), версия workspace = `0.8.4`, из тегов есть только `archive/mobile-android-2026-09`. План наводит «витринный» порядок на корне, не трогая backend-инфраструктуру.
+**Architecture:** Репо — форк ZeroClaw (база ≈ v0.8.5). Инфраструктура релизов частично унаследована (`backend/release-plz.toml`, `backend/scripts/release/*`), но на корне нет `.github/` вообще (ни workflows, ни шаблонов issues), версия workspace = `0.8.4`, из тегов есть только `archive/mobile-android-2026-09`. План наводит «витринный» порядок на корне, не трогая backend-инфраструктуру.
 
 **Tech Stack:** git, GitHub (gh CLI 2.80.0 установлен), Markdown, conventional commits.
 

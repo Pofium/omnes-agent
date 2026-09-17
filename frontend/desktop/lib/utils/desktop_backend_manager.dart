@@ -50,7 +50,7 @@ class DesktopBackendManager {
 
     // 3. Dev tree: climb up directories to find workspace root and backend/target
     Directory dir = Directory(exeDir);
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 12; i++) {
       final debugExe = path.join(dir.path, 'backend', 'target', 'debug', 'omnesagent.exe');
       if (File(debugExe).existsSync() && path.canonicalize(debugExe) != currentAppExe) {
         return debugExe;
@@ -84,8 +84,14 @@ class DesktopBackendManager {
   static String findWorkspaceRoot(String binPath) {
     Directory d = Directory(path.dirname(binPath));
     while (d.path != d.parent.path) {
-      if (Directory(path.join(d.path, 'backend')).existsSync() ||
-          File(path.join(d.path, 'Cargo.toml')).existsSync()) {
+      if (Directory(path.join(d.path, 'backend')).existsSync()) {
+        return d.path;
+      }
+      d = d.parent;
+    }
+    d = Directory(path.dirname(binPath));
+    while (d.path != d.parent.path) {
+      if (File(path.join(d.path, 'Cargo.toml')).existsSync()) {
         return d.path;
       }
       d = d.parent;
@@ -112,7 +118,7 @@ class DesktopBackendManager {
     try {
       _backendProcess = await Process.start(
         binPath,
-        ['gateway', 'start', '-p', '42617'],
+        ['gateway', 'start', '-p', '42617', '--host', '127.0.0.1'],
         workingDirectory: workingDir,
         mode: ProcessStartMode.normal,
       );

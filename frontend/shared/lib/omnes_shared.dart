@@ -12,6 +12,8 @@ export 'core/gateway/sop_runs_ws.dart';
 export 'features/onboarding/personality_composer.dart';
 export 'features/onboarding/personality_templates.dart';
 export 'features/onboarding/user_onboarding_dialog.dart';
+export 'features/settings/voice/voice_settings_section.dart';
+export 'features/settings/voice/handy_models.dart';
 
 export 'model/chat_model/chat_model.dart';
 export 'model/notification_model/notification_model.dart';
