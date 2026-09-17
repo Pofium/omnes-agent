@@ -14,7 +14,7 @@ import 'artifacts/diff_viewer_widget.dart';
 import 'side_chat/side_chat_controller.dart';
 
 class DesktopInspectorPanel extends StatefulWidget {
-  final double width;
+  final double? width;
   final DesktopTaskWorkspaceController controller;
   final int initialTabIndex;
   final String? initialSideChatText;
@@ -22,7 +22,7 @@ class DesktopInspectorPanel extends StatefulWidget {
 
   const DesktopInspectorPanel({
     super.key,
-    this.width = 420.0,
+    this.width,
     required this.controller,
     this.initialTabIndex = 0,
     this.initialSideChatText,
@@ -864,33 +864,56 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
             Expanded(
               child: Container(
                 color: DesktopTheme.bgCanvas,
-                child: Center(
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    width: browserViewportMode == 0
-                        ? double.infinity
-                        : (browserViewportMode == 1 ? 380 : 310),
-                    margin: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: DesktopTheme.borderMedium, width: 1.5),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withOpacity(0.2),
-                          blurRadius: 16,
-                          offset: const Offset(0, 4),
+                width: double.infinity,
+                child: browserViewportMode == 0
+                    ? Container(
+                        width: double.infinity,
+                        height: double.infinity,
+                        margin: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: DesktopTheme.borderMedium, width: 1.5),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.2),
+                              blurRadius: 16,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(7),
-                      child: isInitialized
-                          ? Webview(webviewController.rawController)
-                          : _buildBrowserStandbyView(),
-                    ),
-                  ),
-                ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(7),
+                          child: isInitialized
+                              ? Webview(webviewController.rawController)
+                              : _buildBrowserStandbyView(),
+                        ),
+                      )
+                    : Center(
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 200),
+                          width: browserViewportMode == 1 ? 768 : 380,
+                          margin: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: DesktopTheme.borderMedium, width: 1.5),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.2),
+                                blurRadius: 16,
+                                offset: const Offset(0, 4),
+                              ),
+                            ],
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(7),
+                            child: isInitialized
+                                ? Webview(webviewController.rawController)
+                                : _buildBrowserStandbyView(),
+                          ),
+                        ),
+                      ),
               ),
             ),
 

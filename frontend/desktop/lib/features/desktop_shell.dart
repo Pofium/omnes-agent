@@ -37,11 +37,11 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
   int selectedNavIndex = 0;
   bool isSidebarVisible = true;
   double sidebarWidth = 260.0;
-  double centerWidth = 856.0;
+  double centerWidth = 650.0;
   double inspectorWidth = 420.0;
   bool isInspectorOpen = false; // Closed by default
   bool isCenterCollapsed = false; // When true, inspector occupies the entire middle area
-  static const double targetCenterWidth = 856.0;
+  static const double targetCenterWidth = 650.0;
   int inspectorTabIndex = -1; // -1 opens the 'Open tab' chooser from Screenshot 2
   String? sideChatInitialText;
   Key inspectorKey = UniqueKey();
@@ -518,7 +518,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
                       _buildVerticalResizer(
                         onDrag: (dx) {
                           final newCenterWidth = centerWidth + dx;
-                          // If dragging inspector to the left reduces center width below 856px,
+                          // If dragging inspector to the left reduces center width below 650px,
                           // inspector snaps to occupy the entire middle area.
                           if (newCenterWidth < targetCenterWidth) {
                             setState(() {
@@ -563,7 +563,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
   }
 
   /// Compact header displayed at the top of the expanded inspector when the center
-  /// workspace panel is collapsed. Allows the user to restore the center panel to 856px.
+  /// workspace panel is collapsed. Allows the user to restore the center panel to 650px.
   Widget _buildCenterPanelRestoreBar() {
     return Container(
       height: 38,
@@ -595,7 +595,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
                   Icon(Icons.view_sidebar_outlined, size: 15, color: Color(0xFF00D2FF)),
                   SizedBox(width: 8),
                   Text(
-                    'Открыть рабочую область (856 px)',
+                    'Открыть рабочую область (650 px)',
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.bold,

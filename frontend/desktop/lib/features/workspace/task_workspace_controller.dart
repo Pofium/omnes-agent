@@ -1048,12 +1048,22 @@ class DesktopTaskWorkspaceController extends GetxController {
     thoughtLevel.value = level;
   }
 
-  void _loadSttSettings() {
+  final isHandyInstalled = false.obs;
+
+  bool get hasSttModel => isSttConfiguredAndEnabled.value || isHandyInstalled.value;
+
+  Future<void> _loadSttSettings() async {
     try {
       final storage = GetStorage();
       final enabled = storage.read<bool>('stt_enabled') ?? false;
       final verified = storage.read<bool>('stt_verified') ?? false;
       isSttConfiguredAndEnabled.value = enabled && verified;
+
+      // Check Handy installation
+      final handyStatus = await httpClient.getHandyStatus();
+      if (handyStatus != null) {
+        isHandyInstalled.value = handyStatus['installed'] == true;
+      }
     } catch (_) {}
   }
 
@@ -1062,6 +1072,10 @@ class DesktopTaskWorkspaceController extends GetxController {
       GetStorage().write('stt_enabled', enabled);
       isSttConfiguredAndEnabled.value = enabled;
     } catch (_) {}
+  }
+
+  Future<void> checkSttStatus() async {
+    await _loadSttSettings();
   }
 
   /// Opens native Windows FileDialog to pick any files or images

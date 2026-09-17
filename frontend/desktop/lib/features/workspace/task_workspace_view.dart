@@ -3964,9 +3964,21 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
   Widget _buildVoiceDuplexButton() {
     return Obx(() {
-      final isEnabled = widget.controller.isSttConfiguredAndEnabled.value;
+      final isEnabled = widget.controller.hasSttModel;
       if (!isEnabled) {
-        return const SizedBox.shrink(); // Hidden by default until STT is configured and verified in Settings
+        return IconButton(
+          icon: const Icon(
+            Icons.mic_off_outlined,
+            size: 18,
+            color: Color(0xFF64748B),
+          ),
+          tooltip: DesktopI18n.tr(
+            'Голосовой ввод недоступен: подключите или настройте STT модель в Настройках',
+            'Voice input unavailable: configure or connect an STT model in Settings',
+          ),
+          onPressed: null,
+          splashRadius: 18,
+        );
       }
       final active = widget.controller.isVoiceDuplexActive.value;
       return IconButton(
@@ -3975,7 +3987,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           size: 18,
           color: active ? Colors.redAccent : const Color(0xFF00D2FF),
         ),
-        tooltip: active ? 'Голосовой ввод активен (нажмите для остановки)' : 'Голосовой ввод (микрофон STT)',
+        tooltip: active
+            ? DesktopI18n.tr('Голосовой ввод активен (нажмите для остановки)', 'Voice input active (click to stop)')
+            : DesktopI18n.tr('Голосовой ввод (микрофон STT)', 'Voice input (STT microphone)'),
         onPressed: widget.controller.toggleVoiceDuplex,
         splashRadius: 18,
       );
@@ -3983,37 +3997,47 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   }
 
   Widget _buildHandyDictationButton() {
-    return IconButton(
-      icon: const Icon(
-        Icons.record_voice_over_outlined,
-        size: 18,
-        color: Color(0xFF00D2FF),
-      ),
-      tooltip: DesktopI18n.tr(
-        'Handy: Офлайн-диктовка (Ctrl+Space)',
-        'Handy: Offline dictation (Ctrl+Space)',
-      ),
-      onPressed: () async {
-        try {
-          final res = await GatewayHttpClient().toggleHandyTranscription();
-          if (!res && mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  DesktopI18n.tr(
-                    'Handy не запущен или не установлен. Проверьте Настройки → Голосовой ввод.',
-                    'Handy is not running or installed. Check Settings → Voice Input.',
-                  ),
-                ),
-                backgroundColor: const Color(0xFF1E2228),
-                behavior: SnackBarBehavior.floating,
+    return Obx(() {
+      final isHandy = widget.controller.isHandyInstalled.value;
+      return IconButton(
+        icon: Icon(
+          Icons.record_voice_over_outlined,
+          size: 18,
+          color: isHandy ? const Color(0xFF00D2FF) : const Color(0xFF64748B),
+        ),
+        tooltip: isHandy
+            ? DesktopI18n.tr(
+                'Handy: Офлайн-диктовка (Ctrl+Space)',
+                'Handy: Offline dictation (Ctrl+Space)',
+              )
+            : DesktopI18n.tr(
+                'Handy не установлен: настройте в Настройках → Голосовой ввод',
+                'Handy not installed: configure in Settings → Voice input',
               ),
-            );
-          }
-        } catch (_) {}
-      },
-      splashRadius: 18,
-    );
+        onPressed: isHandy
+            ? () async {
+                try {
+                  final res = await GatewayHttpClient().toggleHandyTranscription();
+                  if (!res && mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          DesktopI18n.tr(
+                            'Handy не запущен или не установлен. Проверьте Настройки → Голосовой ввод.',
+                            'Handy is not running or installed. Check Settings → Voice Input.',
+                          ),
+                        ),
+                        backgroundColor: const Color(0xFF1E2228),
+                        behavior: SnackBarBehavior.floating,
+                      ),
+                    );
+                  }
+                } catch (_) {}
+              }
+            : null,
+        splashRadius: 18,
+      );
+    });
   }
 
   // Helpers
