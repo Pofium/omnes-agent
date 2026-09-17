@@ -1725,12 +1725,8 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 _buildThoughtLevelMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🎙️ Voice Duplex Button]
-                _buildVoiceDuplexButton(),
-                const SizedBox(width: 8),
-
-                // [🗣️ Handy Dictation Button]
-                _buildHandyDictationButton(),
+                // [🎙️ Voice Input Button]
+                _buildVoiceInputButton(),
                 const SizedBox(width: 8),
 
                 // [↑ Send Button]
@@ -3959,10 +3955,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
-  Widget _buildVoiceDuplexButton() {
+  Widget _buildVoiceInputButton() {
     return Obx(() {
-      final isEnabled = widget.controller.hasSttModel;
-      if (!isEnabled) {
+      final hasStt = widget.controller.hasSttModel;
+      if (!hasStt) {
         return IconButton(
           icon: const Icon(
             Icons.mic_off_outlined,
@@ -3986,52 +3982,23 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         ),
         tooltip: active
             ? DesktopI18n.tr('Голосовой ввод активен (нажмите для остановки)', 'Voice input active (click to stop)')
-            : DesktopI18n.tr('Голосовой ввод (микрофон STT)', 'Voice input (STT microphone)'),
-        onPressed: widget.controller.toggleVoiceDuplex,
-        splashRadius: 18,
-      );
-    });
-  }
-
-  Widget _buildHandyDictationButton() {
-    return Obx(() {
-      final isHandy = widget.controller.isHandyInstalled.value;
-      return IconButton(
-        icon: Icon(
-          Icons.record_voice_over_outlined,
-          size: 18,
-          color: isHandy ? const Color(0xFF00D2FF) : const Color(0xFF64748B),
-        ),
-        tooltip: isHandy
-            ? DesktopI18n.tr(
-                'Handy: Офлайн-диктовка (Ctrl+Space)',
-                'Handy: Offline dictation (Ctrl+Space)',
-              )
-            : DesktopI18n.tr(
-                'Handy не установлен: настройте в Настройках → Голосовой ввод',
-                'Handy not installed: configure in Settings → Voice input',
-              ),
-        onPressed: isHandy
-            ? () async {
-                try {
-                  final res = await GatewayHttpClient().toggleHandyTranscription();
-                  if (!res && mounted) {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        content: Text(
-                          DesktopI18n.tr(
-                            'Handy не запущен или не установлен. Проверьте Настройки → Голосовой ввод.',
-                            'Handy is not running or installed. Check Settings → Voice Input.',
-                          ),
-                        ),
-                        backgroundColor: const Color(0xFF1E2228),
-                        behavior: SnackBarBehavior.floating,
-                      ),
-                    );
-                  }
-                } catch (_) {}
+            : (widget.controller.isHandyInstalled.value
+                ? DesktopI18n.tr('Голосовой ввод (Handy / STT)', 'Voice input (Handy / STT)')
+                : DesktopI18n.tr('Голосовой ввод (микрофон STT)', 'Voice input (STT microphone)')),
+        onPressed: () async {
+          if (widget.controller.isHandyInstalled.value) {
+            try {
+              final res = await GatewayHttpClient().toggleHandyTranscription();
+              if (!res && mounted) {
+                widget.controller.toggleVoiceDuplex();
               }
-            : null,
+            } catch (_) {
+              widget.controller.toggleVoiceDuplex();
+            }
+          } else {
+            widget.controller.toggleVoiceDuplex();
+          }
+        },
         splashRadius: 18,
       );
     });
