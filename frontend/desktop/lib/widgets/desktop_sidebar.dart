@@ -727,6 +727,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       final ctrl = Get.find<DesktopTaskWorkspaceController>();
                       ctrl.switchToSession(
                         'sess_${DateTime.now().millisecondsSinceEpoch}',
+                        group: proj.name,
                         project: proj.name,
                         projectPath: proj.path,
                       );

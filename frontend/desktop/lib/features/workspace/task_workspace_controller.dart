@@ -70,7 +70,7 @@ class DesktopTaskWorkspaceController extends GetxController {
   final isNewTask = false.obs;
 
   // Multi-session tabs
-  final openSessionTabs = <String>['omnes-core-arch', 'deepseek-v3-eval'].obs;
+  final openSessionTabs = <String>[].obs;
 
   // Project Git Changes Summary (contextual to active project/group)
   final hasGitRepo = true.obs;
@@ -262,20 +262,31 @@ class DesktopTaskWorkspaceController extends GetxController {
     loadProjectRules();
     final savedTabs = GetStorage().read<List>('desktop_open_tabs');
     if (savedTabs != null && savedTabs.isNotEmpty) {
-      openSessionTabs.assignAll(savedTabs.map((e) => e.toString()));
+      final validTabs = savedTabs
+          .map((e) => e.toString())
+          .where((id) => !_isSessionDeleted(id) && sessions.containsKey(id))
+          .toList();
+      openSessionTabs.assignAll(validTabs);
     }
     final startupMode = GetStorage().read<String>('startup_session_mode') ?? 'last';
     if (startupMode == 'new') {
       createNewTask();
     } else {
       final savedActive = GetStorage().read<String>('desktop_active_session_id');
-      if (savedActive != null && sessions.containsKey(savedActive)) {
+      if (savedActive != null && sessions.containsKey(savedActive) && !_isSessionDeleted(savedActive)) {
         switchToSession(savedActive);
-      } else if (sessions.isNotEmpty) {
-        switchToSession(sessions.keys.first);
       } else {
-        createNewTask();
+        final available = sessions.keys.where((k) => !_isSessionDeleted(k)).toList();
+        if (available.isNotEmpty) {
+          switchToSession(available.first);
+        } else {
+          createNewTask();
+        }
       }
+    }
+    if (openSessionTabs.isEmpty && activeSessionId.value.isNotEmpty && sessions.containsKey(activeSessionId.value) && !_isSessionDeleted(activeSessionId.value)) {
+      openSessionTabs.add(activeSessionId.value);
+      GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
     }
     refreshGitStatus();
     initGatewayConnection();
@@ -325,10 +336,27 @@ class DesktopTaskWorkspaceController extends GetxController {
     return <String>{};
   }
 
+  /// Check if a session ID or any of its prefixed/unprefixed forms was marked as deleted
+  bool _isSessionDeleted(String id) {
+    final deleted = _getDeletedSessionIds();
+    if (deleted.contains(id)) return true;
+    if (id.startsWith('gw_')) {
+      if (deleted.contains(id.substring(3))) return true;
+    } else {
+      if (deleted.contains('gw_$id')) return true;
+    }
+    return false;
+  }
+
   void _recordDeletedSession(String id) {
     try {
       final set = _getDeletedSessionIds();
       set.add(id);
+      if (id.startsWith('gw_')) {
+        set.add(id.substring(3));
+      } else {
+        set.add('gw_$id');
+      }
       GetStorage().write('desktop_deleted_sessions', set.toList());
     } catch (_) {}
   }
@@ -424,14 +452,25 @@ class DesktopTaskWorkspaceController extends GetxController {
     String? projectPath,
     String? branch,
   }) {
+    if (_isSessionDeleted(id)) {
+      final available = sessions.keys.where((k) => !_isSessionDeleted(k)).toList();
+      if (available.isNotEmpty) {
+        switchToSession(available.first);
+      } else {
+        createNewTask();
+      }
+      return;
+    }
+
     _saveCurrentSessionState();
 
     var session = sessions[id];
     if (session == null) {
+      final effectiveGroup = group ?? project ?? 'Разное';
       session = TaskSession(
         id: id,
         title: title ?? id,
-        group: group ?? 'Разное',
+        group: effectiveGroup,
         project: project,
         projectPath: projectPath,
         branch: branch ?? 'main',
@@ -440,16 +479,20 @@ class DesktopTaskWorkspaceController extends GetxController {
         deletions: 0,
         messages: [
           ChatMessage(
-            text: 'Сессия: **${title ?? id}**\nГруппа: `${group ?? "Разное"}` ${project != null ? "| Проект: `$project`" : ""}',
+            text: 'Сессия: **${title ?? id}**\n${project != null ? "Проект: `$project` | " : ""}Группа: `$effectiveGroup`',
             chatMessageType: ChatMessageType.bot,
           ),
         ],
       );
       sessions[id] = session;
+      _saveLocalCustomSessions();
+      sessions.refresh();
     }
 
     if (!openSessionTabs.contains(id)) {
       openSessionTabs.add(id);
+      GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
+      openSessionTabs.refresh();
     }
 
     activeSessionId.value = id;
@@ -497,7 +540,15 @@ class DesktopTaskWorkspaceController extends GetxController {
 
   void closeSessionTab(String id) {
     openSessionTabs.remove(id);
-    if (activeSessionId.value == id) {
+    openSessionTabs.remove('gw_$id');
+    if (id.startsWith('gw_')) {
+      openSessionTabs.remove(id.substring(3));
+    }
+    GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
+    openSessionTabs.refresh();
+    if (activeSessionId.value == id ||
+        activeSessionId.value == 'gw_$id' ||
+        (id.startsWith('gw_') && activeSessionId.value == id.substring(3))) {
       if (openSessionTabs.isNotEmpty) {
         switchToSession(openSessionTabs.last);
       } else {
@@ -761,6 +812,58 @@ class DesktopTaskWorkspaceController extends GetxController {
           name: frame.name,
           args: frame.args,
         ));
+
+        final lower = frame.name.toLowerCase();
+        AgentActionType actionType;
+        String title = frame.name;
+        String? details;
+        String? command;
+        String? filePath;
+        int? additions;
+
+        if (lower.contains('terminal') || lower.contains('bash') || lower.contains('command') || lower.contains('run_command')) {
+          actionType = AgentActionType.runningTerminal;
+          if (frame.args is Map) {
+            command = (frame.args['command'] ?? frame.args['CommandLine'] ?? frame.name).toString();
+            title = command;
+          }
+        } else if (lower.contains('grep') || lower.contains('search') || lower.contains('find') || lower.contains('explore')) {
+          actionType = AgentActionType.searchingFiles;
+          if (frame.args is Map) {
+            title = (frame.args['query'] ?? frame.args['Query'] ?? frame.name).toString();
+          }
+        } else if (lower.contains('view') || lower.contains('read') || lower.contains('cat')) {
+          actionType = AgentActionType.readingFile;
+          if (frame.args is Map) {
+            filePath = (frame.args['path'] ?? frame.args['AbsolutePath'] ?? frame.name).toString();
+            title = filePath;
+          }
+        } else if (lower.contains('write') || lower.contains('edit') || lower.contains('replace') || lower.contains('patch')) {
+          actionType = AgentActionType.editingFile;
+          if (frame.args is Map) {
+            filePath = (frame.args['TargetFile'] ?? frame.args['path'] ?? frame.name).toString();
+            title = filePath;
+            if (frame.args['ReplacementChunks'] is List) {
+              additions = (frame.args['ReplacementChunks'] as List).length * 5;
+            }
+          }
+        } else {
+          actionType = AgentActionType.analyzingCode;
+        }
+
+        if (frame.args != null) {
+          details = frame.args.toString();
+        }
+
+        messages.last.steps.add(AgentActionStep(
+          title: title,
+          type: actionType,
+          filePath: filePath,
+          command: command,
+          additions: additions,
+          details: details,
+          isRunning: true,
+        ));
         messages.refresh();
       }
       runTimelineSteps.add({
@@ -777,8 +880,31 @@ class DesktopTaskWorkspaceController extends GetxController {
         );
         if (existingCall != null) {
           existingCall.output = frame.output;
-          messages.refresh();
         }
+        AgentActionStep? runningStep;
+        for (int i = messages.last.steps.length - 1; i >= 0; i--) {
+          if (messages.last.steps[i].isRunning) {
+            runningStep = messages.last.steps[i];
+            break;
+          }
+        }
+        if (runningStep != null) {
+          runningStep.isRunning = false;
+          if (frame.output.isNotEmpty) {
+            runningStep.details = frame.output;
+            final lowerOut = frame.output.toLowerCase();
+            if (lowerOut.contains('failed') || lowerOut.contains('error:') || lowerOut.contains('exception:')) {
+              runningStep.isError = true;
+              runningStep.failureReason = 'Failed';
+            }
+            // Parse line additions if available in output (e.g. +15 or 15 insertions)
+            final addMatch = RegExp(r'\+(\d+)').firstMatch(frame.output);
+            if (addMatch != null) {
+              runningStep.additions = int.tryParse(addMatch.group(1)!);
+            }
+          }
+        }
+        messages.refresh();
       }
       final step = runTimelineSteps.firstWhereOrNull(
         (s) => (frame.id?.isNotEmpty == true && s['id'] == frame.id) || s['name'] == frame.name,
@@ -797,6 +923,7 @@ class DesktopTaskWorkspaceController extends GetxController {
         if (frame.fullResponse.isNotEmpty) {
           messages.last.text = frame.fullResponse;
         }
+        _extractTodoBlocksForMessage(messages.last);
         messages.refresh();
       }
       isRunning.value = false;
@@ -838,21 +965,107 @@ class DesktopTaskWorkspaceController extends GetxController {
     }
   }
 
+  void _extractTodoBlocksForMessage(ChatMessage msg) {
+    final todos = parseTodoBlocksFromText(msg.text);
+    if (todos.isNotEmpty) {
+      msg.todoBlocks.clear();
+      msg.todoBlocks.addAll(todos);
+    }
+  }
+
+  static List<TodoBlockData> parseTodoBlocksFromText(String text) {
+    final result = <TodoBlockData>[];
+    if (text.isEmpty) return result;
+
+    final lines = text.split('\n');
+    String? currentTitle;
+    int currentDone = 0;
+    int currentTotal = 0;
+    List<TodoTaskItem>? currentItems;
+
+    void flushCurrent() {
+      if (currentItems != null && currentItems!.isNotEmpty) {
+        final total = currentTotal > 0 ? currentTotal : currentItems!.length;
+        final done = currentDone > 0 ? currentDone : currentItems!.where((i) => i.status == TodoTaskStatus.completed).length;
+        result.add(TodoBlockData(
+          title: currentTitle ?? 'Todo',
+          completedCount: done,
+          totalCount: total,
+          items: List.from(currentItems!),
+          isExpanded: true,
+        ));
+        currentItems = null;
+        currentTitle = null;
+        currentDone = 0;
+        currentTotal = 0;
+      }
+    }
+
+    final todoHeaderRegex = RegExp(r'^(?:[^\w\s]*\s*)?(?:Todo|TODO|Задачи|План)[:\s]+(.*?)(?:\s+(\d+)\/(\d+))?$', caseSensitive: false);
+    final taskItemRegex = RegExp(r'^\s*(?:[-*]\s*)?(?:\[([ xX>/-])\]|->|\([vV ]\)|•)\s*(.*)$');
+
+    for (final line in lines) {
+      final trimmed = line.trim();
+      final headerMatch = todoHeaderRegex.firstMatch(trimmed);
+      if (headerMatch != null) {
+        flushCurrent();
+        final rawTitle = headerMatch.group(1)?.trim();
+        currentTitle = (rawTitle != null && rawTitle.isNotEmpty) ? rawTitle : 'Todo';
+        if (headerMatch.group(2) != null && headerMatch.group(3) != null) {
+          currentDone = int.tryParse(headerMatch.group(2)!) ?? 0;
+          currentTotal = int.tryParse(headerMatch.group(3)!) ?? 0;
+        }
+        currentItems = [];
+        continue;
+      }
+
+      final items = currentItems;
+      if (items != null) {
+        final itemMatch = taskItemRegex.firstMatch(trimmed);
+        if (itemMatch != null) {
+          final mark = (itemMatch.group(1) ?? '').toLowerCase();
+          final title = itemMatch.group(2)?.trim() ?? '';
+          if (title.isNotEmpty) {
+            TodoTaskStatus status;
+            if (mark == 'x' || trimmed.startsWith('(v)') || trimmed.startsWith('(V)') || trimmed.startsWith('✓')) {
+              status = TodoTaskStatus.completed;
+            } else if (mark == '>' || mark == '/' || trimmed.startsWith('->')) {
+              status = TodoTaskStatus.running;
+            } else {
+              status = TodoTaskStatus.pending;
+            }
+            items.add(TodoTaskItem(title: title, status: status));
+            continue;
+          }
+        } else if (trimmed.isEmpty) {
+          continue;
+        } else {
+          flushCurrent();
+        }
+      }
+    }
+    flushCurrent();
+    return result;
+  }
+
   /// Fetches real sessions from Gateway API and adds to local map.
   Future<void> fetchBackendSessions() async {
     try {
       final list = await httpClient.getSessionsList();
+      // Purge any locally present sessions that are in deleted list
+      sessions.removeWhere((key, _) => _isSessionDeleted(key));
       if (list.isNotEmpty) {
         backendSessions.assignAll(list);
         for (final s in list) {
-          final deleted = _getDeletedSessionIds();
-          if (!sessions.containsKey(s.sessionId) && !deleted.contains(s.sessionId)) {
+          final isDel = _isSessionDeleted(s.sessionId);
+          if (!sessions.containsKey(s.sessionId) && !isDel) {
+            final matchedProject = s.workspaceDir?.split(RegExp(r'[\\/]')).last;
             sessions[s.sessionId] = TaskSession(
               id: s.sessionId,
               title: s.previewText.isNotEmpty ? s.previewText : s.sessionId,
               tokenCount: '${s.messageCount} сообщ.',
-              group: 'Разное',
-              project: s.workspaceDir?.split(RegExp(r'[\\/]')).last,
+              group: matchedProject ?? 'Разное',
+              project: matchedProject,
               projectPath: s.workspaceDir,
               hasGitRepo: s.workspaceDir != null,
             );
@@ -921,7 +1134,9 @@ class DesktopTaskWorkspaceController extends GetxController {
   void _saveLocalCustomSessions() {
     try {
       final storage = GetStorage();
-      final customList = sessions.values.map((s) {
+      final customList = sessions.values
+          .where((s) => !_isSessionDeleted(s.id))
+          .map((s) {
         return {
           'id': s.id,
           'title': s.title,
@@ -937,20 +1152,19 @@ class DesktopTaskWorkspaceController extends GetxController {
         };
       }).toList();
       storage.write('desktop_custom_sessions', customList);
-      storage.write('desktop_open_tabs', openSessionTabs.toList());
+      storage.write('desktop_open_tabs', openSessionTabs.where((tabId) => !_isSessionDeleted(tabId)).toList());
     } catch (_) {}
   }
 
   void _loadLocalCustomSessions() {
     try {
       final storage = GetStorage();
-      final deleted = _getDeletedSessionIds();
       final raw = storage.read<List>('desktop_custom_sessions');
       if (raw != null) {
         for (final item in raw) {
           if (item is Map) {
             final id = item['id']?.toString() ?? '';
-            if (id.isNotEmpty && !deleted.contains(id)) {
+            if (id.isNotEmpty && !_isSessionDeleted(id)) {
               // Load full message history from session_messages_$id
               final msgRaw = storage.read<List>('session_messages_$id');
               final msgs = <ChatMessage>[];
@@ -1002,18 +1216,40 @@ class DesktopTaskWorkspaceController extends GetxController {
   Future<void> deleteSession(String id) async {
     _recordDeletedSession(id);
     sessions.remove(id);
+    sessions.remove('gw_$id');
+    if (id.startsWith('gw_')) {
+      sessions.remove(id.substring(3));
+    }
+    backendSessions.removeWhere((s) =>
+        s.sessionId == id ||
+        'gw_${s.sessionId}' == id ||
+        s.sessionId == 'gw_$id' ||
+        (id.startsWith('gw_') && s.sessionId == id.substring(3)));
     openSessionTabs.remove(id);
+    openSessionTabs.remove('gw_$id');
+    if (id.startsWith('gw_')) {
+      openSessionTabs.remove(id.substring(3));
+    }
     sessions.refresh();
     openSessionTabs.refresh();
+    backendSessions.refresh();
     GetStorage().remove('session_messages_$id');
-    GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
+    if (id.startsWith('gw_')) {
+      GetStorage().remove('session_messages_${id.substring(3)}');
+    } else {
+      GetStorage().remove('session_messages_gw_$id');
+    }
     _saveLocalCustomSessions();
+    GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
     try {
       await httpClient.deleteSession(id);
     } catch (_) {}
-    if (activeSessionId.value == id) {
-      if (sessions.isNotEmpty) {
-        switchToSession(sessions.keys.first);
+    if (activeSessionId.value == id ||
+        activeSessionId.value == 'gw_$id' ||
+        (id.startsWith('gw_') && activeSessionId.value == id.substring(3))) {
+      final available = sessions.keys.where((k) => !_isSessionDeleted(k)).toList();
+      if (available.isNotEmpty) {
+        switchToSession(available.first);
       } else {
         createNewTask();
       }

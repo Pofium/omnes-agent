@@ -279,23 +279,26 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   // DEDICATED TASKBAR DROPDOWN PANEL
   // ==========================================
   Widget _buildTaskBarDropdown() {
+    final hasProj = widget.controller.activeProject.value != null && widget.controller.activeProject.value!.isNotEmpty;
+    final topOffset = hasProj ? 78.0 : 44.0;
+
     return Positioned(
-      top: 78,
+      top: topOffset,
       right: 14,
-      width: 360,
+      width: 380,
       child: Material(
         color: Colors.transparent,
         child: Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
-            color: DesktopTheme.bgSurface,
+            color: const Color(0xFF16181D),
             borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: DesktopTheme.borderSubtle, width: 1.0),
+            border: Border.all(color: const Color(0xFF282D37), width: 1.0),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(DesktopTheme.isDark ? 0.45 : 0.15),
-                blurRadius: 16,
-                offset: const Offset(0, 6),
+                color: Colors.black.withOpacity(DesktopTheme.isDark ? 0.55 : 0.2),
+                blurRadius: 18,
+                offset: const Offset(0, 8),
               ),
             ],
           ),
@@ -305,33 +308,52 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             children: [
               Row(
                 children: [
-                  const Icon(Icons.playlist_add_check, size: 16, color: Color(0xFF00D2FF)),
+                  const Icon(Icons.checklist_rounded, size: 16, color: Color(0xFF94A3B8)),
                   const SizedBox(width: 8),
+                  const Text(
+                    'Todo',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFFCBD5E1),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
                   Text(
                     'Таск-бар сессии',
-                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
+                    style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted),
                   ),
                   const Spacer(),
                   Obx(() {
                     final steps = widget.controller.runTimelineSteps;
-                    final doneCount = steps.where((s) => s['status'] == 'done').length;
+                    final doneCount = steps.where((s) => s['status'] == 'done' || s['status'] == 'completed').length;
                     final totalCount = steps.isNotEmpty ? steps.length : (widget.controller.isRunning.value ? 4 : 0);
                     return Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF00D2FF).withOpacity(0.12),
+                        color: const Color(0xFF1E222B),
                         borderRadius: BorderRadius.circular(4),
+                        border: Border.all(color: const Color(0xFF333A48), width: 0.8),
                       ),
                       child: Text(
-                        '$doneCount/$totalCount выполнено',
-                        style: const TextStyle(fontSize: 10, fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFF00D2FF)),
+                        '$doneCount/$totalCount',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontFamily: 'Consolas',
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF64748B),
+                        ),
                       ),
                     );
                   }),
                   const SizedBox(width: 8),
                   InkWell(
                     onTap: () => setState(() => isTaskBarOpen = false),
-                    child: Icon(Icons.close, size: 14, color: DesktopTheme.textMuted),
+                    borderRadius: BorderRadius.circular(4),
+                    child: Padding(
+                      padding: const EdgeInsets.all(2),
+                      child: Icon(Icons.close, size: 14, color: DesktopTheme.textMuted),
+                    ),
                   ),
                 ],
               ),
@@ -340,12 +362,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 final steps = widget.controller.runTimelineSteps;
                 if (steps.isEmpty) {
                   return Container(
-                    padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 12),
+                    padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 12),
                     alignment: Alignment.center,
                     child: Text(
                       'Шаги и задачи агента формируются динамически при запуске промпта',
                       textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                      style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted),
                     ),
                   );
                 }
@@ -353,49 +375,77 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
                   itemCount: steps.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 6),
+                  separatorBuilder: (_, __) => const SizedBox(height: 4),
                   itemBuilder: (ctx, i) {
                     final s = steps[i];
-                    final title = s['title']?.toString() ?? s['step']?.toString() ?? 'Шаг ${i + 1}';
+                    final title = s['title']?.toString() ?? s['step']?.toString() ?? s['name']?.toString() ?? 'Шаг ${i + 1}';
                     final status = s['status']?.toString() ?? 'pending';
-                    final isDone = status == 'done';
+                    final isDone = status == 'done' || status == 'completed';
                     final isRunning = status == 'running';
 
-                    return Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-                      decoration: BoxDecoration(
-                        color: DesktopTheme.bgSurfaceElevated,
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: isRunning ? const Color(0xFF00D2FF) : DesktopTheme.borderSubtle,
-                          width: 0.8,
-                        ),
-                      ),
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 3.5),
                       child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          if (isRunning)
-                            const SizedBox(
-                              width: 13,
-                              height: 13,
-                              child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF00D2FF)),
-                            )
-                          else
-                            Icon(
-                              isDone ? Icons.check_circle : Icons.radio_button_unchecked,
-                              size: 14,
-                              color: isDone ? const Color(0xFF10B981) : const Color(0xFF64748B),
+                          if (isDone) ...[
+                            const Padding(
+                              padding: EdgeInsets.only(top: 1),
+                              child: Icon(Icons.check_circle_outline, size: 15, color: Color(0xFF10B981)),
                             ),
-                          const SizedBox(width: 9),
-                          Expanded(
-                            child: Text(
-                              title,
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                color: isDone ? const Color(0xFFE2E8F0) : (isRunning ? Colors.white : const Color(0xFF94A3B8)),
-                                fontWeight: isRunning ? FontWeight.w600 : FontWeight.normal,
+                            const SizedBox(width: 9),
+                            Expanded(
+                              child: Text(
+                                title,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF7E8694),
+                                  height: 1.3,
+                                ),
                               ),
                             ),
-                          ),
+                          ] else if (isRunning) ...[
+                            const Padding(
+                              padding: EdgeInsets.only(top: 1),
+                              child: Text(
+                                '->',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  color: Color(0xFFF1F5F9),
+                                  fontFamily: 'Consolas',
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 9),
+                            Expanded(
+                              child: Text(
+                                title,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFFF1F5F9),
+                                  height: 1.3,
+                                ),
+                              ),
+                            ),
+                          ] else ...[
+                            const Padding(
+                              padding: EdgeInsets.only(top: 1),
+                              child: Icon(Icons.circle_outlined, size: 14, color: Color(0xFF475569)),
+                            ),
+                            const SizedBox(width: 9),
+                            Expanded(
+                              child: Text(
+                                title,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF94A3B8),
+                                  height: 1.3,
+                                ),
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                     );
@@ -821,7 +871,54 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
           const SizedBox(width: 8),
 
-
+          // To-Do / TaskBar dropdown toggle
+          Tooltip(
+            message: 'To-Do / Таск-бар сессии',
+            child: InkWell(
+              onTap: () => setState(() => isTaskBarOpen = !isTaskBarOpen),
+              borderRadius: BorderRadius.circular(4),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isTaskBarOpen
+                      ? const Color(0xFF00D2FF).withOpacity(0.18)
+                      : DesktopTheme.bgSurfaceElevated,
+                  borderRadius: BorderRadius.circular(5),
+                  border: Border.all(
+                    color: isTaskBarOpen ? const Color(0xFF00D2FF) : Colors.transparent,
+                    width: 0.8,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.checklist_rounded,
+                      size: 13,
+                      color: isTaskBarOpen ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
+                    ),
+                    const SizedBox(width: 4),
+                    Obx(() {
+                      final steps = widget.controller.runTimelineSteps;
+                      final doneCount = steps.where((s) => s['status'] == 'done' || s['status'] == 'completed').length;
+                      final totalCount = steps.length;
+                      final label = totalCount > 0 ? '$doneCount/$totalCount' : 'Todo';
+                      return Text(
+                        label,
+                        style: TextStyle(
+                          fontSize: 10.5,
+                          fontFamily: 'Consolas',
+                          fontWeight: FontWeight.w600,
+                          color: isTaskBarOpen ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
+                        ),
+                      );
+                    }),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
 
           // Terminal quick toggle (>_)
           Tooltip(
@@ -2075,34 +2172,6 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         ),
                       ),
 
-                    // Tool calls
-                    if (msg.toolCalls.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      ...msg.toolCalls.map((tool) => Container(
-                            margin: const EdgeInsets.only(top: 6),
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: DesktopTheme.bgSurfaceElevated,
-                              borderRadius: BorderRadius.circular(4),
-                              border: Border.all(color: DesktopTheme.borderSubtle),
-                            ),
-                            child: Row(
-                              children: [
-                                const Icon(Icons.terminal, size: 13, color: Color(0xFF00D2FF)),
-                                const SizedBox(width: 8),
-                                Text(
-                                  tool.name,
-                                  style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
-                                ),
-                                const Spacer(),
-                                Text(
-                                  '✓ ${DesktopI18n.done}',
-                                  style: const TextStyle(fontSize: 10, color: Color(0xFF10B981)),
-                                ),
-                              ],
-                            ),
-                          )),
-                    ],
 
                     // Live Project Changes Review Pill (e.g. "4 files changed +129 -1 > [📄 Review]")
                     if (!isUser && msg.filesChangedCount != null && msg.filesChangedCount! > 0)
@@ -2130,120 +2199,356 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
+  Widget _buildTerminalBadge() {
+    return Container(
+      width: 18,
+      height: 14,
+      margin: const EdgeInsets.only(right: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161B22),
+        borderRadius: BorderRadius.circular(3),
+        border: Border.all(color: const Color(0xFF475569), width: 1.1),
+      ),
+      child: const Center(
+        child: Text(
+          '>_',
+          style: TextStyle(
+            fontSize: 8.5,
+            fontFamily: 'Consolas',
+            fontWeight: FontWeight.w700,
+            color: Color(0xFF94A3B8),
+            height: 1.0,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSingleActionRow(AgentActionStep step, {VoidCallback? onToggle}) {
+    final Widget iconWidget;
+    final String actionLabel;
+    Widget? secondaryIcon;
+    String displayTitle = step.title;
+    final additions = step.additions;
+
+    switch (step.type) {
+      case AgentActionType.runningTerminal:
+        iconWidget = _buildTerminalBadge();
+        actionLabel = 'Terminal';
+        if (step.command != null && step.command!.isNotEmpty) {
+          displayTitle = step.command!;
+        }
+        break;
+      case AgentActionType.searchingFiles:
+        iconWidget = const Padding(
+          padding: EdgeInsets.only(right: 6),
+          child: Icon(Icons.search, size: 13, color: Color(0xFF94A3B8)),
+        );
+        actionLabel = 'Search';
+        break;
+      case AgentActionType.readingFile:
+        iconWidget = const Padding(
+          padding: EdgeInsets.only(right: 6),
+          child: Icon(Icons.search, size: 13, color: Color(0xFF94A3B8)),
+        );
+        actionLabel = 'Read';
+        secondaryIcon = const Padding(
+          padding: EdgeInsets.only(right: 6),
+          child: Icon(FontAwesomeIcons.codeBranch, size: 10, color: Color(0xFF38BDF8)),
+        );
+        if (step.filePath != null && step.filePath!.isNotEmpty) {
+          displayTitle = step.filePath!.split(RegExp(r'[\\/]')).last;
+        }
+        break;
+      case AgentActionType.editingFile:
+        iconWidget = const Padding(
+          padding: EdgeInsets.only(right: 6),
+          child: Icon(Icons.edit_outlined, size: 13, color: Color(0xFF94A3B8)),
+        );
+        actionLabel = 'Edit';
+        secondaryIcon = const Padding(
+          padding: EdgeInsets.only(right: 6),
+          child: Icon(FontAwesomeIcons.codeBranch, size: 10, color: Color(0xFF38BDF8)),
+        );
+        if (step.filePath != null && step.filePath!.isNotEmpty) {
+          displayTitle = step.filePath!.split(RegExp(r'[\\/]')).last;
+        }
+        break;
+      case AgentActionType.analyzingCode:
+        iconWidget = const Padding(
+          padding: EdgeInsets.only(right: 6),
+          child: Icon(Icons.psychology_outlined, size: 13, color: Color(0xFFA78BFA)),
+        );
+        actionLabel = 'Thought';
+        break;
+    }
+
+    return InkWell(
+      onTap: onToggle,
+      borderRadius: BorderRadius.circular(4),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3.5, horizontal: 2),
+        child: Row(
+          children: [
+            iconWidget,
+            Text(
+              '$actionLabel ',
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: Color(0xFF94A3B8),
+              ),
+            ),
+            if (secondaryIcon != null) secondaryIcon,
+            Expanded(
+              child: Text(
+                displayTitle,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontFamily: 'Consolas',
+                  color: (step.type == AgentActionType.editingFile || step.type == AgentActionType.readingFile)
+                      ? const Color(0xFFCBD5E1)
+                      : const Color(0xFF64748B),
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (additions != null && additions > 0) ...[
+              const SizedBox(width: 6),
+              Text(
+                '+$additions',
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontFamily: 'Consolas',
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF10B981),
+                ),
+              ),
+            ],
+            if (step.isError || (step.failureReason != null && step.failureReason!.isNotEmpty)) ...[
+              const SizedBox(width: 6),
+              Text(
+                step.failureReason ?? 'Failed',
+                style: const TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFFEF4444),
+                  decoration: TextDecoration.underline,
+                  decorationStyle: TextDecorationStyle.dotted,
+                ),
+              ),
+            ],
+            if (step.isRunning) ...[
+              const SizedBox(width: 6),
+              const SizedBox(
+                width: 10,
+                height: 10,
+                child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF00D2FF)),
+              ),
+            ] else ...[
+              const SizedBox(width: 6),
+              Icon(
+                step.isExpanded ? Icons.keyboard_arrow_down : Icons.chevron_right,
+                size: 14,
+                color: const Color(0xFF64748B),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActionStepDetails(String details) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(8),
+      margin: const EdgeInsets.fromLTRB(20, 2, 8, 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0D1117),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: const Color(0xFF30363D), width: 0.8),
+      ),
+      child: SelectableText(
+        details,
+        style: const TextStyle(
+          fontSize: 11,
+          fontFamily: 'Consolas',
+          color: Color(0xFF8B949E),
+          height: 1.35,
+        ),
+      ),
+    );
+  }
+
+
+
+  Widget _buildTodoBlockWidget(BuildContext context, TodoBlockData block, {VoidCallback? onToggle}) {
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          InkWell(
+            onTap: onToggle,
+            borderRadius: BorderRadius.circular(6),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+              child: Row(
+                children: [
+                  const Icon(Icons.checklist_rounded, size: 15, color: Color(0xFF94A3B8)),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'Todo',
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFFCBD5E1),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      block.title,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF94A3B8),
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    '${block.completedCount}/${block.totalCount}',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'Consolas',
+                      color: Color(0xFF64748B),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(
+                    block.isExpanded ? Icons.keyboard_arrow_down : Icons.chevron_right,
+                    size: 14,
+                    color: const Color(0xFF64748B),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // Expanded box
+          if (block.isExpanded)
+            Container(
+              margin: const EdgeInsets.only(top: 4, bottom: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: const Color(0xFF16181D),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF282D37), width: 0.9),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: block.items.map((item) {
+                  final isDone = item.status == TodoTaskStatus.completed;
+                  final isRunning = item.status == TodoTaskStatus.running;
+
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (isDone) ...[
+                          const Padding(
+                            padding: EdgeInsets.only(top: 1),
+                            child: Icon(Icons.check_circle_outline, size: 15, color: Color(0xFF10B981)),
+                          ),
+                          const SizedBox(width: 9),
+                          Expanded(
+                            child: Text(
+                              item.title,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFF7E8694),
+                                height: 1.3,
+                              ),
+                            ),
+                          ),
+                        ] else if (isRunning) ...[
+                          const Padding(
+                            padding: EdgeInsets.only(top: 1),
+                            child: Text(
+                              '->',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFFF1F5F9),
+                                fontFamily: 'Consolas',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 9),
+                          Expanded(
+                            child: Text(
+                              item.title,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w500,
+                                color: Color(0xFFF1F5F9),
+                                height: 1.3,
+                              ),
+                            ),
+                          ),
+                        ] else ...[
+                          const Padding(
+                            padding: EdgeInsets.only(top: 1),
+                            child: Icon(Icons.circle_outlined, size: 14, color: Color(0xFF475569)),
+                          ),
+                          const SizedBox(width: 9),
+                          Expanded(
+                            child: Text(
+                              item.title,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFF94A3B8),
+                                height: 1.3,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildAgentActionSteps(BuildContext context, ChatMessage msg) {
     if (msg.steps.isEmpty) return const SizedBox.shrink();
 
     return StatefulBuilder(
       builder: (context, setStepState) {
         return Container(
-          margin: const EdgeInsets.only(bottom: 10),
+          margin: const EdgeInsets.only(bottom: 8),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: msg.steps.map((step) {
-              IconData iconData;
-              Color iconColor;
-              switch (step.type) {
-                case AgentActionType.readingFile:
-                  iconData = Icons.menu_book_outlined;
-                  iconColor = const Color(0xFF38BDF8);
-                  break;
-                case AgentActionType.editingFile:
-                  iconData = Icons.edit_note_outlined;
-                  iconColor = const Color(0xFFFBBF24);
-                  break;
-                case AgentActionType.analyzingCode:
-                  iconData = FontAwesomeIcons.brain;
-                  iconColor = const Color(0xFFA78BFA);
-                  break;
-                case AgentActionType.runningTerminal:
-                  iconData = Icons.terminal;
-                  iconColor = const Color(0xFF34D399);
-                  break;
-                case AgentActionType.searchingFiles:
-                  iconData = Icons.search;
-                  iconColor = const Color(0xFF2DD4BF);
-                  break;
-              }
-
-              return Container(
-                margin: const EdgeInsets.only(bottom: 6),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF161B22),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: step.isRunning ? const Color(0xFF00D2FF).withOpacity(0.5) : DesktopTheme.borderSubtle,
-                    width: 1,
-                  ),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    InkWell(
-                      onTap: () {
-                        if (step.details != null && step.details!.isNotEmpty) {
-                          setStepState(() => step.isExpanded = !step.isExpanded);
-                        }
-                      },
-                      borderRadius: BorderRadius.circular(8),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                        child: Row(
-                          children: [
-                            if (step.isRunning)
-                              const SizedBox(
-                                width: 14,
-                                height: 14,
-                                child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00D2FF)),
-                              )
-                            else
-                              const Icon(Icons.check_circle, size: 14, color: Color(0xFF10B981)),
-                            const SizedBox(width: 8),
-                            Icon(iconData, size: 13, color: iconColor),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                step.title,
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w500,
-                                  color: Color(0xFFE2E8F0),
-                                  fontFamily: 'Consolas',
-                                ),
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                            if (step.details != null && step.details!.isNotEmpty)
-                              Icon(
-                                step.isExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                                size: 14,
-                                color: const Color(0xFF94A3B8),
-                              ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    if (step.isExpanded && step.details != null && step.details!.isNotEmpty)
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(10),
-                        margin: const EdgeInsets.fromLTRB(10, 0, 10, 8),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF0D1117),
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: const Color(0xFF30363D)),
-                        ),
-                        child: SelectableText(
-                          step.details!,
-                          style: const TextStyle(
-                            fontSize: 11,
-                            fontFamily: 'Consolas',
-                            color: Color(0xFF8B949E),
-                            height: 1.35,
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildSingleActionRow(step, onToggle: () {
+                    setStepState(() => step.isExpanded = !step.isExpanded);
+                  }),
+                  if (step.isExpanded && step.details != null && step.details!.isNotEmpty)
+                    _buildActionStepDetails(step.details!),
+                ],
               );
             }).toList(),
           ),
@@ -2915,20 +3220,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       // Inline Code: `code`
       else if (matchedStr.startsWith('`') && matchedStr.endsWith('`')) {
         final inner = matchedStr.substring(1, matchedStr.length - 1);
-        spans.add(WidgetSpan(
-          alignment: PlaceholderAlignment.middle,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-            margin: const EdgeInsets.symmetric(horizontal: 2),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1E222B),
-              borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: const Color(0xFF2D3748), width: 0.8),
-            ),
-            child: Text(
-              inner,
-              style: const TextStyle(fontSize: 12, fontFamily: 'Consolas', color: Color(0xFF38BDF8)),
-            ),
+        spans.add(TextSpan(
+          text: ' $inner ',
+          style: const TextStyle(
+            fontSize: 12,
+            fontFamily: 'Consolas',
+            color: Color(0xFF38BDF8),
+            backgroundColor: Color(0xFF1E222B),
           ),
         ));
       }
@@ -2964,19 +3262,233 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       ));
     }
 
-    return SelectableText.rich(
+    return Text.rich(
       TextSpan(children: spans),
     );
   }
 
+  TodoBlockData? _buildSessionTodoBlockFromTimeline() {
+    final steps = widget.controller.runTimelineSteps;
+    if (steps.isEmpty) return null;
+
+    final items = <TodoTaskItem>[];
+    int doneCount = 0;
+    String? runningTitle;
+
+    for (final s in steps) {
+      final title = s['title']?.toString() ?? s['step']?.toString() ?? s['name']?.toString() ?? 'Шаг';
+      final statusStr = s['status']?.toString() ?? 'pending';
+      final TodoTaskStatus status;
+      if (statusStr == 'done' || statusStr == 'completed') {
+        status = TodoTaskStatus.completed;
+        doneCount++;
+      } else if (statusStr == 'running') {
+        status = TodoTaskStatus.running;
+        runningTitle = title;
+      } else {
+        status = TodoTaskStatus.pending;
+      }
+      items.add(TodoTaskItem(title: title, status: status));
+    }
+
+    final activeTitle = runningTitle ?? (items.isNotEmpty ? items.first.title : 'Задачи сессии');
+    return TodoBlockData(
+      title: activeTitle,
+      completedCount: doneCount,
+      totalCount: items.length,
+      items: items,
+      isExpanded: true,
+    );
+  }
+
+  String _stripTodoLinesFromText(String raw) {
+    final lines = raw.split('\n');
+    final out = <String>[];
+    bool inTodo = false;
+    final todoHeaderRegex = RegExp(r'^(?:[^\w\s]*\s*)?(?:Todo|TODO|Задачи|План)[:\s]+(.*?)(?:\s+(\d+)\/(\d+))?$', caseSensitive: false);
+    final taskItemRegex = RegExp(r'^\s*(?:[-*]\s*)?(?:\[([ xX>/-])\]|->|\([vV ]\)|•)\s*(.*)$');
+
+    for (final line in lines) {
+      final trimmed = line.trim();
+      if (todoHeaderRegex.hasMatch(trimmed)) {
+        inTodo = true;
+        continue;
+      }
+      if (inTodo) {
+        if (taskItemRegex.hasMatch(trimmed) || trimmed.isEmpty) {
+          continue;
+        } else {
+          inTodo = false;
+        }
+      }
+      out.add(line);
+    }
+    return out.join('\n').trim();
+  }
+
   Widget _buildMessageContent(BuildContext context, ChatMessage msg) {
+    final isLastBotMessage = widget.controller.messages.isNotEmpty &&
+        widget.controller.messages.last == msg &&
+        msg.chatMessageType == ChatMessageType.bot;
+
+    final todosInMsg = msg.todoBlocks.isNotEmpty
+        ? msg.todoBlocks
+        : DesktopTaskWorkspaceController.parseTodoBlocksFromText(msg.text);
+
+    TodoBlockData? sessionTodoBlock;
+    if (todosInMsg.isEmpty && isLastBotMessage && widget.controller.runTimelineSteps.isNotEmpty) {
+      sessionTodoBlock = _buildSessionTodoBlockFromTimeline();
+    }
+
+    String contentText = msg.text;
+    if (todosInMsg.isNotEmpty) {
+      contentText = _stripTodoLinesFromText(msg.text);
+    }
+
+    return SelectionArea(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (todosInMsg.isNotEmpty)
+            for (final tb in todosInMsg)
+              StatefulBuilder(
+                builder: (ctx, setTodoState) {
+                  return _buildTodoBlockWidget(
+                    context,
+                    tb,
+                    onToggle: () => setTodoState(() => tb.isExpanded = !tb.isExpanded),
+                  );
+                },
+              )
+          else if (sessionTodoBlock != null) ...[
+            Builder(
+              builder: (ctx) {
+                final sBlock = sessionTodoBlock!;
+                return StatefulBuilder(
+                  builder: (ctx, setTodoState) {
+                    return _buildTodoBlockWidget(
+                      context,
+                      sBlock,
+                      onToggle: () => setTodoState(() => sBlock.isExpanded = !sBlock.isExpanded),
+                    );
+                  },
+                );
+              },
+            ),
+          ],
+          ..._parseAndBuildMessageBody(context, msg, contentText),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _parseAndBuildMessageBody(BuildContext context, ChatMessage msg, String text) {
+    final widgets = <Widget>[];
+
+    final invokeRegex = RegExp(r'<invoke\s+name="([^"]+)">([\s\S]*?)(?:<\/invoke>|$)', caseSensitive: false);
+    final paramRegex = RegExp(r'<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>', caseSensitive: false);
+
+    int lastPos = 0;
+    final invokeMatches = invokeRegex.allMatches(text).toList();
+
+    if (invokeMatches.isEmpty) {
+      return [_buildMarkdownOrCodeBlocks(context, msg, text)];
+    }
+
+    final pendingInvokeSteps = <AgentActionStep>[];
+
+    void flushPendingInvokes() {
+      if (pendingInvokeSteps.isNotEmpty) {
+        final list = List<AgentActionStep>.from(pendingInvokeSteps);
+        pendingInvokeSteps.clear();
+        widgets.add(StatefulBuilder(
+          builder: (ctx, setStepState) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: list.map((s) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildSingleActionRow(s, onToggle: () => setStepState(() => s.isExpanded = !s.isExpanded)),
+                    if (s.isExpanded && s.details != null && s.details!.isNotEmpty)
+                      _buildActionStepDetails(s.details!),
+                  ],
+                );
+              }).toList(),
+            );
+          },
+        ));
+      }
+    }
+
+    for (final m in invokeMatches) {
+      if (m.start > lastPos) {
+        final textBefore = text.substring(lastPos, m.start).trim();
+        if (textBefore.isNotEmpty) {
+          flushPendingInvokes();
+          widgets.add(_buildMarkdownOrCodeBlocks(context, msg, textBefore));
+        }
+      }
+
+      final toolName = m.group(1) ?? 'terminal';
+      final body = m.group(2) ?? '';
+      final params = <String, String>{};
+      for (final p in paramRegex.allMatches(body)) {
+        final pName = p.group(1) ?? '';
+        final pVal = p.group(2) ?? '';
+        params[pName] = pVal;
+      }
+
+      final lower = toolName.toLowerCase();
+      final AgentActionType actionType;
+      String actionTitle;
+      if (lower.contains('terminal') || lower.contains('bash') || lower.contains('command') || lower.contains('cmd')) {
+        actionType = AgentActionType.runningTerminal;
+        actionTitle = params['command'] ?? params['CommandLine'] ?? body.trim();
+      } else if (lower.contains('search') || lower.contains('grep') || lower.contains('find') || lower.contains('explore')) {
+        actionType = AgentActionType.searchingFiles;
+        actionTitle = params['query'] ?? params['Query'] ?? body.trim();
+      } else if (lower.contains('read') || lower.contains('view') || lower.contains('cat')) {
+        actionType = AgentActionType.readingFile;
+        actionTitle = params['path'] ?? params['AbsolutePath'] ?? body.trim();
+      } else if (lower.contains('write') || lower.contains('edit') || lower.contains('replace')) {
+        actionType = AgentActionType.editingFile;
+        actionTitle = params['path'] ?? params['TargetFile'] ?? body.trim();
+      } else {
+        actionType = AgentActionType.analyzingCode;
+        actionTitle = params.isNotEmpty ? params.values.first : body.trim();
+      }
+
+      pendingInvokeSteps.add(AgentActionStep(
+        title: actionTitle.replaceAll('&amp;&amp;', '&&').replaceAll('&gt;', '>').replaceAll('&lt;', '<'),
+        type: actionType,
+        details: params.isNotEmpty ? params.entries.map((e) => '${e.key}: ${e.value}').join('\n') : body.trim(),
+        isRunning: false,
+      ));
+
+      lastPos = m.end;
+    }
+
+    flushPendingInvokes();
+
+    if (lastPos < text.length) {
+      final textAfter = text.substring(lastPos).trim();
+      if (textAfter.isNotEmpty) {
+        widgets.add(_buildMarkdownOrCodeBlocks(context, msg, textAfter));
+      }
+    }
+
+    return widgets;
+  }
+
+  Widget _buildMarkdownOrCodeBlocks(BuildContext context, ChatMessage msg, String rawText) {
     // 1. Check for XML style <question>...</question>
-    final xmlMatch = RegExp(r'<question>([\s\S]*?)<\/question>').firstMatch(msg.text);
+    final xmlMatch = RegExp(r'<question>([\s\S]*?)<\/question>').firstMatch(rawText);
     if (xmlMatch != null) {
       final qData = InteractiveQuestionData.tryParse(xmlMatch.group(1)!);
       if (qData != null) {
-        final prefix = msg.text.substring(0, xmlMatch.start).trim();
-        final suffix = msg.text.substring(xmlMatch.end).trim();
+        final prefix = rawText.substring(0, xmlMatch.start).trim();
+        final suffix = rawText.substring(xmlMatch.end).trim();
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -2992,11 +3504,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       }
     }
 
-    if (!msg.text.contains('```')) {
-      return _buildFormattedMarkdown(context, msg.text);
+    if (!rawText.contains('```')) {
+      return _buildFormattedMarkdown(context, rawText);
     }
 
-    final parts = msg.text.split('```');
+    final parts = rawText.split('```');
     final widgets = <Widget>[];
 
     for (int i = 0; i < parts.length; i++) {

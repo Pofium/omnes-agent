@@ -22,3 +22,12 @@ Do not duplicate state.
 - Never commit secrets, tokens, credentials, personal data, or real identities.
 - Validate all external inputs at function entry points.
 - Production paths must propagate errors without unhandled exceptions or panics.
+
+## ob2h MCP — Mandatory Integration & Usage
+
+Always use `ob2h` MCP tools as the primary mechanism for codebase exploration, memory management, and architectural reasoning:
+- **Codebase Discovery & Exploration**: Call `ob2h:project_scan` and `ob2h:project_context` BEFORE running shell commands or grep.
+- **Knowledge & Memory Retrieval**: Use `ob2h:memory_search`, `ob2h:graph_search`, and `ob2h:graph_reason` to fetch relevant architectural decisions, past user preferences, and repository entity graphs.
+- **Blast Radius & Impact**: Call `ob2h:project_impact` to assess ripple effects across crates/packages prior to non-trivial modifications.
+- **Persistent Memory**: Save significant architectural decisions and user instructions via `ob2h:memory_save`.
+

@@ -8,6 +8,66 @@ enum AgentActionType {
   searchingFiles,
 }
 
+enum TodoTaskStatus { completed, running, pending }
+
+class TodoTaskItem {
+  final String title;
+  final TodoTaskStatus status;
+
+  TodoTaskItem({
+    required this.title,
+    required this.status,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'title': title,
+    'status': status.name,
+  };
+
+  factory TodoTaskItem.fromJson(Map<String, dynamic> json) => TodoTaskItem(
+    title: json['title']?.toString() ?? '',
+    status: TodoTaskStatus.values.firstWhere(
+      (s) => s.name == json['status'],
+      orElse: () => TodoTaskStatus.pending,
+    ),
+  );
+}
+
+class TodoBlockData {
+  final String title;
+  final int completedCount;
+  final int totalCount;
+  final List<TodoTaskItem> items;
+  bool isExpanded;
+
+  TodoBlockData({
+    required this.title,
+    required this.completedCount,
+    required this.totalCount,
+    required this.items,
+    this.isExpanded = true,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'title': title,
+    'completedCount': completedCount,
+    'totalCount': totalCount,
+    'items': items.map((i) => i.toJson()).toList(),
+    'isExpanded': isExpanded,
+  };
+
+  factory TodoBlockData.fromJson(Map<String, dynamic> json) => TodoBlockData(
+    title: json['title']?.toString() ?? '',
+    completedCount: json['completedCount'] as int? ?? 0,
+    totalCount: json['totalCount'] as int? ?? 0,
+    items: (json['items'] as List?)
+            ?.map((i) => TodoTaskItem.fromJson(Map<String, dynamic>.from(i as Map)))
+            .toList() ??
+        [],
+    isExpanded: json['isExpanded'] != false,
+  );
+}
+
 class AgentActionStep {
   final String title;
   final AgentActionType type;
@@ -16,6 +76,10 @@ class AgentActionStep {
   bool isRunning;
   bool isError;
   bool isExpanded;
+  int? additions;
+  int? deletions;
+  String? command;
+  String? failureReason;
 
   AgentActionStep({
     required this.title,
@@ -25,6 +89,10 @@ class AgentActionStep {
     this.isRunning = false,
     this.isError = false,
     this.isExpanded = false,
+    this.additions,
+    this.deletions,
+    this.command,
+    this.failureReason,
   });
 
   Map<String, dynamic> toJson() => {
@@ -35,6 +103,10 @@ class AgentActionStep {
     'isRunning': isRunning,
     'isError': isError,
     'isExpanded': isExpanded,
+    'additions': additions,
+    'deletions': deletions,
+    'command': command,
+    'failureReason': failureReason,
   };
 
   factory AgentActionStep.fromJson(Map<String, dynamic> json) => AgentActionStep(
@@ -48,6 +120,10 @@ class AgentActionStep {
     isRunning: json['isRunning'] == true,
     isError: json['isError'] == true,
     isExpanded: json['isExpanded'] == true,
+    additions: json['additions'] as int?,
+    deletions: json['deletions'] as int?,
+    command: json['command']?.toString(),
+    failureReason: json['failureReason']?.toString(),
   );
 }
 
@@ -86,6 +162,7 @@ class ChatMessage {
     this.thinking,
     List<ToolCallInfo>? toolCalls,
     List<AgentActionStep>? steps,
+    List<TodoBlockData>? todoBlocks,
     this.isStreaming = false,
     this.isError = false,
     this.thinkingSeconds = 0,
@@ -99,6 +176,7 @@ class ChatMessage {
     List<String>? suggestedActions,
   })  : toolCalls = toolCalls ?? [],
         steps = steps ?? [],
+        todoBlocks = todoBlocks ?? [],
         suggestedActions = suggestedActions ?? [];
 
   String text;
@@ -106,6 +184,7 @@ class ChatMessage {
   String? thinking;
   final List<ToolCallInfo> toolCalls;
   final List<AgentActionStep> steps;
+  final List<TodoBlockData> todoBlocks;
   bool isStreaming;
   bool isError;
   int thinkingSeconds;
@@ -125,6 +204,7 @@ class ChatMessage {
     'thinkingSeconds': thinkingSeconds,
     'isError': isError,
     'steps': steps.map((s) => s.toJson()).toList(),
+    'todoBlocks': todoBlocks.map((t) => t.toJson()).toList(),
     'filesChangedCount': filesChangedCount,
     'additions': additions,
     'deletions': deletions,
@@ -143,6 +223,10 @@ class ChatMessage {
     isThinkingExpanded: false,
     steps: (json['steps'] as List?)
             ?.map((s) => AgentActionStep.fromJson(Map<String, dynamic>.from(s as Map)))
+            .toList() ??
+        [],
+    todoBlocks: (json['todoBlocks'] as List?)
+            ?.map((t) => TodoBlockData.fromJson(Map<String, dynamic>.from(t as Map)))
             .toList() ??
         [],
     filesChangedCount: json['filesChangedCount'] as int?,
