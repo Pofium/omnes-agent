@@ -58,6 +58,28 @@ sealed class GatewayFrame {
           argumentsSummary: json['arguments_summary'] as String? ?? json['arguments']?.toString() ?? '',
           timeoutSecs: json['timeout_secs'] as int?,
         );
+      case 'session_meta':
+        return SessionMetaFrame(
+          mode: json['mode'] as String? ?? 'chat',
+          showTodoWidget: json['show_todo_widget'] as bool? ?? false,
+          showSessionTimeline: json['show_session_timeline'] as bool? ?? false,
+          autoContinueActive: json['auto_continue_active'] as bool? ?? true,
+        );
+      case 'mode_changed':
+        return ModeChangedFrame(
+          oldMode: json['old_mode'] as String? ?? '',
+          newMode: json['new_mode'] as String? ?? 'chat',
+          showTodoWidget: json['show_todo_widget'] as bool? ?? false,
+          reason: json['reason'] as String?,
+        );
+      case 'ralph_phase_progress':
+        return RalphProgressFrame(
+          taskId: json['task_id'] as String? ?? '',
+          phase: json['phase'] as String? ?? '',
+          description: json['description'] as String? ?? '',
+          completedSteps: json['completed_steps'] as int? ?? 0,
+          totalSteps: json['total_steps'] as int? ?? 0,
+        );
       case 'session_start':
       case 'connected':
         return ConnectedFrame(
@@ -157,4 +179,51 @@ class ApprovalRequestFrame extends GatewayFrame {
     required this.argumentsSummary,
     this.timeoutSecs,
   }) : super('approval_request');
+}
+
+/// Metadata describing the session profile (mode, UI flags, auto-continue).
+class SessionMetaFrame extends GatewayFrame {
+  final String mode;
+  final bool showTodoWidget;
+  final bool showSessionTimeline;
+  final bool autoContinueActive;
+
+  const SessionMetaFrame({
+    required this.mode,
+    required this.showTodoWidget,
+    required this.showSessionTimeline,
+    required this.autoContinueActive,
+  }) : super('session_meta');
+}
+
+/// Emitted when session escalates (e.g. Chat -> Task).
+class ModeChangedFrame extends GatewayFrame {
+  final String oldMode;
+  final String newMode;
+  final bool showTodoWidget;
+  final String? reason;
+
+  const ModeChangedFrame({
+    required this.oldMode,
+    required this.newMode,
+    required this.showTodoWidget,
+    this.reason,
+  }) : super('mode_changed');
+}
+
+/// Autonomous engineering progress emitted by Ralph loop.
+class RalphProgressFrame extends GatewayFrame {
+  final String taskId;
+  final String phase;
+  final String description;
+  final int completedSteps;
+  final int totalSteps;
+
+  const RalphProgressFrame({
+    required this.taskId,
+    required this.phase,
+    required this.description,
+    required this.completedSteps,
+    required this.totalSteps,
+  }) : super('ralph_phase_progress');
 }

@@ -542,6 +542,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    let mut auto_continue_rounds: usize = 0;
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
@@ -1119,6 +1120,42 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         if tool_calls.is_empty() {
+            // Seamless auto-continue check: if the response was cut off mid-thought or mid-code-block,
+            // automatically request continuation without bothering the user.
+            let truncation = crate::agent::orchestrator::analyze_truncation(&response_text);
+            if truncation.is_truncated
+                && auto_continue_rounds < crate::agent::orchestrator::MAX_AUTO_CONTINUE_ROUNDS
+            {
+                auto_continue_rounds += 1;
+                accumulated_display_text.push_str(&display_text);
+
+                if !response_streamed_live && !protocol_suppressed {
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text).await;
+                }
+
+                ::omnesagent_log::record!(
+                    INFO,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Retry)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Success)
+                        .with_attrs(::serde_json::json!({
+                            "round": auto_continue_rounds,
+                            "reason": truncation.reason,
+                            "in_code_block": truncation.in_code_block,
+                            "iteration": iteration + 1,
+                        })),
+                    "Seamless auto-continue triggered for truncated response"
+                );
+
+                let msg = ChatMessage::assistant(response_text.clone());
+                turn_state.push_dual(msg);
+
+                let cont_prompt = crate::agent::orchestrator::continuation_prompt(truncation.in_code_block);
+                let cont_msg = ChatMessage::user(cont_prompt);
+                turn_state.push_dual(cont_msg);
+                continue;
+            }
+
             ::omnesagent_log::record!(
                 INFO,
                 ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Complete)

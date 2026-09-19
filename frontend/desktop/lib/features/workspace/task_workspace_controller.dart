@@ -113,6 +113,10 @@ class DesktopTaskWorkspaceController extends GetxController {
   final projectRulesContent = ''.obs;
   final isProjectRulesEnabled = true.obs;
 
+  // Session Mode & UI Flags from Orchestrator
+  final currentSessionMode = 'chat'.obs;
+  final showTodoWidget = false.obs;
+
   final isTerminalOpen = false.obs;
   final terminalLines = <String>[
     'OmnesAgent ADE Terminal ready. Enter a command below:',
@@ -962,10 +966,37 @@ class DesktopTaskWorkspaceController extends GetxController {
       }
       isRunning.value = false;
       wsStatus.value = 'error';
+    } else if (frame is SessionMetaFrame) {
+      currentSessionMode.value = frame.mode;
+      showTodoWidget.value = frame.showTodoWidget;
+    } else if (frame is ModeChangedFrame) {
+      currentSessionMode.value = frame.newMode;
+      showTodoWidget.value = frame.showTodoWidget;
+    } else if (frame is RalphProgressFrame) {
+      currentSessionMode.value = 'ralph';
+      showTodoWidget.value = true;
+      runTimelineSteps.add({
+        'id': frame.taskId,
+        'name': 'Ralph: ${frame.phase}',
+        'details': frame.description,
+        'completed': frame.completedSteps,
+        'total': frame.totalSteps,
+        'status': frame.completedSteps >= frame.totalSteps && frame.totalSteps > 0 ? 'completed' : 'running',
+      });
+      runTimelineSteps.refresh();
+      _scrollToBottom();
     }
   }
 
   void _extractTodoBlocksForMessage(ChatMessage msg) {
+    final isTask = showTodoWidget.value ||
+        currentSessionMode.value == 'task' ||
+        currentSessionMode.value == 'ralph' ||
+        currentSessionMode.value == 'admin';
+    if (!isTask) {
+      msg.todoBlocks.clear();
+      return;
+    }
     final todos = parseTodoBlocksFromText(msg.text);
     if (todos.isNotEmpty) {
       msg.todoBlocks.clear();
@@ -2330,10 +2361,14 @@ $goalsText
         botMessage.additions = null;
         botMessage.deletions = null;
         if (!botMessage.text.contains('```question') && !botMessage.text.contains('<question>')) {
-          botMessage.suggestedActions = [
-            '▶ Продолжить выполнение',
-            '🔍 Проверить статус проекта',
-          ];
+          if (currentSessionMode.value == 'task' || currentSessionMode.value == 'ralph') {
+            botMessage.suggestedActions = [
+              '🔍 Проверить статус проекта',
+              '▶ Запустить тесты проекта',
+            ];
+          } else {
+            botMessage.suggestedActions = [];
+          }
         }
       }
       _updateTokenUsageStats();

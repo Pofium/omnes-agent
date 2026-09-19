@@ -174,6 +174,7 @@ class ChatMessage {
     this.selectedQuestionAnswer,
     this.checkpointHash,
     List<String>? suggestedActions,
+    this.metadata,
   })  : toolCalls = toolCalls ?? [],
         steps = steps ?? [],
         todoBlocks = todoBlocks ?? [],
@@ -196,6 +197,7 @@ class ChatMessage {
   String? selectedQuestionAnswer;
   String? checkpointHash;
   List<String> suggestedActions;
+  Map<String, dynamic>? metadata;
 
   Map<String, dynamic> toJson() => {
     'text': text,
@@ -211,6 +213,7 @@ class ChatMessage {
     'selectedQuestionAnswer': selectedQuestionAnswer,
     'checkpointHash': checkpointHash,
     'suggestedActions': suggestedActions,
+    'metadata': metadata,
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -235,5 +238,6 @@ class ChatMessage {
     selectedQuestionAnswer: json['selectedQuestionAnswer'] as String?,
     checkpointHash: json['checkpointHash'] as String?,
     suggestedActions: (json['suggestedActions'] as List?)?.map((e) => e.toString()).toList() ?? [],
+    metadata: json['metadata'] is Map ? Map<String, dynamic>.from(json['metadata'] as Map) : null,
   );
 }

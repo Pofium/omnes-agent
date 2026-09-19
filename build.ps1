@@ -104,7 +104,7 @@ if ($Target -eq "All" -or $Target -eq "Frontend") {
         $sw.Stop()
         $sec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 
-        $possibleExeNames = @("OmnesAgent.exe", "omnes_desktop.exe")
+        $possibleExeNames = @("omnes_agent.exe", "OmnesAgent.exe", "omnes_desktop.exe")
         $exePath = $null
         foreach ($name in $possibleExeNames) {
             $candidate = if ($Mode -eq "Release") {

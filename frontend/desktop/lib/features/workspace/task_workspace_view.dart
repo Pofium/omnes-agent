@@ -3331,17 +3331,25 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         widget.controller.messages.last == msg &&
         msg.chatMessageType == ChatMessageType.bot;
 
-    final todosInMsg = msg.todoBlocks.isNotEmpty
-        ? msg.todoBlocks
-        : DesktopTaskWorkspaceController.parseTodoBlocksFromText(msg.text);
+    final showTodo = msg.metadata?['show_todo_widget'] == true ||
+        widget.controller.showTodoWidget.value ||
+        widget.controller.currentSessionMode.value == 'task' ||
+        widget.controller.currentSessionMode.value == 'ralph' ||
+        widget.controller.currentSessionMode.value == 'admin';
+
+    final todosInMsg = showTodo
+        ? (msg.todoBlocks.isNotEmpty
+            ? msg.todoBlocks
+            : DesktopTaskWorkspaceController.parseTodoBlocksFromText(msg.text))
+        : <TodoBlockData>[];
 
     TodoBlockData? sessionTodoBlock;
-    if (todosInMsg.isEmpty && isLastBotMessage && widget.controller.runTimelineSteps.isNotEmpty) {
+    if (showTodo && todosInMsg.isEmpty && isLastBotMessage && widget.controller.runTimelineSteps.isNotEmpty) {
       sessionTodoBlock = _buildSessionTodoBlockFromTimeline();
     }
 
     String contentText = msg.text;
-    if (todosInMsg.isNotEmpty) {
+    if (showTodo && todosInMsg.isNotEmpty) {
       contentText = _stripTodoLinesFromText(msg.text);
     }
 

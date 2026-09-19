@@ -130,6 +130,8 @@ struct NativeToolSpec {
     #[serde(rename = "type")]
     kind: String,
     function: NativeToolFunctionSpec,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Debug, Serialize)]
@@ -276,7 +278,7 @@ impl OpenRouterModelProvider {
         if items.is_empty() {
             return None;
         }
-        let valid: Vec<NativeToolSpec> = items
+        let mut valid: Vec<NativeToolSpec> = items
             .iter()
             .filter(|tool| is_valid_openai_tool_name(&tool.name))
             .map(|tool| NativeToolSpec {
@@ -286,9 +288,21 @@ impl OpenRouterModelProvider {
                     description: tool.description.clone(),
                     parameters: Arc::clone(&tool.parameters),
                 },
+                cache_control: None,
             })
             .collect();
-        if valid.is_empty() { None } else { Some(valid) }
+        if valid.is_empty() {
+            None
+        } else {
+            // Static prefix cache breakpoint: Mark the last tool definition with ephemeral cache_control
+            // so Anthropic and other prompt-caching models on OpenRouter can cache the entire static prefix.
+            if let Some(last) = valid.last_mut() {
+                last.cache_control = Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                });
+            }
+            Some(valid)
+        }
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -963,7 +977,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
             None
         } else {
-            let specs: Vec<NativeToolSpec> = tools
+            let mut specs: Vec<NativeToolSpec> = tools
                 .iter()
                 .filter_map(|t| {
                     let func = t.get("function")?;
@@ -982,10 +996,20 @@ impl ModelProvider for OpenRouterModelProvider {
                                     .unwrap_or(serde_json::json!({})),
                             ),
                         },
+                        cache_control: None,
                     })
                 })
                 .collect();
-            if specs.is_empty() { None } else { Some(specs) }
+            if specs.is_empty() {
+                None
+            } else {
+                if let Some(last) = specs.last_mut() {
+                    last.cache_control = Some(CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                    });
+                }
+                Some(specs)
+            }
         };
 
         // Convert ChatMessage to NativeMessage, preserving structured assistant/tool entries
@@ -2082,7 +2106,9 @@ mod tests {
         let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].function.name, "valid_tool");
+        assert!(result[0].cache_control.is_none());
         assert_eq!(result[1].function.name, "another-valid");
+        assert_eq!(result[1].cache_control.as_ref().unwrap().cache_type, "ephemeral");
     }
 
     #[test]

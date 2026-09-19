@@ -1,303 +1,563 @@
-# План доработок OmnesAgent ADE (Desktop & Web)
-**Дата**: 11 сентября 2026 г.
+# Архитектурный план: Intent & Tool Orchestrator для OmnesAgent
 
-## 📋 Статус реализации и чеклист задач
-
-### 1. 🧹 Исключение эмодзи папок из тултипов и интерфейса
-- [x] **Запрет эмодзи**: Полный отказ от эмодзи папок (`📁`, `📂`) во всех тултипах и строках интерфейса.
-- [x] **desktop_sidebar.dart** (desktop & web): Заменен тултип `[ 📂 ] Открыть дерево файлов` на лаконичный `Открыть дерево файлов проекта` с использованием векторной иконки `Icons.folder_open_outlined`.
-- [x] **inspector_panel.dart** (desktop & web): Удален эмодзи `[ 📂 ]` из заглушки файлового просмотрщика.
-- [x] **task_workspace_view.dart**: В строке контекста проекта используется исключительно векторная иконка `Icons.folder_outlined`.
+> **Версия:** 2.0 (2026-09-19)
+> **Цели:** Устранить обрывы сообщений, паразитные TODO-блоки при обычных вопросах, оптимизировать контекстное окно LLM через интеллектуальную маршрутизацию интентов, динамическую подгрузку инструментов и бесшовный стриминг.
 
 ---
 
-### 2. 🔀 Открытие Side Chat по клику на иконку ветки в основном чате
-- [x] **task_workspace_view.dart** (desktop & web):
-  - Добавлен коллбэк `onBranchSideChat(String? initialText)`.
-  - Иконка `FontAwesomeIcons.codeBranch` в панели действий под ответом ассистента снабжена подсказкой «Открыть ветку в Side Chat» и обработчиком `onTap`, передающим текст ответа ассистента.
-- [x] **desktop_shell.dart** (desktop & web):
-  - Обработчик `onBranchSideChat` подключен к шеллу: при нажатии правая панель инспектора автоматически открывается (`isRightPanelOpen.value = true`) и активирует вкладку `Side Chat` (индекс 4).
-  - Контроллер Side Chat инициализирует контекст ветки из выбранного сообщения.
+## 1. Аудит текущей кодовой базы (OB2H AST-анализ)
+
+> AST-сканирование: **1 242 файла**, **40 651 узел графа**, **49 964 связи**.
+> Циклических зависимостей: **0** (архитектура ациклична ✅).
+
+### 1.1 Что уже есть и чего не хватает
+
+| Компонент | Файл | Что делает | Чего не хватает |
+|---|---|---|---|
+| **Channel Orchestrator** | [`orchestrator/mod.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-channels/src/orchestrator/mod.rs) | Маршрутизация между каналами связи (Telegram, Slack, Matrix, Discord, Voice, Webhooks). 876 исходящих связей — 2-й God Node. | Это не интеллектуальный оркестратор: он маршрутизирует _транспорт_, а не _интент запроса_. |
+| **Query Classifier** | [`classifier.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/classifier.rs) | Статическая проверка ключевых слов + длины сообщения → возвращает `hint` для выбора модели (`hint:fast`, `hint:code`). | Не разделяет режимы агента (чат vs кодинг). Не управляет набором тулов. Не влияет на UI (TODO-виджеты). |
+| **Complexity Evaluator** | [`eval.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/eval.rs) | Эвристика `estimate_complexity()`: Simple / Standard / Complex на основе длины + ключевых слов (`explain`, `refactor`, `debug` и др.). | Используется только для auto-classify fallback подбора модели. Не влияет на tool selection. |
+| **Context Analyzer** | [`context_analyzer.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/context_analyzer.rs) | `analyze_turn_context()` → `ContextSignals { suggested_tools, history_relevant }`. Анализирует предыдущие tool calls и ключевые слова ассистента. | Работает только на iteration ≥ 1 (внутри цикла). На первом сообщении всегда возвращает пустой `suggested_tools`. Не определяет _режим_ сессии. |
+| **Prompt Caching** | [`openrouter.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-providers/src/openrouter.rs) | Реализован `cache_control: ephemeral` для system prompt + подсчёт `cached_tokens`. | Кэширование только для OpenRouter. Нет стратегического Static Prefix Pattern для остальных провайдеров. |
+| **Tool Pruning в Loop** | [`loop_.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/loop_.rs) (18 151 строка) | Основной цикл агента. | **Нет** обработки `finish_reason: length` → **нет** auto-continue. Нет динамической фильтрации тулов по интенту на первом сообщении. |
+| **Frontend TODO** | [`task_workspace_view.dart`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_view.dart#L3330-L3360) | `parseTodoBlocksFromText()` агрессивно парсит слова «План:», «Задачи:», `- [ ]` из _любого_ ответа и выносит наверх. `_buildSessionTodoBlockFromTimeline()` безусловно показывает timeline steps. | Нет флага `show_todo_widget` от бэкенда. TODO показывается даже при ответе на простой вопрос. |
+| **Policy & Safety** | [`policy.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-config/src/policy.rs) | `ToolOperation::Read` vs `Act`, `CommandRiskLevel`, `ActionTracker` с rate limiting. | Хороший фундамент для привязки к оркестратору: в режиме Chat блокировать Act-операции, в Explorer — разрешать только Read. |
+| **Ralph Orchestrator** | [`omnesagent-ralph`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-ralph) (`loop_driver.rs`, `executor.rs`) | Полноценный автономный агент-разработчик (Ralph Loop v2.1 × OpenCode interpreter × AST/OB2H validation × self-healing test loop × diff generation). | Работает изолированно как standalone/background worker. Не интегрирован в общий Triage Router: сейчас любой запрос на код идёт в общий монолитный `loop_.rs` вместо делегирования оптимизированному Ralph-конвейеру. |
+
+### 1.2 Архитектурный вердикт
+
+> **Нет единого интеллектуального оркестратора.** Существующие компоненты (`classifier`, `eval`, `context_analyzer`) — это разрозненные эвристики, работающие на разных уровнях абстракции. Их необходимо объединить в **единую точку принятия решений (Triage Router)**, которая:
+> 1. Определяет _интент_ запроса (Chat / Explore / Engineer).
+> 2. Формирует _профиль исполнения_ (набор тулов, системный промпт, UI-флаги).
+> 3. Управляет _эскалацией_ режима посреди разговора без потери контекста.
 
 ---
 
-### 3. 🎯 Полноценные мини-меню (3 точки) согласно спецификации
-- [x] **Мини-меню строки сессии (`_buildSessionRow`)**:
-  - Добавлена кнопка вызова `PopupMenuButton` (`Icons.more_vert`).
-  - Пункты меню:
-    1. «Переименовать» — открывает диалог изменения названия сессии с сохранением.
-    2. «Переместить в группу» — диалог выбора целевой группы (Разное, Дом, Работа, Семья, Развлечения, Поездки и путешествия, Временное).
-    3. «Привязать к проекту» — диалог привязки сессии к зарегистрированному проекту.
-    4. «Удалить сессию» — подтверждение удаления сессии с очисткой из списка и шлюза.
-- [x] **Мини-меню строки группы (`_buildGroupItem`)**:
-  - Кнопка `Icons.more_vert` рядом с кнопкой быстрого добавления `+`.
-  - Пункты меню:
-    1. «Новая сессия в группе» — мгновенно создает задачу внутри выбранной группы.
-    2. «Переименовать» — переименование группы.
-    3. «Сменить иконку (20 иконок)» — диалог сетки из 20 материальных иконок.
-    4. «Папка артефактов» — диалог/проводник артефактов группы.
-    5. «Удалить группу» — удаление пользовательских групп (группа «Разное» защищена от удаления).
-- [x] **Мини-меню строки проекта (`_buildProjectItem`)**:
-  - Кнопка `Icons.more_vert` рядом с кнопкой дерева файлов.
-  - Пункты меню:
-    1. «Открыть дерево файлов проекта» — переключение сайдбара в файловый браузер.
-    2. «Переименовать» — изменение названия проекта.
-    3. «Сменить путь» — диалог смены директории репозитория на диске.
-    4. «Удалить проект» — исключение проекта из реестра.
+## 2. Архитектура решения: Unified Triage & Execution Orchestrator
+
+```mermaid
+flowchart TD
+    UserMsg["Входящее сообщение"] --> Triage
+
+    subgraph Triage ["Triage Router (детерминированный + LLM fallback)"]
+        direction TB
+        H["Heuristic Classifier<br/>(0 мс, regex + длина)"]
+        H -->|Уверенность ≥ 0.85| Profile["Execution Profile"]
+        H -->|Неоднозначно| LLM["Fast LLM Router<br/>(Flash / DeepSeek Lite)"]
+        LLM --> Profile
+    end
+
+    Profile --> EP_Chat["DirectChat<br/>0 тулов, auto_continue=on, todo=off"]
+    Profile --> EP_Explore["CodeExplorer<br/>read-only тулы, todo=off"]
+    Profile --> EP_Eng["EngineeringTask<br/>full toolset, todo=on"]
+    Profile --> EP_Admin["SystemAdmin<br/>docker/ssh/devops, todo=on"]
+
+    EP_Chat --> StateMachine
+    EP_Explore --> StateMachine
+    EP_Admin --> StateMachine
+
+    EP_Eng --> EngDelegator{"Сложность задачи?<br/>(eval.rs / complexity)"}
+    EngDelegator -->|Simple / Single-turn| StateMachine
+    EngDelegator -->|Complex / Multi-file / TDD| RalphEngine["Ralph Autonomous Loop<br/>(omnesagent-ralph v2.1)<br/>AST Validate ⇄ Test ⇄ Self-heal"]
+
+    subgraph StateMachine ["Durable State Machine (Agent Loop — omnesagent-runtime)"]
+        direction LR
+        Think["Think / Generate"] --> ToolExec["Tool Execution"]
+        ToolExec --> Eval["Evaluate Result"]
+        Eval -->|"finish_reason=length"| AutoCont["Auto-Continue<br/>(бесшовная склейка)"]
+        AutoCont --> Think
+        Eval -->|"finish_reason=stop"| Respond["Final Response"]
+        Eval -->|"finish_reason=tool_calls"| ToolExec
+    end
+
+    Respond --> SSE["Gateway SSE Stream"]
+    RalphEngine --> RalphEvents["Ralph Step/Diff/Test Events"] --> SSE
+    SSE --> DesktopUI["Desktop ADE View"]
+
+    DesktopUI -.->|"Escalation Signal<br/>(user says 'перепиши')"| Triage
+```
 
 ---
 
-### 4. 🗂️ Панель контекста проекта под табами и терминология «Сессии»
-- [x] **Терминология**: Везде произведена замена слова «задача» на «сессия»:
-  - `desktop_i18n.dart`: «Новая сессия», «Сессии», «Все сессии».
-  - Контроллеры и представления: дефолтные имена `Новая сессия`.
-- [x] **Строка контекста проекта `_buildProjectContextBar`**:
-  - Располагается непосредственно **под панелью табов сессий**.
-  - Отображается **только если активная сессия привязана к проекту**.
-  - Слева: векторная иконка папки `Icons.folder_outlined` + `[Имя проекта] — [Путь на диске]` + иконка ветки + `[Ветка]`.
-  - Справа: бейдж `Изменения +X -Y` (при клике открывает всплывающее окно Git Tools).
-  - Из верхней панели табов лишний бейдж изменений удален для чистоты интерфейса.
+## 3. Пошаговый план реализации
+
+### Этап 1. Backend — Unified Triage Router
+
+#### 1.1 Новый модуль `omnesagent-runtime/src/agent/orchestrator/`
+
+```
+orchestrator/
+├── mod.rs              // Публичный API: triage() → ExecutionProfile
+├── intent.rs           // Enum AgentIntent + классификация
+├── profile.rs          // SessionExecutionProfile (тулы, промпт, UI-флаги)
+├── escalation.rs       // Логика повышения/понижения режима mid-session
+└── tests.rs            // Unit + интеграционные тесты
+```
+
+#### 1.2 `AgentIntent` — перечисление режимов
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AgentIntent {
+    /// Обычный вопрос, объяснение, консультация.
+    /// Не требует инструментов. Ответ стримится чисто.
+    DirectChat,
+    /// Исследование проекта: поиск по коду, архитектурные вопросы.
+    /// Только read-only тулы (read_file, grep, ob2h, AST).
+    CodeExploration,
+    /// Генерация / модификация кода, запуск тестов, рефакторинг.
+    /// Полный набор тулов. Включает TODO-трекинг и approval flow.
+    EngineeringTask,
+    /// DevOps: Docker, SSH, миграции, деплой.
+    /// Полный набор + повышенный контроль (approval для destructive ops).
+    SystemAdmin,
+}
+```
+
+#### 1.3 Гибридная классификация (Heuristic + LLM fallback)
+
+> **Критическое требование 2026:** Маршрутизатор не должен добавлять задержку > 50 мс для очевидных случаев. LLM-маршрутизация — только для неоднозначных запросов.
+
+**Уровень 1 — Детерминированная эвристика (0 мс, ~80% запросов):**
+
+| Сигнал | Intent |
+|---|---|
+| Нет глаголов действия¹, нет файловых путей, длина < 300 символов | `DirectChat` |
+| Глаголы чтения² + упоминание файла/модуля/функции, нет глаголов модификации | `CodeExploration` |
+| Глаголы модификации³ или содержит code fence `` ``` `` | `EngineeringTask` |
+| Ключевые слова DevOps⁴ | `SystemAdmin` |
+
+> ¹ «создай», «исправь», «перепиши», «запусти», «удали», «добавь», «протестируй»
+> ² «найди», «покажи», «где», «объясни как», «что делает»
+> ³ «создай», «измени», «запусти тест», «исправь баг», «отрефактори»
+> ⁴ «docker», «деплой», «миграция», «ssh», «kubernetes»
+
+**Уровень 2 — Fast LLM Router (< 200 мс, ~20% запросов):**
+
+Для сообщений, не попавших в эвристику с высокой уверенностью:
+- Вызвать быструю модель (Gemini Flash / DeepSeek Lite / локальная модель) с жёсткой JSON-схемой:
+  ```json
+  { "intent": "DirectChat" | "CodeExploration" | "EngineeringTask" | "SystemAdmin" }
+  ```
+- Кэшировать результат классификации на время сессии для follow-up сообщений.
+
+**Интеграция с существующими компонентами:**
+- Объединить логику из [`classifier.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/classifier.rs) (ключевые слова + паттерны) и [`eval.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/eval.rs) (`estimate_complexity`) в единый конвейер.
+- `context_analyzer.rs` → вызывать на iteration ≥ 1 как дополнительный сигнал для tool refinement _внутри_ цикла (уже работает).
+
+#### 1.4 `SessionExecutionProfile` — профиль исполнения
+
+```rust
+// Бэкенд исполнения задачи
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ExecutionEngine {
+    /// Обычный агентский цикл omnesagent-runtime (интерактивный чат, поиск, быстрые правки).
+    StandardLoop,
+    /// Автономный цикл разработки Ralph (omnesagent-ralph v2.1) для комплексных инженерных задач.
+    RalphAutonomous,
+}
+
+pub struct SessionExecutionProfile {
+    /// Определённый интент сессии.
+    pub intent: AgentIntent,
+    /// Движок исполнения (StandardLoop vs RalphAutonomous).
+    pub engine: ExecutionEngine,
+    /// Динамически отфильтрованный набор тулов.
+    pub allowed_tools: Vec<ToolSpec>,
+    /// Оверлей системного промпта (например, «Отвечай кратко и по делу»).
+    pub system_prompt_overlay: Option<String>,
+    /// Автоматическое продолжение при finish_reason == length.
+    pub auto_continue: bool,
+    /// Максимальное число авто-продолжений (circuit breaker).
+    pub max_auto_continue_rounds: u8,
+    /// UI-флаги, передаваемые через SSE.
+    pub ui_flags: UiFlags,
+}
+
+pub struct UiFlags {
+    /// Показывать ли TODO-виджет над ответом.
+    pub show_todo_widget: bool,
+    /// Показывать ли timeline шагов сессии.
+    pub show_session_timeline: bool,
+    /// Показывать ли статус выполнения Ralph (фазы, тесты, diff).
+    pub show_ralph_progress: bool,
+    /// Режим для отображения в header UI.
+    pub display_mode: String, // "chat" | "explore" | "task" | "admin" | "ralph"
+}
+```
+
+**Привязка к [`policy.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-config/src/policy.rs):**
+- Для `DirectChat` → блокировать все `ToolOperation::Act` на уровне policy.
+- Для `CodeExploration` → разрешать только `ToolOperation::Read`.
+- Для `EngineeringTask` / `SystemAdmin` → полный доступ с rate limiting через `ActionTracker`.
+- Для `RalphAutonomous` → делегирование политик в sandbox-исполнитель `omnesagent-ralph::executor::RalphExecutor`.
 
 ---
 
-### 5. 🔤 Кодировка UTF-8 в сессиях шлюза (устранение кракозябр)
-- [x] **frontend/shared/lib/core/gateway/gateway_http.dart**:
-  - Внедрен универсальный метод `_decodeBody(res)` на основе `jsonDecode(utf8.decode(res.bodyBytes))` вместо стандартного `res.body`.
-  - Обработаны все 68 мест декодирования JSON ответов шлюза, устраняя принудительное преобразование в Latin-1.
-- [x] **БД сессий шлюза (`~/.omnesagent/data/sessions/sessions.db`)**:
-  - База данных SQLite очищена и обновлена корректными UTF-8 записями:
-    - «Архитектура ядра OmnesAgent» (проект `Omnes agent`, группа `Работа`).
-    - «Тестирование инференса DeepSeek» (проект `Omnes agent`, группа `Работа`).
+### Этап 2. Backend — Seamless Auto-Continue (State Machine Loop)
+
+> **Индустриальный стандарт 2026:** Persistent state machine вместо рекурсии. Паттерн «Deterministic Harness + Streaming Tool Executor».
+
+#### 2.1 Обработка `finish_reason: length` в `loop_.rs`
+
+В текущем [`loop_.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/loop_.rs) (18 151 строка) **нет обработки** truncation. Необходимо добавить:
+
+```rust
+// Псевдокод для agent state machine:
+loop {
+    let response = provider.stream_completion(&messages, &profile.allowed_tools).await?;
+    
+    match response.finish_reason.as_deref() {
+        Some("stop") => {
+            // Финальный ответ — отправить в SSE и завершить цикл.
+            break;
+        }
+        Some("tool_calls") => {
+            // Выполнить инструменты, добавить результаты в messages.
+            execute_tools(&response.tool_calls, &mut messages).await?;
+        }
+        Some("length") if profile.auto_continue && continue_count < profile.max_auto_continue_rounds => {
+            // Бесшовное продолжение: НЕ разрывать SSE-поток.
+            // Добавить токен-продолжение и повторить генерацию.
+            messages.push(continue_prompt(&response.partial_content));
+            continue_count += 1;
+        }
+        _ => break,
+    }
+}
+```
+
+#### 2.2 Context Pruning между итерациями
+
+> **Best Practice 2026:** Selective Truncation — между раундами автоматически убирать объёмные `tool_result` из промежуточных шагов, оставляя только user prompt + финальный assistant response.
+
+- Использовать существующий [`history_pruner.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/history_pruner.rs) и [`history_trim.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/history_trim.rs) — они уже есть в кодовой базе, нужно убедиться, что они активируются перед каждым auto-continue раундом, а не только при явном переполнении окна.
 
 ---
 
-### 6. ⚙️ Деактивация неактивных провайдеров и честный выбор моделей
-- [x] **desktop_settings_dialog.dart** (desktop & web):
-  - Все дефолтные провайдеры переведены в состояние `isConfigured: false`.
-  - Сохранение кастомных и стандартных настроек провайдеров в локальное хранилище `GetStorage` (`provider_key_<id>`).
-  - При сохранении настроек вызывается `controller.loadConfiguredProviders()`.
-- [x] **task_workspace_controller.dart** (desktop & web):
-  - Реактивный список `configuredModels`.
-  - Метод `loadConfiguredProviders()`, сканирующий только фактически настроенные провайдеры с валидными ключами или локальными адресами.
-- [x] **task_workspace_view.dart** (desktop & web):
-  - Выпадающее меню выбора моделей в строке ввода промта теперь формируется динамически.
-  - Если ни один провайдер не настроен: кнопка отображает `🔴 Провайдер не настроен ⌵`. При клике открывается окно настроек для ввода ключа.
-  - При подключении провайдера пользователем — выпадают только реально доступные модели.
+### Этап 3. Backend — Dynamic Tool Pruning (Фильтрация инструментов по интенту)
+
+> **Research 2025-2026 (AutoTool, Lunar.dev):** Подача 30+ tool definitions в каждый запрос к LLM увеличивает «tool space interference» — модель начинает галлюцинировать вызовы тулов, которые не нужны. Semantic tool pruning снижает ошибки выбора инструментов на 35-60%.
+
+#### 3.1 Статические Tool Groups (Namespacing)
+
+```rust
+pub enum ToolGroup {
+    /// Группа для DirectChat: пустой набор тулов.
+    None,
+    /// Read-only инструменты для Code Exploration.
+    ReadOnly,   // file_read, content_search, glob_search, web_search, memory_recall
+    /// Полный набор для Engineering.
+    FullStack,  // все read + file_write, file_edit, shell, git_operations
+    /// DevOps-специфичные.
+    DevOps,     // shell, docker, ssh, deployment
+}
+```
+
+#### 3.2 Semantic Tool Retrieval (для MCP-тулов)
+
+Для крупных наборов MCP-инструментов (когда подключено 50+ тулов от внешних серверов):
+- Embed descriptions тулов через OB2H embedding model (MiniLM 384d — уже есть).
+- При классификации интента → vector search top-K релевантных тулов.
+- Передавать в LLM только top-5…10 + статическую базу для текущего профиля.
 
 ---
 
-### 7. 🧪 Сборка, запуск и интеграция
-- [x] **Статический анализ кода**: `flutter analyze` для `frontend/desktop` и `frontend/web` (0 issues).
-- [x] **Сборка Windows Desktop**: `flutter build windows --debug` завершена успешно.
-- [x] **Ярлык на Рабочем столе**: Создан ярлык `C:\Users\ipres\Desktop\OmnesAgent.lnk` с иконкой приложения и рабочей директорией.
-- [x] **Автозапуск шлюза бэкенда**: `DesktopBackendManager` автоматически запускает шлюз `omnesagent.exe` (порт 42617) при старте настольного приложения и завершает его при закрытии.
-- [x] **Интеграция Side Chat ветки**: При клике на иконку ветки под ответом ассистента текст сообщения передается в `SideChatController.addBranchContext` и инспектор открывается на 4-й вкладке.
-- [x] **Все мини-меню 3 точек**: Реализованы для сессий (переименование, смена группы, привязка к проекту, удаление), групп (создание сессии, переименование, выбор из 20 иконок, артефакты, удаление) и проектов (файловое дерево, переименование, смена пути, удаление).
+### Этап 4. Backend — Prompt Caching Strategy (Static Prefix Pattern)
+
+> **Best Practice 2026:** System prompt + tool definitions = стабильный «static prefix». Динамический контент (история, user message) идёт после. Это гарантирует попадание в prefix cache у Anthropic (~90% скидка), OpenAI (~50% скидка), DeepSeek (prompt_cache_hit).
+
+#### 4.1 Порядок сборки промпта (cache-friendly)
+
+```
+┌────────────────────────────────────────────┐  ← STATIC PREFIX (кэшируется)
+│ 1. System Prompt (personality + rules)     │
+│ 2. Tool Definitions (зависят от профиля)   │
+│ 3. AGENTS.md / project conventions         │
+├────────────────────────────────────────────┤  ← cache_control breakpoint
+│ 4. Conversation History (pruned)           │  ← DYNAMIC SUFFIX
+│ 5. Current User Message                    │
+└────────────────────────────────────────────┘
+```
+
+#### 4.2 Интеграция с существующим кэшированием
+
+- [`openrouter.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-providers/src/openrouter.rs) уже реализует `cache_control: ephemeral` для system message — расширить на tool definitions block.
+- Для [`compatible.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-providers/src/compatible.rs) (DeepSeek, Qwen) — добавить аналогичные `prompt_cache_hit_tokens` маркеры.
+- **Анти-паттерн:** не вставлять timestamps, session IDs или другие динамические маркеры в начало промпта (cache-busting).
 
 ---
 
-## 🚀 Итерация 2: Реактивность сессий, авто-название, выбор провайдера и очистка превью
+### Этап 5. Backend — Seamless Mode Escalation
 
-### 8. ⚡ Реактивность удаления и перемещения сессий
-- [x] **Немедленное удаление сессии из любой точки**:
-  - `sessions` преобразован в реактивный `RxMap<String, TaskSession>`, вызывается `sessions.refresh()` и `openSessionTabs.refresh()`.
-  - Удаление срабатывает мгновенно из меню трех точек и контекстного меню любой сессии, без необходимости переходить в неё.
-  - Добавлен удобный диалог подтверждения перед удалением сессии.
-- [x] **Мгновенное перемещение между группами**:
-  - В `moveSessionToGroup(id, targetGroup)` добавлен немедленный вызов `sessions.refresh()`.
-  - Сессия мгновенно перемещается в целевую группу в сайдбаре без клика на другие сессии.
+> **Best Practice 2026:** Режим сессии — это не фиксированная классификация, а «уровень привилегий», который можно повышать и понижать на лету. Как в Unix: read-only → read-write-execute.
 
-### 9. 🏷️ Авто-название сессии по теме разговора
-- [x] При отправке первого сообщения в сессии (когда имя «Новая сессия» или дефолтное) метод `_generateTopicTitle()` автоматически формирует краткий и точный заголовок на основе первого промта (по границе слов).
-- [x] Название сессии мгновенно обновляется в сайдбаре, табах и синхронизируется со шлюзом бэкенда (`httpClient.sessionRename`).
+#### 5.1 Escalation Triggers
 
-### 10. 🏢 Выбор провайдера левее модели и авто-добавление кастомных моделей
-- [x] **Селектор провайдера**:
-  - Добавлена кнопка выпадающего списка `[🏢 Провайдер ⌵]` строго левее от `[🤖 Модель ⌵]` в строке промта.
-  - Позволяет в один клик переключаться между активными настроенными провайдерами.
-  - Если провайдеры не настроены: отображается `🔴 Нет провайдеров ⌵` с прямым переходом в настройки.
-- [x] **Авто-добавление и выбор моделей кастомного провайдера**:
-  - В `_saveNewCustomProvider` добавлена надежная запись `provider_key_$id`, `provider_url_$id`, `provider_model_$id` в хранилище `GetStorage`.
-  - Добавленный кастомный провайдер немедленно активируется (`ctrl.setProvider(newId)`), а введенная модель сразу выбирается в интерфейсе.
-  - Исключен показ `GLM-5.3-Flash`, если провайдер не настроен или выбран другой провайдер.
+| Ситуация | Текущий режим | Новый режим |
+|---|---|---|
+| Пользователь начал с «Как работает парсер SSE?» | DirectChat | → DirectChat (без изменений) |
+| Следующее сообщение: «Перепиши его на nom» | DirectChat | → EngineeringTask (escalation) |
+| Задача завершена, пользователь спрашивает «Что ты изменил?» | EngineeringTask | → CodeExploration (de-escalation) |
 
-### 11. 🧹 Очистка превью и крестики закрытия артефактов
-- [x] **Удаление демо-контента**: Хардкодные образцы файлов и diff (`task_workspace_controller.dart`, `architecture_diagram.svg`, `release_report.md`) полностью удалены из `ArtifactsViewerController`. При отсутствии артефактов отображается чистая аккуратная заглушка.
-- [x] **Крестики закрытия артефактов**: На каждом табе артефакта в `DiffViewerWidget` добавлен крестик закрытия `[x]`, а в панели действий — кнопка очистки всех артефактов `clearArtifacts()`.
+#### 5.2 Реализация в `orchestrator/escalation.rs`
 
----
+```rust
+pub fn evaluate_escalation(
+    current: AgentIntent,
+    new_message: &str,
+    session_history: &[ConversationMessage],
+) -> AgentIntent {
+    let new_intent = classify_intent(new_message);
+    
+    // Повышение всегда разрешено.
+    if new_intent.privilege_level() > current.privilege_level() {
+        return new_intent;
+    }
+    
+    // Понижение: только если последние N сообщений не содержат tool calls.
+    if new_intent.privilege_level() < current.privilege_level()
+        && no_tool_calls_in_last_n(session_history, 3)
+    {
+        return new_intent;
+    }
+    
+    current // Остаёмся в текущем режиме.
+}
+```
 
-## 🚀 Итерация 3: Дерево файлов, Холст для Markdown, закрытые по умолчанию табы и рабочий терминал
+#### 5.3 Сохранение контекста при эскалации
 
-### 12. 📑 Табы правой панели (инспектора) закрыты по умолчанию
-- [x] По умолчанию `openTabKeys` пуст: табы открываются только при явном вызове инструмента (терминал, чат, файл, холст) или через меню «Выбор вкладки».
-- [x] Если открытых табов нет, показывается чистый экран выбора вкладки («Выбор вкладки»). При открытии инструмента вкладка добавляется в список табов и активируется. При закрытии всех табов отображается выбор вкладки.
+- **Не сбрасывать** conversation history.
+- **Динамически подгрузить** новые тулы без restart сессии: `profile.allowed_tools = load_tools_for(new_intent)`.
+- Передать SSE-событие `ModeChanged { old: "chat", new: "task" }` для обновления UI.
 
-### 13. 🌲 Полноценное интерактивное дерево файлов проекта
-- [x] Раскрытие и сворачивание вложенных папок по клику с шевронами `>` / `v` и отступами уровней.
-- [x] Иконки расширений (`{}` для json, markdown-иконка для md, код для dart/rs/py, изображения, папки).
-- [x] Индикаторы статуса на правом краю (зеленая точка активности, бейдж `U` для новых файлов).
-- [x] Контекстное меню по правому клику (по скриншотам пользователя):
-  - `Открыть` (Open)
-  - `Открыть с помощью >` (Open with: Холст, Редактор кода)
-  - `Показать в Проводнике` (Open in File Explorer через explorer.exe)
-  - `Копировать абсолютный путь` (Copy absolute path)
-  - `Копировать относительный путь` (Copy relative path)
-  - `Добавить в контекст чата` (Add to chat)
+#### 5.4 Двухуровневая маршрутизация задач разработки: Interactive Loop vs Ralph Autonomous Engine
 
-### 14. 🎨 Открытие .md файлов в Холсте (Canvas)
-- [x] При клике на файл с расширением `.md` он автоматически открывается во вкладке «Холст» с форматированным отображением (заголовки, списки, чекбоксы, цитаты, блоки кода, переключение исходник/предпросмотр).
-- [x] Из названия удалено «A2UI», вкладка называется лаконично «Холст» (Canvas).
+В OmnesAgent уже разработан специализированный крейт [`omnesagent-ralph`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-ralph), реализующий спецификацию Ralph v2.1. Это автономный цикл разработки с AST/OB2H валидацией, генерацией спеки, запуском тестов и циклом самолечения (self-healing).
 
-### 15. 🌐 Полная русификация правой панели инспектора
-- [x] Перевод всех названий табов: «Браузер», «Терминал», «Холст», «Превью», «Боковой чат», «Файл».
-- [x] Перевод карточек выбора вкладки («Выбор вкладки»), описаний и кнопок.
-- [x] Перевод панели встроенного браузера (выбор DOM-элемента, режим ожидания, добавление в чат).
+Вместо того чтобы заставлять общий `loop_.rs` обрабатывать сложные мульти-файловые правки с компиляцией и тестами, Triage Router задействует **двухуровневое исполнение (Two-Tier Engineering Execution)**:
 
-### 16. 💻 Рабочий интерактивный терминал
-### 17. 🧹 Кнопка «Очистить холст»
-- [x] Восстановлена и исправлена работа кнопки «Очистить холст»: сброс выбранного пути, содержимого и фрейма холста.
+| Уровень | Сценарий | Исполнитель | Особенности |
+|---|---|---|---|
+| **Tier 1: Interactive Code Assistance** | Вопросы по коду, сниппеты, правка 1 файла, объяснение ошибки | `omnesagent-runtime::agent::loop_` | Быстрый стриминг, обычный чат-интерфейс, минимальный оверхед |
+| **Tier 2: Autonomous Ralph Engine** | Новая фича, рефакторинг нескольких модулей, TDD с тестами, баг-фикс с верификацией | `omnesagent-ralph::loop_driver::RalphLoopDriver` | Генерация плана/спеки (`RalphSpec`), фазы разработки, запуск тестов через `executor.rs`, AST/OB2H валидация diff, self-healing до 3 итераций |
 
-### 18. 📁 Лаконичные имена в дереве файлов
-- [x] В дереве файлов проекта отображаются исключительно короткие имена файлов и папок (без полного пути).
+**Критерии переключения на Ralph Engine:**
+- Интент классифицирован как `EngineeringTask`.
+- Сложность из [`eval.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/eval.rs) `estimate_complexity() == TaskComplexity::Complex` ИЛИ в запросе явно указаны директивы: «протестируй», «напиши тесты», «сделай фичу», «отрефактори модуль», пути к >1 файлу.
+- Результаты фаз Ralph транслируются через Gateway SSE как структурированный прогресс (Task Timeline), где отображение TODO/Status является естественным и ожидаемым.
 
 ---
 
-## 🚀 Итерация 4: Восстановление SVG-логотипа, SSE стриминг кастомных провайдеров (Daluobo), авто-сворачивание «Размышления» и мин. ширина 845px
+### Этап 6. Gateway — Протокол SSE с флагами режима
 
-### 19. 🎨 Восстановление SVG-логотипа OmnesAgent
-- [x] Заменить текстовый контейнер `OA` в верху слева сайдбара на `SvgPicture.asset('assets/Logo/OA_icon.svg', width: 22, height: 22)` в Desktop и Web версиях.
+#### 6.1 Новые SSE-события
 
-### 20. 📐 Минимальная ширина центральной панели — 845 px
-- [x] Ограничить центральную панель задачи (`task_workspace_view.dart`) минимальной шириной 845 px (`minWidth: 845.0`).
-- [x] Настроить ресайзеры сайдбара и инспектора так, чтобы панель нельзя было сжать ниже 845 px при изменении размеров.
+```json
+// При начале генерации:
+{
+  "event": "session_meta",
+  "data": {
+    "mode": "chat",
+    "show_todo_widget": false,
+    "show_session_timeline": false,
+    "auto_continue_active": true
+  }
+}
 
-### 21. ⚡ Исправление ответа провайдеров и SSE стриминг (Qwen, Claude, DeepSeek)
-- [x] Реализовать надежную отправку и прямой SSE стриминг для кастомных провайдеров (Daluobo, DeepSeek, Ollama, OpenRouter).
-- [x] Встроить тайм-аут 12 секунд и отображение ошибок HTTP/API/сети с кнопкой «Повторить».
-- [x] Подключить реальные ответы LLM в Side Chat с изоляцией контекста задачи.
+// При эскалации:
+{
+  "event": "mode_changed",
+  "data": {
+    "old_mode": "chat",
+    "new_mode": "task",
+    "show_todo_widget": true,
+    "reason": "User requested code modification"
+  }
+}
 
-### 22. 🧠 Авто-сворачивающийся блок «Размышления» (`<think>`)
-- [x] Парсинг тегов `<think>...</think>` и reasoning-токенов в потоке ответа.
-- [x] Живой анимированный секундомер во время формулирования мыслей.
-- [x] Автоматическое сворачивание блока по окончании генерации в аккуратный аккордеон `[🧠 Размышления (рассуждал X сек / N слов) ⌵]` (с возможностью развернуть кликом).
-- [x] Исключение блока мыслей из долговременной памяти и повторной передачи контекста.
+// При auto-continue (невидимый для пользователя, но UI знает):
+{
+  "event": "auto_continue",
+  "data": { "round": 2, "max_rounds": 5 }
+}
 
-### 23. 📄 Карточки артефактов и статус терминала в фоне
-- [x] Отрисовка генерируемых файлов в виде карточек с иконками форматов (Dart, Rust, Python, Markdown, HTML, JSON и др.).
-- [x] Кнопка «Открыть в Холсте» прямо в карточке для мгновенного переноса файла в правую панель ADE.
-- [x] Индикаторы фонового терминала: интерактивный бейдж выполнения команды в фоне с выводом результата.
+// При делегировании сложной задачи в Ralph Orchestrator:
+{
+  "event": "ralph_phase_progress",
+  "data": {
+    "task_id": "ralph-8f2a1b",
+    "phase": "Specifying",      // "Analyzing" | "Specifying" | "Coding" | "Testing" | "Done"
+    "description": "Генерация спецификации и AST-анализ графа зависимостей",
+    "completed_steps": 2,
+    "total_steps": 5
+  }
+}
+```
 
----
+#### 6.2 Обратная совместимость
 
-## 🚀 Итерация 5: Доступ ко всем инструментам ADE, Drag & Drop / Скриншоты и Настройка STT
-
-### 24. 🧠 Интеграция контекста инструментов и среды в OmnesAgent LLM Runtime
-- [x] Создан генератор контекста `_buildOmnesAgentSystemPrompt()`: рабочая область `C:\Projects\Omnes-agent`, монорепозиторий (22 Rust crates + Flutter), AST-анализатор (ob2h / codegraph), терминал, файлы, Canvas и браузер.
-- [x] Устранен отказ модели от анализа кода: категорическая инструкция агенту о полном доступе к кодовой базе без заявлений о "нехватке доступа" и без требования скидывать файлы вручную.
-- [x] Таск-бар очищен от декоративных статичных моков и подключен к реальным задачам сессии и статусу шлюза.
-
-### 25. 📎 Полноценная система прикрепления файлов, скриншотов и Drag & Drop
-- [x] Нативный диалог выбора файлов `OpenFileDialog` при нажатии на «Прикрепить файл / изображение...» в меню `+`.
-- [x] Мгновенная вставка скриншота из буфера обмена (`Ctrl+V` / пункт меню) с автосохранением в `.omnesagent/attachments/screenshot_<timestamp>.png` и чипом `[📷 screenshot_...png]`.
-- [x] Карточки вложений с иконками типов (изображения, код, документы) и кнопкой удаления `[x]`.
-
-### 26. 🎙️ Настройка STT (Speech-to-Text) и условное включение кнопки микрофона
-- [x] Кнопка микрофона по умолчанию скрыта в строке ввода, пока STT не настроен и не проверен.
-- [x] В Настройки добавлен полноценный раздел «Голосовой ввод (STT)» (выбор провайдера Groq Whisper / OpenAI Whisper / Cloudflare / Local, URL, API ключ, модель, язык).
-- [x] Кнопка «Проверить подключение» с реальным тестом авторизации и доступности эндпоинта.
-- [x] Тумблер включения активируется только после успешной проверки и динамически включает микрофон в чате.
-
----
-
-## 🚀 Итерация 6: Визуализация работы агента, живой Таск-бар, реальный Git, сохранение сессий и фикс меню
-
-### 27. ⚡ Интерактивные карточки действий агента (Action Step Pills)
-- [x] Внедрены пошаговые плашки выполнения действий в реальном времени: `[📖 Чтение файла]`, `[✏️ Редактирование]`, `[🔍 AST-анализ]`, `[⚡ Терминал]`.
-- [x] Анимированный индикатор выполнения во время работы и зеленая галочка `✓` по завершении.
-- [x] Раскрытие подробностей по клику (вывод команд, диффы, прочитанные строки).
-
-### 28. 📋 Автоматически выпадающий динамический Таск-бар
-- [x] При отправке нового промта таск-бар автоматически выпадает/раскрывается (`isTaskBarExpanded = true`).
-- [x] Формирование реальных шагов задачи и динамическое обновление галочек `✓` и счетчика прогресса (`1/4` -> `2/4` -> `3/4` -> `4/4`).
-- [x] Возможность свернуть/развернуть таск-бар в любой момент по стрелочке.
-
-### 29. 🔍 Реальные данные блока «Изменения» (Live Git Diff)
-- [x] Полностью удален декоративный хардкод `+100 -23`.
-- [x] Реализован запуск `git status --porcelain` и `git diff --shortstat` в рабочей области (`refreshGitStatus`).
-- [x] Плашка «Изменения» отображает точное число строк вставок, удалений и количество измененных файлов (`+10712 -5054 (43 файл.)`).
-
-### 30. 💾 Надежное сохранение сессий и сообщений в GetStorage
-- [x] Снят фильтр, блокировавший сохранение сессий.
-- [x] Реализовано сохранение полной истории сообщений (`_saveSessionMessages`) после каждого сообщения и ответа.
-- [x] Автоматическое восстановление истории при перезапуске приложения и переключении сессий (`_loadSessionMessages`).
-
-### 31. 🎯 Исправление позиций всплывающих меню (Провайдеры и Модели)
-- [x] Устранен жесткий оффсет (`-220px`), вызывавший отрыв меню от кнопок.
-- [x] Меню провайдеров, моделей, уровней рассуждений и режимов подтверждений открываются строго над своими кнопками (`position: PopupMenuPosition.over`, `offset: Offset(0, -8)`).
+- Если фронтенд не поддерживает новые события → игнорирует их (graceful degradation).
+- `GatewayFrame` во Flutter ([`gateway_frame.dart`](file:///c:/Projects/Omnes-agent/frontend/shared/lib/core/gateway/models/gateway_frame.dart)) получит новые типы фреймов.
 
 ---
 
-## 🚀 Итерация 7: Плашка изменений проекта (Review Pill как на скриншоте)
+### Этап 7. Frontend — Исправление TODO и бесшовный стриминг
 
-### 32. 📑 Индикатор измененных файлов и кнопка Review
-- [x] **Автоматическое определение изменений**: После завершения генерации ответа и выполнения команд контроллер опрашивает `refreshGitStatus()` и `git diff --shortstat`.
-- [x] **Модель сообщения (`ChatMessage`)**: Добавлены поля `filesChangedCount`, `additions`, `deletions` с поддержкой сериализации в JSON для сохранения между сессиями.
-- [x] **Пиксель-в-пиксель дизайн по скриншоту**:
-  - Контейнер: темный округлый блок (`#16181D`), тонкая обводка (`#282D37`), мягкая тень.
-  - Текст: `{X} files changed ` + `+{additions} ` (зеленый `#4ADE80`) + `-{deletions} ` (красный `#F87171`) + шеврон `>` (`#64748B`).
-  - Кнопка действия: `[ 📄 Review ]` с темным фоном (`#222732`), обводкой (`#333A48`) и иконкой файла.
-- [x] **Интерактивный переход к дифу**: При нажатии на плашку или кнопку «Review» открывается правая панель инспектора на вкладке артефактов и изменений (`_openInspectorWithTab(3)`).
-- [x] **Синхронизация**: Полная идентичность для `frontend/desktop` и `frontend/web`.
+#### 7.1 [`task_workspace_view.dart`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_view.dart)
 
----
+**Изменения в `_buildMessageContent()` (строки 3329–3360):**
 
-## 🚀 Итерация 8: Полноценный Markdown, изоляция Git-диффов по сообщениям, смена веток и вынос Таск-бара
+```diff
+ Widget _buildMessageContent(BuildContext context, ChatMessage msg) {
++  // Проверяем флаг от бэкенда: показывать ли TODO.
++  final showTodo = msg.metadata?['show_todo_widget'] == true
++      || widget.controller.currentSessionMode.value == 'task';
++
+   final todosInMsg = msg.todoBlocks.isNotEmpty
+       ? msg.todoBlocks
+-      : DesktopTaskWorkspaceController.parseTodoBlocksFromText(msg.text);
++      : showTodo
++          ? DesktopTaskWorkspaceController.parseTodoBlocksFromText(msg.text)
++          : <TodoBlockData>[];
 
-### 33. 🎨 Комплексные улучшения UX и точности данных
-- [x] **Полноценный рендеринг Markdown (`MarkdownContent`)**:
-  - Заголовки `H1`–`H4` с акцентными цветными бейджами, корректным размером шрифтов и отступами.
-  - Маркированные (`•`) и нумерованные (`1.`) списки.
-  - Инлайн-стили: **жирный** (`**...**`), *курсив*, `инлайн-код` (фон `#1E222B`, шрифт `Consolas`, рамка `#2D3748`, цвет `#38BDF8`), зачеркнутый текст, ссылки.
-  - Сохранение интерактивных карточек артефактов для блоков ```` ``` ```` (`_buildArtifactCard`).
-  - Текст доступен для выделения и копирования (`SelectableText.rich`).
-- [x] **Изоляция изменений Git для одного конкретного сообщения**:
-  - Снимок состояния репозитория (`initialSnapshotFiles`, `initialAdditions`, `initialDeletions`) фиксируется в начале генерации.
-  - Вычисляется только дельта изменений: если сообщение текстовое (без модификации файлов на диске), `filesChangedCount = null` и плашка `Review Pill` скрыта.
-  - При наличии правок файлов плашка выводит точные цифры дельты только этого шага.
-- [x] **Реальное определение и переключение ветки Git в UI**:
-  - Метод `refreshGitStatus()` считывает активную ветку (`git branch --show-current`) и список доступных веток (`git branch --list`).
-  - Плашка ветки в строке контекста проекта и в Git-меню снабжена стрелкой `⌵` и кликабельна.
-  - Диалог `_showBranchPicker`: список локальных веток с чекмарком текущей, переключение по клику (`git checkout <branch>`) и форма создания новой ветки (`git checkout -b <branch>`).
-- [x] **Исправление цвета удалений в выпадающем окне изменений**:
-  - `+X` выводится зеленым цветом (`#10B981`), а `-Y` — красным (`#EF4444`).
-- [x] **Вынос инфо Таск-бара в отдельную плашку правее изменений**:
-  - В строке контекста проекта справа расположены две независимые плашки:
-    1. `[Изменения +X -Y (N файл.)]`
-    2. `[Таск-бар M/N ⌵]` (правее блока изменений, с анимированным спиннером во время работы и статусом `M/N`).
-  - При клике на плашку открывается специализированное окно `_buildTaskBarDropdown` с динамическим списком шагов сессии.
+   TodoBlockData? sessionTodoBlock;
+-  if (todosInMsg.isEmpty && isLastBotMessage && widget.controller.runTimelineSteps.isNotEmpty) {
++  if (showTodo && todosInMsg.isEmpty && isLastBotMessage && widget.controller.runTimelineSteps.isNotEmpty) {
+     sessionTodoBlock = _buildSessionTodoBlockFromTimeline();
+   }
+```
+
+#### 7.2 [`task_workspace_controller.dart`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_controller.dart)
+
+- Добавить `RxString currentSessionMode = 'chat'.obs;`.
+- Обновлять при получении SSE-события `session_meta` / `mode_changed`.
+- `parseTodoBlocksFromText` → **не вызывать** если `currentSessionMode == 'chat'`.
+
+#### 7.3 Кнопки «Далее» / «Продолжить»
+
+- Отображать **только** при `ApprovalFlow` (деструктивные операции: `rm`, `DROP`, `docker rm`).
+- **Никогда** не показывать для продолжения текстового ответа — это теперь бесшовный auto-continue на бэкенде.
 
 ---
 
-## 🚀 Итерация 9: Кнопка «+» у проектов, надежное удаление/привязки сессий и очистка Git-карточки
+### Этап 8. Observability & Circuit Breakers
 
-### 34. 📌 Сайдбар, сессии и очистка интерфейса
-- [x] **Кнопка «+» в строке проекта (левее папки)**:
-  - В сайдбаре (`_buildProjectItem`) кнопка `+` (`Icons.add`) размещена строго левее иконки папки (`Icons.folder_open`).
-  - При нажатии создает новую сессию с немедленной привязкой к выбранному проекту (`project: proj.name, projectPath: proj.path`).
-- [x] **Надежное удаление сессий без респавна**:
-  - Устранено безусловное создание семплов `_initSampleSessions()` при каждом перезапуске: инициализация выполняется строго 1 раз (`desktop_sessions_seeded`).
-  - Ведется черный список удаленных сессий `desktop_deleted_sessions` — удаленная сессия больше не возвращается ни из семплов, ни из бэкенд-шлюза.
-  - При удалении сессии удаляются ее сообщения `session_messages_$id` и обновляется список открытых вкладок.
-- [x] **Полная персистентность привязок сессий**:
-  - В `_saveLocalCustomSessions` и `_loadLocalCustomSessions` сохраняются и восстанавливаются абсолютно все свойства `TaskSession`: `group`, `project`, `projectPath`, `branch`, `hasGitRepo`, `additions`, `deletions`.
-  - Сохраняются открытые вкладки (`desktop_open_tabs`) и пользовательские группы сайдбара (`user_groups_registry`).
-- [x] **Очистка Git-карточки от дублирующего прогресса задачи**:
-  - Из `_buildGitToolsCard` удалены разделитель и старый блок чек-листа прогресса задачи, так как он полноценно перенесен в отдельную выпадающую панель таск-бара `[Таск-бар M/N ⌵]`.
-- [x] **Синхронизация и качество**:
-  - Все изменения синхронизированы между `frontend/desktop` и `frontend/web`.
-  - `flutter analyze lib` — 0 ошибок (No issues found!).
+> **Best Practice 2026:** Без наблюдаемости оркестратор — чёрный ящик. Нужны метрики на каждый уровень.
 
+#### 8.1 Телеметрия классификации
 
+- Логировать каждое решение Triage Router через [`omnesagent-log`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-log):
+  ```json
+  {
+    "event": "triage_decision",
+    "intent": "DirectChat",
+    "method": "heuristic",       // или "llm_router"
+    "confidence": 0.92,
+    "latency_ms": 0,             // или 180 для LLM
+    "tools_count": 0,
+    "escalated_from": null
+  }
+  ```
 
+#### 8.2 Circuit Breakers
 
+| Защита | Порог | Действие |
+|---|---|---|
+| Auto-continue rounds | ≤ 5 | Прервать генерацию, показать частичный ответ |
+| Tool execution per turn | ≤ 20 | Прервать loop, запросить подтверждение пользователя |
+| Total session tokens | ≤ 200K | Активировать aggressive pruning через `history_pruner.rs` |
+| LLM Router latency | > 500 мс | Fallback на heuristic с default intent |
+| Escalation frequency | > 3 за 5 сообщений | Зафиксировать режим, не переключать |
+
+---
+
+## 4. Приоритеты и фазы внедрения
+
+```mermaid
+gantt
+    title Фазы внедрения Orchestrator
+    dateFormat YYYY-MM-DD
+    axisFormat %d.%m
+
+    section Фаза 1: Ядро
+    Triage Router + AgentIntent enum       :a1, 2026-09-20, 3d
+    Heuristic classifier (merge eval+classifier) :a2, after a1, 2d
+    SessionExecutionProfile + tool groups  :a3, after a2, 2d
+
+    section Фаза 2: Auto-Continue
+    finish_reason handler in loop_.rs      :b1, after a3, 3d
+    Context pruning перед auto-continue    :b2, after b1, 2d
+    Circuit breakers                       :b3, after b2, 1d
+
+    section Фаза 3: Gateway + Frontend
+    SSE events (session_meta, mode_changed):c1, after b3, 2d
+    Frontend: условный TODO рендеринг     :c2, after c1, 2d
+    Frontend: убрать кнопку «Далее» для текста :c3, after c2, 1d
+
+    section Фаза 4: Расширения
+    Mode escalation logic                  :d1, after c3, 2d
+    Делегирование в omnesagent-ralph       :d2, after d1, 3d
+    Prompt caching optimization            :d3, after d2, 2d
+    Semantic tool retrieval (MCP)          :d4, after d3, 3d
+    Observability & telemetry              :d5, after d4, 2d
+```
+
+### Статус выполнения задач
+
+#### Фаза 1: Ядро Triage Router
+- [x] **1.1** Структура модуля `omnesagent-runtime/src/agent/orchestrator/`
+- [x] **1.2** Перечисления `AgentIntent` и `ExecutionEngine`
+- [x] **1.3** Детерминированный эвристический классификатор (`HeuristicClassifier`)
+- [x] **1.4** `SessionExecutionProfile` и `UiFlags`
+- [x] **1.5** Статические группы инструментов `ToolGroup` и динамический `ToolPruner`
+- [x] **1.6** Публичный API `triage(&str, ...)` и тесты Фазы 1 (8 из 8 тестов пройдены)
+
+#### Фаза 2: Seamless Auto-Continue & Loop
+- [x] **2.1** Детекция обрывов ответов и незакрытых блоков кода (`auto_continue.rs`)
+- [x] **2.2** Бесшовный auto-continue без разрыва SSE в `run_tool_call_loop`
+- [x] **2.3** Context pruning и memory maintenance перед авто-продолжением
+- [x] **2.4** Circuit breakers (`MAX_AUTO_CONTINUE_ROUNDS <= 5`, защита от зацикливания)
+
+#### Фаза 3: Gateway & Frontend UI
+- [x] **3.1** Gateway SSE события `session_meta`, `mode_changed`, `auto_continue`, `ralph_phase_progress` (`gateway_frame.dart`)
+- [x] **3.2** Frontend Flutter: условный рендеринг TODO-блока в `task_workspace_view.dart` по флагу `show_todo_widget` и режиму сессии
+- [x] **3.3** Frontend Flutter: удалена паразитная кнопка «Продолжить выполнение» для текстовых ответов
+
+#### Фаза 4: Расширения и Ralph
+- [x] **4.1** Логика плавной эскалации режимов `escalation.rs` (Chat → Task без сброса контекста)
+- [x] **4.2** Двухуровневая маршрутизация: делегирование сложных задач в `omnesagent-ralph` (RalphAutonomous engine)
+- [x] **4.3** Оптимизация Prompt Caching (Static Prefix Pattern)
+- [x] **4.4** Semantic Tool Retrieval (MCP top-K через OB2H)
+- [x] **4.5** Телеметрия и наблюдаемость решений Triage Router (`omnesagent_log` record)
+
+---
+
+## 5. Метрики успеха
+
+| Проблема | До | После |
+|---|---|---|
+| **Простой вопрос → TODO-блок наверху** | Всегда (parseTodoBlocksFromText безусловен) | Никогда (только при `mode == task`) |
+| **Обрыв ответа → кнопка «Далее»** | На каждом truncation | Бесшовный auto-continue (до 5 раундов) |
+| **Кол-во тулов в промпте для чата** | 30+ (все зарегистрированные) | 0 |
+| **TTFT для обычного вопроса** | 2.5–4.0 сек | < 0.8 сек |
+| **Token cost за сессию** | ~100% base rate | -40…60% (prompt caching + tool pruning) |
+| **Эскалация Chat → Code** | Полный restart сессии / ручной switch | Бесшовная mid-conversation escalation |
+| **Сложные фичи / рефакторинг** | Ошибки и галлюцинации в монолитном `loop_.rs` | Автономный Ralph Loop: спецификация → AST/OB2H → тесты → diff |
+
+---
+
+## 6. Архитектурные решения (ADR)
+
+> Сохранить в OB2H через `memory_save(category: "decision")` после утверждения.
+
+1. **Hybrid Router > Pure LLM Router.** Эвристика покрывает ~80% случаев с нулевой задержкой. LLM-маршрутизация — только fallback для неоднозначных запросов. Это соответствует рекомендации «Avoid LLM-as-a-Router for everything» (2026 consensus).
+
+2. **Orchestrator внутри `omnesagent-runtime`, не отдельный crate.** Оркестратор тесно связан с `agent.rs`, `loop_.rs`, `tool_execution.rs`. Выделение в отдельный crate создаст циклическую зависимость с runtime.
+
+3. **Escalation > Re-classification.** Не переклассифицировать каждое сообщение с нуля, а _повышать/понижать_ уровень привилегий текущей сессии. Это сохраняет контекст и предотвращает «мигание» режимов.
+
+4. **UI-flags через SSE, а не через парсинг текста.** Фронтенд не должен гадать по содержимому ответа, нужен ли TODO-виджет. Бэкенд явно передаёт `show_todo_widget: bool`.
+
+5. **Two-Tier Engineering Execution (Standard Loop vs Ralph Autonomous Engine).** Общий агентский цикл `loop_.rs` оптимален для интерактивного диалога и локальных правок (Tier 1). Комплексные инженерные задачи с компиляцией, AST-валидацией и прогоном тестов делегируются специализированному автономному воркеру `omnesagent-ralph` (Tier 2), что изолирует тяжелые фазы разработки и сохраняет отзывчивость основного шлюза.
