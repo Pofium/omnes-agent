@@ -17,6 +17,9 @@ use omnesagent_config::schema::PacingConfig;
 use omnesagent_providers::ChatMessage;
 use omnesagent_tool_call_parser::ParsedToolCall;
 
+static GLOBAL_COMPRESSOR: std::sync::LazyLock<omnesagent_compression::TokenCompressor> =
+    std::sync::LazyLock::new(omnesagent_compression::TokenCompressor::default);
+
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
     /// Per-call `(tool_call_id, output)` so native-mode history can emit one
@@ -123,7 +126,13 @@ pub(crate) fn collect_tool_results(
         }
         let canonical_output =
             canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
-        let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
+
+        // Native in-process token compression (SmartCrusher + Deduplication + Family Policy)
+        let family = omnesagent_compression::ModelFamily::detect_from_name(model);
+        let compression_policy = omnesagent_compression::CompressionPolicy::for_family(family);
+        let compressed = GLOBAL_COMPRESSOR.compress_tool_output(&canonical_output, &compression_policy);
+
+        let mut result_output = truncate_tool_result(&compressed, max_tool_result_chars);
         // Append HMAC receipt to tool result when receipts are enabled
         if let Some(ref receipt) = outcome.receipt {
             ::omnesagent_log::record!(

@@ -44,6 +44,9 @@ pub struct SessionExecutionProfile {
     /// Filtered list of tools permitted for this turn.
     pub allowed_tools: Vec<ToolSpec>,
 
+    /// Dynamic token compression and deduplication policy.
+    pub compression_policy: omnesagent_compression::CompressionPolicy,
+
     /// Optional system prompt overlay/instruction (e.g. "Focus on direct concise response without tool preamble").
     pub system_prompt_overlay: Option<String>,
 
@@ -88,10 +91,29 @@ impl SessionExecutionProfile {
             ),
         };
 
+        let compression_policy = match intent {
+            AgentIntent::DirectChat => omnesagent_compression::CompressionPolicy::default(),
+            AgentIntent::CodeExploration => omnesagent_compression::CompressionPolicy {
+                enable_ast_code_collapse: true,
+                ..omnesagent_compression::CompressionPolicy::default()
+            },
+            AgentIntent::EngineeringTask => omnesagent_compression::CompressionPolicy {
+                enable_ast_code_collapse: true,
+                enable_dedup: true,
+                enable_smart_crusher: true,
+                ..omnesagent_compression::CompressionPolicy::default()
+            },
+            AgentIntent::SystemAdmin => omnesagent_compression::CompressionPolicy {
+                enable_smart_crusher: true,
+                ..omnesagent_compression::CompressionPolicy::default()
+            },
+        };
+
         Self {
             intent,
             engine,
             allowed_tools,
+            compression_policy,
             system_prompt_overlay,
             auto_continue,
             max_auto_continue_rounds,
@@ -102,5 +124,19 @@ impl SessionExecutionProfile {
                 display_mode,
             },
         }
+    }
+
+    /// Adapts the session compression policy to a specific model family.
+    #[must_use]
+    pub fn with_model_family(mut self, family: omnesagent_compression::ModelFamily) -> Self {
+        self.compression_policy = omnesagent_compression::CompressionPolicy::for_family(family);
+        self
+    }
+
+    /// Overrides the session compression policy directly.
+    #[must_use]
+    pub fn with_compression_policy(mut self, policy: omnesagent_compression::CompressionPolicy) -> Self {
+        self.compression_policy = policy;
+        self
     }
 }

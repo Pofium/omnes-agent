@@ -20,6 +20,7 @@ omnesagent-memory.workspace = true
 omnesagent-kag.workspace = true
 omnesagent-tools.workspace = true
 omnesagent-sop-graph.workspace = true
+omnesagent-compression.workspace = true
 omnesagent-plugins = { workspace = true, optional = true }
 omnesagent-tool-call-parser.workspace = true
 fluent = "0.16"

@@ -609,19 +609,19 @@ gantt
 - [x] **4.5** Телеметрия и наблюдаемость решений Triage Router (`omnesagent_log` record)
 
 #### Фаза 5: Бэкенд — Встроенный нативный Rust-крейт компрессии токенов (`omnesagent-compression`) «Out of the Box»
-- [ ] **5.1** Создание крейта `backend/crates/omnesagent-compression` в workspace монорепозитория (чистый Rust, 0 внешних демонов/Python)
-- [ ] **5.2** `McpSchemaCompressor` (на основе алгоритмов Atlassian Labs `mcp-compressor`): чистая Rust-имплементация сжатия JSON Schema описаний инструментов в компактные сигнатуры (-70%…-90% токенов при регистрации десятков MCP-серверов)
-- [ ] **5.3** `SqzDedupEngine` (на основе алгоритмов `ojuschugh1/sqz`): контентно-адресуемый block-store на Rust, автоматическое определение повторных чтений файлов/выводов команд и замена на 13-токенные контентные ссылки `§ref:HASH|L1-N§` с мгновенным обратимым разжатием
-- [ ] **5.4** `SmartCrusher` (на основе архитектуры `headroom-core` Rust): структурное сжатие JSON-массивов в `markdown-kv`/`csv-schema`, отсечение длинных хвостов с sentinel `_ccr_dropped` и встроенным in-memory CCR (Content Cache Retrieval) хранилищем
-- [ ] **5.5** `AstCodeCompressor`: структурное сворачивание тел нередактируемых функций для контекста файлов (`// [collapsed N lines]`)
-- [ ] **5.6** `ModelFamilyAdaptiveRouter`: адаптивное управление сжатием по семействам LLM:
+- [x] **5.1** Создание крейта `backend/crates/omnesagent-compression` в workspace монорепозитория (чистый Rust, 0 внешних демонов/Python)
+- [x] **5.2** `McpSchemaCompressor` (на основе алгоритмов Atlassian Labs `mcp-compressor`): чистая Rust-имплементация сжатия JSON Schema описаний инструментов в компактные сигнатуры (-70%…-90% токенов при регистрации десятков MCP-серверов)
+- [x] **5.3** `SqzDedupEngine` (на основе алгоритмов `ojuschugh1/sqz`): контентно-адресуемый block-store на Rust, автоматическое определение повторных чтений файлов/выводов команд и замена на 13-токенные контентные ссылки `§ref:HASH|L1-N§` с мгновенным обратимым разжатием
+- [x] **5.4** `SmartCrusher` (на основе архитектуры `headroom-core` Rust): структурное сжатие JSON-массивов в `markdown-kv`/`csv-schema`, отсечение длинных хвостов с sentinel `_ccr_dropped` и встроенным in-memory CCR (Content Cache Retrieval) хранилищем
+- [x] **5.5** `AstCodeCompressor`: структурное сворачивание тел нередактируемых функций для контекста файлов (`// [collapsed N lines]`)
+- [x] **5.6** `ModelFamilyAdaptiveRouter`: адаптивное управление сжатием по семействам LLM:
   - **Семейство DeepSeek**: строгое выравнивание Static Prefix Cache под архитектуру CED/CSA2 для 99% cache hit + `sqz` дедупликация (без оптического pxpipe-сжатия текста).
   - **Семейство GLM (Zhipu AI)**: гибридный sparse-linear KV-кэш, адаптивный режим Safe De-dup для ссылок `§ref§` и структурное сжатие вывода.
   - **Семейство Anthropic Claude**: автоматическая расстановка 4 контрольных точек `cache_control: {"type": "ephemeral"}` + SmartCrusher + `sqz` + MCP schema minification.
   - **Семейство OpenAI / GPT**: автоматический префикс-кэшинг (порог 1024 токенов), режим `compact-json-schema` для структурированных вызовов.
   - **Семейства Alibaba Qwen, Moonshot Kimi, Xiaomi MiMo**: `SmartCrusher` (табличная компактизация) + `SqzDedupEngine` + `AstCodeCompressor`.
-- [ ] **5.7** Нулевые внешние зависимости: компиляция непосредственно в бинарник `omnesagent.exe`, гарантированная работа из коробки для любого пользователя, скачавшего клиент.
-- [ ] **5.8** Сопряжение с системой памяти OB2H и Оркестратором: интеграция с AST-графом `omnesagent-kag`, дедупликация prefetch-блоков `omnesagent-memory` и динамический выбор политик сжатия через `SessionExecutionProfile::compression_policy` в Triage Router.
+- [x] **5.7** Нулевые внешние зависимости: компиляция непосредственно в бинарник `omnesagent.exe`, гарантированная работа из коробки для любого пользователя, скачавшего клиент.
+- [x] **5.8** Сопряжение с системой памяти OB2H и Оркестратором: интеграция с AST-графом `omnesagent-kag`, дедупликация prefetch-блоков `omnesagent-memory` и динамический выбор политик сжатия через `SessionExecutionProfile::compression_policy` в Triage Router.
 
 #### Фаза 6: Фронтенд (Desktop & Web) — Редизайн и оптимизация Студии автоматизации (SOP / Workflow Studio)
 - [x] **6.1** Устранение зависаний и задержек при переключении пайплайнов в `SopStudioController`: оптимистичный мгновенный выбор (0 мс), кэширование графов, сокращение таймаута шлюза с 10 сек до 1.5 сек с fallback

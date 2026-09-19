@@ -6733,6 +6733,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnesagent-compression"
+version = "0.8.4"
+dependencies = [
+ "chrono",
+ "omnesagent-api",
+ "omnesagent-log",
+ "parking_lot",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "omnesagent-config"
 version = "0.8.4"
 dependencies = [
@@ -7151,6 +7166,7 @@ dependencies = [
  "nanohtml2text",
  "omnesagent-api",
  "omnesagent-commands",
+ "omnesagent-compression",
  "omnesagent-config",
  "omnesagent-infra",
  "omnesagent-kag",

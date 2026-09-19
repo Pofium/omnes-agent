@@ -1,0 +1,20 @@
+[package]
+name = "omnesagent-compression"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native in-process token compression, MCP schema minification, and deduplication for OmnesAgent."
+publish = false
+
+[dependencies]
+omnesagent-log.workspace = true
+omnesagent-api.workspace = true
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+parking_lot = "0.12"
+sha2 = "0.10"
+regex = "1.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }
