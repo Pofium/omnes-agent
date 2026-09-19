@@ -615,9 +615,11 @@ gantt
 - [ ] **5.4** `SmartCrusher` (на основе архитектуры `headroom-core` Rust): структурное сжатие JSON-массивов в `markdown-kv`/`csv-schema`, отсечение длинных хвостов с sentinel `_ccr_dropped` и встроенным in-memory CCR (Content Cache Retrieval) хранилищем
 - [ ] **5.5** `AstCodeCompressor`: структурное сворачивание тел нередактируемых функций для контекста файлов (`// [collapsed N lines]`)
 - [ ] **5.6** `ModelFamilyAdaptiveRouter`: адаптивное управление сжатием по семействам LLM:
-  - **DeepSeek**: строгое выравнивание Static Prefix Cache (system prompt + MCP схемы) для 99% cache hit + `sqz` дедупликация (без vision/pxpipe).
-  - **Claude / Anthropic**: автоматическая расстановка точек `cache_control: {"type": "ephemeral"}` + SmartCrusher + `sqz` + MCP schema minification.
-  - **OpenAI / Qwen / Kimi**: SmartCrusher + `sqz` + MCP schema minification.
+  - **Семейство DeepSeek**: строгое выравнивание Static Prefix Cache под архитектуру CED/CSA2 для 99% cache hit + `sqz` дедупликация (без оптического pxpipe-сжатия текста).
+  - **Семейство GLM (Zhipu AI)**: гибридный sparse-linear KV-кэш, адаптивный режим Safe De-dup для ссылок `§ref§` и структурное сжатие вывода.
+  - **Семейство Anthropic Claude**: автоматическая расстановка 4 контрольных точек `cache_control: {"type": "ephemeral"}` + SmartCrusher + `sqz` + MCP schema minification.
+  - **Семейство OpenAI / GPT**: автоматический префикс-кэшинг (порог 1024 токенов), режим `compact-json-schema` для структурированных вызовов.
+  - **Семейства Alibaba Qwen, Moonshot Kimi, Xiaomi MiMo**: `SmartCrusher` (табличная компактизация) + `SqzDedupEngine` + `AstCodeCompressor`.
 - [ ] **5.7** Нулевые внешние зависимости: компиляция непосредственно в бинарник `omnesagent.exe`, гарантированная работа из коробки для любого пользователя, скачавшего клиент.
 
 #### Фаза 6: Фронтенд (Desktop & Web) — Редизайн и оптимизация Студии автоматизации (SOP / Workflow Studio)
@@ -689,20 +691,39 @@ backend/crates/omnesagent-compression/
     ├── smart_crusher.rs         # SmartCrusher для JSON массивов, таблиц и логов (Headroom pattern)
     ├── ccr_store.rs             # In-memory хранилище для обратимого разжатия (Content Cache Retrieval)
     ├── code_ast.rs              # AST-сжатие тел функций и методов кода
-    └── model_router.rs          # Модель-специфичные профили сжатия (DeepSeek, Claude, OpenAI, Qwen)
+    └── model_router.rs          # Семейство-ориентированные профили сжатия (DeepSeek, GLM, Claude, OpenAI, Qwen)
 ```
 
-### 7.3. Модель-специфичные правила сжатия (`model_router.rs`)
+### 7.3. Правила сжатия по семействам моделей (`model_router.rs`)
 
-1. **DeepSeek (V3 / R1)**:
-   - **Static Prefix Priority**: DeepSeek дает скидку до 99% на чтение закэшированного префикса. Описания MCP инструментов и системный промт строго фиксируются в начале контекста и никогда не переставляются между ходами.
-   - **Bypass Vision**: Текстовые токены DeepSeek стоят сверхдешево ($0.14-$0.28 / 1M), тогда как vision-токены дороги и не кэшируются. Оптическое сжатие (pxpipe / текст в картинку) для DeepSeek **строго отключено**.
-   - **Активные модули**: `StaticPrefixFormatter` + `SqzDedupEngine` + `McpSchemaCompressor`.
+Вместо привязки к устаревающим отдельным номерам версий, роутер оперирует фундаментальными архитектурными свойствами **семейств провайдеров**:
 
-2. **Claude (Anthropic Claude 3.5 / 3.7 / Sonnet / Opus)**:
-   - **Ephemeral Cache Breakpoints**: Автоматическая расстановка маркеров `cache_control: {"type": "ephemeral"}` на границах системного промпта, реестра инструментов и истории сообщений.
-   - **Активные модули**: `McpSchemaCompressor` + `SmartCrusher` + `SqzDedupEngine` + `AstCodeCompressor`.
+1. **Семейство DeepSeek (Архитектуры CED / CSA2 / FP4 KV-Cache)**:
+   - **Архитектурные особенности**: Нативная мультимодальность (встроенный vision-канал), архитектура Causal Encoder-Decoder (CED), Compressed Sparse Attention 2 (CSA2) и FP4 KV-кэш (E2M1). Кэшированные токены стоят практически бесплатно ($0.003 / 1M токенов), что делает Prompt Cache главным фактором экономии (до 99%).
+   - **Правило Static Prefix Alignment**: Все статические структуры (системный промпт, сжатые MCP-схемы инструментов, правила проекта) строго позиционируются в неизменном порядке в самом начале контекста. Любые динамические метаданные (время, статус, ID) вытесняются в конец сообщения.
+   - **Bypass Optical Compression**: Поскольку текстовый кэш DeepSeek дешев и имеет 99% hit rate, искусственный рендеринг текста в картинки (pxpipe) не имеет смысла и **отключен** (pass-through).
+   - **Активный стек**: `StaticPrefixFormatter` + `SqzDedupEngine` (сжатие повторных чтений файлов) + `McpSchemaCompressor`.
 
-3. **OpenAI / Qwen / Kimi / MiMo**:
-   - **Активные модули**: `SmartCrusher` (структурное сжатие JSON/выводов) + `SqzDedupEngine` (дедуп повторов) + `McpSchemaCompressor`.
+2. **Семейство GLM (Zhipu AI / Архитектура GLM-5)**:
+   - **Архитектурные особенности**: Нативная мультимодальность (текст + изображение + видео), гибридное sparse-linear внимание с 4.44x сжатием KV-кэша, контекст до 1M токенов, нативная поддержка speculative decoding (MTP).
+   - **Особенность дедупликации (Safe References)**: Модели семейства GLM чувствительны к "голым" непрозрачным ссылкам вида `§ref:HASH§` без контекстного обрамления. Для GLM ссылки оборачиваются в семантические markdown-указатели `[Повторный вывод файла: hash=... сохранен в памяти, обратитесь к файлу при необходимости]` либо мгновенно разжимаются (Safe De-dup).
+   - **Активный стек**: `McpSchemaCompressor` + `SmartCrusher` (структурное сжатие JSON) + `SqzDedupEngine` (в безопасном режиме `safe_ref`).
+
+3. **Семейство Anthropic Claude**:
+   - **Архитектурные особенности**: Эксплицитный prompt-caching с ограничением до 4 контрольных точек `cache_control: {"type": "ephemeral"}`. Длинные JSON Schema инструментов расходуют драгоценный лимит контекста.
+   - **Cache Breakpoints Placement**: Автоматическая расстановка маркеров `ephemeral` на 3 уровнях: 1) Системный промпт + AGENTS.md; 2) Сжатые схемы MCP-инструментов; 3) Зафиксированная история turns сессии.
+   - **Активный стек**: `McpSchemaCompressor` (минимизация схем в типизированные сигнатуры -80%) + `SmartCrusher` (сжатие tool outputs) + `SqzDedupEngine` + `AstCodeCompressor`.
+
+4. **Семейство OpenAI / GPT**:
+   - **Архитектурные особенности**: Автоматический префиксный кэшинг (блоки от 1024 токенов с шагом 128 токенов без ручных маркеров). Строгая валидация Structured Outputs (JSON Schema).
+   - **Особенность Schema Delivery**: Для моделей, требующих валидный JSON Schema, `McpSchemaCompressor` использует режим `compact-json-schema` (удаление метаданных, `title`, `description`, сжатие `properties`), сохраняя валидный JSON Schema синтаксис.
+   - **Активный стек**: `McpSchemaCompressor(mode: CompactJson)` + `SmartCrusher` (JSON table projection) + `SqzDedupEngine`.
+
+5. **Семейство Alibaba Qwen**:
+   - **Архитектурные особенности**: Сверхдлинные контексты (128K–1M), высокая восприимчивость к коду и structured output.
+   - **Активный стек**: `McpSchemaCompressor` + `SmartCrusher` (сворачивание больших JSON ответов в таблицы) + `AstCodeCompressor`.
+
+6. **Семейства Moonshot Kimi & Xiaomi MiMo**:
+   - **Архитектурные особенности**: Оптимизация под длинный контекст и кодогенерацию.
+   - **Активный стек**: `SmartCrusher` + `SqzDedupEngine` + `McpSchemaCompressor`.
 
