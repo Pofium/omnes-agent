@@ -608,25 +608,25 @@ gantt
 - [x] **4.4** Semantic Tool Retrieval (MCP top-K через OB2H)
 - [x] **4.5** Телеметрия и наблюдаемость решений Triage Router (`omnesagent_log` record)
 
-#### Фаза 5: Бэкенд — Интеграция прокси-стека сжатия токенов и модель-специфичной компрессии
-- [ ] **5.1** Архитектура `TokenCompressionMiddleware` в `omnesagent-runtime/src/agent/dispatcher.rs` для перехвата tool outputs
-- [ ] **5.2** Интеграция дедупликатора файлов `sqz` (v1.3.0 pattern): замена повторно прочитанных файлов на 13-токенные контентные ссылки (-92% на повторах)
-- [ ] **5.3** Клиент к `Headroom` (HTTP `127.0.0.1:8787`): сжатие JSON через SmartCrusher (-92%), сжатие AST кода (-47%) и текстов (-73%) с обратимым кэшированием
-- [ ] **5.4** Интеграция `mcp-compressor` (Atlassian Labs, Rust): сжатие JSON-схем и описаний MCP-инструментов перед инжекцией в LLM context (-70%…-97%)
-- [ ] **5.5** Модель-специфичный роутер сжатия (`ModelFamilyProxyRouter`):
-  - **DeepSeek**: нативный prompt-cache (~99% hit) + `sqz` дедупликация, прямой обход `pxpipe` (pass-through).
-  - **Claude / Anthropic**: статический префикс Prompt Caching + Headroom (tool outputs) + `sqz` + `pxpipe` (:47821, текст → PNG для vision-канала со скидкой ~60%).
-  - **OpenAI / GPT-4o / GPT-5**: Headroom + `sqz` + `mcp-compressor`.
-  - **Qwen / Kimi / MiMo**: `mcp-compressor` + Headroom + `sqz`.
-- [ ] **5.6** Lifecycle-менеджер локальных компрессоров: проверка доступности портов (`8787`, `47821`), graceful fallback при неактивных демонах
+#### Фаза 5: Бэкенд — Встроенный нативный Rust-крейт компрессии токенов (`omnesagent-compression`) «Out of the Box»
+- [ ] **5.1** Создание крейта `backend/crates/omnesagent-compression` в workspace монорепозитория (чистый Rust, 0 внешних демонов/Python)
+- [ ] **5.2** `McpSchemaCompressor` (на основе алгоритмов Atlassian Labs `mcp-compressor`): чистая Rust-имплементация сжатия JSON Schema описаний инструментов в компактные сигнатуры (-70%…-90% токенов при регистрации десятков MCP-серверов)
+- [ ] **5.3** `SqzDedupEngine` (на основе алгоритмов `ojuschugh1/sqz`): контентно-адресуемый block-store на Rust, автоматическое определение повторных чтений файлов/выводов команд и замена на 13-токенные контентные ссылки `§ref:HASH|L1-N§` с мгновенным обратимым разжатием
+- [ ] **5.4** `SmartCrusher` (на основе архитектуры `headroom-core` Rust): структурное сжатие JSON-массивов в `markdown-kv`/`csv-schema`, отсечение длинных хвостов с sentinel `_ccr_dropped` и встроенным in-memory CCR (Content Cache Retrieval) хранилищем
+- [ ] **5.5** `AstCodeCompressor`: структурное сворачивание тел нередактируемых функций для контекста файлов (`// [collapsed N lines]`)
+- [ ] **5.6** `ModelFamilyAdaptiveRouter`: адаптивное управление сжатием по семействам LLM:
+  - **DeepSeek**: строгое выравнивание Static Prefix Cache (system prompt + MCP схемы) для 99% cache hit + `sqz` дедупликация (без vision/pxpipe).
+  - **Claude / Anthropic**: автоматическая расстановка точек `cache_control: {"type": "ephemeral"}` + SmartCrusher + `sqz` + MCP schema minification.
+  - **OpenAI / Qwen / Kimi**: SmartCrusher + `sqz` + MCP schema minification.
+- [ ] **5.7** Нулевые внешние зависимости: компиляция непосредственно в бинарник `omnesagent.exe`, гарантированная работа из коробки для любого пользователя, скачавшего клиент.
 
 #### Фаза 6: Фронтенд (Desktop & Web) — Редизайн и оптимизация Студии автоматизации (SOP / Workflow Studio)
-- [ ] **6.1** Устранение зависаний и задержек при переключении пайплайнов в `SopStudioController`: оптимистичный мгновенный выбор, кэширование графов, сокращение таймаута шлюза с 10 сек до 1.5 сек с fallback
-- [ ] **6.2** Дифференциация DAG-графов: уникальные, подробные узлы и шаги для каждого сценария (`security-audit`, `release-build`, `vps-proxy-sync`, `code-review-gate`, `auto-refactor`)
-- [ ] **6.3** Информационный модуль «Что такое SOP и зачем нужны пайплайны»: доступное объяснение автономных процедур агента, фонового выполнения и экономии времени разработчика
-- [ ] **6.4** Информационные бейджи и всплывающие подсказки к узлам графа: Триггер (Trigger) → Инструмент (Tool) → Валидация (Step) → Шлюз согласования (Approval Gate) → Доставка артефактов (Deliverable) с векторными иконками (без эмодзи)
-- [ ] **6.5** Синхронизация и выравнивание реализации Студии SOP между `frontend/desktop` и `frontend/web`
-- [ ] **6.6** Интерактивная панель мониторинга запусков: отображение статусов узлов в реальном времени, кнопка ручного подтверждения опасных операций в шлюзе (Approval Gate)
+- [x] **6.1** Устранение зависаний и задержек при переключении пайплайнов в `SopStudioController`: оптимистичный мгновенный выбор (0 мс), кэширование графов, сокращение таймаута шлюза с 10 сек до 1.5 сек с fallback
+- [x] **6.2** Дифференциация DAG-графов: уникальные, подробные узлы и шаги для каждого сценария (`security-audit`, `release-build`, `vps-proxy-sync`, `code-review-gate`, `auto-refactor`)
+- [x] **6.3** Информационный модуль «Что такое SOP и зачем нужны пайплайны»: доступное объяснение автономных процедур агента, фонового выполнения и экономии времени разработчика (раскрывающийся гид и модальная справка)
+- [x] **6.4** Информационные бейджи и описания к узлам графа: Триггер (Trigger) → Инструмент (Tool) → Валидация (Step) → Шлюз согласования (Approval Gate) → Доставка артефактов (Deliverable) с векторными иконками FontAwesome (без эмодзи)
+- [x] **6.5** Синхронизация и выравнивание реализации Студии SOP между `frontend/desktop` и `frontend/web`
+- [x] **6.6** Интерактивная панель мониторинга запусков: отображение статусов узлов в реальном времени, кнопка ручного подтверждения опасных операций прямо в карточке шлюза (Approval Gate: Approve / Deny)
 
 ---
 
@@ -638,9 +638,12 @@ gantt
 | **Обрыв ответа → кнопка «Далее»** | На каждом truncation | Бесшовный auto-continue (до 5 раундов) |
 | **Кол-во тулов в промпте для чата** | 30+ (все зарегистрированные) | 0 |
 | **TTFT для обычного вопроса** | 2.5–4.0 сек | < 0.8 сек |
-| **Token cost за сессию** | ~100% base rate | -40…60% (prompt caching + tool pruning) |
+| **Token cost за сессию** | ~100% base rate | -60…85% (сжатие схем MCP + sqz дедупликация + SmartCrusher) |
 | **Эскалация Chat → Code** | Полный restart сессии / ручной switch | Бесшовная mid-conversation escalation |
 | **Сложные фичи / рефакторинг** | Ошибки и галлюцинации в монолитном `loop_.rs` | Автономный Ralph Loop: спецификация → AST/OB2H → тесты → diff |
+| **Переключение SOP пайплайнов** | Фриз 10 секунд и одинаковый мок-граф | Мгновенное (0 мс) с уникальным реалистичным DAG графом |
+| **Понятность автоматизаций для пользователя** | Непонятно, зачем нужны пайплайны | Наглядный гид, справка, бейджи типов узлов и кнопки согласования |
+| **Зависимости компрессоров токенов** | Внешний Python venv, порты :8787, .bat скрипты | 100% чистый встроенный Rust-код из коробки в `omnesagent.exe` |
 
 ---
 
@@ -657,3 +660,49 @@ gantt
 4. **UI-flags через SSE, а не через парсинг текста.** Фронтенд не должен гадать по содержимому ответа, нужен ли TODO-виджет. Бэкенд явно передаёт `show_todo_widget: bool`.
 
 5. **Two-Tier Engineering Execution (Standard Loop vs Ralph Autonomous Engine).** Общий агентский цикл `loop_.rs` оптимален для интерактивного диалога и локальных правок (Tier 1). Комплексные инженерные задачи с компиляцией, AST-валидацией и прогоном тестов делегируются специализированному автономному воркеру `omnesagent-ralph` (Tier 2), что изолирует тяжелые фазы разработки и сохраняет отзывчивость основного шлюза.
+
+6. **Встроенная компрессия в Rust (`omnesagent-compression`) > Внешние прокси-демоны.** 
+   Пользователь, скачавший приложение OmnesAgent, не должен настраивать Python 3.13, виртуальные окружения, компиляторы или фоновые bat-файлы. Все проверенные алгоритмы передовых систем сжатия контекста (`atlassian-labs/mcp-compressor`, `ojuschugh1/sqz`, `headroom-core`) реализуются на чистом Rust внутри нового крейта `omnesagent-compression` и компилируются непосредственно в бинарник `omnesagent.exe`.
+
+---
+
+## 7. Детальная спецификация нативного крейта `omnesagent-compression`
+
+### 7.1. Мотивация и анализ исходного кода инструментов
+
+| Инструмент | Источник / Лицензия | Исходная архитектура | Имплементация в `omnesagent-compression` | Ожидаемая экономия |
+|---|---|---|---|---|
+| **mcp-compressor** | Atlassian Labs (Apache 2.0, Rust) | Внешний прокси над stdio/SSE MCP серверами, стриппит JSON Schema | Модуль `mcp_schema.rs`: прямое сжатие списка инструментов в памяти Gateway/Runtime до отправки в модель | −70%…−97% на tool descriptions |
+| **sqz** (v1.3.0) | `ojuschugh1/sqz` (MIT, Rust) | CLI утилита + bash-хук, разбиение на блоки, хеширование, ссылки `§ref:HASH§` | Модуль `sqz_dedup.rs`: in-memory block store в `omnesagent-runtime`, перехват повторных чтений файлов и логов | ~92% на повторных чтениях |
+| **Headroom** | `headroom-ai` (Rust `crates/headroom-core` + Python shim) | Прокси :8787: SmartCrusher, JSON compaction, CCR (Content Cache Retrieval) | Модуль `smart_crusher.rs`: структурное сжатие JSON/таблиц, sentinel `_ccr_dropped`, встроенный CCR store | JSON −92%, логи −73% |
+| **AST Compressor** | Алгоритмы `sqz` + `headroom` AST | Парсинг syn/tree-sitter, сворачивание тел нерелевантных функций | Модуль `code_ast.rs`: сворачивание тел приватных функций (`// [collapsed N lines]`) при чтении файлов контекста | Код −45%…−60% |
+
+### 7.2. Структура крейта `backend/crates/omnesagent-compression`
+
+```
+backend/crates/omnesagent-compression/
+├── Cargo.toml
+└── src/
+    ├── lib.rs                   # Публичный API: TokenCompressor, CompressionPolicy, CompressedOutput
+    ├── mcp_schema.rs            # Сжатие JSON Schema MCP инструментов (Atlassian pattern)
+    ├── sqz_dedup.rs             # Дедупликация повторов через §ref:HASH§ (sqz pattern)
+    ├── smart_crusher.rs         # SmartCrusher для JSON массивов, таблиц и логов (Headroom pattern)
+    ├── ccr_store.rs             # In-memory хранилище для обратимого разжатия (Content Cache Retrieval)
+    ├── code_ast.rs              # AST-сжатие тел функций и методов кода
+    └── model_router.rs          # Модель-специфичные профили сжатия (DeepSeek, Claude, OpenAI, Qwen)
+```
+
+### 7.3. Модель-специфичные правила сжатия (`model_router.rs`)
+
+1. **DeepSeek (V3 / R1)**:
+   - **Static Prefix Priority**: DeepSeek дает скидку до 99% на чтение закэшированного префикса. Описания MCP инструментов и системный промт строго фиксируются в начале контекста и никогда не переставляются между ходами.
+   - **Bypass Vision**: Текстовые токены DeepSeek стоят сверхдешево ($0.14-$0.28 / 1M), тогда как vision-токены дороги и не кэшируются. Оптическое сжатие (pxpipe / текст в картинку) для DeepSeek **строго отключено**.
+   - **Активные модули**: `StaticPrefixFormatter` + `SqzDedupEngine` + `McpSchemaCompressor`.
+
+2. **Claude (Anthropic Claude 3.5 / 3.7 / Sonnet / Opus)**:
+   - **Ephemeral Cache Breakpoints**: Автоматическая расстановка маркеров `cache_control: {"type": "ephemeral"}` на границах системного промпта, реестра инструментов и истории сообщений.
+   - **Активные модули**: `McpSchemaCompressor` + `SmartCrusher` + `SqzDedupEngine` + `AstCodeCompressor`.
+
+3. **OpenAI / Qwen / Kimi / MiMo**:
+   - **Активные модули**: `SmartCrusher` (структурное сжатие JSON/выводов) + `SqzDedupEngine` (дедуп повторов) + `McpSchemaCompressor`.
+

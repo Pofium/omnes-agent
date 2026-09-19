@@ -29,6 +29,24 @@ class _AutomationsViewState extends State<AutomationsView> {
   int selectedTab = 0; // 0: SOP Studio, 1: Scheduled Tasks
   late final SopStudioController sopController;
   bool isKeepAwakeEnabled = true;
+  bool isSopGuideExpanded = true;
+
+  IconData _getSopIcon(String name) {
+    switch (name) {
+      case 'security-audit':
+        return FontAwesomeIcons.shieldVirus;
+      case 'release-build':
+        return FontAwesomeIcons.boxArchive;
+      case 'vps-proxy-sync':
+        return FontAwesomeIcons.server;
+      case 'code-review-gate':
+        return FontAwesomeIcons.codePullRequest;
+      case 'auto-refactor':
+        return FontAwesomeIcons.wandMagicSparkles;
+      default:
+        return FontAwesomeIcons.diagramProject;
+    }
+  }
 
   // Active scheduled tasks list
   final List<Map<String, dynamic>> scheduledTasks = [];
@@ -439,8 +457,11 @@ class _AutomationsViewState extends State<AutomationsView> {
                       final sop = sopController.sops[i];
                       final name = sop['name']?.toString() ?? '';
                       final title = sop['title']?.toString() ?? name;
+                      final desc = sop['description']?.toString() ?? '';
                       final isSelected = sopController.selectedSopName.value == name;
                       final mode = sop['execution_mode']?.toString() ?? 'autonomous';
+                      final sopIcon = _getSopIcon(name);
+
                       return Container(
                         margin: const EdgeInsets.only(bottom: 6),
                         decoration: BoxDecoration(
@@ -450,42 +471,84 @@ class _AutomationsViewState extends State<AutomationsView> {
                             color: isSelected ? DesktopTheme.accentCyan : DesktopTheme.borderSubtle.withOpacity(0.5),
                           ),
                         ),
-                        child: ListTile(
-                          dense: true,
-                          title: Text(
-                            title,
-                            style: TextStyle(
-                              fontSize: 12.5,
-                              fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
-                              color: DesktopTheme.textPrimary,
-                            ),
-                          ),
-                          subtitle: Text(
-                            name,
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontFamily: 'Consolas',
-                              color: DesktopTheme.textMuted,
-                            ),
-                          ),
-                          trailing: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: mode == 'supervised'
-                                  ? Colors.amber.withOpacity(0.15)
-                                  : const Color(0xFF10B981).withOpacity(0.15),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Text(
-                              mode,
-                              style: TextStyle(
-                                fontSize: 10,
-                                fontWeight: FontWeight.w600,
-                                color: mode == 'supervised' ? Colors.amber : const Color(0xFF10B981),
-                              ),
-                            ),
-                          ),
+                        child: InkWell(
                           onTap: () => sopController.selectSop(name),
+                          borderRadius: BorderRadius.circular(8),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+                            child: Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(8),
+                                  margin: const EdgeInsets.only(top: 2),
+                                  decoration: BoxDecoration(
+                                    color: isSelected
+                                        ? DesktopTheme.accentCyan.withOpacity(0.18)
+                                        : DesktopTheme.bgSurfaceElevated,
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Icon(
+                                    sopIcon,
+                                    size: 13,
+                                    color: isSelected ? DesktopTheme.accentCyan : DesktopTheme.textMuted,
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: Text(
+                                              title,
+                                              style: TextStyle(
+                                                fontSize: 12,
+                                                fontWeight: isSelected ? FontWeight.bold : FontWeight.w600,
+                                                color: isSelected ? DesktopTheme.accentCyan : DesktopTheme.textPrimary,
+                                              ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                                            decoration: BoxDecoration(
+                                              color: mode == 'supervised'
+                                                  ? Colors.amber.withOpacity(0.15)
+                                                  : const Color(0xFF10B981).withOpacity(0.15),
+                                              borderRadius: BorderRadius.circular(4),
+                                            ),
+                                            child: Text(
+                                              mode == 'supervised' ? 'Gate' : 'Auto',
+                                              style: TextStyle(
+                                                fontSize: 9.5,
+                                                fontWeight: FontWeight.w600,
+                                                color: mode == 'supervised' ? Colors.amber : const Color(0xFF10B981),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 3),
+                                      Text(
+                                        desc.isNotEmpty ? desc : name,
+                                        style: TextStyle(
+                                          fontSize: 10.5,
+                                          color: DesktopTheme.textMuted,
+                                          height: 1.25,
+                                        ),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
                       );
                     },
@@ -547,6 +610,13 @@ class _AutomationsViewState extends State<AutomationsView> {
                         ],
                       ),
                       const Spacer(),
+                      IconButton(
+                        icon: const Icon(FontAwesomeIcons.circleQuestion, size: 15),
+                        color: DesktopTheme.accentCyan,
+                        tooltip: 'Что такое SOP и как работают пайплайны?',
+                        onPressed: () => _showSopHelpDialog(context),
+                      ),
+                      const SizedBox(width: 8),
                       OutlinedButton.icon(
                         icon: const Icon(FontAwesomeIcons.robot, size: 12),
                         label: const Text('AI Wire-Draft', style: TextStyle(fontSize: 12)),
@@ -579,6 +649,9 @@ class _AutomationsViewState extends State<AutomationsView> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
+                        // Educational Guide Banner
+                        _buildSopEducationalGuide(),
+
                         // Visual DAG Nodes Flow
                         _buildDagGraphNodes(nodes),
                         const SizedBox(height: 24),
@@ -658,26 +731,38 @@ class _AutomationsViewState extends State<AutomationsView> {
   Widget _buildNodeCard(Map<String, dynamic> node) {
     final kind = node['kind']?.toString() ?? 'step';
     final title = node['title']?.toString() ?? node['id']?.toString() ?? '';
+    final description = node['description']?.toString() ?? '';
     final status = node['status']?.toString() ?? 'idle';
+    final nodeId = node['id']?.toString() ?? '';
 
     IconData icon;
     Color iconColor;
+    String kindLabel;
     switch (kind) {
       case 'trigger':
         icon = FontAwesomeIcons.bolt;
         iconColor = const Color(0xFF38BDF8);
+        kindLabel = 'Триггер';
         break;
       case 'tool':
         icon = FontAwesomeIcons.wrench;
         iconColor = const Color(0xFFA78BFA);
+        kindLabel = 'Инструмент';
         break;
       case 'gate':
         icon = FontAwesomeIcons.shieldHalved;
         iconColor = const Color(0xFFF59E0B);
+        kindLabel = 'Шлюз согласования';
+        break;
+      case 'deliverable':
+        icon = FontAwesomeIcons.boxArchive;
+        iconColor = const Color(0xFF10B981);
+        kindLabel = 'Артефакт';
         break;
       default:
-        icon = FontAwesomeIcons.gears;
+        icon = FontAwesomeIcons.circleCheck;
         iconColor = DesktopTheme.accentCyan;
+        kindLabel = 'Анализ / Шаг';
     }
 
     Color statusColor;
@@ -700,6 +785,8 @@ class _AutomationsViewState extends State<AutomationsView> {
         statusLabel = 'Ожидание';
     }
 
+    final isPendingGate = kind == 'gate' && status == 'pending';
+
     return Container(
       width: double.infinity,
       constraints: const BoxConstraints(maxWidth: 720),
@@ -708,74 +795,158 @@ class _AutomationsViewState extends State<AutomationsView> {
         color: DesktopTheme.bgSurfaceElevated,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
-          color: status == 'pending' ? const Color(0xFFF59E0B) : DesktopTheme.borderSubtle,
-          width: status == 'pending' ? 1.5 : 1,
+          color: isPendingGate ? const Color(0xFFF59E0B) : DesktopTheme.borderSubtle,
+          width: isPendingGate ? 1.5 : 1,
         ),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(
-              color: iconColor.withOpacity(0.12),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(icon, size: 14, color: iconColor),
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: iconColor.withOpacity(0.12),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, size: 14, color: iconColor),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            title,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              color: DesktopTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: iconColor.withOpacity(0.12),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            kindLabel,
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w600,
+                              color: iconColor,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      'ID: $nodeId • Тип: $kind',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontFamily: 'Consolas',
+                        color: DesktopTheme.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: statusColor.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: statusColor,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      statusLabel,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: statusColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.bold,
-                    color: DesktopTheme.textPrimary,
-                  ),
+          if (description.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Padding(
+              padding: const EdgeInsets.only(left: 48),
+              child: Text(
+                description,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: DesktopTheme.textMuted,
+                  height: 1.35,
                 ),
-                const SizedBox(height: 3),
-                Text(
-                  'Тип: $kind • ID: ${node['id']}',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontFamily: 'Consolas',
-                    color: DesktopTheme.textMuted,
-                  ),
-                ),
-              ],
+              ),
             ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: statusColor.withOpacity(0.15),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 6,
-                  height: 6,
-                  decoration: BoxDecoration(
-                    color: statusColor,
-                    shape: BoxShape.circle,
+          ],
+          if (isPendingGate) ...[
+            const SizedBox(height: 12),
+            Padding(
+              padding: const EdgeInsets.only(left: 48),
+              child: Row(
+                children: [
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.check, size: 13),
+                    label: const Text('Одобрить шаг', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold)),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF10B981),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                    ),
+                    onPressed: () {
+                      sopController.approveGate(nodeId);
+                    },
                   ),
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  statusLabel,
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: statusColor,
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    icon: const Icon(Icons.close, size: 13),
+                    label: const Text('Отклонить', style: TextStyle(fontSize: 11.5)),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFFEF4444),
+                      side: const BorderSide(color: Color(0xFFEF4444)),
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+                    ),
+                    onPressed: () {
+                      Get.snackbar(
+                        'Шаг отклонен',
+                        'Выполнение остановлено оператором.',
+                        backgroundColor: const Color(0xFF0F172A),
+                        colorText: const Color(0xFFEF4444),
+                        snackPosition: SnackPosition.BOTTOM,
+                      );
+                    },
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -826,6 +997,16 @@ class _AutomationsViewState extends State<AutomationsView> {
                   padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                 ),
                 onPressed: () async {
+                  final cur = sopController.selectedGraph.value;
+                  if (cur != null) {
+                    final nodes = (cur['nodes'] as List<dynamic>?)
+                        ?.map((e) => Map<String, dynamic>.from(e as Map))
+                        .toList();
+                    final pendingGate = nodes?.firstWhereOrNull((n) => n['kind'] == 'gate' && n['status'] == 'pending');
+                    if (pendingGate != null) {
+                      sopController.approveGate(pendingGate['id'].toString());
+                    }
+                  }
                   await sopController.httpClient.sopApprove(sopName);
                   sopController.selectSop(sopName);
                   Get.snackbar('SOP согласован', 'Шаг пайплайна утвержден оператором');
@@ -851,6 +1032,307 @@ class _AutomationsViewState extends State<AutomationsView> {
           ),
         ],
       ),
+    );
+  }
+
+  void _showSopHelpDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DesktopTheme.bgSurfaceElevated,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        title: Row(
+          children: [
+            const Icon(FontAwesomeIcons.circleQuestion, size: 18, color: DesktopTheme.accentCyan),
+            const SizedBox(width: 10),
+            Text(
+              'Справка: Архитектура и назначение SOP',
+              style: TextStyle(
+                color: DesktopTheme.textPrimary,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        content: SizedBox(
+          width: 540,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Что такое SOP (Standard Operating Procedure)?',
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.bold,
+                    color: DesktopTheme.accentCyan,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'SOP — это стандартизированные сценарии автоматизации, представленные в виде направленного ациклического графа (DAG). В отличие от обычного диалога в чате, где агент может забыть важный шаг, SOP гарантирует строгое пошаговое выполнение регламента.',
+                  style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted, height: 1.4),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Зачем нужны SOP пайплайны?',
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.bold,
+                    color: DesktopTheme.accentCyan,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                _buildHelpFeatureItem(
+                  FontAwesomeIcons.bullseye,
+                  'Детерминированность',
+                  'Процессы аудита безопасности, сборки релизов и код-ревью выполняются по предсказуемому маршруту с проверкой каждого шага.',
+                ),
+                const SizedBox(height: 8),
+                _buildHelpFeatureItem(
+                  FontAwesomeIcons.shieldHalved,
+                  'Шлюзы безопасности (Human-in-the-Loop)',
+                  'Любые критические операции (изменение зависимостей, публикация артефактов, слияние веток) останавливают поток и требуют подтверждения оператором.',
+                ),
+                const SizedBox(height: 8),
+                _buildHelpFeatureItem(
+                  FontAwesomeIcons.brain,
+                  'Интеграция с памятью OB2H',
+                  'Все результаты, замеры Blast Radius и решения фиксируются в долгосрочную память и граф знаний для других сессий.',
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Типы узлов в графе:',
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.bold,
+                    color: DesktopTheme.accentCyan,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _buildNodeTypeBadge('Триггер', FontAwesomeIcons.bolt, const Color(0xFF38BDF8)),
+                    _buildNodeTypeBadge('Инструмент (Tool)', FontAwesomeIcons.wrench, const Color(0xFFA78BFA)),
+                    _buildNodeTypeBadge('Анализ / Шаг', FontAwesomeIcons.circleCheck, DesktopTheme.accentCyan),
+                    _buildNodeTypeBadge('Шлюз согласования', FontAwesomeIcons.shieldHalved, const Color(0xFFF59E0B)),
+                    _buildNodeTypeBadge('Артефакт / Релиз', FontAwesomeIcons.boxArchive, const Color(0xFF10B981)),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: DesktopTheme.accentCyan,
+              foregroundColor: Colors.black,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Понятно'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHelpFeatureItem(IconData icon, String title, String desc) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(top: 2),
+          child: Icon(icon, size: 13, color: DesktopTheme.accentCyan),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: RichText(
+            text: TextSpan(
+              style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted, height: 1.35),
+              children: [
+                TextSpan(
+                  text: '$title: ',
+                  style: TextStyle(color: DesktopTheme.textPrimary, fontWeight: FontWeight.bold),
+                ),
+                TextSpan(text: desc),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildNodeTypeBadge(String label, IconData icon, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.12),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withOpacity(0.4)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 11, color: color),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: color),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSopEducationalGuide() {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 24),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurfaceElevated,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: DesktopTheme.accentCyan.withOpacity(0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => isSopGuideExpanded = !isSopGuideExpanded),
+            borderRadius: BorderRadius.circular(10),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: DesktopTheme.accentCyan.withOpacity(0.12),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(FontAwesomeIcons.circleInfo, size: 13, color: DesktopTheme.accentCyan),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Гид по SOP пайплайнам (Архитектура и назначение)',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            color: DesktopTheme.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'Стандартные процедуры автоматизируют сложные регламенты разработки с защитой через шлюзы согласования.',
+                          style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Icon(
+                    isSopGuideExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                    color: DesktopTheme.textMuted,
+                    size: 18,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (isSopGuideExpanded) ...[
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: _buildGuideFeatureColumn(
+                          FontAwesomeIcons.bullseye,
+                          'Зачем это нужно?',
+                          'Вместо непредсказуемого диалога в чате SOP выполняет цепочку задач строго по регламенту (сборка, проверка уязвимостей, аудит PR).',
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: _buildGuideFeatureColumn(
+                          FontAwesomeIcons.shieldHalved,
+                          'Контроль человеком',
+                          'Опасные операции (изменение lock-файлов, слияние веток) останавливаются на шлюзах безопасности и ждут вашего аппрува.',
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: _buildGuideFeatureColumn(
+                          FontAwesomeIcons.bolt,
+                          'Автозапуск и триггеры',
+                          'Пайплайны могут запускаться вручную кнопкой «Запустить SOP», по Git-событиям (pre-commit, tag) или по cron-расписанию.',
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      Text(
+                        'Легенда графа:',
+                        style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.bold, color: DesktopTheme.textMuted),
+                      ),
+                      const SizedBox(width: 10),
+                      _buildNodeTypeBadge('Триггер', FontAwesomeIcons.bolt, const Color(0xFF38BDF8)),
+                      const SizedBox(width: 6),
+                      _buildNodeTypeBadge('Инструмент', FontAwesomeIcons.wrench, const Color(0xFFA78BFA)),
+                      const SizedBox(width: 6),
+                      _buildNodeTypeBadge('Анализ', FontAwesomeIcons.circleCheck, DesktopTheme.accentCyan),
+                      const SizedBox(width: 6),
+                      _buildNodeTypeBadge('Шлюз согласования', FontAwesomeIcons.shieldHalved, const Color(0xFFF59E0B)),
+                      const SizedBox(width: 6),
+                      _buildNodeTypeBadge('Артефакт', FontAwesomeIcons.boxArchive, const Color(0xFF10B981)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGuideFeatureColumn(IconData icon, String title, String text) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Icon(icon, size: 12, color: DesktopTheme.accentCyan),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                text,
+                style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted, height: 1.3),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 
@@ -1119,12 +1601,12 @@ class _AutomationsViewState extends State<AutomationsView> {
                         ],
                       ),
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.delete_outline, size: 15, color: Color(0xFF64748B)),
-                      onPressed: () {
-                        setState(() => scheduledTasks.remove(t));
-                        _saveScheduledTasks();
-                      },
+                      IconButton(
+                        icon: const Icon(Icons.delete_outline, size: 15, color: Color(0xFF64748B)),
+                        onPressed: () {
+                          setState(() => scheduledTasks.remove(t));
+                          _saveScheduledTasks();
+                        },
                       padding: EdgeInsets.zero,
                       constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
                     ),
