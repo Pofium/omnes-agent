@@ -473,6 +473,82 @@ pub fn evaluate_escalation(
 
 ---
 
+### Этап 9. Backend: Token Compression Proxy Stack & Model-Family Routing
+
+> **Исследование стека компрессии на рабочей машине:**
+> На системе развернут проверенный стек сжатия контекста:
+> - **`Headroom` (HTTP `127.0.0.1:8787`)**: Реверсивный прокси сжатия вывода инструментов: JSON (SmartCrusher −92%), AST-код (−47%), текст ML (−73%).
+> - **`sqz` (v1.3.0 CLI + hook)**: Дедупликация повторного чтения файлов в 13-токенные контентные хэши (−92%), сжатие длинного вывода консоли (`sqz compress`).
+> - **`mcp-compressor` (Atlassian Labs, Rust)**: Сжатие JSON-схем и описаний MCP инструментов на 70–97%.
+> - **`pxpipe` (HTTP `127.0.0.1:47821`)**: Оптический шлюз: текст → PNG → vision-канал для моделей с дешевым зрением (~60% экономии).
+> - **`context-mode`**: Изоляция сырых тяжелых данных вне контекста LLM с быстрым FTS5-поиском.
+> - **`distil-llm`** (в `~/compressor-venv`): Легковесное токен-левел сжатие (альтернатива тяжелому LLMLingua).
+
+#### 9.1 Архитектура `TokenCompressionMiddleware` в `omnesagent-runtime`
+- Перехват в [`dispatcher.rs`](file:///c:/Projects/Omnes-agent/backend/crates/omnesagent-runtime/src/agent/dispatcher.rs) перед записью в `ToolResults`:
+  1. Если вывод инструмента содержит JSON > 1 КБ → отправка через Headroom SmartCrusher (`:8787`).
+  2. Если инструмент `view_file` возвращает файл, который уже читался в этой сессии → дедупликация через `sqz` в 13-токенную ссылку.
+  3. Длинный вывод shell-команд > 2 КБ → сжатие через `sqz compress` / Headroom.
+  4. Сжатие MCP ToolSpecs: прогон JSON-схем через алгоритм `mcp-compressor` перед отправкой в системный промпт.
+
+#### 9.2 Модель-специфичные правила маршрутизации (`ModelFamilyProxyRouter`)
+- **DeepSeek (V3, R1, deepx)**:
+  - 100% нативный Prompt Cache (~99% hit rate).
+  - Использовать `sqz` дедупликацию.
+  - **Байпас `pxpipe`**: `pxpipe` для DeepSeek отключен (pass-through, так как у DeepSeek текст дешевле оптического канала).
+- **Claude / Anthropic (Sonnet 3.7, Opus, Haiku)**:
+  - Статический префикс Prompt Caching (эфемеральное кэширование системного промпта + тулов).
+  - `Headroom` сжатие tool-outputs.
+  - `sqz` дедупликация.
+  - Включение `pxpipe` (:47821) для больших текстовых массивов/логов.
+- **OpenAI / GPT-4o / GPT-5**:
+  - `Headroom` SmartCrusher для tool outputs.
+  - `sqz` дедупликация.
+  - `mcp-compressor` для схем инструментов.
+- **Qwen / Kimi / MiMo / Trae / OpenCode**:
+  - `mcp-compressor`: обязательное сжатие схем MCP (−70%…−97%).
+  - `Headroom` SmartCrusher для JSON/AST.
+  - `sqz` для повторных файлов.
+
+#### 9.3 Graceful Fallback & Healthcheck
+- Если локальные демоны (`Headroom :8787`, `pxpipe :47821`) не запущены, бэкенд не падает, а прозрачно пропускает сырые данные (Zero Downtime).
+- Проверка доступности портов при старте шлюза с логом в телеметрию.
+
+---
+
+### Этап 10. Frontend: Переработка Студии автоматизации (SOP / Workflow Studio)
+
+> **Проблема:** Пользователю непонятно назначение пайплайнов («зачем это нужно»), а переключение между ними зависает из-за 10-секундного HTTP-таймаута, при этом все пайплайны отображают один и тот же шаблонный мок-граф.
+
+#### 10.1 Устранение задержек переключения в `SopStudioController`
+- **Мгновенный оптический switch**: При клике на SOP в списке слева, контроллер сразу рендерит специализированный граф из локального реестра без ожидания HTTP-ответа.
+- **Быстрый таймаут**: `httpClient.getSopGraph` вызывается с таймаутом 1.5 секунды; при отсутствии ответа шлюза используется локальная преднастроенная топология.
+
+#### 10.2 Дифференциация и реалистичные DAG-графы
+Каждый регламентный пайплайн получает собственный состав шагов и смысловые узлы:
+1. **`security-audit` (Аудит безопасности зависимостей)**:
+   - `Trigger (Manual/Cron)` → `Cargo/NPM Audit Scan` → `Vulnerability CVE Filter` → `Approval Gate (Обновление уязвимых пакетов)` → `Generate Security Report`.
+2. **`release-build` (Сборка и валидация релиза)**:
+   - `Trigger` → `Static Analysis (cargo clippy & flutter analyze)` → `Unit & Integration Tests` → `Build Release Binaries (Cargo & Flutter)` → `Checksum & Artifact Packing`.
+3. **`vps-proxy-sync` (Синхронизация прокси и VPS)**:
+   - `Cron Trigger` → `Ping VPS Bridge (193.109.79.30)` → `Check SOCKS5 / SSH Tunnel` → `Restart Dead Daemons` → `Health Check Latency Verification`.
+4. **`code-review-gate` (Автономное ревью PR / коммитов)**:
+   - `Git Hook Trigger` → `Git Diff Extractor` → `OB2H Blast Radius Analysis` → `AI Reviewer Critique` → `Approval Gate (Merge / Request Changes)`.
+
+#### 10.3 Пользовательский интерфейс и гид «Зачем нужны SOP»
+- В шапке студии размещается понятная карточка-гид с объяснением концепции:
+  - *«SOP (Standard Operating Procedure) — это автоматизированные регламентные процессы агента. Они выполняют повторяющиеся цепочки задач (ночной аудит, релизная сборка, проверка серверов) по расписанию или по кнопке, с обязательными точками согласования (Approval Gate) при опасных операциях.»*
+- Векторные иконки для каждого типа узла:
+  - `Trigger` (`FontAwesomeIcons.bolt` / `Icons.play_circle_outline`)
+  - `Tool Action` (`FontAwesomeIcons.wrench` / `Icons.build_outlined`)
+  - `Validation Step` (`FontAwesomeIcons.checkDouble` / `Icons.verified_outlined`)
+  - `Approval Gate` (`FontAwesomeIcons.shieldHalved` / `Icons.lock_outline`)
+  - `Artifact` (`FontAwesomeIcons.boxArchive` / `Icons.inventory_2_outlined`)
+- **Строго без эмодзи** — только SVG и системные иконки.
+- Синхронизация между `frontend/desktop` и `frontend/web`.
+
+---
+
 ## 4. Приоритеты и фазы внедрения
 
 ```mermaid
@@ -531,6 +607,26 @@ gantt
 - [x] **4.3** Оптимизация Prompt Caching (Static Prefix Pattern)
 - [x] **4.4** Semantic Tool Retrieval (MCP top-K через OB2H)
 - [x] **4.5** Телеметрия и наблюдаемость решений Triage Router (`omnesagent_log` record)
+
+#### Фаза 5: Бэкенд — Интеграция прокси-стека сжатия токенов и модель-специфичной компрессии
+- [ ] **5.1** Архитектура `TokenCompressionMiddleware` в `omnesagent-runtime/src/agent/dispatcher.rs` для перехвата tool outputs
+- [ ] **5.2** Интеграция дедупликатора файлов `sqz` (v1.3.0 pattern): замена повторно прочитанных файлов на 13-токенные контентные ссылки (-92% на повторах)
+- [ ] **5.3** Клиент к `Headroom` (HTTP `127.0.0.1:8787`): сжатие JSON через SmartCrusher (-92%), сжатие AST кода (-47%) и текстов (-73%) с обратимым кэшированием
+- [ ] **5.4** Интеграция `mcp-compressor` (Atlassian Labs, Rust): сжатие JSON-схем и описаний MCP-инструментов перед инжекцией в LLM context (-70%…-97%)
+- [ ] **5.5** Модель-специфичный роутер сжатия (`ModelFamilyProxyRouter`):
+  - **DeepSeek**: нативный prompt-cache (~99% hit) + `sqz` дедупликация, прямой обход `pxpipe` (pass-through).
+  - **Claude / Anthropic**: статический префикс Prompt Caching + Headroom (tool outputs) + `sqz` + `pxpipe` (:47821, текст → PNG для vision-канала со скидкой ~60%).
+  - **OpenAI / GPT-4o / GPT-5**: Headroom + `sqz` + `mcp-compressor`.
+  - **Qwen / Kimi / MiMo**: `mcp-compressor` + Headroom + `sqz`.
+- [ ] **5.6** Lifecycle-менеджер локальных компрессоров: проверка доступности портов (`8787`, `47821`), graceful fallback при неактивных демонах
+
+#### Фаза 6: Фронтенд (Desktop & Web) — Редизайн и оптимизация Студии автоматизации (SOP / Workflow Studio)
+- [ ] **6.1** Устранение зависаний и задержек при переключении пайплайнов в `SopStudioController`: оптимистичный мгновенный выбор, кэширование графов, сокращение таймаута шлюза с 10 сек до 1.5 сек с fallback
+- [ ] **6.2** Дифференциация DAG-графов: уникальные, подробные узлы и шаги для каждого сценария (`security-audit`, `release-build`, `vps-proxy-sync`, `code-review-gate`, `auto-refactor`)
+- [ ] **6.3** Информационный модуль «Что такое SOP и зачем нужны пайплайны»: доступное объяснение автономных процедур агента, фонового выполнения и экономии времени разработчика
+- [ ] **6.4** Информационные бейджи и всплывающие подсказки к узлам графа: Триггер (Trigger) → Инструмент (Tool) → Валидация (Step) → Шлюз согласования (Approval Gate) → Доставка артефактов (Deliverable) с векторными иконками (без эмодзи)
+- [ ] **6.5** Синхронизация и выравнивание реализации Студии SOP между `frontend/desktop` и `frontend/web`
+- [ ] **6.6** Интерактивная панель мониторинга запусков: отображение статусов узлов в реальном времени, кнопка ручного подтверждения опасных операций в шлюзе (Approval Gate)
 
 ---
 
