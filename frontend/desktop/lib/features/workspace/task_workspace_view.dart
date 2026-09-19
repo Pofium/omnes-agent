@@ -533,6 +533,142 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               ),
             ),
 
+            const SizedBox(width: 14),
+
+            // Triage Router Mode Badge (Interactive switcher & status)
+            Obx(() {
+              final mode = widget.controller.currentSessionMode.value;
+              Color modeColor;
+              IconData modeIcon;
+              String modeLabel;
+
+              switch (mode.toLowerCase()) {
+                case 'task':
+                case 'code':
+                  modeColor = const Color(0xFF10B981);
+                  modeIcon = Icons.terminal_outlined;
+                  modeLabel = 'Task / Code';
+                  break;
+                case 'explore':
+                  modeColor = const Color(0xFF8B5CF6);
+                  modeIcon = Icons.travel_explore_outlined;
+                  modeLabel = 'Explore / Search';
+                  break;
+                case 'ralph':
+                  modeColor = const Color(0xFFF59E0B);
+                  modeIcon = Icons.psychology_outlined;
+                  modeLabel = 'Ralph Loop';
+                  break;
+                case 'admin':
+                  modeColor = const Color(0xFFEF4444);
+                  modeIcon = Icons.admin_panel_settings_outlined;
+                  modeLabel = 'Admin / Ops';
+                  break;
+                case 'chat':
+                default:
+                  modeColor = const Color(0xFF38BDF8);
+                  modeIcon = Icons.chat_bubble_outline;
+                  modeLabel = 'Direct Chat';
+                  break;
+              }
+
+              return PopupMenuButton<String>(
+                tooltip: 'Режим маршрутизатора агента (Triage Router Mode)',
+                color: DesktopTheme.bgSurfaceElevated,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  side: BorderSide(color: DesktopTheme.borderSubtle),
+                ),
+                offset: const Offset(0, 26),
+                onSelected: (newMode) {
+                  widget.controller.currentSessionMode.value = newMode;
+                  widget.controller.showTodoWidget.value = (newMode == 'task' || newMode == 'ralph');
+                },
+                itemBuilder: (ctx) => [
+                  PopupMenuItem(
+                    value: 'chat',
+                    height: 36,
+                    child: Row(
+                      children: const [
+                        Icon(Icons.chat_bubble_outline, size: 14, color: Color(0xFF38BDF8)),
+                        SizedBox(width: 8),
+                        Text('Direct Chat (Прямой диалог без тулзов)', style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'task',
+                    height: 36,
+                    child: Row(
+                      children: const [
+                        Icon(Icons.terminal_outlined, size: 14, color: Color(0xFF10B981)),
+                        SizedBox(width: 8),
+                        Text('Task / Code (Разработка с тулзами и Todo)', style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'explore',
+                    height: 36,
+                    child: Row(
+                      children: const [
+                        Icon(Icons.travel_explore_outlined, size: 14, color: Color(0xFF8B5CF6)),
+                        SizedBox(width: 8),
+                        Text('Explore / Search (Исследование кодовой базы)', style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'ralph',
+                    height: 36,
+                    child: Row(
+                      children: const [
+                        Icon(Icons.psychology_outlined, size: 14, color: Color(0xFFF59E0B)),
+                        SizedBox(width: 8),
+                        Text('Ralph Loop (Автономный цикл валидации)', style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'admin',
+                    height: 36,
+                    child: Row(
+                      children: const [
+                        Icon(Icons.admin_panel_settings_outlined, size: 14, color: Color(0xFFEF4444)),
+                        SizedBox(width: 8),
+                        Text('Admin / Ops (Инфраструктура и сервер)', style: TextStyle(fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                ],
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
+                  decoration: BoxDecoration(
+                    color: modeColor.withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: modeColor.withOpacity(0.4), width: 0.8),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(modeIcon, size: 11, color: modeColor),
+                      const SizedBox(width: 5),
+                      Text(
+                        modeLabel,
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w600,
+                          color: modeColor,
+                        ),
+                      ),
+                      const SizedBox(width: 3),
+                      Icon(Icons.keyboard_arrow_down, size: 11, color: modeColor.withOpacity(0.8)),
+                    ],
+                  ),
+                ),
+              );
+            }),
+
             const Spacer(),
 
             // Right side: 1. Git Changes Badge

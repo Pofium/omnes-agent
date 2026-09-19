@@ -14,6 +14,7 @@ import '../features/onboarding/user_onboarding_dialog.dart';
 import '../features/workspace/task_workspace_controller.dart';
 import '../theme/desktop_theme.dart';
 import '../utils/desktop_i18n.dart';
+import '../utils/project_scaffolding.dart';
 
 class DesktopProject {
   final String id;
@@ -23,6 +24,11 @@ class DesktopProject {
   List<String> suggestedSkills;
   List<String> suggestedAgents;
   List<String> suggestedTools;
+  String? customInstructions;
+  String colorHex;
+  String iconName;
+  bool gitInitialized;
+  bool ob2hIndexed;
 
   DesktopProject({
     required this.id,
@@ -32,6 +38,11 @@ class DesktopProject {
     this.suggestedSkills = const [],
     this.suggestedAgents = const [],
     this.suggestedTools = const [],
+    this.customInstructions,
+    this.colorHex = '#00D2FF',
+    this.iconName = 'code',
+    this.gitInitialized = false,
+    this.ob2hIndexed = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -42,6 +53,11 @@ class DesktopProject {
         'suggestedSkills': suggestedSkills,
         'suggestedAgents': suggestedAgents,
         'suggestedTools': suggestedTools,
+        'customInstructions': customInstructions,
+        'colorHex': colorHex,
+        'iconName': iconName,
+        'gitInitialized': gitInitialized,
+        'ob2hIndexed': ob2hIndexed,
       };
 
   factory DesktopProject.fromJson(Map<String, dynamic> j) => DesktopProject(
@@ -52,6 +68,11 @@ class DesktopProject {
         suggestedSkills: List<String>.from(j['suggestedSkills'] ?? []),
         suggestedAgents: List<String>.from(j['suggestedAgents'] ?? []),
         suggestedTools: List<String>.from(j['suggestedTools'] ?? []),
+        customInstructions: j['customInstructions']?.toString(),
+        colorHex: j['colorHex']?.toString() ?? '#00D2FF',
+        iconName: j['iconName']?.toString() ?? 'code',
+        gitInitialized: j['gitInitialized'] == true,
+        ob2hIndexed: j['ob2hIndexed'] == true,
       );
 }
 
@@ -142,6 +163,8 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
   // Active Project for File Tree mode
   DesktopProject? activeFileTreeProject;
+  String fileTreeSearchQuery = '';
+  final TextEditingController fileTreeSearchCtrl = TextEditingController();
 
   // 20 Group icons catalog
   static const List<Map<String, dynamic>> groupIconsCatalog = [
@@ -679,6 +702,35 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
   Widget _buildProjectItem(DesktopProject proj, List<TaskSession> sessions) {
     final isCollapsed = collapsedSections.contains(proj.name);
 
+    Color projColor = const Color(0xFF00D2FF);
+    try {
+      final clean = proj.colorHex.replaceAll('#', '');
+      if (clean.length == 6) {
+        projColor = Color(int.parse('0xFF$clean'));
+      }
+    } catch (_) {}
+
+    IconData projIcon = Icons.folder_outlined;
+    switch (proj.iconName) {
+      case 'code':
+        projIcon = Icons.code_rounded;
+        break;
+      case 'terminal':
+        projIcon = Icons.terminal_rounded;
+        break;
+      case 'globe':
+        projIcon = Icons.language_rounded;
+        break;
+      case 'cpu':
+        projIcon = Icons.memory_rounded;
+        break;
+      case 'layers':
+        projIcon = Icons.layers_outlined;
+        break;
+      default:
+        projIcon = Icons.folder_outlined;
+    }
+
     return Container(
       margin: const EdgeInsets.only(bottom: 4),
       child: Column(
@@ -705,7 +757,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     color: DesktopTheme.textMuted,
                   ),
                   const SizedBox(width: 4),
-                  Icon(Icons.folder_outlined, size: 13, color: const Color(0xFF00D2FF)),
+                  Icon(projIcon, size: 13, color: projColor),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
@@ -738,7 +790,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   // Button to browse project file tree
                   IconButton(
                     tooltip: 'Открыть дерево файлов проекта',
-                    icon: const Icon(Icons.folder_open, size: 14, color: Color(0xFF00D2FF)),
+                    icon: Icon(Icons.folder_open, size: 14, color: projColor),
                     onPressed: () {
                       setState(() {
                         activeFileTreeProject = proj;
@@ -762,6 +814,21 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     onSelected: (val) {
                       if (val == 'tree') {
                         setState(() => activeFileTreeProject = proj);
+                      } else if (val == 'explorer') {
+                        ProjectScaffoldingService.openInExplorer(proj.path);
+                      } else if (val == 'code') {
+                        ProjectScaffoldingService.openInCode(proj.path);
+                      } else if (val == 'terminal') {
+                        ProjectScaffoldingService.openInTerminal(proj.path);
+                      } else if (val == 'ob2h') {
+                        ProjectScaffoldingService.runOb2hScanAsync(proj.path);
+                        Get.snackbar(
+                          'OB2H AST-сканирование',
+                          'Индексация проекта запущена в фоновом режиме',
+                          backgroundColor: const Color(0xFF0F172A),
+                          colorText: const Color(0xFFA855F7),
+                          snackPosition: SnackPosition.BOTTOM,
+                        );
                       } else if (val == 'rename') {
                         _showRenameProjectDialog(proj);
                       } else if (val == 'path') {
@@ -776,12 +843,45 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     itemBuilder: (ctx) => [
                       PopupMenuItem(
                         value: 'tree',
-                        child: Row(children: const [
-                          Icon(Icons.folder_open, size: 14),
-                          SizedBox(width: 8),
-                          Text('Открыть дерево файлов проекта'),
+                        child: Row(children: [
+                          Icon(Icons.folder_open, size: 14, color: projColor),
+                          const SizedBox(width: 8),
+                          const Text('Открыть дерево файлов проекта'),
                         ]),
                       ),
+                      PopupMenuItem(
+                        value: 'explorer',
+                        child: Row(children: const [
+                          Icon(Icons.folder_special_outlined, size: 14, color: Color(0xFF00D2FF)),
+                          SizedBox(width: 8),
+                          Text('Открыть в Проводнике'),
+                        ]),
+                      ),
+                      PopupMenuItem(
+                        value: 'code',
+                        child: Row(children: const [
+                          Icon(Icons.code, size: 14, color: Color(0xFF38BDF8)),
+                          SizedBox(width: 8),
+                          Text('Открыть в VS Code / IDE'),
+                        ]),
+                      ),
+                      PopupMenuItem(
+                        value: 'terminal',
+                        child: Row(children: const [
+                          Icon(Icons.terminal, size: 14, color: Color(0xFF10B981)),
+                          SizedBox(width: 8),
+                          Text('Открыть терминал в папке'),
+                        ]),
+                      ),
+                      PopupMenuItem(
+                        value: 'ob2h',
+                        child: Row(children: const [
+                          Icon(Icons.psychology_outlined, size: 14, color: Color(0xFFA855F7)),
+                          SizedBox(width: 8),
+                          Text('Переиндексировать в OB2H'),
+                        ]),
+                      ),
+                      const PopupMenuDivider(height: 1),
                       PopupMenuItem(
                         value: 'rename',
                         child: Row(children: const [
@@ -1145,6 +1245,52 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           ),
         ),
 
+        // File Search & Filter Bar
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgSurfaceElevated,
+            border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.filter_list, size: 13, color: Color(0xFF94A3B8)),
+              const SizedBox(width: 6),
+              Expanded(
+                child: TextField(
+                  controller: fileTreeSearchCtrl,
+                  style: TextStyle(fontSize: 11, color: DesktopTheme.textPrimary),
+                  decoration: InputDecoration(
+                    hintText: 'Фильтр файлов (*.dart, *.rs)...',
+                    hintStyle: TextStyle(fontSize: 10, color: DesktopTheme.textMuted),
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 4),
+                    border: InputBorder.none,
+                  ),
+                  onChanged: (val) {
+                    setState(() {
+                      fileTreeSearchQuery = val.trim().toLowerCase();
+                    });
+                  },
+                ),
+              ),
+              if (fileTreeSearchQuery.isNotEmpty)
+                IconButton(
+                  icon: const Icon(Icons.close, size: 12),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
+                  color: DesktopTheme.textMuted,
+                  onPressed: () {
+                    setState(() {
+                      fileTreeSearchCtrl.clear();
+                      fileTreeSearchQuery = '';
+                    });
+                  },
+                ),
+            ],
+          ),
+        ),
+
         // File list with recursive folder expansion
         Expanded(
           child: ListView(
@@ -1188,11 +1334,23 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     }
 
     final List<Widget> widgets = [];
+    final hasSearch = fileTreeSearchQuery.isNotEmpty;
+
     for (final ent in entities) {
       final isDir = universal_io.FileSystemEntity.isDirectorySync(ent.path);
       final cleanPath = ent.path.replaceAll(r'\', '/');
       final name = cleanPath.split('/').lastWhere((s) => s.isNotEmpty, orElse: () => cleanPath);
-      final isExpanded = expandedProjectDirs.contains(ent.path);
+
+      // Apply search filter if active
+      if (hasSearch && !isDir) {
+        final matchesName = name.toLowerCase().contains(fileTreeSearchQuery);
+        final matchesPath = cleanPath.toLowerCase().contains(fileTreeSearchQuery);
+        if (!matchesName && !matchesPath) {
+          continue;
+        }
+      }
+
+      final isExpanded = hasSearch || expandedProjectDirs.contains(ent.path);
       final cleanRoot = rootPath.replaceAll(r'\', '/');
       final relativePath = cleanPath.startsWith(cleanRoot)
           ? cleanPath.substring(cleanRoot.length).replaceAll(RegExp(r'^/+'), '')
@@ -1628,46 +1786,63 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
   void _showAddProjectDialog() {
     final nameCtrl = TextEditingController();
     final pathCtrl = TextEditingController(text: _getDefaultInitialPath());
-    String selectedDomain = 'Rust / Системная разработка';
 
-    final Map<String, Map<String, List<String>>> domainRecommendations = {
-      'Rust / Системная разработка': {
-        'agents': ['chief', 'code-agent'],
-        'tools': ['cargo', 'rust-analyzer', 'git'],
-        'skills': ['ob2h', 'testsprite'],
-      },
-      'Веб-приложения / Frontend': {
-        'agents': ['web-agent'],
-        'tools': ['npm', 'chrome-devtools', 'playwright'],
-        'skills': ['magicui', 'shadcn-ui'],
-      },
-      'AI / Data Science': {
-        'agents': ['chief'],
-        'tools': ['python', 'fetch'],
-        'skills': ['science', 'pubchem-database'],
-      },
-      'DevOps / Инфраструктура': {
-        'agents': ['ops-agent'],
-        'tools': ['docker', 'cloudrun', 'git'],
-        'skills': ['vps_bridge'],
-      },
-      'Автоматизация': {
-        'agents': ['chief'],
-        'tools': ['playwright', 'fetch', 'filesystem'],
-        'skills': ['workflow-skill-creator'],
-      },
-      'Общее': {
-        'agents': ['chief'],
-        'tools': ['filesystem', 'git'],
-        'skills': ['ob2h'],
-      },
-    };
+    final instructionsCtrl = TextEditingController();
+    bool initGit = true;
+    bool createAgentsMd = true;
+    bool createReadme = true;
+    bool runOb2hScan = true;
+    String selectedColor = '#00D2FF';
+    String selectedIcon = 'code';
+    bool isScaffolding = false;
+
+    // Initial pre-production analysis
+    ProjectAnalysisResult analysis = ProjectAnalyzer.analyze(pathCtrl.text);
+    if (analysis.hasGit) initGit = false;
+    if (analysis.hasAgentsMd) createAgentsMd = false;
+
+    final availableColors = [
+      '#00D2FF',
+      '#10B981',
+      '#8B5CF6',
+      '#F59E0B',
+      '#EC4899',
+      '#38BDF8',
+    ];
+
+    final availableIcons = [
+      {'name': 'code', 'icon': Icons.code},
+      {'name': 'terminal', 'icon': Icons.terminal},
+      {'name': 'rocket', 'icon': Icons.rocket_launch_outlined},
+      {'name': 'shield', 'icon': Icons.security_outlined},
+      {'name': 'cpu', 'icon': Icons.memory_outlined},
+      {'name': 'box', 'icon': Icons.inventory_2_outlined},
+    ];
+
+    IconData getStackIcon(String iconKey) {
+      switch (iconKey) {
+        case 'rust':
+          return FontAwesomeIcons.rust;
+        case 'web':
+          return FontAwesomeIcons.code;
+        case 'flutter':
+          return Icons.flutter_dash;
+        case 'python':
+          return FontAwesomeIcons.python;
+        case 'go':
+          return FontAwesomeIcons.golang;
+        case 'php':
+          return FontAwesomeIcons.php;
+        default:
+          return Icons.folder_open_outlined;
+      }
+    }
 
     showDialog(
       context: context,
+      barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDlgState) {
-          final rec = domainRecommendations[selectedDomain] ?? domainRecommendations['Общее']!;
           final folderExists = _doesFolderExist(pathCtrl.text);
 
           return AlertDialog(
@@ -1678,294 +1853,551 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
             ),
             title: Row(
               children: [
-                const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00D2FF), size: 18),
-                const SizedBox(width: 8),
-                Text('Создать новый проект', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
+                Container(
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00D2FF).withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: const Icon(Icons.psychology_outlined, color: Color(0xFF00D2FF), size: 20),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Подключение и анализ проекта', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 2),
+                      Text('Предпроизводственный анализ, архитектурные правила и интеграция с агентом', style: TextStyle(color: DesktopTheme.textMuted, fontSize: 11)),
+                    ],
+                  ),
+                ),
               ],
             ),
             content: SizedBox(
-              width: 500,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Название проекта:', style: TextStyle(fontSize: 12, color: DesktopTheme.textSecondary)),
-                  const SizedBox(height: 6),
-                  TextField(
-                    controller: nameCtrl,
-                    style: TextStyle(fontSize: 13, color: DesktopTheme.textPrimary),
-                    decoration: InputDecoration(
-                      hintText: 'Например: OmnesAgent Engine',
-                      hintStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
-                      filled: true,
-                      fillColor: DesktopTheme.bgSurfaceElevated,
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-
-                  Text('Папка на диске:', style: TextStyle(fontSize: 12, color: DesktopTheme.textSecondary)),
-                  const SizedBox(height: 6),
-                  TextField(
-                    controller: pathCtrl,
-                    style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
-                    decoration: InputDecoration(
-                      hintText: universal_io.Platform.isWindows ? r'C:\Projects\my-project' : '/home/user/projects/my-project',
-                      hintStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
-                      filled: true,
-                      fillColor: DesktopTheme.bgSurfaceElevated,
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
-                      suffixIcon: Tooltip(
-                        message: 'Выбрать папку через проводник',
-                        child: IconButton(
-                          icon: const Icon(Icons.folder_open_outlined, color: Color(0xFF00D2FF), size: 18),
-                          onPressed: () async {
-                            final picked = await _pickFolderNative(initialPath: pathCtrl.text);
-                            if (picked != null && picked.isNotEmpty) {
-                              pathCtrl.text = picked;
-                              if (nameCtrl.text.trim().isEmpty) {
-                                final normalized = picked.replaceAll(r'\', '/');
-                                final segments = normalized.split('/').where((s) => s.isNotEmpty).toList();
-                                if (segments.isNotEmpty) {
-                                  nameCtrl.text = segments.last;
-                                }
-                              }
-                              setDlgState(() {});
-                            }
-                          },
-                        ),
+              width: 580,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // 1. Имя проекта
+                    Text('Название проекта:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textSecondary)),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: nameCtrl,
+                      style: TextStyle(fontSize: 13, color: DesktopTheme.textPrimary),
+                      decoration: InputDecoration(
+                        hintText: 'Например: omnes-agent-core',
+                        hintStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
+                        filled: true,
+                        fillColor: DesktopTheme.bgSurfaceElevated,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
                       ),
                     ),
-                    onChanged: (_) => setDlgState(() {}),
-                  ),
-                  if (pathCtrl.text.trim().isNotEmpty) ...[
+                    const SizedBox(height: 12),
+
+                    // 2. Путь на диске
+                    Text('Папка на диске:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textSecondary)),
                     const SizedBox(height: 6),
-                    Row(
-                      children: [
-                        Icon(
-                          folderExists ? Icons.check_circle_rounded : Icons.info_outline_rounded,
-                          size: 14,
-                          color: folderExists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
-                        ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            folderExists
-                                ? 'Папка найдена на диске'
-                                : 'Папка не существует на диске',
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: folderExists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
-                            ),
-                          ),
-                        ),
-                        if (!folderExists)
-                          InkWell(
-                            onTap: () async {
-                              final err = await _createDirectory(pathCtrl.text.trim());
-                              if (err == null) {
+                    TextField(
+                      controller: pathCtrl,
+                      style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
+                      decoration: InputDecoration(
+                        hintText: universal_io.Platform.isWindows ? r'C:\Projects\my-project' : '/home/user/projects/my-project',
+                        hintStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 12),
+                        filled: true,
+                        fillColor: DesktopTheme.bgSurfaceElevated,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                        suffixIcon: Tooltip(
+                          message: 'Выбрать папку через проводник',
+                          child: IconButton(
+                            icon: const Icon(Icons.folder_open_outlined, color: Color(0xFF00D2FF), size: 18),
+                            onPressed: () async {
+                              final picked = await _pickFolderNative(initialPath: pathCtrl.text);
+                              if (picked != null && picked.isNotEmpty) {
+                                pathCtrl.text = picked;
+                                if (nameCtrl.text.trim().isEmpty) {
+                                  final normalized = picked.replaceAll(r'\', '/');
+                                  final segments = normalized.split('/').where((s) => s.isNotEmpty).toList();
+                                  if (segments.isNotEmpty) {
+                                    nameCtrl.text = segments.last;
+                                  }
+                                }
+                                analysis = ProjectAnalyzer.analyze(picked);
+                                if (analysis.hasGit) initGit = false;
+                                if (analysis.hasAgentsMd) createAgentsMd = false;
                                 setDlgState(() {});
-                                Get.snackbar(
-                                  'Папка создана',
-                                  'Папка успешно создана на диске',
-                                  backgroundColor: const Color(0xFF0F172A),
-                                  colorText: const Color(0xFF00D2FF),
-                                  snackPosition: SnackPosition.BOTTOM,
-                                );
-                              } else {
-                                Get.snackbar(
-                                  'Ошибка создания папки',
-                                  err,
-                                  backgroundColor: const Color(0xFF450A0A),
-                                  colorText: const Color(0xFFEF4444),
-                                  snackPosition: SnackPosition.BOTTOM,
-                                );
                               }
                             },
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF00D2FF).withOpacity(0.15),
-                                borderRadius: BorderRadius.circular(4),
-                                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: const [
-                                  Icon(Icons.create_new_folder_outlined, size: 13, color: Color(0xFF00D2FF)),
-                                  SizedBox(width: 4),
-                                  Text(
-                                    'Создать папку',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w600,
-                                      color: Color(0xFF00D2FF),
-                                    ),
-                                  ),
-                                ],
+                          ),
+                        ),
+                      ),
+                      onChanged: (val) {
+                        analysis = ProjectAnalyzer.analyze(val);
+                        if (analysis.hasGit) initGit = false;
+                        if (analysis.hasAgentsMd) createAgentsMd = false;
+                        setDlgState(() {});
+                      },
+                    ),
+                    if (pathCtrl.text.trim().isNotEmpty) ...[
+                      const SizedBox(height: 5),
+                      Row(
+                        children: [
+                          Icon(
+                            folderExists ? Icons.check_circle_rounded : Icons.info_outline_rounded,
+                            size: 13,
+                            color: folderExists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              folderExists ? 'Директория обнаружена на диске' : 'Директория не существует — будет создана автоматически',
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: folderExists ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
                               ),
                             ),
                           ),
+                          if (!folderExists)
+                            InkWell(
+                              onTap: () async {
+                                final err = await _createDirectory(pathCtrl.text.trim());
+                                if (err == null) {
+                                  analysis = ProjectAnalyzer.analyze(pathCtrl.text.trim());
+                                  setDlgState(() {});
+                                }
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF00D2FF).withOpacity(0.12),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.3)),
+                                ),
+                                child: const Text('Создать папку', style: TextStyle(fontSize: 10, color: Color(0xFF00D2FF))),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 14),
+
+                    // 3. Блок предпроизводственного анализа агента
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: DesktopTheme.bgSurfaceElevated,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.35)),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(getStackIcon(analysis.iconKey), size: 15, color: const Color(0xFF00D2FF)),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'Предпроизводственный анализ: ${analysis.detectedStack}',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF00D2FF),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            analysis.summary,
+                            style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary),
+                          ),
+                          const SizedBox(height: 10),
+
+                          // Индикаторы состояния проекта
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 6,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: (analysis.hasGit ? const Color(0xFF10B981) : const Color(0xFFF59E0B)).withOpacity(0.12),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: (analysis.hasGit ? const Color(0xFF10B981) : const Color(0xFFF59E0B)).withOpacity(0.4)),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(FontAwesomeIcons.codeBranch, size: 10, color: analysis.hasGit ? const Color(0xFF10B981) : const Color(0xFFF59E0B)),
+                                    const SizedBox(width: 5),
+                                    Text(
+                                      analysis.hasGit ? 'Git: активен' : 'Git: инициализировать',
+                                      style: TextStyle(fontSize: 10, color: analysis.hasGit ? const Color(0xFF10B981) : const Color(0xFFF59E0B)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: (analysis.hasAgentsMd ? const Color(0xFF10B981) : const Color(0xFF38BDF8)).withOpacity(0.12),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: (analysis.hasAgentsMd ? const Color(0xFF10B981) : const Color(0xFF38BDF8)).withOpacity(0.4)),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(Icons.shield_outlined, size: 11, color: analysis.hasAgentsMd ? const Color(0xFF10B981) : const Color(0xFF38BDF8)),
+                                    const SizedBox(width: 5),
+                                    Text(
+                                      analysis.hasAgentsMd ? 'AGENTS.md: настроен' : 'AGENTS.md: сгенерировать',
+                                      style: TextStyle(fontSize: 10, color: analysis.hasAgentsMd ? const Color(0xFF10B981) : const Color(0xFF38BDF8)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF8B5CF6).withOpacity(0.12),
+                                  borderRadius: BorderRadius.circular(4),
+                                  border: Border.all(color: const Color(0xFF8B5CF6).withOpacity(0.4)),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: const [
+                                    Icon(Icons.hub_outlined, size: 11, color: Color(0xFFA78BFA)),
+                                    SizedBox(width: 5),
+                                    Text(
+                                      'OB2H Граф памяти',
+                                      style: TextStyle(fontSize: 10, color: Color(0xFFA78BFA)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+
+                          // Автоматически подобранные агенты и тулзы
+                          Text('Рекомендованный агентский стек:', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: DesktopTheme.accentCyan)),
+                          const SizedBox(height: 4),
+                          Wrap(
+                            spacing: 4,
+                            runSpacing: 4,
+                            children: [
+                              ...analysis.recommendedAgents.map((a) => Chip(
+                                    backgroundColor: const Color(0xFF3B82F6).withOpacity(0.18),
+                                    label: Text('Агент: $a', style: const TextStyle(fontSize: 9, color: Color(0xFF60A5FA))),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  )),
+                              ...analysis.recommendedTools.map((t) => Chip(
+                                    backgroundColor: const Color(0xFF10B981).withOpacity(0.18),
+                                    label: Text('MCP: $t', style: const TextStyle(fontSize: 9, color: Color(0xFF34D399))),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  )),
+                              ...analysis.recommendedSkills.map((s) => Chip(
+                                    backgroundColor: const Color(0xFF8B5CF6).withOpacity(0.18),
+                                    label: Text('Скилл: $s', style: const TextStyle(fontSize: 9, color: Color(0xFFA78BFA))),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: EdgeInsets.zero,
+                                  )),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+
+                    // 4. Опции автоматизации
+                    Text('Опции инициализации и интеграции:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textSecondary)),
+                    const SizedBox(height: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: DesktopTheme.bgSurfaceElevated,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: DesktopTheme.borderSubtle),
+                      ),
+                      child: Column(
+                        children: [
+                          _buildScaffoldCheckbox(
+                            title: 'Инициализировать Git репозиторий',
+                            subtitle: 'Выполнит git init и создаст адаптированный .gitignore',
+                            value: initGit,
+                            onChanged: (v) => setDlgState(() => initGit = v ?? true),
+                          ),
+                          Divider(height: 8, color: DesktopTheme.borderSubtle.withOpacity(0.4)),
+                          _buildScaffoldCheckbox(
+                            title: 'Создать архитектурный файл AGENTS.md',
+                            subtitle: 'Инструкции для агентов оркестратора, стек и правила кода',
+                            value: createAgentsMd,
+                            onChanged: (v) => setDlgState(() => createAgentsMd = v ?? true),
+                          ),
+                          Divider(height: 8, color: DesktopTheme.borderSubtle.withOpacity(0.4)),
+                          _buildScaffoldCheckbox(
+                            title: 'Сгенерировать README.md',
+                            subtitle: 'Описание проекта, структура каталогов и команды запуска',
+                            value: createReadme,
+                            onChanged: (v) => setDlgState(() => createReadme = v ?? true),
+                          ),
+                          Divider(height: 8, color: DesktopTheme.borderSubtle.withOpacity(0.4)),
+                          _buildScaffoldCheckbox(
+                            title: 'Индексация в графе знаний OB2H',
+                            subtitle: 'Фоновое сканирование структуры проекта в память агента',
+                            value: runOb2hScan,
+                            onChanged: (v) => setDlgState(() => runOb2hScan = v ?? true),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+
+                    // 5. Персонализация (Цвет и иконка)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Цвет акцента:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textSecondary)),
+                              const SizedBox(height: 6),
+                              Row(
+                                children: availableColors.map((colHex) {
+                                  final colorVal = Color(int.parse(colHex.replaceFirst('#', '0xFF')));
+                                  final isSel = selectedColor == colHex;
+                                  return GestureDetector(
+                                    onTap: () => setDlgState(() => selectedColor = colHex),
+                                    child: Container(
+                                      margin: const EdgeInsets.only(right: 8),
+                                      width: 22,
+                                      height: 22,
+                                      decoration: BoxDecoration(
+                                        color: colorVal,
+                                        shape: BoxShape.circle,
+                                        border: Border.all(
+                                          color: isSel ? Colors.white : Colors.transparent,
+                                          width: 2,
+                                        ),
+                                        boxShadow: isSel
+                                            ? [BoxShadow(color: colorVal.withOpacity(0.6), blurRadius: 6)]
+                                            : null,
+                                      ),
+                                      child: isSel ? const Icon(Icons.check, size: 12, color: Colors.black) : null,
+                                    ),
+                                  );
+                                }).toList(),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('Иконка проекта:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textSecondary)),
+                              const SizedBox(height: 6),
+                              Row(
+                                children: availableIcons.map((ic) {
+                                  final isSel = selectedIcon == ic['name'];
+                                  return GestureDetector(
+                                    onTap: () => setDlgState(() => selectedIcon = ic['name'] as String),
+                                    child: Container(
+                                      margin: const EdgeInsets.only(right: 6),
+                                      padding: const EdgeInsets.all(4),
+                                      decoration: BoxDecoration(
+                                        color: isSel ? const Color(0xFF00D2FF).withOpacity(0.2) : DesktopTheme.bgSurfaceElevated,
+                                        borderRadius: BorderRadius.circular(4),
+                                        border: Border.all(color: isSel ? const Color(0xFF00D2FF) : DesktopTheme.borderSubtle),
+                                      ),
+                                      child: Icon(ic['icon'] as IconData, size: 14, color: isSel ? const Color(0xFF00D2FF) : DesktopTheme.textSecondary),
+                                    ),
+                                  );
+                                }).toList(),
+                              ),
+                            ],
+                          ),
+                        ),
                       ],
                     ),
+                    const SizedBox(height: 14),
+
+                    // 6. Индивидуальные инструкции
+                    Text('Индивидуальные инструкции агенту для проекта (опционально):', style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textSecondary)),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: instructionsCtrl,
+                      maxLines: 2,
+                      style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
+                      decoration: InputDecoration(
+                        hintText: 'Например: Строго следовать TDD, архитектурный стиль Hexagonal...',
+                        hintStyle: TextStyle(color: DesktopTheme.textMuted, fontSize: 11),
+                        filled: true,
+                        fillColor: DesktopTheme.bgSurfaceElevated,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                      ),
+                    ),
                   ],
-                  const SizedBox(height: 12),
-
-                  Text('Тематика проекта:', style: TextStyle(fontSize: 12, color: DesktopTheme.textSecondary)),
-                  const SizedBox(height: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    decoration: BoxDecoration(
-                      color: DesktopTheme.bgSurfaceElevated,
-                      borderRadius: BorderRadius.circular(6),
-                      border: Border.all(color: DesktopTheme.borderSubtle),
-                    ),
-                    child: DropdownButton<String>(
-                      value: selectedDomain,
-                      isExpanded: true,
-                      underline: const SizedBox(),
-                      dropdownColor: DesktopTheme.bgSurfaceElevated,
-                      items: domainRecommendations.keys.map((d) {
-                        return DropdownMenuItem(
-                          value: d,
-                          child: Text(d, style: TextStyle(fontSize: 13, color: DesktopTheme.textPrimary)),
-                        );
-                      }).toList(),
-                      onChanged: (val) {
-                        if (val != null) {
-                          setDlgState(() => selectedDomain = val);
-                        }
-                      },
-                    ),
-                  ),
-                  const SizedBox(height: 14),
-
-                  // Auto-suggested recommendation preview
-                  Text('Рекомендованные агенты, инструменты и навыки:', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: DesktopTheme.accentCyan)),
-                  const SizedBox(height: 6),
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 4,
-                    children: [
-                      ...rec['agents']!.map((a) => Chip(
-                            backgroundColor: const Color(0xFF3B82F6).withOpacity(0.2),
-                            label: Text('Агент: $a', style: const TextStyle(fontSize: 10, color: Color(0xFF60A5FA))),
-                            visualDensity: VisualDensity.compact,
-                          )),
-                      ...rec['tools']!.map((t) => Chip(
-                            backgroundColor: const Color(0xFF10B981).withOpacity(0.2),
-                            label: Text('MCP: $t', style: const TextStyle(fontSize: 10, color: Color(0xFF34D399))),
-                            visualDensity: VisualDensity.compact,
-                          )),
-                      ...rec['skills']!.map((s) => Chip(
-                            backgroundColor: const Color(0xFF8B5CF6).withOpacity(0.2),
-                            label: Text('Скилл: $s', style: const TextStyle(fontSize: 10, color: Color(0xFFA78BFA))),
-                            visualDensity: VisualDensity.compact,
-                          )),
-                    ],
-                  ),
-                ],
+                ),
               ),
             ),
             actions: [
               TextButton(
-                onPressed: () => Navigator.of(ctx).pop(),
+                onPressed: isScaffolding ? null : () => Navigator.of(ctx).pop(),
                 child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted)),
               ),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF00D2FF),
                   foregroundColor: const Color(0xFF0F172A),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                 ),
-                onPressed: () async {
-                  final name = nameCtrl.text.trim();
-                  final path = pathCtrl.text.trim();
-                  if (name.isNotEmpty && path.isNotEmpty) {
-                    if (!_doesFolderExist(path)) {
-                      final shouldCreate = await showDialog<bool>(
-                        context: ctx,
-                        builder: (confirmCtx) => AlertDialog(
-                          backgroundColor: DesktopTheme.bgSurface,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                            side: BorderSide(color: DesktopTheme.borderSubtle),
-                          ),
-                          title: Row(
-                            children: [
-                              const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00D2FF), size: 18),
-                              const SizedBox(width: 8),
-                              Text('Создать папку?', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
-                            ],
-                          ),
-                          content: Text(
-                            'Папка «$path» не существует на диске.\nСоздать её автоматически?',
-                            style: TextStyle(color: DesktopTheme.textSecondary, fontSize: 13),
-                          ),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.of(confirmCtx).pop(false),
-                              child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted)),
-                            ),
-                            ElevatedButton(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF00D2FF),
-                                foregroundColor: const Color(0xFF0F172A),
-                              ),
-                              onPressed: () => Navigator.of(confirmCtx).pop(true),
-                              child: const Text('Создать и продолжить', style: TextStyle(fontWeight: FontWeight.bold)),
-                            ),
-                          ],
-                        ),
-                      );
-                      if (shouldCreate != true) return;
-                      final err = await _createDirectory(path);
-                      if (err != null) {
-                        Get.snackbar(
-                          'Ошибка создания папки',
-                          err,
-                          backgroundColor: const Color(0xFF450A0A),
-                          colorText: const Color(0xFFEF4444),
-                          snackPosition: SnackPosition.BOTTOM,
-                        );
-                        return;
-                      }
-                    }
+                onPressed: isScaffolding
+                    ? null
+                    : () async {
+                        final name = nameCtrl.text.trim();
+                        final path = pathCtrl.text.trim();
+                        if (name.isEmpty || path.isEmpty) {
+                          Get.snackbar(
+                            'Не все поля заполнены',
+                            'Укажите название проекта и путь к папке',
+                            backgroundColor: const Color(0xFF450A0A),
+                            colorText: const Color(0xFFEF4444),
+                            snackPosition: SnackPosition.BOTTOM,
+                          );
+                          return;
+                        }
 
-                    final newP = DesktopProject(
-                      id: 'proj_${DateTime.now().millisecondsSinceEpoch}',
-                      name: name,
-                      path: path,
-                      domain: selectedDomain,
-                      suggestedAgents: rec['agents']!,
-                      suggestedTools: rec['tools']!,
-                      suggestedSkills: rec['skills']!,
-                    );
-                    if (mounted) {
-                      setState(() {
-                        projects.add(newP);
-                        _saveProjects();
-                      });
-                    }
-                    if (ctx.mounted) {
-                      Navigator.of(ctx).pop();
-                    }
-                  } else {
-                    Get.snackbar(
-                      'Не все поля заполнены',
-                      'Укажите название проекта и путь к папке',
-                      backgroundColor: const Color(0xFF450A0A),
-                      colorText: const Color(0xFFEF4444),
-                      snackPosition: SnackPosition.BOTTOM,
-                    );
-                  }
-                },
-                child: const Text('Создать проект', style: TextStyle(fontWeight: FontWeight.bold)),
+                        setDlgState(() => isScaffolding = true);
+
+                        try {
+                          final dirErr = await _createDirectory(path);
+                          if (dirErr != null) {
+                            setDlgState(() => isScaffolding = false);
+                            Get.snackbar('Ошибка создания папки', dirErr, backgroundColor: const Color(0xFF450A0A), colorText: const Color(0xFFEF4444), snackPosition: SnackPosition.BOTTOM);
+                            return;
+                          }
+
+                          // Запуск скаффолдинга и регистрации на базе предпроизводственного анализа
+                          final scaffoldOptions = ProjectScaffoldOptions(
+                            initGit: initGit,
+                            createAgentsMd: createAgentsMd,
+                            createReadme: createReadme,
+                            runOb2hScan: runOb2hScan,
+                            customInstructions: instructionsCtrl.text.trim().isNotEmpty ? instructionsCtrl.text.trim() : null,
+                            colorHex: selectedColor,
+                            iconName: selectedIcon,
+                          );
+
+                          final scaffoldRes = await ProjectScaffoldingService.scaffold(
+                            projectPath: path,
+                            projectName: name,
+                            options: scaffoldOptions,
+                          );
+
+                          final newP = DesktopProject(
+                            id: 'proj_${DateTime.now().millisecondsSinceEpoch}',
+                            name: name,
+                            path: path,
+                            domain: scaffoldRes.analysis.domain,
+                            suggestedAgents: scaffoldRes.analysis.recommendedAgents,
+                            suggestedTools: scaffoldRes.analysis.recommendedTools,
+                            suggestedSkills: scaffoldRes.analysis.recommendedSkills,
+                            customInstructions: instructionsCtrl.text.trim().isNotEmpty ? instructionsCtrl.text.trim() : null,
+                            colorHex: selectedColor,
+                            iconName: selectedIcon,
+                            gitInitialized: initGit || scaffoldRes.analysis.hasGit,
+                            ob2hIndexed: runOb2hScan,
+                          );
+
+                          if (mounted) {
+                            setState(() {
+                              projects.add(newP);
+                              activeFileTreeProject = newP;
+                              _saveProjects();
+                            });
+                          }
+
+                          if (ctx.mounted) {
+                            Navigator.of(ctx).pop();
+                          }
+
+                          Get.snackbar(
+                            'Проект подключен',
+                            scaffoldRes.message,
+                            backgroundColor: const Color(0xFF0F172A),
+                            colorText: const Color(0xFF00D2FF),
+                            icon: const Icon(Icons.check_circle_outline, color: Color(0xFF00D2FF)),
+                            snackPosition: SnackPosition.BOTTOM,
+                            duration: const Duration(seconds: 4),
+                          );
+                        } catch (e) {
+                          setDlgState(() => isScaffolding = false);
+                          Get.snackbar('Ошибка', 'Не удалось завершить создание проекта: $e', backgroundColor: const Color(0xFF450A0A), colorText: const Color(0xFFEF4444), snackPosition: SnackPosition.BOTTOM);
+                        }
+                      },
+                child: isScaffolding
+                    ? Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: const [
+                          SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF0F172A))),
+                          SizedBox(width: 8),
+                          Text('Анализ и настройка...', style: TextStyle(fontWeight: FontWeight.bold)),
+                        ],
+                      )
+                    : const Text('Подключить к агенту', style: TextStyle(fontWeight: FontWeight.bold)),
               ),
             ],
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildScaffoldCheckbox({
+    required String title,
+    required String subtitle,
+    required bool value,
+    required ValueChanged<bool?> onChanged,
+  }) {
+    return InkWell(
+      onTap: () => onChanged(!value),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 20,
+              height: 20,
+              child: Checkbox(
+                value: value,
+                onChanged: onChanged,
+                activeColor: const Color(0xFF00D2FF),
+                checkColor: const Color(0xFF0F172A),
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textPrimary)),
+                  Text(subtitle, style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted)),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
