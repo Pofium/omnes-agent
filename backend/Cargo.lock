@@ -6680,6 +6680,7 @@ dependencies = [
  "omnesagent-memory",
  "omnesagent-providers",
  "omnesagent-runtime",
+ "omnesagent-s1",
  "omnesagent-spawn",
  "omnesagent-tool-call-parser",
  "omnesagent-tools",
@@ -7176,6 +7177,7 @@ dependencies = [
  "omnesagent-plugins",
  "omnesagent-providers",
  "omnesagent-relay-proto",
+ "omnesagent-s1",
  "omnesagent-sop-graph",
  "omnesagent-spawn",
  "omnesagent-tls",
@@ -7223,6 +7225,30 @@ dependencies = [
  "windows",
  "wiremock",
  "zeroize",
+]
+
+[[package]]
+name = "omnesagent-s1"
+version = "0.8.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "chrono",
+ "hex",
+ "hf-hub",
+ "omnesagent-log",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

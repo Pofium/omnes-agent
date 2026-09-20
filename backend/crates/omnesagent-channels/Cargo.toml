@@ -17,6 +17,7 @@ omnesagent-providers.workspace = true
 omnesagent-runtime.workspace = true
 omnesagent-tool-call-parser.workspace = true
 omnesagent-tools.workspace = true
+omnesagent-s1.workspace = true
 anyhow = "1.0"
 lru = "0.18.2"
 rumqttc = { version = "0.25", optional = true }

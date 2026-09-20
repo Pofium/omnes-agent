@@ -46,6 +46,66 @@ pub fn analyze_turn_context(
     }
 }
 
+/// Analyze context using System One multilingual semantic classification when enabled,
+/// or fall back to keyword heuristics.
+pub async fn analyze_turn_context_with_s1(
+    history: &[ChatMessage],
+    user_message: &str,
+    iteration: usize,
+    last_tool_calls: &[String],
+) -> ContextSignals {
+    let mut signals = analyze_turn_context(history, user_message, iteration, last_tool_calls);
+
+    let s1_config = omnesagent_s1::SystemOneConfig::from_env();
+    if s1_config.tool_gate_enabled && s1_config.provider != omnesagent_s1::ProviderKind::Off {
+        let s1 = omnesagent_s1::create_system_one(&s1_config);
+        if s1.is_available() {
+            let state = if !user_message.is_empty() {
+                user_message
+            } else if let Some(last) = history.last() {
+                last.content.as_str()
+            } else {
+                ""
+            };
+
+            if !state.is_empty() {
+                let question = omnesagent_s1::Question::choice(
+                    "tool_category",
+                    "Which tool category is relevant for user intent?",
+                    vec![
+                        "filesystem".into(),
+                        "shell".into(),
+                        "memory".into(),
+                        "web".into(),
+                        "general".into(),
+                    ],
+                );
+                if let Ok(answers) = s1.decide(state, &[question]).await {
+                    if let Some(ans) = answers.first() {
+                        if let Some(category) = ans.choice_value() {
+                            let mut tools = match category {
+                                "filesystem" => vec!["file_read".into(), "file_write".into(), "file_edit".into(), "glob_search".into()],
+                                "shell" => vec!["shell".into()],
+                                "memory" => vec!["memory_store".into(), "memory_recall".into()],
+                                "web" => vec!["web_fetch".into(), "web_search_tool".into()],
+                                _ => Vec::new(),
+                            };
+                            for t in tools.drain(..) {
+                                if !signals.suggested_tools.contains(&t) {
+                                    signals.suggested_tools.push(t);
+                                }
+                            }
+                            signals.suggested_tools.sort();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    signals
+}
+
 fn tools_for_keyword(keyword: &str) -> &'static [&'static str] {
     match keyword.to_lowercase().as_str() {
         "file" | "read" | "write" | "edit" | "path" | "directory" => {

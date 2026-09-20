@@ -3505,6 +3505,44 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
+    // S1 Fast-Path Gate: if OMNESAGENT_S1_CHANNEL_INTENT is enabled, resolve intent locally in ~30ms
+    let s1_config = omnesagent_s1::SystemOneConfig::from_env();
+    if s1_config.channel_intent_enabled && s1_config.provider != omnesagent_s1::ProviderKind::Off {
+        let s1 = omnesagent_s1::create_system_one(&s1_config);
+        if s1.is_available() {
+            let start = std::time::Instant::now();
+            let question = omnesagent_s1::Question::choice(
+                "channel_reply_intent",
+                "Decide whether to REPLY or NO_REPLY to the inbound channel message",
+                vec!["REPLY".into(), "NO_REPLY_INFO".into(), "NO_REPLY_REFUSE".into()],
+            );
+            if let Ok(answers) = s1.decide(&convo, &[question.clone()]).await {
+                if let Some(ans) = answers.first() {
+                    let duration_us = start.elapsed().as_micros() as u64;
+                    if s1_config.log_enabled {
+                        omnesagent_s1::log_decision("channel_intent", &convo, &question, ans, duration_us, s1.model_id()).await;
+                    }
+                    if let omnesagent_s1::Answer::Choice { selected_value, confidence, .. } = ans {
+                        if *confidence >= 0.75 {
+                            match selected_value.as_str() {
+                                "REPLY" => return Ok(AssistantChannelOutcome::Reply(String::new())),
+                                "NO_REPLY_INFO" => return Ok(AssistantChannelOutcome::NoReply {
+                                    kind: NoReplyKind::Informational,
+                                    reason: Some("classified by S1".into()),
+                                }),
+                                "NO_REPLY_REFUSE" => return Ok(AssistantChannelOutcome::NoReply {
+                                    kind: NoReplyKind::Refused,
+                                    reason: Some("refused by S1".into()),
+                                }),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let response = ProviderDispatch::from_ref(model_provider)
         .chat_with_system(Some(system_prompt), &convo, model, temperature)
         .await?;

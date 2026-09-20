@@ -60,6 +60,47 @@ pub fn classify_with_decision(
     None
 }
 
+/// Classify a user message with System One semantic fallback when rules produce no match.
+pub async fn classify_with_s1(
+    config: &QueryClassificationConfig,
+    message: &str,
+) -> Option<ClassificationDecision> {
+    if let Some(decision) = classify_with_decision(config, message) {
+        return Some(decision);
+    }
+
+    let s1_config = omnesagent_s1::SystemOneConfig::from_env();
+    if s1_config.router_enabled && s1_config.provider != omnesagent_s1::ProviderKind::Off && !message.trim().is_empty() {
+        let s1 = omnesagent_s1::create_system_one(&s1_config);
+        if s1.is_available() {
+            let question = omnesagent_s1::Question::choice(
+                "model_route",
+                "Classify user prompt into optimal execution hint",
+                vec![
+                    "fast".into(),
+                    "code".into(),
+                    "reasoning".into(),
+                    "general".into(),
+                ],
+            );
+            if let Ok(answers) = s1.decide(message, &[question]).await {
+                if let Some(ans) = answers.first() {
+                    if let Some(hint) = ans.choice_value() {
+                        if hint != "general" {
+                            return Some(ClassificationDecision {
+                                hint: hint.to_string(),
+                                priority: 5,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,4 +249,27 @@ mod tests {
         assert_eq!(decision.hint, "code");
         assert_eq!(decision.priority, 10);
     }
+
+    #[tokio::test]
+    async fn classify_with_s1_returns_rule_decision_first() {
+        let config = make_config(
+            true,
+            vec![ClassificationRule {
+                hint: "code".into(),
+                keywords: vec!["code".into()],
+                priority: 10,
+                ..Default::default()
+            }],
+        );
+        let decision = classify_with_s1(&config, "write code now").await;
+        assert_eq!(decision.unwrap().hint, "code");
+    }
+
+    #[tokio::test]
+    async fn classify_with_s1_returns_none_when_off() {
+        let config = make_config(true, vec![]);
+        let decision = classify_with_s1(&config, "no keyword match").await;
+        assert!(decision.is_none());
+    }
 }
+

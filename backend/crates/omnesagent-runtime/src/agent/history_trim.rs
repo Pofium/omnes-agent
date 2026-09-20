@@ -235,6 +235,119 @@ pub fn trim_to_reported_budget(
     }
 }
 
+/// Trims conversation history using System One semantic importance scoring when enabled,
+/// or falls back to traditional recency trimming.
+pub async fn trim_with_s1_scoring(
+    history: Vec<ChatMessage>,
+    budget_tokens: usize,
+    user_goal: Option<&str>,
+) -> TrimResult {
+    let s1_config = omnesagent_s1::SystemOneConfig::from_env();
+    if !s1_config.compaction_enabled || s1_config.provider == omnesagent_s1::ProviderKind::Off {
+        return trim_to_recent_turns(history, budget_tokens);
+    }
+
+    let s1 = omnesagent_s1::create_system_one(&s1_config);
+    if !s1.is_available() {
+        return trim_to_recent_turns(history, budget_tokens);
+    }
+
+    let total_turns = count_turns(&history);
+    let tokens_before = estimate_history_tokens(&history);
+    if budget_tokens == 0 || tokens_before <= budget_tokens || total_turns <= 1 {
+        return TrimResult {
+            history,
+            dropped_messages: 0,
+            dropped_turns: 0,
+            kept_turns: total_turns,
+            tokens_before,
+            tokens_after: tokens_before,
+            trimmed: false,
+        };
+    }
+
+    // Isolate leading system messages
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let system: Vec<ChatMessage> = history[..leading_system].to_vec();
+    let body = &history[leading_system..];
+
+    // Find turn boundaries
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| is_turn_boundary(m))
+        .map(|(i, _)| i)
+        .collect();
+
+    if boundaries.len() <= 1 {
+        return trim_to_recent_turns(history, budget_tokens);
+    }
+
+    // Score turns (except the very latest turn, which must always be kept)
+    let goal_desc = user_goal.unwrap_or("general conversation task");
+    let mut questions = Vec::new();
+    for (turn_idx, &start_b) in boundaries.iter().take(boundaries.len() - 1).enumerate() {
+        let end_b = next_boundary_after(&boundaries, start_b);
+        let turn_slice = &body[start_b..end_b.min(body.len())];
+        let preview = turn_slice.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" ");
+        let preview_truncated = if preview.len() > 300 { &preview[..300] } else { &preview };
+        questions.push(omnesagent_s1::Question::score(
+            format!("turn_{}", turn_idx),
+            format!("Rate importance of this dialogue turn for goal '{}': {}", goal_desc, preview_truncated),
+            5,
+        ));
+    }
+
+    let answers = match s1.decide(&format!("Goal: {}", goal_desc), &questions).await {
+        Ok(ans) => ans,
+        Err(_) => return trim_to_recent_turns(history, budget_tokens),
+    };
+
+    // Map each turn index to its score (1..5)
+    let mut turn_scores: Vec<(usize, u8)> = Vec::new();
+    for (idx, ans) in answers.iter().enumerate() {
+        let score = ans.score_level().unwrap_or(3);
+        turn_scores.push((idx, score));
+    }
+
+    // Sort turns by score ascending (lowest score evicted first)
+    turn_scores.sort_by_key(|&(_, score)| score);
+
+    // Filter out candidate turns until tokens fit budget
+    let mut dropped_turn_indices = std::collections::HashSet::new();
+
+    for (candidate_idx, _) in turn_scores {
+        dropped_turn_indices.insert(candidate_idx);
+
+        // Reconstruct probe without dropped turns
+        let mut reconstructed = system.clone();
+        for (turn_idx, &start_b) in boundaries.iter().enumerate() {
+            if !dropped_turn_indices.contains(&turn_idx) {
+                let end_b = if turn_idx + 1 < boundaries.len() { boundaries[turn_idx + 1] } else { body.len() };
+                reconstructed.extend_from_slice(&body[start_b..end_b]);
+            }
+        }
+
+        if estimate_history_tokens(&reconstructed) <= budget_tokens {
+            let tokens_after = estimate_history_tokens(&reconstructed);
+            let dropped_turns = dropped_turn_indices.len();
+            let dropped_messages = body.len() - (reconstructed.len() - system.len());
+            return TrimResult {
+                history: reconstructed,
+                dropped_messages,
+                dropped_turns,
+                kept_turns: total_turns.saturating_sub(dropped_turns),
+                tokens_before,
+                tokens_after,
+                trimmed: true,
+            };
+        }
+    }
+
+    // If scoring eviction didn't reach budget, fallback to recent turns trim
+    trim_to_recent_turns(history, budget_tokens)
+}
+
 fn next_boundary_after(boundaries: &[usize], current: usize) -> usize {
     boundaries
         .iter()
@@ -976,4 +1089,20 @@ mod tests {
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
     }
+
+    #[tokio::test]
+    async fn test_trim_with_s1_scoring_fallback_when_off() {
+        let h = vec![
+            sys("system"),
+            user("turn1 - very long long long content ".repeat(10).as_str()),
+            asst("answer1"),
+            user("turn2 - recent question"),
+            asst("answer2"),
+        ];
+        let res = trim_with_s1_scoring(h, 50, Some("finish the task")).await;
+        // When S1 is OFF by default, it trims via trim_to_recent_turns
+        assert!(res.trimmed);
+        assert_eq!(res.kept_turns, 1);
+    }
 }
+

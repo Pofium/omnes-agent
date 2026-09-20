@@ -334,6 +334,42 @@ pub async fn render_memory_context(
         decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
     }
 
+    // S1 Semantic Memory Rerank: filter memory candidates via calibrated Noul probability
+    let s1_config = omnesagent_s1::SystemOneConfig::from_env();
+    if s1_config.memory_rerank_enabled && s1_config.provider != omnesagent_s1::ProviderKind::Off && !entries.is_empty() {
+        let s1 = omnesagent_s1::create_system_one(&s1_config);
+        if s1.is_available() {
+            let start_s1 = Instant::now();
+            let mut questions = Vec::with_capacity(entries.len());
+            for (idx, entry) in entries.iter().enumerate() {
+                let preview = if entry.content.len() > 300 { &entry.content[..300] } else { &entry.content };
+                questions.push(omnesagent_s1::Question::noul(
+                    format!("mem_{}", idx),
+                    format!("Does this memory snippet assist the query '{}'?: {}", user_msg, preview),
+                ));
+            }
+            if let Ok(answers) = s1.decide(user_msg, &questions).await {
+                let duration_us = start_s1.elapsed().as_micros() as u64;
+                if s1_config.log_enabled && !questions.is_empty() && !answers.is_empty() {
+                    omnesagent_s1::log_decision("memory_rerank", user_msg, &questions[0], &answers[0], duration_us, s1.model_id()).await;
+                }
+                let mut scored_entries: Vec<(MemoryEntry, f32)> = Vec::with_capacity(entries.len());
+                for (idx, entry) in entries.into_iter().enumerate() {
+                    let prob = answers.get(idx).and_then(|a| a.noul_prob()).unwrap_or(0.5);
+                    scored_entries.push((entry, prob));
+                }
+                scored_entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let mut filtered = Vec::new();
+                for (entry, prob) in scored_entries {
+                    if prob >= 0.40 || filtered.is_empty() {
+                        filtered.push(entry);
+                    }
+                }
+                entries = filtered;
+            }
+        }
+    }
+
     let mut context = String::new();
     let mut included = 0usize;
     let mut used_chars = 0usize;
