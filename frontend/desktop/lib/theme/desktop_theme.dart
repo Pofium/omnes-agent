@@ -78,8 +78,8 @@ class DesktopTheme {
       isDark ? textSecondaryDark : textSecondaryLight;
   static Color get textMuted => isDark ? textMutedDark : textMutedLight;
 
-  // Button styling (shadcn/ui style: solid black in light mode, elevated surface in dark mode)
-  static Color get btnPrimaryBg => isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A);
+  // Button styling (shadcn/ui style: sleek dark-gray in light mode, elevated surface in dark mode)
+  static Color get btnPrimaryBg => isDark ? const Color(0xFF282D37) : const Color(0xFF334155);
   static Color get btnPrimaryFg => Colors.white;
 
   static ThemeData get darkTheme {
@@ -128,9 +128,9 @@ class DesktopTheme {
     return ThemeData(
       brightness: Brightness.light,
       scaffoldBackgroundColor: bgCanvasLight,
-      primaryColor: const Color(0xFF0F172A),
+      primaryColor: const Color(0xFF334155),
       colorScheme: const ColorScheme.light(
-        primary: Color(0xFF0F172A),
+        primary: Color(0xFF334155),
         secondary: accentSky,
         surface: bgSurfaceLight,
         error: statusError,
@@ -139,7 +139,7 @@ class DesktopTheme {
       dividerColor: borderSubtleLight,
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFF0F172A),
+          backgroundColor: const Color(0xFF334155),
           foregroundColor: Colors.white,
           elevation: 0,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),

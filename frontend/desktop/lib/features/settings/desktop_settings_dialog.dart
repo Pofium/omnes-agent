@@ -81,7 +81,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   String? skillStatusMsg;
 
   // Host FS state
-  final hostFsPathController = TextEditingController(text: 'C:\\Projects\\Omnes-agent');
+  final hostFsPathController = TextEditingController(text: DesktopTaskWorkspaceController.resolveInitialProjectPath());
   List<Map<String, dynamic>> hostFsEntries = [];
   bool isHostFsLoading = false;
   final newFolderController = TextEditingController();

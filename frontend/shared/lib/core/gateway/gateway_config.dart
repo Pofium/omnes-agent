@@ -1,6 +1,7 @@
-// Configuration management for OmnesAgent Gateway connection.
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:get_storage/get_storage.dart';
+import 'package:universal_io/io.dart' as universal_io;
 
 class GatewayConfig {
   static const String defaultHttpUrl = "http://127.0.0.1:42617";
@@ -36,6 +37,28 @@ class GatewayConfig {
       if (stored != null && stored.isNotEmpty) return stored;
     } catch (_) {}
 
+    if (!kIsWeb) {
+      try {
+        final envUrl = universal_io.Platform.environment['OMNES_GATEWAY_URL'];
+        if (envUrl != null && envUrl.isNotEmpty) {
+          return envUrl.endsWith('/') ? envUrl.substring(0, envUrl.length - 1) : envUrl;
+        }
+
+        final envPort = universal_io.Platform.environment['OMNES_GATEWAY_PORT'];
+        if (envPort != null && envPort.isNotEmpty) {
+          return 'http://127.0.0.1:$envPort';
+        }
+
+        final discFile = universal_io.File('.omnes/gateway.json');
+        if (discFile.existsSync()) {
+          final parsed = jsonDecode(discFile.readAsStringSync());
+          if (parsed is Map && parsed['port'] != null) {
+            return 'http://127.0.0.1:${parsed['port']}';
+          }
+        }
+      } catch (_) {}
+    }
+
     if (kIsWeb) {
       try {
         final origin = Uri.base.origin;
@@ -64,6 +87,12 @@ class GatewayConfig {
       return httpUrl.replaceFirst('http://', 'ws://');
     }
     return "ws://$httpUrl";
+  }
+
+  /// Returns port of configured gateway
+  static int getPort() {
+    final u = Uri.tryParse(getBaseUrl());
+    return u?.port != null && u!.port > 0 ? u.port : 42617;
   }
 
   /// Returns currently selected agent alias (default: chief).

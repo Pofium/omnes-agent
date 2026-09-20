@@ -783,4 +783,40 @@ pub struct CompressionPolicy {
 - Для `AgentIntent::CodeExploration`: активны `AstCodeCompressor` (только сигнатуры и типы) и `SqzDedupEngine`.
 - Для `AgentIntent::EngineeringTask`: активируется полный конвейер сжатия схем, логов компилятора и CCR-буферизации.
 
+---
+
+## 8. Реестр захардкоженных элементов кодовой базы и дорожная карта их динамизации
+
+В ходе комплексного аудита монорепозитория выявлен ряд статически зафиксированных конфигураций, моковых структур и литералов, которые снижают переносимость системы и должны быть переведены на динамическое получение из среды исполнения, API или файловой системы.
+
+### 8.1. Сводная таблица захардкоженных элементов
+
+| № | Категория | Файл и строка | Захардкоженное значение | Целевое динамическое решение | Приоритет |
+|---|---|---|---|---|---|
+| **1** | **Пути к проектам** | [`task_workspace_controller.dart:67`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_controller.dart#L67)<br>[`desktop_sidebar.dart:324, 1851`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/widgets/desktop_sidebar.dart#L324)<br>[`desktop_settings_dialog.dart:84`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/settings/desktop_settings_dialog.dart#L84) | `r'C:\Projects\Omnes-agent'`<br>`r'C:\Projects\'` | 1. Инициализация через `Directory.current.path`.<br>2. Чтение переменной окружения `OMNES_WORKSPACE_ROOT`.<br>3. Определение домашней директории пользователя (`Platform.environment['USERPROFILE']` / `HOME`). | **P0** (Критично для кросс-платформенности) |
+| **2** | **Ветки Git** | [`task_workspace_controller.dart:71`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_controller.dart#L71) | `availableBranches = <String>['main'].obs;` | Мгновенное синхронное чтение файла `.git/HEAD` (парсинг целевой ветки без вызова процесса), динамический листинг каталога `.git/refs/heads/`. | **P1** |
+| **3** | **Стартовые сессии и проекты** | [`task_workspace_controller.dart:63-65`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_controller.dart#L63)<br>[`desktop_sidebar.dart:320-340`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/widgets/desktop_sidebar.dart#L320) | `id: 'omnes-core-arch'`, `'Архитектура ядра OmnesAgent'`<br>Проекты `'omnes_agent'`, `'deepseek_harness'` | 1. Восстановление последней активной сессии из SQLite `TaskStorageService`.<br>2. Если база пуста — автоматический запуск предпроизводственного анализа рабочей папки через `ProjectAnalyzer` и создание стартовой сессии под имя текущего проекта. | **P1** |
+| **4** | **Быстрые промпты Welcome Screen** | [`task_workspace_view.dart:1787-1840`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_view.dart#L1787) | `'Объясни архитектуру'`<br>`'Запусти тесты cargo'`<br>`'Проверь статус Git'` | Формирование чипов на базе обнаруженного стека (`ProjectAnalyzer`): для Flutter — `flutter test / analyze`, для Rust — `cargo test / check`, для Python — `pytest / ruff`. | **P2** |
+| **5** | **URL базовых API провайдеров** | [`task_workspace_controller.dart:2150-2165`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/features/workspace/task_workspace_controller.dart#L2150) | `https://api.deepseek.com/v1`, `https://api.openai.com/v1`, etc. | Чтение из централизованного манифеста провайдеров шлюза `GET /api/v1/providers` и поддержка локальных сервисов (Ollama `http://localhost:11434`, LM Studio `http://localhost:1234`). | **P1** |
+| **6** | **Порт и хост бэкенд-шлюза** | [`desktop_backend_manager.dart`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/utils/desktop_backend_manager.dart)<br>[`gateway_http.dart`](file:///c:/Projects/Omnes-agent/frontend/shared/lib/core/gateway/gateway_http.dart) | Порты `18789` и `42617` | Создание бэкендом файла `.omnes/gateway.json` при запуске (с записью реального PID и выделенного порта `bind 127.0.0.1:0`), чтение клиентом при инициализации. | **P0** |
+| **7** | **Каталог иконок групп** | [`desktop_sidebar.dart:242-262`](file:///c:/Projects/Omnes-agent/frontend/desktop/lib/widgets/desktop_sidebar.dart#L242) | Статический список из 20 иконок `groupIconsCatalog` | Загрузка расширяемого каталога категорий из конфигурации пользователя или метаданных KAG-доменов. | **P3** |
+
+---
+
+### 8.2. План поэтапной миграции на динамические источники
+
+#### Этап 1: Динамизация рабочей области и Git-контекста
+- [x] Заменить статический путь `C:\Projects\Omnes-agent` в `task_workspace_controller.dart`, `desktop_sidebar.dart` и `desktop_settings_dialog.dart` на определение через `Directory.current.path` и `OMNES_WORKSPACE_ROOT`.
+- [x] Реализовать прямой синхронный парсинг `.git/HEAD` и `.git/refs/heads/` для мгновенного (0ms) получения активной ветки без ожидания CLI `git branch`.
+- [x] Настроить чтение discovery-файла порта шлюза (`.omnes/gateway.json`, `OMNES_GATEWAY_PORT`, `OMNES_GATEWAY_URL`) для исключения жестких портов 42617/18789.
+
+#### Этап 2: Контекстные подсказки и адаптация под проект
+- [x] Встроить генератор подсказок первого экрана на базе `ProjectAnalyzer`: адаптация под обнаруженные фреймворки (Cargo для Rust, Flutter/Dart, Python/Pytest/Ruff, Node/NPM/Web, Go).
+- [x] Перевести список моделей и провайдеров на опрос шлюза и автодетектирование локальных LLM (Ollama `11434`, LM Studio `1234`, переменные окружения `*_BASE_URL` и `*_API_KEY`).
+
+#### Этап 3: Полная изоляция пользовательских данных
+- [x] Удалить демо-сессии (`omnes-core-arch`, `deepseek-v3-eval`) из холодного старта; генерировать сессию на лету под открытую пользователем папку и её стек.
+- [x] Синхронизировать реестр проектов с графом OB2H для прозрачного шаринга контекста между сессиями.
+
+
 

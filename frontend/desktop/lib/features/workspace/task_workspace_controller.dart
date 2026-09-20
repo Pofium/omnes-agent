@@ -1,6 +1,3 @@
-import 'package:universal_io/io.dart';
-// Desktop Task Workspace Controller with OmnesAgent Multi-Session Chat, Goal Tracking, and Context.
-
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
@@ -8,6 +5,8 @@ import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:omnes_shared/omnes_shared.dart';
+import 'package:path/path.dart' as p;
+import 'package:universal_io/io.dart';
 import 'package:universal_io/io.dart' as universal_io;
 
 /// Represents an independent chat session in OmnesAgent ADE
@@ -56,17 +55,90 @@ class DesktopTaskWorkspaceController extends GetxController {
 
   final inputController = TextEditingController();
   final scrollController = ScrollController();
+  final isAutoScrollEnabled = true.obs;
+  final isScrolledUp = false.obs;
+
+  /// Resolves the initial project root path dynamically.
+  static String resolveInitialProjectPath() {
+    try {
+      final envPath = universal_io.Platform.environment['OMNES_WORKSPACE_ROOT'];
+      if (envPath != null && envPath.trim().isNotEmpty && universal_io.Directory(envPath).existsSync()) {
+        return envPath.trim();
+      }
+      final currentDir = universal_io.Directory.current.path;
+      if (currentDir.isNotEmpty && universal_io.Directory(currentDir).existsSync()) {
+        return currentDir;
+      }
+      final userProfile = universal_io.Platform.environment['USERPROFILE'] ?? universal_io.Platform.environment['HOME'];
+      if (userProfile != null && userProfile.isNotEmpty) {
+        final devDir = universal_io.Directory(p.join(userProfile, 'Projects'));
+        if (devDir.existsSync()) return devDir.path;
+        return userProfile;
+      }
+    } catch (_) {}
+    return universal_io.Directory.current.path;
+  }
+
+  /// Resolves the initial project name dynamically from the directory path.
+  static String resolveInitialProjectName([String? projectPath]) {
+    final targetPath = projectPath ?? resolveInitialProjectPath();
+    final name = p.basename(targetPath);
+    return name.isNotEmpty ? name : 'Мой проект';
+  }
+
+  /// Synchronously reads current Git branch from .git/HEAD in 0ms without running sub-processes.
+  static String? readGitHeadBranchSync(String? projectPath) {
+    if (projectPath == null || projectPath.isEmpty) return null;
+    try {
+      final headFile = universal_io.File(p.join(projectPath, '.git', 'HEAD'));
+      if (!headFile.existsSync()) return null;
+      final headContent = headFile.readAsStringSync().trim();
+      if (headContent.startsWith('ref: refs/heads/')) {
+        return headContent.substring('ref: refs/heads/'.length).trim();
+      }
+      if (headContent.length >= 7) {
+        return headContent.substring(0, 7);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Synchronously reads available local branches from .git/refs/heads in 0ms.
+  static List<String> readGitLocalBranchesSync(String? projectPath) {
+    if (projectPath == null || projectPath.isEmpty) return [];
+    try {
+      final headsDir = universal_io.Directory(p.join(projectPath, '.git', 'refs', 'heads'));
+      if (!headsDir.existsSync()) return [];
+      final branches = <String>[];
+      for (final entity in headsDir.listSync(recursive: true)) {
+        if (entity is universal_io.File) {
+          final relative = p.relative(entity.path, from: headsDir.path);
+          branches.add(relative.replaceAll('\\', '/'));
+        }
+      }
+      return branches;
+    } catch (_) {}
+    return [];
+  }
 
   final isRunning = false.obs;
 
   // Active Session info
-  final activeSessionId = 'omnes-core-arch'.obs;
-  final activeTaskTitle = 'Архитектура ядра OmnesAgent'.obs;
-  final activeGroup = RxnString('Разное');
-  final activeProject = RxnString('Omnes agent');
-  final activeProjectPath = RxnString('C:\\Projects\\Omnes-agent');
-  final activeBranch = RxnString('main');
-  final availableBranches = <String>['main'].obs;
+  final activeSessionId = 'session-init'.obs;
+  late final activeTaskTitle = RxString('Рабочая область ${resolveInitialProjectName()}');
+  late final activeGroup = RxnString(resolveInitialProjectName());
+  late final activeProject = RxnString(resolveInitialProjectName());
+  late final activeProjectPath = RxnString(resolveInitialProjectPath());
+  final activeProjectIcon = RxString('code');
+  final activeProjectColor = RxString('#00D2FF');
+  late final activeBranch = RxnString(readGitHeadBranchSync(resolveInitialProjectPath()) ?? 'main');
+  late final availableBranches = <String>[
+    ...readGitLocalBranchesSync(resolveInitialProjectPath()).isNotEmpty
+        ? readGitLocalBranchesSync(resolveInitialProjectPath())
+        : (readGitHeadBranchSync(resolveInitialProjectPath()) != null
+            ? [readGitHeadBranchSync(resolveInitialProjectPath())!]
+            : ['main'])
+  ].obs;
   final isNewTask = false.obs;
 
   // Multi-session tabs
@@ -255,6 +327,7 @@ class DesktopTaskWorkspaceController extends GetxController {
   @override
   void onInit() {
     super.onInit();
+    scrollController.addListener(_onScrollChanged);
     final isSeeded = GetStorage().read<bool>('desktop_sessions_seeded') ?? false;
     if (!isSeeded) {
       _initSampleSessions();
@@ -366,83 +439,57 @@ class DesktopTaskWorkspaceController extends GetxController {
   }
 
   void _initSampleSessions() {
-    // 1. omnes-core-arch (Real session from gateway)
     final deleted = _getDeletedSessionIds();
-    if (!deleted.contains('omnes-core-arch')) {
-      sessions['omnes-core-arch'] = TaskSession(
-      id: 'omnes-core-arch',
-      title: 'Архитектура ядра OmnesAgent',
-      group: 'Работа',
-      project: 'Omnes agent',
-      projectPath: r'C:\Projects\Omnes-agent',
-      branch: 'feat/ade-split',
-      hasGitRepo: true,
-      additions: 100,
-      deletions: 23,
-      activeModel: 'GLM-5.3-Flash',
-      messages: [
-        ChatMessage(
-          text: 'Спланируй модульную архитектуру ядра OmnesAgent для распределенного исполнения задач.',
-          chatMessageType: ChatMessageType.user,
-        ),
-        ChatMessage(
-          text: 'Архитектурный план ядра OmnesAgent подготовлен:\n\n1. `omnesagent-gateway`: шлюз протоколов WebSocket, SSE и REST.\n2. `omnesagent-runtime`: исполнитель циклов планирования, ReAct-рассуждений и вызова инструментов.\n3. `ob2h_runtime`: долгосрочная память, графы сущностей и оценка Blast Radius.\n4. `omnesagent-tools`: встроенные песочницы для выполнения кода, git и файловых операций.',
-          chatMessageType: ChatMessageType.bot,
-          thinking: 'Thought: Архитектурный анализ кодовой базы завершен. Разделение модулей валидировано.',
-        ),
-      ],
+    final initProj = resolveInitialProjectName();
+    final initPath = resolveInitialProjectPath();
+    final initBranch = readGitHeadBranchSync(initPath) ?? 'main';
+    final hasGit = universal_io.Directory(p.join(initPath, '.git')).existsSync();
+
+    // 1. Primary workspace session for currently opened project
+    if (!deleted.contains('session-init')) {
+      sessions['session-init'] = TaskSession(
+        id: 'session-init',
+        title: 'Рабочая область $initProj',
+        group: initProj,
+        project: initProj,
+        projectPath: initPath,
+        branch: initBranch,
+        hasGitRepo: hasGit,
+        additions: 0,
+        deletions: 0,
+        activeModel: 'GLM-5.3-Flash',
+        messages: [
+          ChatMessage(
+            text: 'Добро пожаловать в OmnesAgent. Рабочая область проекта "$initProj" ($initPath) готова к решению задач.',
+            chatMessageType: ChatMessageType.bot,
+          ),
+        ],
       );
     }
 
-    // 2. deepseek-v3-eval (Real session from gateway)
-    if (!deleted.contains('deepseek-v3-eval')) {
-      sessions['deepseek-v3-eval'] = TaskSession(
-      id: 'deepseek-v3-eval',
-      title: 'Тестирование инференса DeepSeek',
-      group: 'Работа',
-      project: 'deepseek-harness-master',
-      projectPath: r'C:\Projects\Omnes-agent',
-      branch: 'desktop-brand-ru',
-      hasGitRepo: true,
-      additions: 45,
-      deletions: 12,
-      activeModel: 'deepseek-chat',
-      messages: [
-        ChatMessage(
-          text: 'Проведи оценку скорости ответа модели DeepSeek Chat через OpenAI-совместимый API.',
-          chatMessageType: ChatMessageType.user,
-        ),
-        ChatMessage(
-          text: 'Результаты замера производительности инференса DeepSeek:\n\n• Время до первого токена (TTFT): 342ms\n• Скорость генерации: 68.4 токенов/сек\n• Успешность запросов: 100% (20/20 проб)\n• Потребление контекста: 14.2k токенов\n\nМодель полностью готова для использования в агентах по умолчанию.',
-          chatMessageType: ChatMessageType.bot,
-        ),
-      ],
-      );
-    }
-
-    // 3. quick-draft (Default group "Разное", without repository)
+    // 2. quick-draft (Default group "Разное", without repository)
     if (!deleted.contains('quick-draft')) {
       sessions['quick-draft'] = TaskSession(
-      id: 'quick-draft',
-      title: 'Заметки и идеи',
-      group: 'Разное',
-      project: null,
-      projectPath: null,
-      branch: null,
-      hasGitRepo: false,
-      additions: 0,
-      deletions: 0,
-      activeModel: 'GLM-5.3-Flash',
-      messages: [
-        ChatMessage(
-          text: 'Напомни ключевые концепции протокола Model Context Protocol (MCP).',
-          chatMessageType: ChatMessageType.user,
-        ),
-        ChatMessage(
-          text: 'Основные концепции MCP:\n\n1. **Tools**: функции с JSON-Schema, вызываемые моделью.\n2. **Resources**: URI-адресуемые данные (файлы, базы данных, логи).\n3. **Prompts**: шаблоны взаимодействия.\n4. **Sampling**: запрос агента к хост-модели для выполнения рассуждений.',
-          chatMessageType: ChatMessageType.bot,
-        ),
-      ],
+        id: 'quick-draft',
+        title: 'Заметки и идеи',
+        group: 'Разное',
+        project: null,
+        projectPath: null,
+        branch: null,
+        hasGitRepo: false,
+        additions: 0,
+        deletions: 0,
+        activeModel: 'GLM-5.3-Flash',
+        messages: [
+          ChatMessage(
+            text: 'Напомни ключевые концепции протокола Model Context Protocol (MCP).',
+            chatMessageType: ChatMessageType.user,
+          ),
+          ChatMessage(
+            text: 'Основные концепции MCP:\n\n1. **Tools**: функции с JSON-Schema, вызываемые моделью.\n2. **Resources**: URI-адресуемые данные (файлы, базы данных, логи).\n3. **Prompts**: шаблоны взаимодействия.\n4. **Sampling**: запрос агента к хост-модели для выполнения рассуждений.',
+            chatMessageType: ChatMessageType.bot,
+          ),
+        ],
       );
     }
   }
@@ -504,6 +551,7 @@ class DesktopTaskWorkspaceController extends GetxController {
     activeGroup.value = session.group;
     activeProject.value = session.project;
     activeProjectPath.value = session.projectPath;
+    _updateProjectMeta(session.project);
     activeBranch.value = session.branch;
     hasGitRepo.value = session.hasGitRepo;
     gitAdditions.value = session.additions;
@@ -540,6 +588,22 @@ class DesktopTaskWorkspaceController extends GetxController {
     // Connect WebSocket and fetch backend messages for this session
     _connectWebSocket(id);
     fetchSessionMessages(id);
+  }
+
+  void _updateProjectMeta(String? projName) {
+    if (projName == null || projName.isEmpty) return;
+    try {
+      final raw = GetStorage().read<List>('user_projects_registry');
+      if (raw != null) {
+        for (final item in raw) {
+          if (item is Map && (item['name'] == projName || item['id'] == projName)) {
+            if (item['iconName'] != null) activeProjectIcon.value = item['iconName'].toString();
+            if (item['colorHex'] != null) activeProjectColor.value = item['colorHex'].toString();
+            return;
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   void closeSessionTab(String id) {
@@ -602,7 +666,12 @@ class DesktopTaskWorkspaceController extends GetxController {
 
       for (final p in standardDefs) {
         final id = p['id'] as String;
-        final key = storage.read<String>('provider_key_$id') ?? '';
+        var key = storage.read<String>('provider_key_$id') ?? '';
+        if (key.trim().isEmpty) {
+          key = universal_io.Platform.environment['${id.toUpperCase()}_API_KEY'] ??
+              (id == 'qwen' ? universal_io.Platform.environment['DASHSCOPE_API_KEY'] : null) ??
+              (id == 'moonshot' ? universal_io.Platform.environment['KIMI_API_KEY'] : null) ?? '';
+        }
         if (key.trim().isNotEmpty) {
           providersList.add({
             'id': id,
@@ -613,12 +682,24 @@ class DesktopTaskWorkspaceController extends GetxController {
         }
       }
 
-      final ollamaEnabled = storage.read<bool>('provider_enabled_ollama') ?? false;
+      final hasOllamaEnv = universal_io.Platform.environment['OLLAMA_HOST'] != null || universal_io.Platform.environment['OLLAMA_BASE_URL'] != null;
+      final ollamaEnabled = storage.read<bool>('provider_enabled_ollama') ?? hasOllamaEnv;
       if (ollamaEnabled) {
         providersList.add({
           'id': 'ollama',
           'name': 'Ollama (Local)',
           'models': ['qwen2.5-coder:32b', 'deepseek-r1:14b', 'llama3.2'],
+          'isCustom': false,
+        });
+      }
+
+      final hasLmStudioEnv = universal_io.Platform.environment['LMSTUDIO_BASE_URL'] != null;
+      final lmStudioEnabled = storage.read<bool>('provider_enabled_lmstudio') ?? hasLmStudioEnv;
+      if (lmStudioEnabled) {
+        providersList.add({
+          'id': 'lmstudio',
+          'name': 'LM Studio (Local)',
+          'models': ['local-model', 'qwen2.5-coder-7b-instruct', 'deepseek-r1-distill-qwen-7b'],
           'isCustom': false,
         });
       }
@@ -710,6 +791,64 @@ class DesktopTaskWorkspaceController extends GetxController {
       return '${truncated.substring(0, lastSpace)}...';
     }
     return '$truncated...';
+  }
+
+  List<Map<String, dynamic>> _generateDynamicStepsForPrompt(String prompt) {
+    final lower = prompt.toLowerCase();
+
+    if (lower.contains('тест') || lower.contains('test') || lower.contains('spec')) {
+      String target = 'модуля';
+      final match = RegExp(r'([\w_]+(?:_service|_controller|_repository|\.dart|\.rs))', caseSensitive: false).firstMatch(prompt);
+      if (match != null) {
+        target = match.group(1)!;
+      }
+      return [
+        {'title': 'Анализ спецификаций и кода $target', 'status': 'running'},
+        {'title': 'Проверка Git-ветки и тестового окружения', 'status': 'pending'},
+        {'title': 'Реализация тестовых сценариев и моков', 'status': 'pending'},
+        {'title': 'Запуск тестов и валидация результатов', 'status': 'pending'},
+      ];
+    }
+
+    if (lower.contains('исправ') || lower.contains('fix') || lower.contains('ошибк') || lower.contains('баг') || lower.contains('bug')) {
+      return [
+        {'title': 'Локализация проблемы и анализ зависимостей', 'status': 'running'},
+        {'title': 'Подготовка целевого патча решения', 'status': 'pending'},
+        {'title': 'Применение правок в кодовой базе', 'status': 'pending'},
+        {'title': 'Проверка компиляции и регрессионный контроль', 'status': 'pending'},
+      ];
+    }
+
+    if (lower.contains('созда') || lower.contains('добав') || lower.contains('новый') || lower.contains('feat') || lower.contains('реализ')) {
+      return [
+        {'title': 'Проектирование структуры и интерфейсов', 'status': 'running'},
+        {'title': 'Генерация кода и реализация компонентов', 'status': 'pending'},
+        {'title': 'Интеграция с архитектурой проекта', 'status': 'pending'},
+        {'title': 'Верификация целостности артефактов', 'status': 'pending'},
+      ];
+    }
+
+    if (lower.contains('рефактор') || lower.contains('оптимиз') || lower.contains('ревью') || lower.contains('review')) {
+      return [
+        {'title': 'Анализ архитектуры и выявление узких мест', 'status': 'running'},
+        {'title': 'Рефакторинг структур данных и логики', 'status': 'pending'},
+        {'title': 'Проверка сборки и совместимости', 'status': 'pending'},
+        {'title': 'Формирование итогового отчёта изменений', 'status': 'pending'},
+      ];
+    }
+
+    String cleanQuery = prompt.split('\n').first.trim();
+    if (cleanQuery.length > 38) {
+      cleanQuery = '${cleanQuery.substring(0, 35)}...';
+    }
+    if (cleanQuery.isEmpty) cleanQuery = 'задачи';
+
+    return [
+      {'title': 'Анализ запроса: $cleanQuery', 'status': 'running'},
+      {'title': 'Инспекция контекста и релевантных файлов', 'status': 'pending'},
+      {'title': 'Выполнение операций и подготовка решения', 'status': 'pending'},
+      {'title': 'Формирование итоговых артефактов', 'status': 'pending'},
+    ];
   }
 
   void bindSessionToProject(String id, String projectName, String projectPath) {
@@ -870,12 +1009,21 @@ class DesktopTaskWorkspaceController extends GetxController {
         ));
         messages.refresh();
       }
+      final currentRunning = runTimelineSteps.firstWhereOrNull((s) => s['status'] == 'running');
+      if (currentRunning != null) {
+        currentRunning['status'] = 'completed';
+        final nextPending = runTimelineSteps.firstWhereOrNull((s) => s['status'] == 'pending');
+        if (nextPending != null) {
+          nextPending['status'] = 'running';
+        }
+      }
       runTimelineSteps.add({
         'id': frame.id,
         'name': frame.name,
         'args': frame.args,
         'status': 'running',
       });
+      runTimelineSteps.refresh();
       _scrollToBottom();
     } else if (frame is ToolResultFrame) {
       if (messages.isNotEmpty && messages.last.chatMessageType == ChatMessageType.bot) {
@@ -930,6 +1078,12 @@ class DesktopTaskWorkspaceController extends GetxController {
         _extractTodoBlocksForMessage(messages.last);
         messages.refresh();
       }
+      for (final step in runTimelineSteps) {
+        if (step['status'] != 'error' && step['status'] != 'failed') {
+          step['status'] = 'completed';
+        }
+      }
+      runTimelineSteps.refresh();
       isRunning.value = false;
       _saveCurrentSessionState();
       _scrollToBottom();
@@ -1792,7 +1946,7 @@ $goalsText
   Future<bool> switchGitBranch(String branchName) async {
     try {
       final currentSession = sessions[activeSessionId.value];
-      final projPath = currentSession?.projectPath ?? activeProjectPath.value ?? r'C:\Projects\Omnes-agent';
+      final projPath = currentSession?.projectPath ?? activeProjectPath.value ?? resolveInitialProjectPath();
       final res = await Process.run('git', ['checkout', branchName], workingDirectory: projPath);
       if (res.exitCode == 0) {
         activeBranch.value = branchName;
@@ -1810,7 +1964,7 @@ $goalsText
   Future<bool> createNewGitBranch(String branchName) async {
     try {
       final currentSession = sessions[activeSessionId.value];
-      final projPath = currentSession?.projectPath ?? activeProjectPath.value ?? r'C:\Projects\Omnes-agent';
+      final projPath = currentSession?.projectPath ?? activeProjectPath.value ?? resolveInitialProjectPath();
       final res = await Process.run('git', ['checkout', '-b', branchName], workingDirectory: projPath);
       if (res.exitCode == 0) {
         activeBranch.value = branchName;
@@ -1827,13 +1981,29 @@ $goalsText
   Future<void> refreshGitStatus() async {
     try {
       final currentSession = sessions[activeSessionId.value];
-      final projPath = currentSession?.projectPath ?? activeProjectPath.value;
-      if (projPath == null || projPath.isEmpty || !Directory(projPath).existsSync()) {
+      final projPath = currentSession?.projectPath ?? activeProjectPath.value ?? resolveInitialProjectPath();
+      if (projPath.isEmpty || !Directory(projPath).existsSync()) {
         gitModifiedFiles.clear();
         gitStagedFiles.clear();
         gitAdditions.value = 0;
         gitDeletions.value = 0;
         return;
+      }
+
+      // 0. Synchronous Git HEAD & branches resolution (instant 0ms response)
+      final syncBranch = readGitHeadBranchSync(projPath);
+      if (syncBranch != null && syncBranch.isNotEmpty) {
+        activeBranch.value = syncBranch;
+        if (currentSession != null) {
+          currentSession.branch = syncBranch;
+        }
+        if (!availableBranches.contains(syncBranch)) {
+          availableBranches.add(syncBranch);
+        }
+      }
+      final syncBranches = readGitLocalBranchesSync(projPath);
+      if (syncBranches.isNotEmpty) {
+        availableBranches.assignAll(syncBranches);
       }
 
       // 1. Run git status --porcelain to separate staged and unstaged files
@@ -1982,7 +2152,9 @@ $goalsText
     final currentSession = sessions[activeSessionId.value];
     final isDefaultTitle = currentSession == null ||
         currentSession.title == 'Новая сессия' ||
+        currentSession.title.startsWith('sess_') ||
         activeTaskTitle.value == 'Новая сессия' ||
+        activeTaskTitle.value.startsWith('sess_') ||
         isNewTask.value;
 
     if (isDefaultTitle && rawText.isNotEmpty) {
@@ -2028,15 +2200,11 @@ $goalsText
     );
     messages.add(userMsg);
     _saveSessionMessages(activeSessionId.value);
+    _scrollToBottom(force: true);
 
-    // Auto-expand TaskBar and populate real task steps for this request
+    // Auto-expand TaskBar and populate dynamic contextual steps for this request
     isTaskBarExpanded.value = true;
-    runTimelineSteps.assignAll([
-      {'title': 'Анализ запроса и контекста проекта', 'status': 'running'},
-      {'title': 'Проверка Git-изменений и AST-символов', 'status': 'pending'},
-      {'title': 'Инспекция кодовой базы и выполнение', 'status': 'pending'},
-      {'title': 'Формирование артефактов решения', 'status': 'pending'},
-    ]);
+    runTimelineSteps.assignAll(_generateDynamicStepsForPrompt(rawText));
 
     inputController.clear();
     attachments.clear();
@@ -2058,31 +2226,58 @@ $goalsText
       }
     }
 
+    if (customKey.isEmpty) {
+      if (provId == 'openai') {
+        customKey = universal_io.Platform.environment['OPENAI_API_KEY'] ?? '';
+      } else if (provId == 'deepseek') {
+        customKey = universal_io.Platform.environment['DEEPSEEK_API_KEY'] ?? '';
+      } else if (provId == 'anthropic') {
+        customKey = universal_io.Platform.environment['ANTHROPIC_API_KEY'] ?? '';
+      } else if (provId == 'gemini') {
+        customKey = universal_io.Platform.environment['GEMINI_API_KEY'] ?? '';
+      } else if (provId == 'groq') {
+        customKey = universal_io.Platform.environment['GROQ_API_KEY'] ?? '';
+      } else if (provId == 'openrouter') {
+        customKey = universal_io.Platform.environment['OPENROUTER_API_KEY'] ?? '';
+      } else if (provId == 'mistral') {
+        customKey = universal_io.Platform.environment['MISTRAL_API_KEY'] ?? '';
+      } else if (provId == 'moonshot') {
+        customKey = universal_io.Platform.environment['MOONSHOT_API_KEY'] ?? universal_io.Platform.environment['KIMI_API_KEY'] ?? '';
+      } else if (provId == 'qwen') {
+        customKey = universal_io.Platform.environment['QWEN_API_KEY'] ?? universal_io.Platform.environment['DASHSCOPE_API_KEY'] ?? '';
+      }
+    }
+
     if (customUrl.isEmpty) {
       if (provId == 'deepseek') {
-        customUrl = 'https://api.deepseek.com/v1';
+        customUrl = universal_io.Platform.environment['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com/v1';
       } else if (provId == 'openai') {
-        customUrl = 'https://api.openai.com/v1';
+        customUrl = universal_io.Platform.environment['OPENAI_BASE_URL'] ?? 'https://api.openai.com/v1';
       } else if (provId == 'anthropic') {
-        customUrl = 'https://api.anthropic.com/v1';
+        customUrl = universal_io.Platform.environment['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com/v1';
       } else if (provId == 'glm') {
         customUrl = 'https://open.bigmodel.cn/api/paas/v4';
       } else if (provId == 'groq') {
         customUrl = 'https://api.groq.com/openai/v1';
       } else if (provId == 'openrouter') {
-        customUrl = 'https://openrouter.ai/api/v1';
+        customUrl = universal_io.Platform.environment['OPENROUTER_BASE_URL'] ?? 'https://openrouter.ai/api/v1';
       } else if (provId == 'mistral') {
         customUrl = 'https://api.mistral.ai/v1';
       } else if (provId == 'moonshot') {
         customUrl = 'https://api.moonshot.cn/v1';
       } else if (provId == 'qwen') {
-        customUrl = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+        customUrl = universal_io.Platform.environment['QWEN_BASE_URL'] ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1';
       } else if (provId == 'ollama') {
-        customUrl = 'http://localhost:11434/v1';
+        customUrl = universal_io.Platform.environment['OLLAMA_HOST'] ??
+            universal_io.Platform.environment['OLLAMA_BASE_URL'] ??
+            'http://localhost:11434/v1';
+      } else if (provId == 'lmstudio' || provId == 'local') {
+        customUrl = universal_io.Platform.environment['LMSTUDIO_BASE_URL'] ??
+            'http://localhost:1234/v1';
       }
     }
 
-    final hasDirectCredentials = customKey.isNotEmpty || provId == 'ollama';
+    final hasDirectCredentials = customKey.isNotEmpty || provId == 'ollama' || provId == 'lmstudio' || provId == 'local';
     final isCustomProvider = provId.startsWith('custom_') ||
         provId.toLowerCase().contains('daluobo') ||
         !configuredProviders.any((p) => p['id'] == provId && p['isCustom'] == false);
@@ -2118,8 +2313,9 @@ $goalsText
         } else if (isRunning.value && messages.length == initialMessageCount) {
           // Timeout with no credentials
           isRunning.value = false;
+          final gwAddress = GatewayConfig.getBaseUrl().replaceAll('http://', '');
           messages.add(ChatMessage(
-            text: '⚠️ Шлюз OmnesAgent (127.0.0.1:42617) не ответил вовремя на запрос.\nПроверьте подключение шлюза или настройте прямой API ключ провайдера в Настройках.',
+            text: '⚠️ Шлюз OmnesAgent ($gwAddress) не ответил вовремя на запрос.\nПроверьте подключение шлюза или настройте прямой API ключ провайдера в Настройках.',
             chatMessageType: ChatMessageType.bot,
             isError: true,
           ));
@@ -2157,7 +2353,7 @@ $goalsText
     _scrollToBottom();
   }
 
-  /// Direct SSE streaming from any OpenAI-compatible endpoint (Qwen, Claude, DeepSeek, Daluobo, Ollama).
+  /// Direct SSE streaming from any OpenAI-compatible endpoint (Qwen, Claude, DeepSeek, Daluobo, Ollama, LM Studio).
   Future<void> _streamFromProviderDirectly({
     required String prompt,
     required String providerId,
@@ -2184,7 +2380,7 @@ $goalsText
       title: 'Инспекция контекста $activeProject и подготовка ответа',
       type: AgentActionType.analyzingCode,
       isRunning: true,
-      details: 'Чтение структуры рабочей области ${activeProjectPath.value ?? r"C:\Projects\Omnes-agent"}',
+      details: 'Чтение структуры рабочей области ${activeProjectPath.value ?? resolveInitialProjectPath()}',
     );
 
     final botMessage = ChatMessage(
@@ -2288,7 +2484,10 @@ $goalsText
           final reasoning = delta['reasoning_content'] as String?;
           if (reasoning != null && reasoning.isNotEmpty) {
             botMessage.thinking = (botMessage.thinking ?? '') + reasoning;
+            botMessage.isThinkingExpanded = true;
+            botMessage.isThinkingFinished = false;
             messages.refresh();
+            _scrollToBottom();
           }
 
           // Check content
@@ -2371,6 +2570,13 @@ $goalsText
           }
         }
       }
+      if (botMessage.text.trim().isEmpty && (botMessage.thinking?.trim().isNotEmpty ?? false)) {
+        botMessage.text = botMessage.thinking!.trim();
+      }
+      for (final s in runTimelineSteps) {
+        s['status'] = 'completed';
+      }
+      runTimelineSteps.refresh();
       _updateTokenUsageStats();
       isRunning.value = false;
       thinkingTimer.cancel();
@@ -2497,13 +2703,49 @@ $goalsText
     }
   }
 
-  void _scrollToBottom() {
+  void _onScrollChanged() {
+    if (!scrollController.hasClients) return;
+    final max = scrollController.position.maxScrollExtent;
+    final current = scrollController.position.pixels;
+    final distance = max - current;
+
+    // If distance from bottom is notable, user scrolled up
+    if (distance > 70) {
+      if (!isScrolledUp.value) isScrolledUp.value = true;
+      if (distance > 100 && isAutoScrollEnabled.value) {
+        isAutoScrollEnabled.value = false;
+      }
+    } else {
+      if (isScrolledUp.value) isScrolledUp.value = false;
+      if (!isAutoScrollEnabled.value) isAutoScrollEnabled.value = true;
+    }
+  }
+
+  void _scrollToBottom({bool force = false}) {
+    if (!isAutoScrollEnabled.value && !force) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (scrollController.hasClients) {
+        final target = scrollController.position.maxScrollExtent;
+        if ((scrollController.position.pixels - target).abs() > 4) {
+          scrollController.animateTo(
+            target,
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOutCubic,
+          );
+        }
+      }
+    });
+  }
+
+  void scrollToBottomDirect() {
+    isAutoScrollEnabled.value = true;
+    isScrolledUp.value = false;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (scrollController.hasClients) {
         scrollController.animateTo(
           scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 200),
-          curve: Curves.easeOut,
+          duration: const Duration(milliseconds: 320),
+          curve: Curves.easeInOutCubic,
         );
       }
     });
@@ -2511,6 +2753,7 @@ $goalsText
 
   @override
   void onClose() {
+    scrollController.removeListener(_onScrollChanged);
     _termStdoutSub?.cancel();
     _termStderrSub?.cancel();
     try {

@@ -6,17 +6,18 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:omnes_shared/omnes_shared.dart';
 import 'package:path/path.dart' as path;
 
 class DesktopBackendManager {
   static Process? _backendProcess;
   static bool _startedByDesktop = false;
 
-  /// Checks whether OmnesAgent gateway is currently responding on port 42617.
+  /// Checks whether OmnesAgent gateway is currently responding.
   static Future<bool> isBackendRunning() async {
     try {
       final res = await http
-          .get(Uri.parse('http://127.0.0.1:42617/health'))
+          .get(Uri.parse('${GatewayConfig.getBaseUrl()}/health'))
           .timeout(const Duration(milliseconds: 600));
       return res.statusCode == 200;
     } catch (_) {
@@ -102,7 +103,7 @@ class DesktopBackendManager {
   /// Starts backend gateway process if it is not already running.
   static Future<bool> startBackendIfNeeded() async {
     if (await isBackendRunning()) {
-      debugPrint('[DesktopBackendManager] Backend gateway is already active on port 42617');
+      debugPrint('[DesktopBackendManager] Backend gateway is already active at ${GatewayConfig.getBaseUrl()}');
       return true;
     }
 
@@ -118,7 +119,7 @@ class DesktopBackendManager {
     try {
       _backendProcess = await Process.start(
         binPath,
-        ['gateway', 'start', '-p', '42617', '--host', '127.0.0.1'],
+        ['gateway', 'start', '-p', '${GatewayConfig.getPort()}', '--host', '127.0.0.1'],
         workingDirectory: workingDir,
         mode: ProcessStartMode.normal,
       );

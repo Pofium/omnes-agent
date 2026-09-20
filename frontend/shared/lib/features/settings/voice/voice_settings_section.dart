@@ -102,7 +102,6 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
   Future<void> _handleInstallHandy() async {
     final confirmed = await HandyInstallDialog.show(
       context,
-      onConfirm: () {},
       onDontAskAgainChanged: (dontAsk) {
         if (dontAsk) {
           _storage.write('handy_install_policy_ack', true);

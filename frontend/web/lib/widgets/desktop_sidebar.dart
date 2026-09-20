@@ -102,7 +102,7 @@ class DesktopSidebar extends StatefulWidget {
   final VoidCallback onOpenSettings;
   final VoidCallback onToggleSidebar;
   final VoidCallback? onOpenSkills;
-  final VoidCallback? onOpenAutomations;
+  final VoidCallback onOpenAutomations;
   final UserProfileData userProfile;
   final VoidCallback onOpenProfile;
   final Function(String filePath)? onOpenFile;
@@ -118,7 +118,7 @@ class DesktopSidebar extends StatefulWidget {
     required this.onOpenSettings,
     required this.onToggleSidebar,
     this.onOpenSkills,
-    this.onOpenAutomations,
+    required this.onOpenAutomations,
     required this.userProfile,
     required this.onOpenProfile,
     this.onOpenFile,
@@ -142,6 +142,22 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
   // Active Project for File Tree mode
   DesktopProject? activeFileTreeProject;
+  bool isRefreshingTree = false;
+
+  Future<void> _refreshProjectFiles() async {
+    if (isRefreshingTree) return;
+    setState(() => isRefreshingTree = true);
+    try {
+      if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+        final ctrl = Get.find<DesktopTaskWorkspaceController>();
+        await ctrl.refreshGitStatus();
+      }
+    } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (mounted) {
+      setState(() => isRefreshingTree = false);
+    }
+  }
 
   // 20 Group icons catalog
   static const List<Map<String, dynamic>> groupIconsCatalog = [
@@ -328,7 +344,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       label: DesktopI18n.automations,
                       shortcut: '',
                       isSelected: widget.selectedIndex == -3,
-                      onTap: widget.onOpenAutomations ?? () {},
+                      onTap: widget.onOpenAutomations,
                     ),
                   ],
                 ),
@@ -1134,12 +1150,18 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
               ),
               const SizedBox(width: 4),
               IconButton(
-                icon: const Icon(Icons.refresh, size: 13),
+                icon: isRefreshingTree
+                    ? const SizedBox(
+                        width: 11,
+                        height: 11,
+                        child: CircularProgressIndicator(strokeWidth: 1.5, color: DesktopTheme.accentCyan),
+                      )
+                    : const Icon(Icons.refresh, size: 13),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
-                tooltip: 'Обновить дерево',
-                color: DesktopTheme.textMuted,
-                onPressed: () => setState(() {}),
+                tooltip: 'Обновить дерево файлов и Git статус',
+                color: isRefreshingTree ? DesktopTheme.accentCyan : DesktopTheme.textMuted,
+                onPressed: _refreshProjectFiles,
               ),
             ],
           ),

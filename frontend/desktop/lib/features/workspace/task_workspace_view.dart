@@ -11,6 +11,8 @@ import 'package:omnes_shared/omnes_shared.dart';
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_backend_manager.dart';
 import '../../utils/desktop_i18n.dart';
+import '../../utils/project_scaffolding.dart';
+import '../../widgets/desktop_sidebar.dart';
 import '../../widgets/interactive_question_card.dart';
 import 'task_workspace_controller.dart';
 
@@ -405,14 +407,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                               ),
                             ),
                           ] else if (isRunning) ...[
-                            const Padding(
-                              padding: EdgeInsets.only(top: 1),
+                            Padding(
+                              padding: const EdgeInsets.only(top: 1),
                               child: Text(
                                 '->',
                                 style: TextStyle(
                                   fontSize: 13,
                                   fontWeight: FontWeight.bold,
-                                  color: Color(0xFFF1F5F9),
+                                  color: DesktopTheme.textPrimary,
                                   fontFamily: 'Consolas',
                                 ),
                               ),
@@ -421,10 +423,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                             Expanded(
                               child: Text(
                                 title,
-                                style: const TextStyle(
+                                style: TextStyle(
                                   fontSize: 12,
                                   fontWeight: FontWeight.w600,
-                                  color: Color(0xFFF1F5F9),
+                                  color: DesktopTheme.textPrimary,
                                   height: 1.3,
                                 ),
                               ),
@@ -478,8 +480,18 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         ),
         child: Row(
           children: [
-            // Project Folder Icon (no emojis!)
-            const Icon(Icons.folder_outlined, size: 14, color: Color(0xFF00D2FF)),
+            // Dynamic Project Icon and Color
+            Icon(
+              DesktopProject.resolveIcon(widget.controller.activeProjectIcon.value),
+              size: 14,
+              color: () {
+                try {
+                  final clean = widget.controller.activeProjectColor.value.replaceAll('#', '');
+                  if (clean.length == 6) return Color(int.parse('0xFF$clean'));
+                } catch (_) {}
+                return DesktopTheme.accentCyan;
+              }(),
+            ),
             const SizedBox(width: 6),
             Text(
               proj,
@@ -579,6 +591,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   borderRadius: BorderRadius.circular(8),
                   side: BorderSide(color: DesktopTheme.borderSubtle),
                 ),
+                constraints: const BoxConstraints(minWidth: 320, maxWidth: 420),
                 offset: const Offset(0, 26),
                 onSelected: (newMode) {
                   widget.controller.currentSessionMode.value = newMode;
@@ -847,17 +860,22 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFF00D2FF)),
               ),
               const SizedBox(width: 10),
-              Text(
-                DesktopI18n.tr(
-                  'Подключение к шлюзу OmnesAgent (127.0.0.1:42617)...',
-                  'Connecting to OmnesAgent Gateway (127.0.0.1:42617)...',
-                ),
-                style: const TextStyle(
-                  fontSize: 11.5,
-                  color: Color(0xFF00D2FF),
-                  fontFamily: 'Consolas',
-                  fontWeight: FontWeight.w500,
-                ),
+              Builder(
+                builder: (context) {
+                  final gwAddress = GatewayConfig.getBaseUrl().replaceAll('http://', '');
+                  return Text(
+                    DesktopI18n.tr(
+                      'Подключение к шлюзу OmnesAgent ($gwAddress)...',
+                      'Connecting to OmnesAgent Gateway ($gwAddress)...',
+                    ),
+                    style: const TextStyle(
+                      fontSize: 11.5,
+                      color: Color(0xFF00D2FF),
+                      fontFamily: 'Consolas',
+                      fontWeight: FontWeight.w500,
+                    ),
+                  );
+                },
               ),
             ],
           ),
@@ -876,14 +894,19 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               const Icon(Icons.cloud_off_rounded, size: 14, color: Color(0xFFF87171)),
               const SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  DesktopI18n.tr(
-                    'Шлюз OmnesAgent (127.0.0.1:42617) недоступен. Ожидание запуска демона...',
-                    'OmnesAgent Gateway (127.0.0.1:42617) is offline. Waiting for daemon...',
-                  ),
-                  style: const TextStyle(fontSize: 11.5, color: Color(0xFFFCA5A5)),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                child: Builder(
+                  builder: (context) {
+                    final gwAddress = GatewayConfig.getBaseUrl().replaceAll('http://', '');
+                    return Text(
+                      DesktopI18n.tr(
+                        'Шлюз OmnesAgent ($gwAddress) недоступен. Ожидание запуска демона...',
+                        'OmnesAgent Gateway ($gwAddress) is offline. Waiting for daemon...',
+                      ),
+                      style: const TextStyle(fontSize: 11.5, color: Color(0xFFFCA5A5)),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    );
+                  },
                 ),
               ),
               InkWell(
@@ -1728,42 +1751,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
               const SizedBox(height: 20),
 
-              // 3 Quick Action Cards
+              // Stack-adaptive dynamic template cards via ProjectAnalyzer
               Row(
-                children: [
-                  Expanded(
-                    child: _buildTemplateCard(
-                      title: DesktopI18n.standupGitTitle,
-                      desc: DesktopI18n.standupGitDesc,
-                      onTap: () {
-                        widget.controller.inputController.text = DesktopI18n.standupPrompt;
-                      },
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _buildTemplateCard(
-                      title: DesktopI18n.ciFailuresTitle,
-                      desc: DesktopI18n.ciFailuresDesc,
-                      onTap: () {
-                        widget.controller.inputController.text = DesktopI18n.ciFailuresPrompt;
-                      },
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: _buildTemplateCard(
-                      title: DesktopI18n.customizeTitle,
-                      desc: DesktopI18n.customizeDesc,
-                      onTap: () {
-                        widget.controller.inputController.text = DesktopI18n.tr(
-                          'Помоги настроить и кастомизировать конфигурацию текущего рабочего пространства под мой стек технологий.',
-                          'Help configure and customize the current workspace settings for my tech stack.',
-                        );
-                      },
-                    ),
-                  ),
-                ],
+                children: _getDynamicTemplateCards(),
               ),
             ],
           ),
@@ -1772,9 +1762,131 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
+  List<Widget> _getDynamicTemplateCards() {
+    final projPath = widget.controller.activeProjectPath.value ?? '';
+    final analysis = ProjectAnalyzer.analyze(projPath);
+    final stack = analysis.detectedStack.toLowerCase();
+
+    String title1 = DesktopI18n.standupGitTitle;
+    String desc1 = DesktopI18n.standupGitDesc;
+    String prompt1 = DesktopI18n.standupPrompt;
+    IconData icon1 = Icons.commit_outlined;
+
+    String title2 = DesktopI18n.ciFailuresTitle;
+    String desc2 = DesktopI18n.ciFailuresDesc;
+    String prompt2 = DesktopI18n.ciFailuresPrompt;
+    IconData icon2 = Icons.bug_report_outlined;
+
+    String title3 = DesktopI18n.customizeTitle;
+    String desc3 = DesktopI18n.customizeDesc;
+    String prompt3 = DesktopI18n.tr(
+      'Помоги настроить и кастомизировать конфигурацию текущего рабочего пространства под мой стек технологий.',
+      'Help configure and customize the current workspace settings for my tech stack.',
+    );
+    IconData icon3 = Icons.tune_outlined;
+
+    if (stack.contains('rust')) {
+      title1 = 'Cargo Test & Clippy';
+      desc1 = 'Запуск тестов и проверка линтером clippy в воркспейсе';
+      prompt1 = 'Выполни `cargo test --workspace` и `cargo clippy --all-targets`, выяви предупреждения и устрани найденные ошибки.';
+      icon1 = FontAwesomeIcons.rust;
+
+      title2 = 'Архитектура крейтов';
+      desc2 = 'Анализ зависимостей и изоляции модулей в backend/';
+      prompt2 = 'Проанализируй архитектуру крейтов Cargo.toml, зависимости и публичные API. Сформируй рекомендации по модульности.';
+      icon2 = Icons.account_tree_outlined;
+
+      title3 = 'Git Standup';
+      desc3 = DesktopI18n.standupGitDesc;
+      prompt3 = DesktopI18n.standupPrompt;
+      icon3 = Icons.history_edu_outlined;
+    } else if (stack.contains('flutter') || stack.contains('dart')) {
+      title1 = 'Flutter Test & Analyze';
+      desc1 = 'Проверка линтера Dart и запуск тестов виджетов';
+      prompt1 = 'Выполни `flutter analyze` и `flutter test`, проверь линтер и синтаксис Dart файлов.';
+      icon1 = Icons.flutter_dash;
+
+      title2 = 'UI & Дизайн-система';
+      desc2 = 'Аудит компонентов Cyber UI и адаптивности';
+      prompt2 = 'Проведи инспекцию виджетов UI, соответствия правилам темной/светлой темы и отсутствия переполнений (overflow).';
+      icon2 = Icons.palette_outlined;
+
+      title3 = 'Git Standup';
+      desc3 = DesktopI18n.standupGitDesc;
+      prompt3 = DesktopI18n.standupPrompt;
+      icon3 = Icons.history_edu_outlined;
+    } else if (stack.contains('python')) {
+      title1 = 'Pytest & Ruff';
+      desc1 = 'Запуск модульных тестов и быстрая проверка линтером';
+      prompt1 = 'Запусти `pytest` и проверку линтером `ruff check .`, исправь ошибки форматирования и типизации.';
+      icon1 = FontAwesomeIcons.python;
+
+      title2 = 'Рефакторинг кода';
+      desc2 = 'Добавление type hints и документации к модулям';
+      prompt2 = 'Проверь Python-код на соответствие PEP 8, добавь строгие type hints и docstring комментарии.';
+      icon2 = Icons.auto_fix_high_outlined;
+
+      title3 = 'Git Standup';
+      desc3 = DesktopI18n.standupGitDesc;
+      prompt3 = DesktopI18n.standupPrompt;
+      icon3 = Icons.history_edu_outlined;
+    } else if (stack.contains('web') || stack.contains('node')) {
+      title1 = 'NPM Test & Lint';
+      desc1 = 'Запуск тестов и валидация TypeScript / ESLint';
+      prompt1 = 'Выполни `npm test` и `npm run lint`, исправь ошибки компиляции и проверки стилей.';
+      icon1 = FontAwesomeIcons.nodeJs;
+
+      title2 = 'Веб-компоненты';
+      desc2 = 'Оптимизация рендеринга и доступности компонентов';
+      prompt2 = 'Проанализируй структуру веб-компонентов и работу со стейтом.';
+      icon2 = Icons.web_asset_outlined;
+
+      title3 = 'Git Standup';
+      desc3 = DesktopI18n.standupGitDesc;
+      prompt3 = DesktopI18n.standupPrompt;
+      icon3 = Icons.history_edu_outlined;
+    }
+
+    return [
+      Expanded(
+        child: _buildTemplateCard(
+          title: title1,
+          desc: desc1,
+          icon: icon1,
+          onTap: () {
+            widget.controller.inputController.text = prompt1;
+          },
+        ),
+      ),
+      const SizedBox(width: 12),
+      Expanded(
+        child: _buildTemplateCard(
+          title: title2,
+          desc: desc2,
+          icon: icon2,
+          onTap: () {
+            widget.controller.inputController.text = prompt2;
+          },
+        ),
+      ),
+      const SizedBox(width: 12),
+      Expanded(
+        child: _buildTemplateCard(
+          title: title3,
+          desc: desc3,
+          icon: icon3,
+          onTap: () {
+            widget.controller.inputController.text = prompt3;
+          },
+        ),
+      ),
+    ];
+  }
+
   Widget _buildTemplateCard({
     required String title,
     required String desc,
+    IconData icon = Icons.nightlight_round,
     required VoidCallback onTap,
   }) {
     return InkWell(
@@ -1793,7 +1905,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           children: [
             Row(
               children: [
-                const Icon(Icons.nightlight_round, size: 14, color: Color(0xFF00D2FF)),
+                Icon(icon, size: 14, color: const Color(0xFF00D2FF)),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
@@ -2193,10 +2305,21 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   // CHAT TIMELINE (Active Task Run)
   // ==========================================
   Widget _buildChatTimeline() {
-    return ListView.builder(
-      controller: widget.controller.scrollController,
-      padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-      itemCount: widget.controller.messages.length + (widget.controller.isRunning.value && (widget.controller.messages.isEmpty || !widget.controller.messages.last.isStreaming) ? 1 : 0),
+    return Stack(
+      children: [
+        NotificationListener<ScrollNotification>(
+          onNotification: (notification) {
+            if (notification is ScrollUpdateNotification) {
+              if ((notification.scrollDelta ?? 0) < -1) {
+                widget.controller.isAutoScrollEnabled.value = false;
+              }
+            }
+            return false;
+          },
+          child: ListView.builder(
+            controller: widget.controller.scrollController,
+            padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+            itemCount: widget.controller.messages.length + (widget.controller.isRunning.value && (widget.controller.messages.isEmpty || !widget.controller.messages.last.isStreaming) ? 1 : 0),
       itemBuilder: (context, index) {
         if (index >= widget.controller.messages.length) {
           return _buildAgentGeneratingIndicator();
@@ -2332,7 +2455,88 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           ),
         );
       },
-    );
+    ),
+  ),
+
+  // Floating "Scroll to bottom" button when user scrolled up
+  Positioned(
+    bottom: 18,
+    right: 28,
+    child: Obx(() {
+      final isScrolledUp = widget.controller.isScrolledUp.value;
+      final isRunning = widget.controller.isRunning.value;
+
+      return AnimatedSlide(
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOutCubic,
+        offset: isScrolledUp ? Offset.zero : const Offset(0, 1.5),
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+          opacity: isScrolledUp ? 1.0 : 0.0,
+          child: isScrolledUp
+              ? Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    onTap: widget.controller.scrollToBottomDirect,
+                    borderRadius: BorderRadius.circular(20),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: DesktopTheme.bgSurfaceElevated,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: isRunning ? const Color(0xFF00D2FF).withOpacity(0.6) : DesktopTheme.borderSubtle,
+                          width: 1.2,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.25),
+                            blurRadius: 10,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (isRunning) ...[
+                            Container(
+                              width: 7,
+                              height: 7,
+                              margin: const EdgeInsets.only(right: 6),
+                              decoration: const BoxDecoration(
+                                color: Color(0xFF10B981),
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            Text(
+                              DesktopI18n.tr('Печатает...', 'Typing...'),
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: Color(0xFF10B981),
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          Icon(
+                            Icons.arrow_downward_rounded,
+                            size: 14,
+                            color: DesktopTheme.accentCyan,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
+      );
+    }),
+  ),
+],
+);
   }
 
   Widget _buildTerminalBadge() {
@@ -2614,14 +2818,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                             ),
                           ),
                         ] else if (isRunning) ...[
-                          const Padding(
-                            padding: EdgeInsets.only(top: 1),
+                          Padding(
+                            padding: const EdgeInsets.only(top: 1),
                             child: Text(
                               '->',
                               style: TextStyle(
                                 fontSize: 13,
                                 fontWeight: FontWeight.bold,
-                                color: Color(0xFFF1F5F9),
+                                color: DesktopTheme.textPrimary,
                                 fontFamily: 'Consolas',
                               ),
                             ),
@@ -2630,10 +2834,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                           Expanded(
                             child: Text(
                               item.title,
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.w500,
-                                color: Color(0xFFF1F5F9),
+                                color: DesktopTheme.textPrimary,
                                 height: 1.3,
                               ),
                             ),
@@ -3080,7 +3284,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           padding: const EdgeInsets.only(top: 14, bottom: 6),
           child: SelectableText(
             line.substring(2).trim(),
-            style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: Colors.white, height: 1.3),
+            style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary, height: 1.3),
           ),
         ));
       }
@@ -3112,7 +3316,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           padding: const EdgeInsets.only(top: 10, bottom: 4),
           child: SelectableText(
             line.substring(4).trim(),
-            style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: Color(0xFFE2E8F0), height: 1.3),
+            style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: DesktopTheme.textPrimary, height: 1.3),
           ),
         ));
       }
@@ -3342,7 +3546,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         final inner = matchedStr.substring(2, matchedStr.length - 2);
         spans.add(TextSpan(
           text: inner,
-          style: const TextStyle(fontSize: 13, height: 1.5, fontWeight: FontWeight.bold, color: Colors.white),
+          style: TextStyle(fontSize: 13, height: 1.5, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
         ));
       }
       // Italic: *text*
@@ -3350,7 +3554,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         final inner = matchedStr.substring(1, matchedStr.length - 1);
         spans.add(TextSpan(
           text: inner,
-          style: const TextStyle(fontSize: 13, height: 1.5, fontStyle: FontStyle.italic, color: Color(0xFFE2E8F0)),
+          style: TextStyle(fontSize: 13, height: 1.5, fontStyle: FontStyle.italic, color: DesktopTheme.textSecondary),
         ));
       }
       // Inline Code: `code`
@@ -3358,11 +3562,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         final inner = matchedStr.substring(1, matchedStr.length - 1);
         spans.add(TextSpan(
           text: ' $inner ',
-          style: const TextStyle(
+          style: TextStyle(
             fontSize: 12,
             fontFamily: 'Consolas',
-            color: Color(0xFF38BDF8),
-            backgroundColor: Color(0xFF1E222B),
+            color: const Color(0xFF38BDF8),
+            backgroundColor: DesktopTheme.isDark ? const Color(0xFF1E222B) : const Color(0xFFE2E8F0),
           ),
         ));
       }
@@ -4677,7 +4881,17 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.folder_outlined, size: 12, color: Color(0xFF00D2FF)),
+          Icon(
+            DesktopProject.resolveIcon(widget.controller.activeProjectIcon.value),
+            size: 12,
+            color: () {
+              try {
+                final clean = widget.controller.activeProjectColor.value.replaceAll('#', '');
+                if (clean.length == 6) return Color(int.parse('0xFF$clean'));
+              } catch (_) {}
+              return DesktopTheme.accentCyan;
+            }(),
+          ),
           const SizedBox(width: 6),
           Text(proj, style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textPrimary)),
           const SizedBox(width: 4),

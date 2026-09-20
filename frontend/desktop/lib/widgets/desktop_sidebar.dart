@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/services.dart';
 // OmnesAgent ADE Desktop Sidebar matching authentic Windows ADE layout.
 // Features Windows native header, # Group vs Project Project switcher, real projects hierarchy,
@@ -44,6 +45,39 @@ class DesktopProject {
     this.gitInitialized = false,
     this.ob2hIndexed = false,
   });
+
+  IconData get resolvedIcon => resolveIcon(iconName);
+
+  static IconData resolveIcon(String name) {
+    switch (name.toLowerCase()) {
+      case 'code':
+        return Icons.code_rounded;
+      case 'terminal':
+        return Icons.terminal_rounded;
+      case 'globe':
+        return Icons.language_rounded;
+      case 'cpu':
+        return Icons.memory_rounded;
+      case 'layers':
+        return Icons.layers_outlined;
+      case 'rocket':
+        return Icons.rocket_launch_rounded;
+      case 'shield':
+        return Icons.security_rounded;
+      case 'box':
+        return Icons.inventory_2_rounded;
+      case 'flutter':
+        return Icons.flutter_dash;
+      case 'rust':
+        return FontAwesomeIcons.rust;
+      case 'python':
+        return FontAwesomeIcons.python;
+      case 'php':
+        return FontAwesomeIcons.php;
+      default:
+        return Icons.folder_rounded;
+    }
+  }
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -123,7 +157,7 @@ class DesktopSidebar extends StatefulWidget {
   final VoidCallback onOpenSettings;
   final VoidCallback onToggleSidebar;
   final VoidCallback? onOpenSkills;
-  final VoidCallback? onOpenAutomations;
+  final VoidCallback onOpenAutomations;
   final UserProfileData userProfile;
   final VoidCallback onOpenProfile;
   final Function(String filePath)? onOpenFile;
@@ -139,7 +173,7 @@ class DesktopSidebar extends StatefulWidget {
     required this.onOpenSettings,
     required this.onToggleSidebar,
     this.onOpenSkills,
-    this.onOpenAutomations,
+    required this.onOpenAutomations,
     required this.userProfile,
     required this.onOpenProfile,
     this.onOpenFile,
@@ -165,6 +199,50 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
   DesktopProject? activeFileTreeProject;
   String fileTreeSearchQuery = '';
   final TextEditingController fileTreeSearchCtrl = TextEditingController();
+  bool isRefreshingTree = false;
+  StreamSubscription? _fileWatcherSub;
+  Timer? _fileWatcherDebounce;
+
+  void _setupDirectoryWatcher(String path) {
+    _fileWatcherSub?.cancel();
+    _fileWatcherDebounce?.cancel();
+    try {
+      final dir = universal_io.Directory(path);
+      if (dir.existsSync()) {
+        _fileWatcherSub = dir.watch(recursive: false).listen((event) {
+          _fileWatcherDebounce?.cancel();
+          _fileWatcherDebounce = Timer(const Duration(milliseconds: 250), () {
+            if (mounted) {
+              setState(() {});
+            }
+          });
+        }, onError: (_) {});
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _refreshProjectFiles() async {
+    if (isRefreshingTree) return;
+    setState(() => isRefreshingTree = true);
+    try {
+      if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+        final ctrl = Get.find<DesktopTaskWorkspaceController>();
+        await ctrl.refreshGitStatus();
+      }
+    } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (mounted) {
+      setState(() => isRefreshingTree = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _fileWatcherSub?.cancel();
+    _fileWatcherDebounce?.cancel();
+    fileTreeSearchCtrl.dispose();
+    super.dispose();
+  }
 
   // 20 Group icons catalog
   static const List<Map<String, dynamic>> groupIconsCatalog = [
@@ -245,26 +323,22 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
         }
       }
     } else {
-      projects.addAll([
-        DesktopProject(
-          id: 'omnes_agent',
-          name: 'Omnes agent',
-          path: r'C:\Projects\Omnes-agent',
-          domain: 'Rust / Системная разработка',
-          suggestedAgents: ['chief', 'code-agent'],
-          suggestedTools: ['cargo', 'git'],
-          suggestedSkills: ['ob2h'],
-        ),
-        DesktopProject(
-          id: 'deepseek_harness',
-          name: 'deepseek-harness-master',
-          path: r'C:\Projects\Omnes-agent',
-          domain: 'AI / Data Science',
-          suggestedAgents: ['chief'],
-          suggestedTools: ['python'],
-          suggestedSkills: ['science'],
-        ),
-      ]);
+      final initialPath = DesktopTaskWorkspaceController.resolveInitialProjectPath();
+      final initialName = DesktopTaskWorkspaceController.resolveInitialProjectName(initialPath);
+      final analysis = ProjectAnalyzer.analyze(initialPath);
+      final defaultProject = DesktopProject(
+        id: 'project_${DateTime.now().millisecondsSinceEpoch}',
+        name: initialName,
+        path: initialPath,
+        domain: analysis.domain,
+        iconName: analysis.iconKey,
+        colorHex: '#00D2FF',
+        suggestedAgents: analysis.recommendedAgents,
+        suggestedTools: analysis.recommendedTools,
+        suggestedSkills: analysis.recommendedSkills,
+      );
+      projects.add(defaultProject);
+      _saveProjects();
     }
   }
 
@@ -351,7 +425,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       label: DesktopI18n.automations,
                       shortcut: '',
                       isSelected: widget.selectedIndex == -3,
-                      onTap: widget.onOpenAutomations ?? () {},
+                      onTap: widget.onOpenAutomations,
                     ),
                   ],
                 ),
@@ -372,7 +446,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
                         decoration: BoxDecoration(
                           color: isGroupView
-                              ? (DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A))
+                              ? (DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155))
                               : Colors.transparent,
                           borderRadius: BorderRadius.circular(6),
                         ),
@@ -407,7 +481,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
                         decoration: BoxDecoration(
                           color: !isGroupView
-                              ? (DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A))
+                              ? (DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155))
                               : Colors.transparent,
                           borderRadius: BorderRadius.circular(6),
                         ),
@@ -638,19 +712,19 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     final Border? border;
 
     if (isPrimary) {
-      bgColor = isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A);
+      bgColor = isDark ? const Color(0xFF282D37) : const Color(0xFF334155);
       fgColor = Colors.white;
       iconColor = isDark ? const Color(0xFF00D2FF) : Colors.white;
-      border = Border.all(color: isDark ? const Color(0xFF00D2FF).withOpacity(0.3) : const Color(0xFF0F172A));
+      border = Border.all(color: isDark ? const Color(0xFF00D2FF).withOpacity(0.3) : const Color(0xFF334155));
     } else if (isSelected) {
-      bgColor = isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A);
+      bgColor = isDark ? const Color(0xFF282D37) : const Color(0xFF334155);
       fgColor = Colors.white;
       iconColor = isDark ? const Color(0xFF00D2FF) : Colors.white;
-      border = Border.all(color: isDark ? const Color(0xFF3B82F6) : const Color(0xFF0F172A));
+      border = Border.all(color: isDark ? const Color(0xFF3B82F6) : const Color(0xFF334155));
     } else {
       bgColor = Colors.transparent;
-      fgColor = isDark ? const Color(0xFFE2E8F0) : const Color(0xFF0F172A);
-      iconColor = isDark ? const Color(0xFFCBD5E1) : const Color(0xFF475569);
+      fgColor = isDark ? const Color(0xFFE2E8F0) : const Color(0xFF334155);
+      iconColor = isDark ? const Color(0xFFCBD5E1) : const Color(0xFF64748B);
       border = null;
     }
 
@@ -702,34 +776,14 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
   Widget _buildProjectItem(DesktopProject proj, List<TaskSession> sessions) {
     final isCollapsed = collapsedSections.contains(proj.name);
 
-    Color projColor = const Color(0xFF00D2FF);
+    Color projColor = DesktopTheme.accentCyan;
     try {
       final clean = proj.colorHex.replaceAll('#', '');
       if (clean.length == 6) {
         projColor = Color(int.parse('0xFF$clean'));
       }
     } catch (_) {}
-
-    IconData projIcon = Icons.folder_outlined;
-    switch (proj.iconName) {
-      case 'code':
-        projIcon = Icons.code_rounded;
-        break;
-      case 'terminal':
-        projIcon = Icons.terminal_rounded;
-        break;
-      case 'globe':
-        projIcon = Icons.language_rounded;
-        break;
-      case 'cpu':
-        projIcon = Icons.memory_rounded;
-        break;
-      case 'layers':
-        projIcon = Icons.layers_outlined;
-        break;
-      default:
-        projIcon = Icons.folder_outlined;
-    }
+    final projIcon = proj.resolvedIcon;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 4),
@@ -795,6 +849,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       setState(() {
                         activeFileTreeProject = proj;
                       });
+                      _setupDirectoryWatcher(proj.path);
                     },
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
@@ -814,6 +869,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     onSelected: (val) {
                       if (val == 'tree') {
                         setState(() => activeFileTreeProject = proj);
+                        _setupDirectoryWatcher(proj.path);
                       } else if (val == 'explorer') {
                         ProjectScaffoldingService.openInExplorer(proj.path);
                       } else if (val == 'code') {
@@ -1205,7 +1261,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           child: Row(
             children: [
               InkWell(
-                onTap: () => setState(() => activeFileTreeProject = null),
+                onTap: () {
+                  _fileWatcherSub?.cancel();
+                  setState(() => activeFileTreeProject = null);
+                },
                 borderRadius: BorderRadius.circular(4),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
@@ -1222,7 +1281,13 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 ),
               ),
               const Spacer(),
-              Icon(Icons.folder_open, size: 14, color: DesktopTheme.accentCyan),
+              Icon(proj.resolvedIcon, size: 14, color: () {
+                try {
+                  final clean = proj.colorHex.replaceAll('#', '');
+                  if (clean.length == 6) return Color(int.parse('0xFF$clean'));
+                } catch (_) {}
+                return DesktopTheme.accentCyan;
+              }()),
               const SizedBox(width: 4),
               ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 100),
@@ -1234,12 +1299,18 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
               ),
               const SizedBox(width: 4),
               IconButton(
-                icon: const Icon(Icons.refresh, size: 13),
+                icon: isRefreshingTree
+                    ? const SizedBox(
+                        width: 11,
+                        height: 11,
+                        child: CircularProgressIndicator(strokeWidth: 1.5, color: DesktopTheme.accentCyan),
+                      )
+                    : const Icon(Icons.refresh, size: 13),
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
-                tooltip: 'Обновить дерево',
-                color: DesktopTheme.textMuted,
-                onPressed: () => setState(() {}),
+                tooltip: 'Обновить дерево файлов и Git статус',
+                color: isRefreshingTree ? DesktopTheme.accentCyan : DesktopTheme.textMuted,
+                onPressed: _refreshProjectFiles,
               ),
             ],
           ),
@@ -1761,26 +1832,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
 
   /// Returns OS-aware default initial path.
   String _getDefaultInitialPath() {
-    try {
-      if (universal_io.Platform.isWindows) {
-        if (universal_io.Directory(r'C:\Projects').existsSync()) {
-          return r'C:\Projects\';
-        }
-        final userProfile = universal_io.Platform.environment['USERPROFILE'];
-        if (userProfile != null && userProfile.isNotEmpty) {
-          return '$userProfile\\Projects\\';
-        }
-        return r'C:\Projects\';
-      } else {
-        final home = universal_io.Platform.environment['HOME'] ?? '';
-        if (home.isNotEmpty) {
-          return '$home/Projects/';
-        }
-        return '/home/Projects/';
-      }
-    } catch (_) {
-      return r'C:\Projects\';
-    }
+    return DesktopTaskWorkspaceController.resolveInitialProjectPath();
   }
 
   void _showAddProjectDialog() {

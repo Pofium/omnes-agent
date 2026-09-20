@@ -5,18 +5,18 @@ import '../../../utils/desktop_i18n.dart';
 
 /// Confirmation dialog asking user permission to automatically install Handy.
 class HandyInstallDialog extends StatefulWidget {
-  final VoidCallback onConfirm;
+  final VoidCallback? onConfirm;
   final ValueChanged<bool>? onDontAskAgainChanged;
 
   const HandyInstallDialog({
     super.key,
-    required this.onConfirm,
+    this.onConfirm,
     this.onDontAskAgainChanged,
   });
 
   static Future<bool?> show(
     BuildContext context, {
-    required VoidCallback onConfirm,
+    VoidCallback? onConfirm,
     ValueChanged<bool>? onDontAskAgainChanged,
   }) {
     return showDialog<bool>(
@@ -114,7 +114,7 @@ class _HandyInstallDialogState extends State<HandyInstallDialog> {
                   label: DesktopI18n.tr('Установить', 'Install'),
                   onPressed: () {
                     Navigator.of(context).pop(true);
-                    widget.onConfirm();
+                    widget.onConfirm?.call();
                   },
                 ),
               ],
