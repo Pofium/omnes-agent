@@ -28,11 +28,38 @@
 
 ---
 
+## 🖥️ Application Interface
+
+OmnesAgent Desktop ADE is not a chat window — it is the agent's entire workspace: project context, conversation, tools and artifacts share a single screen with no app switching. The visual layer is built on the **Cyber Zinc & Neon Cyan** design system (`shadcn/ui + reui`) — dark and light schemes, a cyan accent, rounded panels and theme tokens instead of hard-coded colors.
+
+<div align="center">
+  <a href="assets/screenshots/01-workspace.png"><img src="assets/screenshots/01-workspace.png" alt="OmnesAgent Desktop ADE workspace" width="100%" /></a>
+  <br /><br />
+  <em>Workspace: project tree with type filters on the left, the live agent conversation in the center, the tab panel on the right. Side Chat for clarifications, Preview & Diffs, Interactive Canvas, Terminal and Browser open in one click, while the context menu carries any file to its destination: open in Canvas or code editor, reveal in Explorer, or add to the chat context.</em>
+</div>
+
+<br />
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="assets/screenshots/02-agent-chat.png"><img src="assets/screenshots/02-agent-chat.png" alt="OmnesAgent agent conversation" width="100%" /></a>
+      <p><b>A conversation you can steer.</b> <code>Direct Chat</code> mode, the change counter and the task bar sit in a single row above the thread. Agent reasoning collapses into a tidy <em>Thought</em> accordion, next steps arrive as action chips ("Check project status", "Run project tests"), and every answer can be copied, rated or forked into a separate branch. The composer keeps reasoning level (<code>Low / High / Max</code>), permission mode (<code>Full access</code>) and the model picker with its provider status indicator close at hand.</p>
+    </td>
+    <td width="50%" valign="top">
+      <a href="assets/screenshots/03-settings.png"><img src="assets/screenshots/03-settings.png" alt="OmnesAgent settings" width="100%" /></a>
+      <p><b>Settings instead of config files.</b> Providers and appearance, agent personality, Quickstart and configuration wizards, MCP servers, skills, WASM plugins and messaging channels — all in one window. The local Rust gateway reports its state up front: <code>127.0.0.1:42617</code>, while the ob2h AST long-term memory flips on with a single toggle and wastes no tokens searching its fact and code-symbol graph.</p>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## 🏛️ Monorepo Architecture
 
 ```
 Omnes-agent/
-├── assets/                  # Brand graphics, emblem, and UI media
+├── assets/                  # Brand graphics, UI screenshots, and media
 ├── backend/                 # Rust Workspace (20+ crates)
 │   ├── apps/
 │   │   ├── omnescode/       # Standalone Terminal TUI coding assistant
