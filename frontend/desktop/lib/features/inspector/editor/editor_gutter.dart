@@ -38,8 +38,10 @@ class EditorGutter extends StatelessWidget {
           onTapUp: (details) {
             // Клик по стрелке фолда — сворачивание/разворачивание.
             final m = metrics;
+            final dy = details.localPosition.dy - 6.0;
+            if (dy < 0) return;
             final ordinal =
-                (((scrollY + details.localPosition.dy) / m.lineHeight).floor())
+                (((scrollY + dy) / m.lineHeight).floor())
                     .clamp(0, math.max(0, controller.visibleRowCount - 1))
                     .toInt();
             final row = controller.rowAtVisible(ordinal);
@@ -110,7 +112,7 @@ class _GutterPainter extends CustomPainter {
     final ordinal0 =
         ((scrollY / m.lineHeight).floor().clamp(0, math.max(0, controller.visibleRowCount - 1)))
             .toInt();
-    var y = ordinal0 * m.lineHeight - scrollY;
+    var y = ordinal0 * m.lineHeight - scrollY + 6.0;
     var row = controller.rowAtVisible(ordinal0);
     final maxRow = controller.rows.length - 1;
 

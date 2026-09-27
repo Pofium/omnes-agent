@@ -685,10 +685,10 @@ class _EditorViewportState extends State<EditorViewport> {
   void _ensureCaretVisible() {
     final m = widget.metrics;
     final caretTop =
-        widget.controller.visibleBefore(widget.controller.caretRow) * m.lineHeight;
+        widget.controller.visibleBefore(widget.controller.caretRow) * m.lineHeight + 6.0;
     final viewportH = context.size?.height ?? 400;
-    if (caretTop < _scrollY) {
-      setState(() => _scrollY = caretTop);
+    if (caretTop - 6.0 < _scrollY) {
+      setState(() => _scrollY = math.max(0.0, caretTop - 6.0));
     } else if (caretTop + m.lineHeight > _scrollY + viewportH) {
       setState(() => _scrollY = caretTop + m.lineHeight - viewportH);
     }
@@ -707,8 +707,9 @@ class _EditorViewportState extends State<EditorViewport> {
   (int, int) _hitTest(Offset local) {
     final m = widget.metrics;
     final maxRow = math.max(0, widget.controller.rows.length - 1);
+    final adjustedY = local.dy - 6.0;
     final ordinal =
-        (((_scrollY + local.dy) / m.lineHeight).floor().clamp(0, math.max(0, widget.controller.visibleRowCount - 1)))
+        (((_scrollY + math.max(0.0, adjustedY)) / m.lineHeight).floor().clamp(0, math.max(0, widget.controller.visibleRowCount - 1)))
             .toInt();
     final row = widget.controller.rowAtVisible(ordinal).clamp(0, maxRow);
     final maxCol = widget.controller.rows.isEmpty ? 0 : widget.controller.rows[row].length;
@@ -945,7 +946,7 @@ class _EditorPainter extends CustomPainter {
             .floor()
             .clamp(0, math.max(0, controller.visibleRowCount - 1)))
         .toInt();
-    var y = ordinal0 * m.lineHeight - scrollY;
+    var y = ordinal0 * m.lineHeight - scrollY + 6.0;
     var row = controller.rowAtVisible(ordinal0);
     final maxRow = controller.rows.length - 1;
 
@@ -996,7 +997,7 @@ class _EditorPainter extends CustomPainter {
       for (final s in controller.allSelections) {
         if (!controller.isRowHidden(s.caretRow)) {
           final cx = s.caretCol * m.charWidth - scrollX;
-          final cy = controller.visibleBefore(s.caretRow) * m.lineHeight - scrollY;
+          final cy = controller.visibleBefore(s.caretRow) * m.lineHeight - scrollY + 6.0;
           canvas.drawRect(
             Rect.fromLTWH(cx, cy, 2, m.lineHeight),
             Paint()..color = caretColor,

@@ -117,6 +117,19 @@ async fn handle_editor_socket(
         return;
     }
 
+    // Initial snapshot: deliver initial rows with syntax runs immediately so the
+    // client has syntax highlighting right after connecting without waiting for an edit.
+    if let Ok(page) = editor.rows(buffer_id, 0, info.num_lines) {
+        let initial_snapshot = json!({
+            "type": "rows_snapshot",
+            "rev": info.rev,
+            "from": page.from,
+            "total_lines": page.total_lines,
+            "rows": page.rows,
+        });
+        let _ = tx.send(initial_snapshot.to_string()).await;
+    }
+
     // Latest revision this connection has been told about; guards against
     // duplicate row frames after our own `edit_ops` application.
     let mut last_sent_rev = info.rev;

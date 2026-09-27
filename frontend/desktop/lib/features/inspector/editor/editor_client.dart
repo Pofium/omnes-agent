@@ -89,8 +89,10 @@ class EditorClient {
     switch (frame.type) {
       case 'hello':
         controller.applyHello(frame);
-        // Ensure the viewport rows match the authoritative revision.
-        if (frame.rev != null && frame.rev != controller.rev) {
+        // Ensure the viewport rows match the authoritative revision and load syntax runs.
+        if (controller.rows.isEmpty ||
+            controller.rowRuns(0, controller.rev).isEmpty ||
+            (frame.rev != null && frame.rev != controller.rev)) {
           requestFullResync();
         }
       case 'rows_snapshot':

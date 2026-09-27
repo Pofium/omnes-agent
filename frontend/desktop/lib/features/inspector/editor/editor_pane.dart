@@ -87,28 +87,30 @@ class _EditorPaneState extends State<EditorPane> {
             Expanded(
               child: Container(
                 color: bg,
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    EditorGutter(
-                      controller: controller,
-                      metrics: metrics,
-                      scrollY: _scrollY,
-                    ),
-                    Expanded(
-                      child: EditorViewport(
-                        key: ValueKey(controller.path),
+                child: ClipRect(
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      EditorGutter(
                         controller: controller,
-                        client: client,
                         metrics: metrics,
-                        onScrollChanged: (offset) {
-                          if (mounted && offset != _scrollY) {
-                            setState(() => _scrollY = offset);
-                          }
-                        },
+                        scrollY: _scrollY,
                       ),
-                    ),
-                  ],
+                      Expanded(
+                        child: EditorViewport(
+                          key: ValueKey(controller.path),
+                          controller: controller,
+                          client: client,
+                          metrics: metrics,
+                          onScrollChanged: (offset) {
+                            if (mounted && offset != _scrollY) {
+                              setState(() => _scrollY = offset);
+                            }
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),

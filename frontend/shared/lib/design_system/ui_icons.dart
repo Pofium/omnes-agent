@@ -70,7 +70,7 @@ class UiIcon extends StatelessWidget {
     assert(body != null, 'Unknown UiIcon: $icon');
     if (body == null) return SizedBox(width: size, height: size);
     return SvgPicture.string(
-      '<svg viewBox="0 0 24 24" stroke-linecap="round" '
+      '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-linecap="round" '
       'stroke-linejoin="round" stroke-width="1.8">$body</svg>',
       width: size,
       height: size,

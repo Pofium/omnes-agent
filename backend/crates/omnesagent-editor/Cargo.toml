@@ -24,7 +24,7 @@ inkjet = { version = "0.11", default-features = false, features = [
     "language-tsx", "language-javascript", "language-html", "language-css",
     "language-scss", "language-cpp", "language-c", "language-go",
     "language-dockerfile", "language-diff", "language-sql", "language-hcl",
-    "language-java", "language-kotlin",
+    "language-java", "language-kotlin", "language-php",
 ] }
 # Markdown (Ф1): inkjet 0.11 не содержит markdown; грамматика 0.3.2 собрана
 # ровно под tree-sitter ^0.23 (одна версия в воркспейсе, §11.5). Блок-грамматика

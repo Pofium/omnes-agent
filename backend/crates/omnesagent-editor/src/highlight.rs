@@ -205,6 +205,7 @@ fn inkjet_language(language_id: &str) -> Option<inkjet::Language> {
         "hcl" => L::Hcl,
         "java" => L::Java,
         "kotlin" => L::Kotlin,
+        "php" => L::Php,
         _ => return None,
     })
 }

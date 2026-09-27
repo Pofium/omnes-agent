@@ -28,11 +28,20 @@ class AgentModeSwitcher extends StatelessWidget {
             child: Tooltip(
               message: mode.description,
               preferBelow: false,
+              textStyle: const TextStyle(
+                color: Color(0xFFF8FAFC),
+                fontSize: 11,
+                fontFamily: 'Segoe UI',
+                fontWeight: FontWeight.w500,
+              ),
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: ShadcnColors.cardElevated,
+                color: const Color(0xFF131A29),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: ShadcnColors.borderActive.withOpacity(0.5)),
+                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.6), width: 0.8),
+                boxShadow: const [
+                  BoxShadow(color: Color(0x66000000), blurRadius: 10, offset: Offset(0, 3)),
+                ],
               ),
               child: InkWell(
                 onTap: () => onModeChanged(mode),
