@@ -116,6 +116,36 @@ pub enum TurnEvent {
         output_tokens: Option<u64>,
         cost_usd: Option<f64>,
     },
+    /// An execution trajectory step for interactive step inspection.
+    TrajectoryStep {
+        id: String,
+        session_id: String,
+        turn_id: String,
+        step_index: usize,
+        parent_step_id: Option<String>,
+        step_type: String,
+        payload_json: String,
+        tokens_used: usize,
+        duration_us: u64,
+        created_at: String,
+    },
+    /// Dynamic token budget profile snapshot.
+    ContextBudgetUpdate {
+        system_tokens: usize,
+        kag_ast_tokens: usize,
+        memory_tokens: usize,
+        dialog_history_tokens: usize,
+        tool_outputs_tokens: usize,
+        compression_saved_tokens: usize,
+        context_limit: usize,
+    },
+    /// Grounding citations linking model claims directly to verified code/memory artifacts.
+    GroundingCitation {
+        id: String,
+        uri: String,
+        label: String,
+        source_type: String,
+    },
 }
 
 #[cfg(test)]

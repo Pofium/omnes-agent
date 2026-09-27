@@ -1336,7 +1336,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 const SizedBox(width: 6),
                 _buildTerminalQuickStdinChip('↵ Enter', () => widget.controller.sendTerminalStdin('')),
                 const SizedBox(width: 6),
-                _buildTerminalQuickStdinChip('✕ Ctrl+C', () => widget.controller.sendTerminalStdin('^C'), isDanger: true),
+                _buildTerminalQuickStdinChip('Ctrl+C', () => widget.controller.sendTerminalStdin('^C'), isDanger: true),
               ],
             ),
           ),
@@ -1699,7 +1699,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             ),
           ),
 
-          // 4. Bottom Controls Row: [+] [🛡️ Mode ⌵] ... [🟢 Model ⌵] [🧠 Max ⌵] [↑]
+          // 4. Bottom Controls Row: [+] [Mode] ... [Model] [Max] [Up]
           Padding(
             padding: const EdgeInsets.only(left: 12, right: 12, bottom: 10),
             child: Row(
@@ -1708,24 +1708,24 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 _buildAddMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🛡️ Permission Mode ⌵]
+                // [Permission Mode]
                 _buildPermissionModeMenuButton(),
 
                 const Spacer(),
 
-                // [🏢 Provider ⌵]
+                // [Provider]
                 _buildProviderMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🟢 Model ⌵]
+                // [Model]
                 _buildModelMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🧠 Thought Level ⌵]
+                // [Thought Level]
                 _buildThoughtLevelMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🎙️ Voice Input Button]
+                // [Voice Input Button]
                 _buildVoiceInputButton(),
                 const SizedBox(width: 8),
 
@@ -2093,7 +2093,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                                 ),
                                 const Spacer(),
                                 Text(
-                                  '✓ ${DesktopI18n.done}',
+                                  DesktopI18n.done,
                                   style: const TextStyle(fontSize: 10, color: Color(0xFF10B981)),
                                 ),
                               ],
@@ -2101,7 +2101,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                           )),
                     ],
 
-                    // Live Project Changes Review Pill (e.g. "4 files changed +129 -1 > [📄 Review]")
+                    // Live Project Changes Review Pill (e.g. "4 files changed +129 -1 > [Review]")
                     if (!isUser && msg.filesChangedCount != null && msg.filesChangedCount! > 0)
                       _buildReviewPill(
                         context,
@@ -2110,7 +2110,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         deletions: msg.deletions ?? 0,
                       ),
 
-                    // Message Reactions Row (Image 2 match: [⎘ Copy] [👍] [👎] [🔀 Branch] 9/5, 10:07 AM)
+                    // Message Reactions Row (Image 2 match: [Copy] [Like] [Dislike] [Branch] 9/5, 10:07 AM)
                     if (!isUser)
                       _buildMessageReactionsRow(context, msg),
 

@@ -260,7 +260,9 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   final Map<String, TextEditingController> _urlControllers = {};
   final Map<String, TextEditingController> _modelControllers = {};
   final Map<String, bool> _showKeyMap = {};
-  final Map<String, String?> _testStatusMap = {};
+  /// Provider test status — explicit success flag drives the color
+  /// (AGENTS.md: never marker characters inside the text).
+  final Map<String, ({bool ok, String text})?> _testStatusMap = {};
 
   // Custom Provider Form
   bool isAddingProvider = false;
@@ -382,7 +384,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     );
     if (mounted) {
       setState(() {
-        personalityStatusMsg = ok ? '✓ Файл сохранён и применён шлюзом' : 'Ошибка сохранения файла';
+        personalityStatusMsg = ok ? 'Файл сохранён и применён шлюзом' : 'Ошибка сохранения файла';
       });
     }
   }
@@ -435,7 +437,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       if (mounted) {
         setState(() {
           isChannelBinding = false;
-          channelStatusMsg = ok ? '✓ Канал $channelType успешно привязан!' : 'Ошибка привязки канала $channelType';
+          channelStatusMsg = ok ? 'Канал $channelType успешно привязан!' : 'Ошибка привязки канала $channelType';
         });
         await _loadChannels();
       }
@@ -454,7 +456,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     final ok = await _httpClient.channelRelink(channelType);
     if (mounted) {
       setState(() {
-        channelStatusMsg = ok ? '✓ Сигнал переподключения $channelType отправлен' : 'Ошибка переподключения $channelType';
+        channelStatusMsg = ok ? 'Сигнал переподключения $channelType отправлен' : 'Ошибка переподключения $channelType';
       });
       await _loadChannels();
     }
@@ -524,7 +526,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     final ok = await _httpClient.writeSkill(bundle, name, skillEditContentController.text);
     if (mounted) {
       setState(() {
-        skillStatusMsg = ok ? '✓ Навык $name успешно сохранён!' : 'Ошибка при сохранении навыка';
+        skillStatusMsg = ok ? 'Навык $name успешно сохранён!' : 'Ошибка при сохранении навыка';
       });
       await _loadSkills();
     }
@@ -540,7 +542,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         isCreatingNewSkill = false;
         newSkillNameController.clear();
         selectedSkillToEdit = null;
-        skillStatusMsg = ok ? '✓ Навык $name успешно создан!' : 'Ошибка создания навыка';
+        skillStatusMsg = ok ? 'Навык $name успешно создан!' : 'Ошибка создания навыка';
       });
       await _loadSkills();
     }
@@ -552,7 +554,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     if (mounted) {
       setState(() {
         if (selectedSkillToEdit == name) selectedSkillToEdit = null;
-        skillStatusMsg = ok ? '✓ Навык $name удалён' : 'Ошибка удаления навыка';
+        skillStatusMsg = ok ? 'Навык $name удалён' : 'Ошибка удаления навыка';
       });
       await _loadSkills();
     }
@@ -600,7 +602,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     if (mounted) {
       setState(() {
         isAdminOperating = false;
-        adminActionMsg = ok ? '✓ Шлюз успешно перезагрузил конфигурацию' : 'Ошибка при reload';
+        adminActionMsg = ok ? 'Шлюз успешно перезагрузил конфигурацию' : 'Ошибка при reload';
       });
     }
   }
@@ -614,7 +616,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     if (mounted) {
       setState(() {
         isAdminOperating = false;
-        adminActionMsg = ok ? '✓ Сигнал shutdown отправлен шлюзу' : 'Ошибка при shutdown';
+        adminActionMsg = ok ? 'Сигнал shutdown отправлен шлюзу' : 'Ошибка при shutdown';
       });
     }
   }
@@ -629,7 +631,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       setState(() {
         isAdminOperating = false;
         adminGeneratedPaircode = code;
-        adminActionMsg = code != null ? '✓ Сгенерирован код: $code' : 'Ошибка генерации кода';
+        adminActionMsg = code != null ? 'Сгенерирован код: $code' : 'Ошибка генерации кода';
       });
     }
   }
@@ -673,7 +675,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     final ok = await _httpClient.configSectionSelect(section, key);
     if (mounted) {
       setState(() {
-        configWizardStatusMsg = ok ? '✓ Элемент $key успешно выбран и сохранён' : 'Ошибка выбора $key';
+        configWizardStatusMsg = ok ? 'Элемент $key успешно выбран и сохранён' : 'Ошибка выбора $key';
       });
       await _loadConfigWizard(section);
     }
@@ -724,7 +726,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       });
       if (mounted) {
         setState(() {
-          webauthnStatusMsg = finishOk ? '✓ Ключ FIDO2/WebAuthn успешно зарегистрирован' : 'Ошибка верификации ключа';
+          webauthnStatusMsg = finishOk ? 'Ключ FIDO2/WebAuthn успешно зарегистрирован' : 'Ошибка верификации ключа';
         });
       }
     } else {
@@ -741,7 +743,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     final ok = await _httpClient.webauthnDeleteCredential(id);
     if (mounted) {
       setState(() {
-        webauthnStatusMsg = ok ? '✓ Ключ $id удалён' : 'Ошибка удаления ключа';
+        webauthnStatusMsg = ok ? 'Ключ $id удалён' : 'Ошибка удаления ключа';
       });
       await _loadWebauthn();
     }
@@ -767,7 +769,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     final ok = await _httpClient.cronSettingsPatch(patch);
     if (mounted) {
       setState(() {
-        cronStatusMsg = ok ? '✓ Параметры Cron применены' : 'Ошибка сохранения настроек Cron';
+        cronStatusMsg = ok ? 'Параметры Cron применены' : 'Ошибка сохранения настроек Cron';
       });
       await _loadCronSettings();
     }
@@ -878,7 +880,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
           Get.find<DesktopTaskWorkspaceController>().loadConfiguredProviders();
         }
-        _testStatusMap[id] = 'Синхронизация со шлюзом...';
+        _testStatusMap[id] = (ok: false, text: 'Синхронизация со шлюзом...');
       });
     }
 
@@ -894,13 +896,13 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       }
       if (mounted) {
         setState(() {
-          _testStatusMap[id] = '✓ Настройки синхронизированы со шлюзом';
+          _testStatusMap[id] = (ok: true, text: 'Настройки синхронизированы со шлюзом');
         });
       }
     } catch (_) {
       if (mounted) {
         setState(() {
-          _testStatusMap[id] = '✓ Сохранено локально (шлюз оффлайн)';
+          _testStatusMap[id] = (ok: true, text: 'Сохранено локально (шлюз оффлайн)');
         });
       }
     }
@@ -908,7 +910,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
 
   void _testProviderConnection(String id) {
     setState(() {
-      _testStatusMap[id] = 'Проверка подключения...';
+      _testStatusMap[id] = (ok: false, text: 'Проверка подключения...');
     });
 
     Future.delayed(const Duration(milliseconds: 600), () {
@@ -916,11 +918,11 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       final key = _apiKeyControllers[id]?.text.trim() ?? '';
       setState(() {
         if (id == 'ollama') {
-          _testStatusMap[id] = '✓ Подключение успешно (Ollama daemon live, 14ms)';
+          _testStatusMap[id] = (ok: true, text: 'Подключение успешно (Ollama daemon live, 14ms)');
         } else if (key.isEmpty) {
-          _testStatusMap[id] = '⚠ API ключ не указан';
+          _testStatusMap[id] = (ok: false, text: 'API ключ не указан');
         } else {
-          _testStatusMap[id] = '✓ Соединение установлено (HTTP 200, 52ms)';
+          _testStatusMap[id] = (ok: true, text: 'Соединение установлено (HTTP 200, 52ms)');
         }
       });
     });
@@ -2023,10 +2025,10 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                             if (testStatus != null)
                               Expanded(
                                 child: Text(
-                                  testStatus,
+                                  testStatus.text,
                                   style: TextStyle(
                                     fontSize: 11,
-                                    color: testStatus.contains('✓') ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
+                                    color: testStatus.ok ? const Color(0xFF10B981) : const Color(0xFFF59E0B),
                                     fontWeight: FontWeight.bold,
                                   ),
                                   overflow: TextOverflow.ellipsis,
@@ -2911,7 +2913,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               color: const Color(0xFF10B981).withOpacity(0.15),
               borderRadius: BorderRadius.circular(4),
             ),
-            child: const Text('✓ Подключено', style: TextStyle(color: Color(0xFF10B981), fontSize: 11, fontWeight: FontWeight.bold)),
+            child: const Text('Подключено', style: TextStyle(color: Color(0xFF10B981), fontSize: 11, fontWeight: FontWeight.bold)),
           ),
         ),
         const SizedBox(height: 12),
@@ -2934,7 +2936,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
           stepNum: '3',
           title: 'Рабочая станция и среда разработки',
           desc: 'PowerShell / Git / Rust Cargo / Flutter ADE обнаружены в системе.',
-          statusWidget: const Text('✓ Готово', style: TextStyle(color: Color(0xFF10B981), fontSize: 11, fontWeight: FontWeight.bold)),
+          statusWidget: const Text('Готово', style: TextStyle(color: Color(0xFF10B981), fontSize: 11, fontWeight: FontWeight.bold)),
         ),
         const SizedBox(height: 24),
 

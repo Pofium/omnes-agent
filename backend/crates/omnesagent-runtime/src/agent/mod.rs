@@ -3,6 +3,7 @@ pub mod agent;
 pub(crate) mod approval_bridge;
 pub mod classifier;
 pub mod context_analyzer;
+pub mod context_budget;
 pub mod cost;
 pub mod dispatcher;
 pub mod eval;
@@ -69,7 +70,7 @@ impl ::omnesagent_api::attribution::Attributable for AgentAttribution<'_> {
 #[cfg(test)]
 mod tests;
 
-#[allow(unused_imports)]
 pub use agent::{Agent, AgentBuilder, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
+pub use context_budget::{AgentExecutionMode, ContextBudgetProfiler, ContextBudgetSnapshot};
 #[allow(unused_imports)]
 pub use loop_::{process_message, run};

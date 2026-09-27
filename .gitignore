@@ -24,6 +24,8 @@ frontend/web/build/
 # ==========================================
 data/*
 !data/.gitkeep
+.omnes/
+backend/.omnes/
 logs/
 *.log
 *.db

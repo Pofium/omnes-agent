@@ -1,7 +1,7 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, SessionStep,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -118,6 +118,24 @@ impl SqliteSessionBackend {
              END;",
         )
         .context("Failed to initialize session schema")?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_steps (
+                id          TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL,
+                turn_id     TEXT NOT NULL,
+                step_index  INTEGER NOT NULL,
+                parent_step_id TEXT,
+                step_type   TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                tokens_used INTEGER DEFAULT 0,
+                duration_us INTEGER DEFAULT 0,
+                created_at  TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_steps_session_turn ON session_steps(session_id, turn_id);
+             CREATE INDEX IF NOT EXISTS idx_steps_session_index ON session_steps(session_id, step_index);",
+        )
+        .context("Failed to initialize session_steps schema")?;
 
         for (column, ddl) in [
             ("name", "ALTER TABLE session_metadata ADD COLUMN name TEXT"),
@@ -761,6 +779,150 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn insert_step(&self, step: &SessionStep) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO session_steps (
+                id, session_id, turn_id, step_index, parent_step_id, step_type, payload_json, tokens_used, duration_us, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                step.id,
+                step.session_id,
+                step.turn_id,
+                step.step_index as i64,
+                step.parent_step_id,
+                step.step_type,
+                step.payload_json,
+                step.tokens_used as i64,
+                step.duration_us as i64,
+                step.created_at,
+            ],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn load_steps(&self, session_id: &str) -> Vec<SessionStep> {
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT id, session_id, turn_id, step_index, parent_step_id, step_type, payload_json, tokens_used, duration_us, created_at
+             FROM session_steps WHERE session_id = ?1 ORDER BY step_index ASC"
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match stmt.query_map(params![session_id], |row| {
+            let step_index_i64: i64 = row.get(3)?;
+            let tokens_used_i64: i64 = row.get(7)?;
+            let duration_us_i64: i64 = row.get(8)?;
+            Ok(SessionStep {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                turn_id: row.get(2)?,
+                step_index: step_index_i64.max(0) as usize,
+                parent_step_id: row.get(4)?,
+                step_type: row.get(5)?,
+                payload_json: row.get(6)?,
+                tokens_used: tokens_used_i64.max(0) as usize,
+                duration_us: duration_us_i64.max(0) as u64,
+                created_at: row.get(9)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    fn fork_session(
+        &self,
+        source_key: &str,
+        target_key: &str,
+        at_step_id: Option<&str>,
+        new_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+
+        let cutoff_time: Option<String> = if let Some(step_id) = at_step_id {
+            conn.query_row(
+                "SELECT created_at FROM session_steps WHERE id = ?1 AND session_id = ?2",
+                params![step_id, source_key],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        let orig_meta: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT agent_alias, channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
+                params![source_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .ok();
+
+        let (agent_alias, channel_id, room_id, sender_id) = orig_meta.unwrap_or_default();
+
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id, state)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, 'idle')",
+            params![
+                target_key,
+                now,
+                now,
+                new_name,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
+            ],
+        )?;
+
+        if let Some(ref cutoff) = cutoff_time {
+            conn.execute(
+                "INSERT INTO sessions (session_key, role, content, created_at)
+                 SELECT ?1, role, content, created_at FROM sessions
+                 WHERE session_key = ?2 AND created_at <= ?3 ORDER BY id ASC",
+                params![target_key, source_key, cutoff],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO sessions (session_key, role, content, created_at)
+                 SELECT ?1, role, content, created_at FROM sessions
+                 WHERE session_key = ?2 ORDER BY id ASC",
+                params![target_key, source_key],
+            )?;
+        }
+
+        conn.execute(
+            "UPDATE session_metadata SET message_count = (SELECT COUNT(*) FROM sessions WHERE session_key = ?1)
+             WHERE session_key = ?1",
+            params![target_key],
+        )?;
+
+        if let Some(ref cutoff) = cutoff_time {
+            conn.execute(
+                "INSERT INTO session_steps (id, session_id, turn_id, step_index, parent_step_id, step_type, payload_json, tokens_used, duration_us, created_at)
+                 SELECT ('step_' || hex(randomblob(8))), ?1, turn_id, step_index, parent_step_id, step_type, payload_json, tokens_used, duration_us, created_at
+                 FROM session_steps WHERE session_id = ?2 AND created_at <= ?3 ORDER BY step_index ASC",
+                params![target_key, source_key, cutoff],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO session_steps (id, session_id, turn_id, step_index, parent_step_id, step_type, payload_json, tokens_used, duration_us, created_at)
+                 SELECT ('step_' || hex(randomblob(8))), ?1, turn_id, step_index, parent_step_id, step_type, payload_json, tokens_used, duration_us, created_at
+                 FROM session_steps WHERE session_id = ?2 ORDER BY step_index ASC",
+                params![target_key, source_key],
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -1085,11 +1247,19 @@ impl SessionBackend for SqliteSessionBackend {
     fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
             params![name_val, session_key],
         )
         .map_err(std::io::Error::other)?;
+        if updated == 0 && name_val.is_some() {
+            let now = Utc::now().to_rfc3339();
+            let _ = conn.execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, name, state)
+                 VALUES (?1, ?2, ?3, 0, ?4, 'idle')",
+                params![session_key, now, now, name_val],
+            );
+        }
         Ok(())
     }
 
@@ -2467,6 +2637,17 @@ mod tests {
         assert!(meta[0].name.is_none());
     }
 
+    #[test]
+    fn set_session_name_inserts_when_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.set_session_name("s_new", "Auto Title").unwrap();
+
+        let name = backend.get_session_name("s_new").unwrap();
+        assert_eq!(name.as_deref(), Some("Auto Title"));
+    }
+
     // ── session state tests ─────────────────────────────────────────
 
     #[test]
@@ -2807,4 +2988,82 @@ mod tests {
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
     }
+
+    #[test]
+    fn test_trajectory_steps_insert_and_load() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let step1 = SessionStep {
+            id: "step_1".to_string(),
+            session_id: "sess_a".to_string(),
+            turn_id: "turn_1".to_string(),
+            step_index: 0,
+            parent_step_id: None,
+            step_type: "s1_gate".to_string(),
+            payload_json: r#"{"intent":"code"}"#.to_string(),
+            tokens_used: 12,
+            duration_us: 15000,
+            created_at: "2026-09-21T10:00:00Z".to_string(),
+        };
+
+        let step2 = SessionStep {
+            id: "step_2".to_string(),
+            session_id: "sess_a".to_string(),
+            turn_id: "turn_1".to_string(),
+            step_index: 1,
+            parent_step_id: Some("step_1".to_string()),
+            step_type: "tool_call".to_string(),
+            payload_json: r#"{"tool":"cargo_check"}"#.to_string(),
+            tokens_used: 45,
+            duration_us: 800000,
+            created_at: "2026-09-21T10:00:01Z".to_string(),
+        };
+
+        backend.insert_step(&step1).unwrap();
+        backend.insert_step(&step2).unwrap();
+
+        let steps = backend.load_steps("sess_a");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].id, "step_1");
+        assert_eq!(steps[0].step_type, "s1_gate");
+        assert_eq!(steps[1].id, "step_2");
+        assert_eq!(steps[1].parent_step_id.as_deref(), Some("step_1"));
+    }
+
+    #[test]
+    fn test_fork_session_with_steps_and_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("sess_parent", &ChatMessage::user("initial question")).unwrap();
+        backend.append("sess_parent", &ChatMessage::assistant("initial answer")).unwrap();
+
+        let step1 = SessionStep {
+            id: "step_parent_1".to_string(),
+            session_id: "sess_parent".to_string(),
+            turn_id: "turn_1".to_string(),
+            step_index: 0,
+            parent_step_id: None,
+            step_type: "s1_gate".to_string(),
+            payload_json: "{}".to_string(),
+            tokens_used: 10,
+            duration_us: 20000,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        backend.insert_step(&step1).unwrap();
+
+        backend.fork_session("sess_parent", "sess_child", Some("step_parent_1"), Some("Forked Branch")).unwrap();
+
+        let child_msgs = backend.load("sess_child");
+        assert_eq!(child_msgs.len(), 2);
+
+        let child_steps = backend.load_steps("sess_child");
+        assert_eq!(child_steps.len(), 1);
+        assert_eq!(child_steps[0].step_type, "s1_gate");
+
+        let child_meta = backend.get_session_metadata("sess_child").unwrap();
+        assert_eq!(child_meta.name.as_deref(), Some("Forked Branch"));
+    }
 }
+

@@ -1374,6 +1374,7 @@ mod tests {
         let memory: std::sync::Arc<dyn omnesagent_api::memory_traits::Memory> =
             std::sync::Arc::new(omnesagent_memory::NoneMemory::new("none"));
         AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),

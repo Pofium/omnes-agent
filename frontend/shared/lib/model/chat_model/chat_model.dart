@@ -1,3 +1,5 @@
+import '../../core/gateway/models/grounding_citation.dart';
+
 enum ChatMessageType { user, bot }
 
 enum AgentActionType {
@@ -163,6 +165,7 @@ class ChatMessage {
     List<ToolCallInfo>? toolCalls,
     List<AgentActionStep>? steps,
     List<TodoBlockData>? todoBlocks,
+    List<GroundingCitation>? citations,
     this.isStreaming = false,
     this.isError = false,
     this.thinkingSeconds = 0,
@@ -178,6 +181,7 @@ class ChatMessage {
   })  : toolCalls = toolCalls ?? [],
         steps = steps ?? [],
         todoBlocks = todoBlocks ?? [],
+        citations = citations ?? [],
         suggestedActions = suggestedActions ?? [];
 
   String text;
@@ -186,6 +190,7 @@ class ChatMessage {
   final List<ToolCallInfo> toolCalls;
   final List<AgentActionStep> steps;
   final List<TodoBlockData> todoBlocks;
+  final List<GroundingCitation> citations;
   bool isStreaming;
   bool isError;
   int thinkingSeconds;
@@ -207,6 +212,7 @@ class ChatMessage {
     'isError': isError,
     'steps': steps.map((s) => s.toJson()).toList(),
     'todoBlocks': todoBlocks.map((t) => t.toJson()).toList(),
+    'citations': citations.map((c) => c.toJson()).toList(),
     'filesChangedCount': filesChangedCount,
     'additions': additions,
     'deletions': deletions,
@@ -230,6 +236,10 @@ class ChatMessage {
         [],
     todoBlocks: (json['todoBlocks'] as List?)
             ?.map((t) => TodoBlockData.fromJson(Map<String, dynamic>.from(t as Map)))
+            .toList() ??
+        [],
+    citations: (json['citations'] as List?)
+            ?.map((c) => GroundingCitation.fromJson(Map<String, dynamic>.from(c as Map)))
             .toList() ??
         [],
     filesChangedCount: json['filesChangedCount'] as int?,

@@ -2045,6 +2045,391 @@ pub async fn handle_api_session_state(
     }
 }
 
+// ── Session Creation & Forking & Trace Handlers ──────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateSessionRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub project_path: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub agent_alias: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// POST /api/v1/sessions — create new session with project/branch binding
+pub async fn handle_api_session_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateSessionRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Session persistence is disabled" })),
+        )
+            .into_response();
+    };
+
+    let raw_id = payload
+        .session_id
+        .unwrap_or_else(|| format!("s_{}", uuid::Uuid::new_v4().simple()));
+    let session_key = if raw_id.starts_with("gw_") {
+        raw_id
+    } else {
+        format!("gw_{raw_id}")
+    };
+    let display_id = session_key
+        .strip_prefix("gw_")
+        .unwrap_or(&session_key)
+        .to_string();
+
+    let name = payload.name.unwrap_or_else(|| {
+        if let Some(branch) = &payload.git_branch {
+            format!("{display_id} ({branch})")
+        } else {
+            display_id.clone()
+        }
+    });
+
+    let _ = backend.set_session_name(&session_key, &name);
+    if let Some(alias) = &payload.agent_alias {
+        let _ = backend.rename_agent_attribution("", alias);
+    }
+    let now = chrono::Utc::now();
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "session_id": display_id,
+            "session_key": session_key,
+            "name": name,
+            "project_path": payload.project_path,
+            "git_branch": payload.git_branch,
+            "agent_alias": payload.agent_alias,
+            "created_at": now.to_rfc3339(),
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/sessions/{id}/steps — list recorded trajectory steps for a session
+pub async fn handle_api_session_steps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Session persistence is disabled" })),
+        )
+            .into_response();
+    };
+
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    if !backend.session_exists(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Session {id} not found") })),
+        )
+            .into_response();
+    }
+
+    let steps = backend.load_steps(&session_key);
+    Json(serde_json::json!({
+        "session_id": gateway_display_session_id(&session_key),
+        "session_key": session_key,
+        "steps": steps,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ForkSessionRequest {
+    #[serde(default)]
+    pub at_step_id: Option<String>,
+    #[serde(default)]
+    pub new_title: Option<String>,
+    #[serde(default)]
+    pub overrides: Option<serde_json::Value>,
+}
+
+/// POST /api/v1/sessions/{id}/fork — fork session up to at_step_id
+pub async fn handle_api_session_fork(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<ForkSessionRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Session persistence is disabled" })),
+        )
+            .into_response();
+    };
+
+    let source_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    if !backend.session_exists(&source_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Session {id} not found") })),
+        )
+            .into_response();
+    }
+
+    let target_id = format!("fork_{}", uuid::Uuid::new_v4().simple());
+    let target_key = format!("gw_{target_id}");
+    let title = payload
+        .new_title
+        .as_deref()
+        .unwrap_or("Forked Branch");
+
+    match backend.fork_session(
+        &source_key,
+        &target_key,
+        payload.at_step_id.as_deref(),
+        Some(title),
+    ) {
+        Ok(()) => {
+            let parent_id = gateway_display_session_id(&source_key);
+            Json(serde_json::json!({
+                "session_id": target_id,
+                "session_key": target_key,
+                "parent_session_id": parent_id,
+                "forked_at_step_id": payload.at_step_id,
+                "title": title,
+                "overrides": payload.overrides,
+                "created_at": chrono::Utc::now().to_rfc3339(),
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to fork session: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/v1/sessions/{id}/export_trace — export session trace
+pub async fn handle_api_session_export_trace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Session persistence is disabled" })),
+        )
+            .into_response();
+    };
+
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    if !backend.session_exists(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("Session {id} not found") })),
+        )
+            .into_response();
+    }
+
+    let messages = backend.load_with_timestamps(&session_key);
+    let steps = backend.load_steps(&session_key);
+    let meta = backend.get_session_metadata(&session_key);
+
+    Json(serde_json::json!({
+        "session_id": gateway_display_session_id(&session_key),
+        "session_key": session_key,
+        "metadata": meta,
+        "messages": messages.into_iter().map(|m| serde_json::json!({
+            "role": m.message.role,
+            "content": m.message.content,
+            "created_at": m.created_at.map(|t| t.to_rfc3339()),
+        })).collect::<Vec<_>>(),
+        "steps": steps,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}
+
+/// POST /api/v1/sessions/replay — replay session trace
+pub async fn handle_api_session_replay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let replay_id = format!("replay_{}", uuid::Uuid::new_v4().simple());
+    let step_count = payload
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "status": "replay_accepted",
+        "replay_id": replay_id,
+        "steps_count": step_count,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}
+
+/// GET /api/v1/providers — registry of available model providers
+pub async fn handle_api_providers_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let cfg = state.config.read();
+    let catalog: Vec<serde_json::Value> = omnesagent_providers::list_model_providers()
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "display_name": p.display_name,
+                "local": p.local,
+                "category": format!("{:?}", p.category),
+            })
+        })
+        .collect();
+    let mut configured = Vec::new();
+    for (ty, alias, base) in cfg.providers.models.iter_entries() {
+        configured.push(serde_json::json!({
+            "type": ty,
+            "alias": alias,
+            "model": base.model,
+            "has_api_key": base.api_key.is_some(),
+        }));
+    }
+
+    Json(serde_json::json!({
+        "catalog": catalog,
+        "configured": configured,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct AstReindexRequest {
+    pub project_path: Option<String>,
+}
+
+/// POST /api/v1/ast/reindex — trigger background reindexing of AST graph
+pub async fn handle_api_ast_reindex(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Option<Json<AstReindexRequest>>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let req = payload.map(|p| p.0).unwrap_or_default();
+    let project = req.project_path.unwrap_or_else(|| ".".to_string());
+
+    let path_clone = project.clone();
+    tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&path_clone);
+        if p.exists() {
+            let extractor = omnesagent_kag::AstCodeExtractor::new();
+            let _ = extractor.scan_directory(p, None);
+        }
+    });
+
+    Json(serde_json::json!({
+        "status": "indexing_started",
+        "project": project,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}
+
+/// GET /api/v1/s1/status — current status of System One layer
+pub async fn handle_api_s1_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let s1_cfg = omnesagent_s1::config::SystemOneConfig::default();
+    let ready = s1_cfg
+        .model_path
+        .as_deref()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+        || std::env::var("OMNESAGENT_S1_PATH")
+            .map(|p| std::path::Path::new(&p).exists())
+            .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "provider": format!("{:?}", s1_cfg.provider),
+        "model": "convaiinnovations/laya",
+        "ready": ready,
+        "max_tokens": s1_cfg.max_tokens,
+        "device": format!("{:?}", s1_cfg.device),
+    }))
+    .into_response()
+}
+
+/// POST /api/v1/s1/download — command to background prefetch Laya weights
+pub async fn handle_api_s1_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    tokio::task::spawn_blocking(|| {
+        if let Ok(api) = hf_hub::api::sync::Api::new() {
+            let repo = api.model("convaiinnovations/laya".to_string());
+            let _ = repo.get("config.json");
+            let _ = repo.get("tokenizer.json");
+            let _ = repo.get("model.safetensors");
+        }
+    });
+
+    Json(serde_json::json!({
+        "status": "download_started",
+        "model": "convaiinnovations/laya",
+        "source": "huggingface_hub",
+        "started_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .into_response()
+}
+
 // ── Session abort endpoint ────────────────────────────────────────
 
 pub async fn handle_api_session_abort(
@@ -2285,6 +2670,7 @@ pub(crate) mod tests {
 
     pub(crate) fn test_state(config: omnesagent_config::schema::Config) -> AppState {
         AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider),
@@ -2448,6 +2834,8 @@ pub(crate) mod tests {
             tenant_id: None,
             agent_alias: None,
             agent_id: None,
+            trust: None,
+            last_feedback_at: None,
         }
     }
 

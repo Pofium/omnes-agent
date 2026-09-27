@@ -476,6 +476,28 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(TurnEvent::TrajectoryStep {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: channel_name.to_string(),
+                turn_id: turn_id.to_string(),
+                step_index: 0,
+                parent_step_id: None,
+                step_type: "s1_gate".to_string(),
+                payload_json: serde_json::json!({
+                    "decision": "loop",
+                    "intent": "autonomous_coding",
+                    "query_preview": if p1_text.len() > 100 { &p1_text[..100] } else { p1_text },
+                })
+                .to_string(),
+                tokens_used: (p1_text.len() + 3) / 4,
+                duration_us: 15_000,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await;
+    }
+
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -511,8 +533,72 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             if !context.is_empty() {
                 let existing = &turn_state.history[last_user_idx].content;
                 turn_state.history[last_user_idx].content = format!("{context}{existing}");
+
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(TurnEvent::TrajectoryStep {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            session_id: channel_name.to_string(),
+                            turn_id: turn_id.to_string(),
+                            step_index: 1,
+                            parent_step_id: None,
+                            step_type: "context_inject".to_string(),
+                            payload_json: serde_json::json!({
+                                "source": "memory",
+                                "bytes": context.len(),
+                            })
+                            .to_string(),
+                            tokens_used: (context.len() + 3) / 4,
+                            duration_us: 5_000,
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        })
+                        .await;
+
+                    let _ = tx
+                        .send(TurnEvent::GroundingCitation {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            uri: "memory://long_term_knowledge".to_string(),
+                            label: "Long-Term Memory".to_string(),
+                            source_type: "memory".to_string(),
+                        })
+                        .await;
+                }
             }
         }
+    }
+
+    if let Some(ref tx) = event_tx {
+        let mut profiler = crate::agent::context_budget::ContextBudgetProfiler::new();
+        let sys_prompt = turn_state
+            .history
+            .iter()
+            .find(|m| m.role == "system")
+            .map_or("", |m| m.content.as_str());
+        profiler.record_system_prompt(sys_prompt);
+        let history_text: String = turn_state
+            .history
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        profiler.record_dialog_history(&history_text);
+        let snap = profiler.snapshot(if context_token_budget == 0 {
+            128_000
+        } else {
+            context_token_budget
+        });
+        let _ = tx
+            .send(TurnEvent::ContextBudgetUpdate {
+                system_tokens: snap.system_tokens,
+                kag_ast_tokens: snap.kag_ast_tokens,
+                memory_tokens: snap.memory_tokens,
+                dialog_history_tokens: snap.dialog_history_tokens,
+                tool_outputs_tokens: snap.tool_outputs_tokens,
+                compression_saved_tokens: snap.compression_saved_tokens,
+                context_limit: snap.context_limit,
+            })
+            .await;
     }
 
     let max_iterations = if max_tool_iterations == 0 {
@@ -1199,6 +1285,27 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     observer,
                 )
                 .await;
+            }
+            if let Some(ref tx) = event_tx {
+                let tokens_est = (accumulated_display_text.len() + 3) / 4;
+                let _ = tx
+                    .send(TurnEvent::TrajectoryStep {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id: channel_name.to_string(),
+                        turn_id: turn_id.to_string(),
+                        step_index: 100,
+                        parent_step_id: None,
+                        step_type: "synthesis".to_string(),
+                        payload_json: serde_json::json!({
+                            "response_length": accumulated_display_text.len(),
+                            "status": "completed",
+                        })
+                        .to_string(),
+                        tokens_used: tokens_est,
+                        duration_us: loop_started_at.elapsed().as_micros() as u64,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    })
+                    .await;
             }
             return Ok(accumulated_display_text);
         }

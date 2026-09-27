@@ -1,0 +1,26 @@
+[package]
+name = "floem-editor-core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.91"
+repository = "https://github.com/lapce/floem"
+license = "MIT"
+description = "The core of the floem text editor"
+# Vendored into OmnesAgent; not published to crates.io.
+publish = false
+# This crate is intentionally detached from the OmnesAgent cargo workspace:
+# the backend workspace `exclude`s this directory (it is a plain path
+# dependency, not a member).
+
+[dependencies]
+serde = { version = "1.0", default-features = false, optional = true }
+strum = { version = "0.28", features = ["derive"] }
+strum_macros = "0.28"
+lapce-xi-rope = "0.4.0"
+itertools = "0.14.0"
+bitflags = "2.4.2"
+memchr = "2.7.1"
+
+[features]
+default = []
+serde = ["dep:serde"]

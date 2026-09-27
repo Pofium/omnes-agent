@@ -1,0 +1,38 @@
+[package]
+name = "omnesagent-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "File editor core for OmnesAgent: buffers, revisions, coordinates, row snapshots (PLAN_FILE_EDITOR_ZED, phase F0)"
+
+[dependencies]
+# Text storage + editor model. Behavior reference for the service layer:
+# PLAN_FILE_EDITOR_ZED.md §11 (Lapce stack) and BACKEND_SPEC.md §9.2.
+floem-editor-core = { path = "vendor/editor-core" }
+lapce-xi-rope = "0.4.0"
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tokio = { version = "1.50", default-features = false, features = ["sync"] }
+# Server-side tree-sitter highlighting (F1). Ready-made Apache/MIT layer with
+# bundled grammars/queries; keeps a single tree-sitter version workspace-wide
+# (PLAN §11.5). The lapce-core/syntax port (§11.11) is deferred — this module
+# is the swappable `highlight.rs` seam.
+inkjet = { version = "0.11", default-features = false, features = [
+    "language-rust", "language-dart", "language-json", "language-yaml",
+    "language-toml", "language-bash", "language-python", "language-typescript",
+    "language-tsx", "language-javascript", "language-html", "language-css",
+    "language-scss", "language-cpp", "language-c", "language-go",
+    "language-dockerfile", "language-diff", "language-sql", "language-hcl",
+    "language-java", "language-kotlin",
+] }
+# Markdown (Ф1): inkjet 0.11 не содержит markdown; грамматика 0.3.2 собрана
+# ровно под tree-sitter ^0.23 (одна версия в воркспейсе, §11.5). Блок-грамматика
+# + инъекции дают подсветку код-блоков через уже имеющийся injection-callback.
+tree-sitter-md = "0.3.2"
+tree-sitter = "0.23"
+
+[dev-dependencies]
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+tempfile = "3.27"
+tokio = { version = "1.50", default-features = false, features = ["rt", "macros"] }

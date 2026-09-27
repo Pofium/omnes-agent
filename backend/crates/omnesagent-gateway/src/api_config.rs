@@ -2620,6 +2620,7 @@ mod tests {
         let memory: Arc<dyn omnesagent_memory::Memory> =
             Arc::new(omnesagent_memory::NoneMemory::new("api-config-test"));
         AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider),

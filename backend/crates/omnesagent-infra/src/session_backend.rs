@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use omnesagent_api::model_provider::ChatMessage;
 
 /// Metadata about a persisted session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionMetadata {
     /// Session key (e.g. `telegram_user123`).
     pub key: String,
@@ -65,9 +65,44 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// A structured step in an agent's execution trajectory.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionStep {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub step_index: usize,
+    pub parent_step_id: Option<String>,
+    pub step_type: String, // 's1_gate', 'context_inject', 'cot_thinking', 'tool_call', 'tool_observation', 'synthesis'
+    pub payload_json: String,
+    pub tokens_used: usize,
+    pub duration_us: u64,
+    pub created_at: String,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Insert a trajectory step.
+    fn insert_step(&self, _step: &SessionStep) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Load trajectory steps for a session.
+    fn load_steps(&self, _session_id: &str) -> Vec<SessionStep> {
+        Vec::new()
+    }
+
+    /// Fork a session up to a specific step id, returning the new session key.
+    fn fork_session(
+        &self,
+        _source_key: &str,
+        _target_key: &str,
+        _at_step_id: Option<&str>,
+        _new_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("Session forking is not supported by this backend")
+    }
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 

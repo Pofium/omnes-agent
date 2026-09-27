@@ -12,6 +12,9 @@ import 'browser/desktop_webview_controller.dart';
 import 'artifacts/artifacts_viewer_controller.dart';
 import 'artifacts/diff_viewer_widget.dart';
 import 'side_chat/side_chat_controller.dart';
+import 'trajectory/trajectory_inspector_panel.dart';
+import 'editor/editor_pane.dart';
+import 'editor/image_viewer_pane.dart';
 
 class DesktopInspectorPanel extends StatefulWidget {
   final double? width;
@@ -109,8 +112,12 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
     }
 
     if (widget.initialTabIndex == 5) {
-      if (!openTabKeys.contains('file')) openTabKeys.add('file');
-      activeTabKey = 'file';
+      if (!openTabKeys.contains('editor')) openTabKeys.add('editor');
+      activeTabKey = 'editor';
+      showTabChooser = false;
+    } else if (widget.initialTabIndex == 6) {
+      if (!openTabKeys.contains('image')) openTabKeys.add('image');
+      activeTabKey = 'image';
       showTabChooser = false;
     } else if (widget.initialTabIndex >= 0 && widget.initialTabIndex < 5) {
       final defaultKeys = ['browser', 'terminal', 'canvas', 'preview', 'side_chat'];
@@ -133,8 +140,12 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
     super.didUpdateWidget(oldWidget);
     if (widget.initialTabIndex != oldWidget.initialTabIndex) {
       if (widget.initialTabIndex == 5) {
-        if (!openTabKeys.contains('file')) openTabKeys.add('file');
-        activeTabKey = 'file';
+        if (!openTabKeys.contains('editor')) openTabKeys.add('editor');
+        activeTabKey = 'editor';
+        showTabChooser = false;
+      } else if (widget.initialTabIndex == 6) {
+        if (!openTabKeys.contains('image')) openTabKeys.add('image');
+        activeTabKey = 'image';
         showTabChooser = false;
       } else if (widget.initialTabIndex >= 0 && widget.initialTabIndex < 5) {
         final defaultKeys = ['browser', 'terminal', 'canvas', 'preview', 'side_chat'];
@@ -267,8 +278,17 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         return _buildPreviewTab();
       case 'side_chat':
         return _buildSideChatTab();
+      case 'trajectory':
+        return TrajectoryInspectorPanel(
+          steps: widget.controller.trajectorySteps,
+          onForkAtStep: (step) => widget.controller.forkSessionAtStep(step.id),
+        );
       case 'file':
         return _buildFileViewerTab();
+      case 'editor':
+        return _buildEditorTab();
+      case 'image':
+        return _buildImageTab();
       default:
         return _buildOpenTabChooser();
     }
@@ -357,13 +377,63 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         return ('Превью', FontAwesomeIcons.eye);
       case 'side_chat':
         return ('Боковой чат', FontAwesomeIcons.comments);
+      case 'trajectory':
+        return ('Траектория', Icons.hub_outlined);
       case 'file':
         final path = widget.controller.selectedFilePath.value;
         final name = path != null ? path.split(RegExp(r'[\\/]')).last : 'Файл';
         return (name, Icons.code);
+      case 'editor':
+        final path = widget.controller.selectedFilePath.value;
+        final name = path != null ? path.split(RegExp(r'[\\/]')).last : 'Редактор';
+        return (name, Icons.edit_note);
+      case 'image':
+        final path = widget.controller.selectedFilePath.value;
+        final name = path != null ? path.split(RegExp(r'[\\/]')).last : 'Изображение';
+        return (name, Icons.image_outlined);
       default:
         return (key, Icons.tab);
     }
+  }
+
+  /// Image viewer tab: gateway-served bytes + native Flutter rendering.
+  Widget _buildImageTab() {
+    final path = widget.controller.selectedFilePath.value;
+    if (path == null || path.isEmpty) {
+      return Center(
+        child: Text(
+          'Изображение не выбрано',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: DesktopTheme.textMuted, fontSize: 13),
+        ),
+      );
+    }
+    return ImagePane(
+      key: ValueKey(path),
+      filePath: path,
+      projectRoot: widget.controller.activeProjectPath.value,
+    );
+  }
+
+  /// File editor tab (FRONTEND_SPEC §5.5): gateway-owned buffer + virtual
+  /// viewport. Replaces the read-only viewer flow for project files; the old
+  /// `file` tab stays until the F3 cleanup removes the direct-FS paths.
+  Widget _buildEditorTab() {
+    final path = widget.controller.selectedFilePath.value;
+    if (path == null || path.isEmpty) {
+      return Center(
+        child: Text(
+          'Файл не выбран\nВыберите файл в дереве проекта',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: DesktopTheme.textMuted, fontSize: 13),
+        ),
+      );
+    }
+    return EditorPane(
+      key: ValueKey(path),
+      filePath: path,
+      projectRoot: widget.controller.activeProjectPath.value,
+    );
   }
 
   Widget _buildFileViewerTab() {
@@ -503,6 +573,19 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
             ),
             const SizedBox(height: 10),
             _buildChooserCard(
+              icon: Icons.hub_outlined,
+              label: 'Инспектор Траектории',
+              subtitle: 'Временная шкала рассуждений CoT, s1-гейтов, тулов и форк сессий',
+              onTap: () {
+                setState(() {
+                  if (!openTabKeys.contains('trajectory')) openTabKeys.add('trajectory');
+                  activeTabKey = 'trajectory';
+                  showTabChooser = false;
+                });
+              },
+            ),
+            const SizedBox(height: 10),
+            _buildChooserCard(
               icon: Icons.assignment_outlined,
               label: 'Превью и Диффы',
               subtitle: 'Просмотр артефактов и изменений кода',
@@ -554,6 +637,19 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
               },
             ),
             if (widget.controller.selectedFilePath.value != null) ...[
+              const SizedBox(height: 10),
+              _buildChooserCard(
+                icon: Icons.edit_note,
+                label: 'Редактор: ${widget.controller.selectedFilePath.value!.split(RegExp(r"[\\/]")).last}',
+                subtitle: 'Правки через шлюз: буфер, ревизии, сохранение',
+                onTap: () {
+                  setState(() {
+                    if (!openTabKeys.contains('editor')) openTabKeys.add('editor');
+                    activeTabKey = 'editor';
+                    showTabChooser = false;
+                  });
+                },
+              ),
               const SizedBox(height: 10),
               _buildChooserCard(
                 icon: Icons.code,

@@ -2,6 +2,7 @@
 // Features Git Tools status card popover, bottom terminal toggle, multi-project breadcrumbs,
 // git diff chips, and localized Russian assistant prompts.
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -15,6 +16,7 @@ import '../../utils/project_scaffolding.dart';
 import '../../widgets/desktop_sidebar.dart';
 import '../../widgets/interactive_question_card.dart';
 import 'task_workspace_controller.dart';
+import 'turn_rail.dart';
 
 class DesktopTaskWorkspaceView extends StatefulWidget {
   final DesktopTaskWorkspaceController controller;
@@ -50,8 +52,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   bool isBannerDismissed = false;
   bool isGitToolsOpen = false;
   bool isTaskBarOpen = false;
+  bool isDropHovering = false;
   final TextEditingController _bottomTerminalInput = TextEditingController();
   final ScrollController _bottomTerminalScroll = ScrollController();
+
+  // Turn rail («палочки» слева от чата): ключ на каждом сообщении
+  // пользователя для прыжка и трекинга активного хода.
+  final Map<int, GlobalKey> _turnKeys = {};
+  int _activeTurnOrdinal = 0;
 
   @override
   void dispose() {
@@ -1593,9 +1601,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 const SizedBox(width: 6),
                 _buildTerminalQuickStdinChip('n', () => widget.controller.sendTerminalStdin('n')),
                 const SizedBox(width: 6),
-                _buildTerminalQuickStdinChip('↵ Enter', () => widget.controller.sendTerminalStdin('')),
+                _buildTerminalQuickStdinChip('Enter', () => widget.controller.sendTerminalStdin('')),
                 const SizedBox(width: 6),
-                _buildTerminalQuickStdinChip('✕ Ctrl+C', () => widget.controller.sendTerminalStdin('^C'), isDanger: true),
+                _buildTerminalQuickStdinChip('Ctrl+C', () => widget.controller.sendTerminalStdin('^C'), isDanger: true),
               ],
             ),
           ),
@@ -1942,15 +1950,26 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   // COMPOSER CARD (Hero & Floating)
   // ==========================================
   Widget _buildComposerCard({bool isHero = false}) {
-    return Container(
+    final cardWidget = AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeOut,
       decoration: BoxDecoration(
-        color: DesktopTheme.bgSurface,
+        color: isDropHovering
+            ? DesktopTheme.bgSurfaceElevated
+            : DesktopTheme.bgSurface,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: DesktopTheme.borderSubtle, width: 1.2),
+        border: Border.all(
+          color: isDropHovering
+              ? const Color(0xFF00D2FF)
+              : DesktopTheme.borderSubtle,
+          width: isDropHovering ? 2.0 : 1.2,
+        ),
         boxShadow: [
           BoxShadow(
-            color: DesktopTheme.isDark ? Colors.black.withOpacity(0.35) : Colors.black.withOpacity(0.06),
-            blurRadius: 24,
+            color: isDropHovering
+                ? const Color(0xFF00D2FF).withOpacity(0.35)
+                : (DesktopTheme.isDark ? Colors.black.withOpacity(0.35) : Colors.black.withOpacity(0.06)),
+            blurRadius: isDropHovering ? 28 : 24,
             offset: const Offset(0, 8),
           ),
         ],
@@ -1967,7 +1986,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   _buildProjectChip(),
                   const SizedBox(width: 8),
                   _buildBranchChip(),
+                  const SizedBox(width: 8),
                 ],
+                // Mode Switcher (Fast, DeepCode, Architect, RalphLoop)
+                Obx(() => AgentModeSwitcher(
+                  currentMode: widget.controller.currentExecutionMode.value,
+                  onModeChanged: (mode) => widget.controller.currentExecutionMode.value = mode,
+                )),
                 const Spacer(),
                 // Top-right corner: System file icon (AGENTS.md) + Circular progress context indicator
                 _buildProjectRulesIconButton(),
@@ -1976,6 +2001,44 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               ],
             ),
           ),
+
+          // Context Budget Gauge Bar
+          Obx(() {
+            final budget = widget.controller.currentContextBudget.value;
+            if (budget == null) return const SizedBox.shrink();
+            return Padding(
+              padding: const EdgeInsets.only(left: 14, right: 14, top: 6),
+              child: ContextBudgetBar(budget: budget),
+            );
+          }),
+
+          // Drag & Drop hover banner indicator
+          if (isDropHovering)
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF00D2FF).withOpacity(0.12),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5)),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.file_download, size: 16, color: Color(0xFF00D2FF)),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Отпустите файлы или папки для добавления ссылки (@path)',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF00D2FF),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
 
           // 2. Attachment chips if any
           Obx(() {
@@ -2047,7 +2110,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             ),
           ),
 
-          // 4. Bottom Controls Row: [+] [🛡️ Mode ⌵] ... [🟢 Model ⌵] [🧠 Max ⌵] [↑]
+          // 4. Bottom Controls Row: [+] [Mode] ... [Model] [Max] [Up]
           Padding(
             padding: const EdgeInsets.only(left: 12, right: 12, bottom: 10),
             child: Row(
@@ -2056,24 +2119,24 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 _buildAddMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🛡️ Permission Mode ⌵]
+                // [Permission Mode]
                 _buildPermissionModeMenuButton(),
 
                 const Spacer(),
 
-                // [🏢 Provider ⌵]
+                // [Provider]
                 _buildProviderMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🟢 Model ⌵]
+                // [Model]
                 _buildModelMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🧠 Thought Level ⌵]
+                // [Thought Level]
                 _buildThoughtLevelMenuButton(),
                 const SizedBox(width: 8),
 
-                // [🎙️ Voice Input Button]
+                // [Voice Input Button]
                 _buildVoiceInputButton(),
                 const SizedBox(width: 8),
 
@@ -2083,6 +2146,35 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             ),
           ),
         ],
+      ),
+    );
+
+    return DropTarget(
+      onDragEntered: (details) {
+        setState(() => isDropHovering = true);
+      },
+      onDragExited: (details) {
+        setState(() => isDropHovering = false);
+      },
+      onDragDone: (details) {
+        setState(() => isDropHovering = false);
+        for (final file in details.files) {
+          widget.controller.attachPathToPrompt(file.path);
+        }
+      },
+      child: DragTarget<String>(
+        onWillAcceptWithDetails: (details) => true,
+        onMove: (details) {
+          if (!isDropHovering) setState(() => isDropHovering = true);
+        },
+        onLeave: (data) {
+          setState(() => isDropHovering = false);
+        },
+        onAcceptWithDetails: (details) {
+          setState(() => isDropHovering = false);
+          widget.controller.attachPathToPrompt(details.data);
+        },
+        builder: (context, candidateData, rejectedData) => cardWidget,
       ),
     );
   }
@@ -2304,15 +2396,80 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   // ==========================================
   // CHAT TIMELINE (Active Task Run)
   // ==========================================
+  /// Индексы сообщений пользователя (начала ходов диалога).
+  List<int> _userTurnIndices() {
+    final indices = <int>[];
+    for (var i = 0; i < widget.controller.messages.length; i++) {
+      if (widget.controller.messages[i].chatMessageType == ChatMessageType.user) {
+        indices.add(i);
+      }
+    }
+    _turnKeys.removeWhere((key, _) => !indices.contains(key));
+    return indices;
+  }
+
+  String _turnPreview(String text) {
+    final flat = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return flat.isEmpty ? '—' : (flat.length > 56 ? '${flat.substring(0, 56)}…' : flat);
+  }
+
+  /// Активный ход — последний, чьё начало выше ~35% высоты вьюпорта.
+  void _updateActiveTurn(List<int> turns) {
+    if (turns.isEmpty) return;
+    var best = 0;
+    for (var ordinal = 0; ordinal < turns.length; ordinal++) {
+      final ctx = _turnKeys[turns[ordinal]]?.currentContext;
+      if (ctx == null) continue;
+      final box = ctx.findRenderObject();
+      if (box is! RenderBox || !box.attached) continue;
+      final scrollable = Scrollable.maybeOf(ctx);
+      final vpBox = scrollable?.context.findRenderObject();
+      if (vpBox is! RenderBox || !vpBox.attached) continue;
+      final rel = box.localToGlobal(Offset.zero).dy - vpBox.localToGlobal(Offset.zero).dy;
+      if (rel <= vpBox.size.height * 0.35) best = ordinal;
+    }
+    if (best != _activeTurnOrdinal) {
+      setState(() => _activeTurnOrdinal = best);
+    }
+  }
+
+  void _jumpToTurn(List<int> turns, int ordinal) {
+    if (ordinal < 0 || ordinal >= turns.length) return;
+    final ctx = _turnKeys[turns[ordinal]]?.currentContext;
+    if (ctx == null) return;
+    widget.controller.isAutoScrollEnabled.value = false;
+    Scrollable.ensureVisible(
+      ctx,
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
+      alignment: 0.02,
+    );
+  }
+
   Widget _buildChatTimeline() {
+    final turns = _userTurnIndices();
     return Stack(
       children: [
+        // Turn rail: одна засечка на ход пользователя.
+        Positioned(
+          left: 2,
+          top: 12,
+          bottom: 12,
+          child: TurnRail(
+            turnPreviews: [
+              for (final i in turns) _turnPreview(widget.controller.messages[i].text),
+            ],
+            activeIndex: _activeTurnOrdinal.clamp(0, turns.isEmpty ? 0 : turns.length - 1),
+            onTapTurn: (ordinal) => _jumpToTurn(turns, ordinal),
+          ),
+        ),
         NotificationListener<ScrollNotification>(
           onNotification: (notification) {
             if (notification is ScrollUpdateNotification) {
               if ((notification.scrollDelta ?? 0) < -1) {
                 widget.controller.isAutoScrollEnabled.value = false;
               }
+              _updateActiveTurn(turns);
             }
             return false;
           },
@@ -2326,8 +2483,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         }
         final msg = widget.controller.messages[index];
         final isUser = msg.chatMessageType == ChatMessageType.user;
+        if (isUser) {
+          _turnKeys.putIfAbsent(index, () => GlobalKey());
+        }
 
-        return Padding(
+        final messageWidget = Padding(
           padding: const EdgeInsets.only(bottom: 20),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -2395,6 +2555,24 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
                     _buildMessageContent(context, msg),
 
+                    // Grounding Citations
+                    if (!isUser && msg.citations.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: msg.citations
+                              .asMap()
+                              .entries
+                              .map((e) => GroundingCitationBadge(
+                                    index: e.key + 1,
+                                    citation: e.value,
+                                  ))
+                              .toList(),
+                        ),
+                      ),
+
                     // Error banner with retry button
                     if (msg.isError)
                       Container(
@@ -2432,7 +2610,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       ),
 
 
-                    // Live Project Changes Review Pill (e.g. "4 files changed +129 -1 > [📄 Review]")
+                    // Live Project Changes Review Pill (e.g. "4 files changed +129 -1 > [Review]")
                     if (!isUser && msg.filesChangedCount != null && msg.filesChangedCount! > 0)
                       _buildReviewPill(
                         context,
@@ -2441,7 +2619,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         deletions: msg.deletions ?? 0,
                       ),
 
-                    // Message Reactions Row (Image 2 match: [⎘ Copy] [👍] [👎] [🔀 Branch] 9/5, 10:07 AM)
+                    // Message Reactions Row (Image 2 match: [Copy] [Like] [Dislike] [Branch] 9/5, 10:07 AM)
                     if (!isUser)
                       _buildMessageReactionsRow(context, msg),
 
@@ -2453,6 +2631,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               ),
             ],
           ),
+        );
+        // Ход пользователя помечается ключом для рельсы ходов.
+        if (!isUser) return messageWidget;
+        return KeyedSubtree(
+          key: _turnKeys[index],
+          child: messageWidget,
         );
       },
     ),
@@ -2987,85 +3171,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     if (msg.thinking == null || msg.thinking!.trim().isEmpty) {
       return const SizedBox.shrink();
     }
-
     final isStreamingThinking = msg.isStreaming && !msg.isThinkingFinished;
-    final wordCount = msg.thinking!.trim().split(RegExp(r'\s+')).length;
-    final seconds = msg.thinkingSeconds;
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          InkWell(
-            onTap: () {
-              setState(() {
-                msg.isThinkingExpanded = !msg.isThinkingExpanded;
-              });
-            },
-            borderRadius: BorderRadius.circular(6),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: DesktopTheme.bgSurfaceElevated,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(
-                  color: isStreamingThinking ? const Color(0xFF00D2FF).withOpacity(0.5) : DesktopTheme.borderSubtle,
-                ),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (isStreamingThinking)
-                    const SizedBox(
-                      width: 12,
-                      height: 12,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00D2FF)),
-                    )
-                  else
-                    const Icon(Icons.psychology_outlined, size: 14, color: Color(0xFF00D2FF)),
-                  const SizedBox(width: 7),
-                  Text(
-                    isStreamingThinking
-                        ? 'Размышления (${seconds > 0 ? '$seconds с' : 'думает...'})'
-                        : 'Размышления (${seconds > 0 ? 'рассуждал $seconds с · ' : ''}$wordCount слов)',
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w500,
-                      color: isStreamingThinking ? const Color(0xFF00D2FF) : DesktopTheme.textSecondary,
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Icon(
-                    msg.isThinkingExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                    size: 14,
-                    color: DesktopTheme.textMuted,
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (msg.isThinkingExpanded)
-            Container(
-              margin: const EdgeInsets.only(top: 6),
-              padding: const EdgeInsets.all(12),
-              width: double.infinity,
-              decoration: BoxDecoration(
-                color: DesktopTheme.isDark ? const Color(0xFF141720) : const Color(0xFFF1F5F9),
-                borderRadius: BorderRadius.circular(6),
-                border: const Border(left: BorderSide(color: Color(0xFF00D2FF), width: 2.5)),
-              ),
-              child: SelectableText(
-                msg.thinking!.trim(),
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontFamily: 'Consolas',
-                  height: 1.45,
-                  color: DesktopTheme.isDark ? const Color(0xFF94A3B8) : const Color(0xFF475569),
-                ),
-              ),
-            ),
-        ],
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: ThinkingAccordion(
+        thinkingContent: msg.thinking!,
+        isThinking: isStreamingThinking,
+        elapsedSeconds: msg.thinkingSeconds,
       ),
     );
   }

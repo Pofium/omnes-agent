@@ -28,6 +28,7 @@ class TaskSession {
   int additions;
   int deletions;
   bool hasGitRepo;
+  bool isCustomNamed;
 
   TaskSession({
     required this.id,
@@ -47,6 +48,7 @@ class TaskSession {
     this.additions = 0,
     this.deletions = 0,
     this.hasGitRepo = false,
+    this.isCustomNamed = false,
   })  : messages = messages ?? [],
         runTimelineSteps = runTimelineSteps ?? [];
 }
@@ -180,6 +182,11 @@ class DesktopTaskWorkspaceController extends GetxController {
   final usedTokens = 0.obs;
   final maxTokens = 128000.obs;
   final estimatedCost = 0.0.obs;
+
+  // DeepSeek / OmnesAgent Harness state
+  final trajectorySteps = <TrajectoryStep>[].obs;
+  final currentContextBudget = Rxn<ContextBudgetSnapshot>();
+  final currentExecutionMode = AgentExecutionMode.fast.obs;
 
   // Project Rules Inspector
   final projectRulesContent = ''.obs;
@@ -576,6 +583,8 @@ class DesktopTaskWorkspaceController extends GetxController {
       messages.assignAll(session.messages);
     }
     runTimelineSteps.assignAll(session.runTimelineSteps);
+    trajectorySteps.clear();
+    currentContextBudget.value = null;
     refreshGitStatus();
     attachments.clear();
     inputController.clear();
@@ -625,21 +634,33 @@ class DesktopTaskWorkspaceController extends GetxController {
     }
   }
 
+  /// Extensions served as binary previews (image viewer) — never read as text.
+  static const Set<String> _kBinaryPreviewExtensions = {
+    'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'wbmp', 'avif', 'svg',
+  };
+
   void openProjectFile(String path, [String? content]) {
     selectedFilePath.value = path;
     if (content != null) {
       selectedFileContent.value = content;
-    } else {
-      try {
-        final f = universal_io.File(path);
-        if (f.existsSync()) {
-          selectedFileContent.value = f.readAsStringSync();
-        } else {
-          selectedFileContent.value = '// Файл не найден: $path';
-        }
-      } catch (e) {
-        selectedFileContent.value = '// Ошибка чтения файла: $e';
+      return;
+    }
+    final ext = path.contains('.') ? path.split('.').last.toLowerCase() : '';
+    if (_kBinaryPreviewExtensions.contains(ext)) {
+      // Binary asset: the image viewer fetches bytes via the gateway
+      // (`/api/v1/editor/raw`); reading it as text here is meaningless.
+      selectedFileContent.value = null;
+      return;
+    }
+    try {
+      final f = universal_io.File(path);
+      if (f.existsSync()) {
+        selectedFileContent.value = f.readAsStringSync();
+      } else {
+        selectedFileContent.value = '// Файл не найден: $path';
       }
+    } catch (e) {
+      selectedFileContent.value = '// Ошибка чтения файла: $e';
     }
   }
 
@@ -781,11 +802,16 @@ class DesktopTaskWorkspaceController extends GetxController {
   }
 
   String _generateTopicTitle(String prompt) {
-    String clean = prompt.trim().replaceAll(RegExp(r'^(/[\w\-]+|\*+|#+)\s*'), '');
+    String clean = prompt.trim()
+        .replaceAll(RegExp(r'^(/[\w\-]+|\*+|#+|[-*•"«»])\s*'), '')
+        .trim();
     final firstLine = clean.split('\n').first.trim();
     if (firstLine.isEmpty) return 'Новая сессия';
-    if (firstLine.length <= 35) return firstLine;
-    final truncated = firstLine.substring(0, 35);
+    final formatted = firstLine.length > 1
+        ? '${firstLine[0].toUpperCase()}${firstLine.substring(1)}'
+        : firstLine.toUpperCase();
+    if (formatted.length <= 35) return formatted;
+    final truncated = formatted.substring(0, 35);
     final lastSpace = truncated.lastIndexOf(' ');
     if (lastSpace > 12) {
       return '${truncated.substring(0, lastSpace)}...';
@@ -1109,11 +1135,11 @@ class DesktopTaskWorkspaceController extends GetxController {
         messages.last.isError = true;
         messages.last.isThinkingFinished = true;
         messages.last.isThinkingExpanded = false;
-        messages.last.text += '\n\n⚠️ Ошибка шлюза: ${frame.message}';
+        messages.last.text += '\n\nОшибка шлюза: ${frame.message}';
         messages.refresh();
       } else if (isRunning.value) {
         messages.add(ChatMessage(
-          text: '⚠️ Ошибка шлюза: ${frame.message}',
+          text: 'Ошибка шлюза: ${frame.message}',
           chatMessageType: ChatMessageType.bot,
           isError: true,
         ));
@@ -1139,6 +1165,26 @@ class DesktopTaskWorkspaceController extends GetxController {
       });
       runTimelineSteps.refresh();
       _scrollToBottom();
+    } else if (frame is TrajectoryStepFrame) {
+      trajectorySteps.add(frame.step);
+      trajectorySteps.refresh();
+    } else if (frame is ContextBudgetFrame) {
+      currentContextBudget.value = frame.budget;
+      usedTokens.value = frame.budget.totalUsedTokens;
+      maxTokens.value = frame.budget.maxWindowTokens;
+    } else if (frame is GroundingCitationFrame) {
+      if (messages.isNotEmpty && messages.last.chatMessageType == ChatMessageType.bot) {
+        messages.last.citations.add(frame.citation);
+        messages.refresh();
+      }
+    } else if (frame is S1EventFrame) {
+      runTimelineSteps.add({
+        'id': 's1_${DateTime.now().millisecondsSinceEpoch}',
+        'name': 's1: ${frame.status}',
+        'details': frame.payload.toString(),
+        'status': 'completed',
+      });
+      runTimelineSteps.refresh();
     }
   }
 
@@ -1243,17 +1289,36 @@ class DesktopTaskWorkspaceController extends GetxController {
         backendSessions.assignAll(list);
         for (final s in list) {
           final isDel = _isSessionDeleted(s.sessionId);
+          final sessionTitle = (s.name != null && s.name!.trim().isNotEmpty)
+              ? s.name!.trim()
+              : (s.previewText.trim().isNotEmpty ? s.previewText.trim() : s.sessionId);
+          final hasExplicitName = s.name != null && s.name!.trim().isNotEmpty;
+
           if (!sessions.containsKey(s.sessionId) && !isDel) {
             final matchedProject = s.workspaceDir?.split(RegExp(r'[\\/]')).last;
             sessions[s.sessionId] = TaskSession(
               id: s.sessionId,
-              title: s.previewText.isNotEmpty ? s.previewText : s.sessionId,
+              title: sessionTitle,
               tokenCount: '${s.messageCount} сообщ.',
               group: matchedProject ?? 'Разное',
               project: matchedProject,
               projectPath: s.workspaceDir,
               hasGitRepo: s.workspaceDir != null,
+              isCustomNamed: hasExplicitName,
             );
+          } else if (sessions.containsKey(s.sessionId) && hasExplicitName) {
+            final existing = sessions[s.sessionId]!;
+            if (!existing.isCustomNamed &&
+                (existing.title.startsWith('sess_') ||
+                 existing.title.startsWith('sess-') ||
+                 existing.title == 'Новая сессия' ||
+                 existing.title == existing.id)) {
+              existing.title = s.name!.trim();
+              existing.isCustomNamed = true;
+              if (activeSessionId.value == s.sessionId) {
+                activeTaskTitle.value = s.name!.trim();
+              }
+            }
           }
         }
       }
@@ -1295,6 +1360,8 @@ class DesktopTaskWorkspaceController extends GetxController {
     messages.clear();
     attachments.clear();
     runTimelineSteps.clear();
+    trajectorySteps.clear();
+    currentContextBudget.value = null;
     activeGoal.value = null;
     inputController.clear();
 
@@ -1334,6 +1401,7 @@ class DesktopTaskWorkspaceController extends GetxController {
           'deletions': s.deletions,
           'activeModel': s.activeModel,
           'tokenCount': s.tokenCount,
+          'isCustomNamed': s.isCustomNamed,
         };
       }).toList();
       storage.write('desktop_custom_sessions', customList);
@@ -1375,6 +1443,7 @@ class DesktopTaskWorkspaceController extends GetxController {
                 deletions: item['deletions'] as int? ?? 0,
                 activeModel: item['activeModel']?.toString() ?? 'GLM-5.3-Flash',
                 tokenCount: item['tokenCount']?.toString() ?? '28.4k tokens',
+                isCustomNamed: item['isCustomNamed'] == true,
                 messages: msgs,
               );
             }
@@ -1384,10 +1453,13 @@ class DesktopTaskWorkspaceController extends GetxController {
     } catch (_) {}
   }
 
-  Future<void> renameSession(String id, String newTitle) async {
+  Future<void> renameSession(String id, String newTitle, {bool userInitiated = false}) async {
     final s = sessions[id];
     if (s != null) {
       s.title = newTitle;
+      if (userInitiated) {
+        s.isCustomNamed = true;
+      }
       if (activeSessionId.value == id) {
         activeTaskTitle.value = newTitle;
       }
@@ -1888,7 +1960,7 @@ $rulesSection
         : '• Выполнение текущей инженерной задачи';
 
     final summaryMessage = ChatMessage(
-      text: '''📦 **[Контекст сжат и сохранен в памяти]**
+      text: '''**[Контекст сжат и сохранен в памяти]**
 Сжато предыдущих реплик диалога: **$countCompacted**
 Ключевые цели сессии:
 $goalsText
@@ -2132,6 +2204,58 @@ $goalsText
     }
   }
 
+  /// Attaches a file or folder path to the prompt.
+  /// If inside the active project, creates an `@relativePath` reference.
+  /// If outside, attaches the normalized path or quotes if containing spaces.
+  /// Adds to [attachments] and inserts reference into [inputController] at cursor position.
+  void attachPathToPrompt(String rawPath, {bool insertIntoText = true}) {
+    if (rawPath.trim().isEmpty) return;
+    final path = rawPath.trim();
+    final projectRoot = activeProjectPath.value ?? universal_io.Directory.current.path;
+
+    String refTag;
+    try {
+      final normPath = p.normalize(path);
+      final normRoot = p.normalize(projectRoot);
+      if (p.isWithin(normRoot, normPath)) {
+        final rel = p.relative(normPath, from: normRoot).replaceAll('\\', '/');
+        refTag = '@$rel';
+      } else {
+        final clean = normPath.replaceAll('\\', '/');
+        refTag = clean.contains(' ') ? '"$clean"' : clean;
+      }
+    } catch (_) {
+      refTag = path.replaceAll('\\', '/');
+    }
+
+    // 1. Add to attachments chips
+    addAttachment(refTag);
+
+    // 2. Insert into inputController at cursor or append
+    if (insertIntoText) {
+      final currentText = inputController.text;
+      final sel = inputController.selection;
+      if (sel.isValid && sel.start >= 0 && sel.end >= sel.start) {
+        final before = currentText.substring(0, sel.start);
+        final after = currentText.substring(sel.end);
+        final spacerBefore = (before.isNotEmpty && !before.endsWith(' ') && !before.endsWith('\n')) ? ' ' : '';
+        final spacerAfter = (after.isNotEmpty && !after.startsWith(' ')) ? ' ' : ' ';
+        final inserted = '$spacerBefore$refTag$spacerAfter';
+        inputController.text = '$before$inserted$after';
+        final newCursorPos = sel.start + inserted.length;
+        inputController.selection = TextSelection.collapsed(offset: newCursorPos);
+      } else {
+        if (currentText.isEmpty) {
+          inputController.text = '$refTag ';
+        } else {
+          final prefix = currentText.endsWith(' ') || currentText.endsWith('\n') ? '' : ' ';
+          inputController.text = '$currentText$prefix$refTag ';
+        }
+        inputController.selection = TextSelection.collapsed(offset: inputController.text.length);
+      }
+    }
+  }
+
   void addElementContext({
     required String selector,
     required String text,
@@ -2150,14 +2274,28 @@ $goalsText
     }
 
     final currentSession = sessions[activeSessionId.value];
-    final isDefaultTitle = currentSession == null ||
-        currentSession.title == 'Новая сессия' ||
-        currentSession.title.startsWith('sess_') ||
-        activeTaskTitle.value == 'Новая сессия' ||
-        activeTaskTitle.value.startsWith('sess_') ||
-        isNewTask.value;
+    final hasUserMessages = messages.any((m) => m.chatMessageType == ChatMessageType.user);
+    final title = currentSession?.title.trim() ?? activeTaskTitle.value.trim();
 
-    if (isDefaultTitle && rawText.isNotEmpty) {
+    final isDefaultPattern = title.isEmpty ||
+        title == 'Новая сессия' ||
+        title == 'New Session' ||
+        title == 'Новая задача' ||
+        title == 'New Task' ||
+        title.startsWith('sess_') ||
+        title.startsWith('sess-') ||
+        title.startsWith('session-') ||
+        title.startsWith('session_') ||
+        title.startsWith('gw_') ||
+        title.startsWith('Рабочая область') ||
+        title == activeSessionId.value ||
+        (currentSession != null && title == currentSession.id);
+
+    final shouldAutoRename = isNewTask.value ||
+        isDefaultPattern ||
+        (!hasUserMessages && currentSession?.isCustomNamed != true);
+
+    if (shouldAutoRename && rawText.isNotEmpty) {
       isNewTask.value = false;
       final autoTitle = _generateTopicTitle(rawText);
       activeTaskTitle.value = autoTitle;
@@ -2168,13 +2306,22 @@ $goalsText
         sessions[activeSessionId.value] = TaskSession(
           id: activeSessionId.value,
           title: autoTitle,
+          group: activeGroup.value ?? activeProject.value ?? 'Разное',
           project: activeProject.value,
-          branch: activeBranch.value,
+          projectPath: activeProjectPath.value,
+          branch: activeBranch.value ?? 'main',
           permissionMode: permissionMode.value,
           thoughtLevel: thoughtLevel.value,
           activeModel: activeModel.value,
+          hasGitRepo: hasGitRepo.value,
         );
       }
+
+      if (!openSessionTabs.contains(activeSessionId.value)) {
+        openSessionTabs.add(activeSessionId.value);
+        GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
+      }
+
       renameSession(activeSessionId.value, autoTitle);
       sessions.refresh();
       openSessionTabs.refresh();
@@ -2298,7 +2445,7 @@ $goalsText
     // Try Gateway WebSocket if connected
     if (_wsClient != null && _wsClient!.isConnected) {
       final initialMessageCount = messages.length;
-      _wsClient!.sendMessage(fullMessage);
+      _wsClient!.sendMessage(fullMessage, mode: currentExecutionMode.value.id);
 
       // Fallback timer: if after 5 seconds the gateway hasn't emitted any answer or thinking, and we have direct credentials, switch to direct stream!
       Future.delayed(const Duration(seconds: 5), () {
@@ -2315,7 +2462,7 @@ $goalsText
           isRunning.value = false;
           final gwAddress = GatewayConfig.getBaseUrl().replaceAll('http://', '');
           messages.add(ChatMessage(
-            text: '⚠️ Шлюз OmnesAgent ($gwAddress) не ответил вовремя на запрос.\nПроверьте подключение шлюза или настройте прямой API ключ провайдера в Настройках.',
+            text: 'Шлюз OmnesAgent ($gwAddress) не ответил вовремя на запрос.\nПроверьте подключение шлюза или настройте прямой API ключ провайдера в Настройках.',
             chatMessageType: ChatMessageType.bot,
             isError: true,
           ));
@@ -2326,7 +2473,7 @@ $goalsText
     } else {
       // Gateway not connected, try connecting
       _connectWebSocket(activeSessionId.value).then((_) {
-        final sent = _wsClient?.sendMessage(fullMessage) ?? false;
+        final sent = _wsClient?.sendMessage(fullMessage, mode: currentExecutionMode.value.id) ?? false;
         if (!sent) {
           if (hasDirectCredentials) {
             _streamFromProviderDirectly(
@@ -2338,7 +2485,7 @@ $goalsText
             );
           } else {
             messages.add(ChatMessage(
-              text: '⚠️ Шлюз OmnesAgent не доступен, а для провайдера "$provId" не указан API ключ.\nОткройте Настройки (шестерёнка внизу слева) и укажите ключ для прямого подключения к LLM.',
+              text: 'Шлюз OmnesAgent не доступен, а для провайдера "$provId" не указан API ключ.\nОткройте Настройки (шестерёнка внизу слева) и укажите ключ для прямого подключения к LLM.',
               chatMessageType: ChatMessageType.bot,
               isError: true,
             ));
@@ -2456,7 +2603,7 @@ $goalsText
         botMessage.isError = true;
         botMessage.isThinkingFinished = true;
         botMessage.isThinkingExpanded = false;
-        botMessage.text = '⚠️ Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody';
+        botMessage.text = 'Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody';
         isRunning.value = false;
         thinkingTimer.cancel();
         messages.refresh();
@@ -2551,8 +2698,8 @@ $goalsText
         botMessage.checkpointHash = preExecutionHash ?? 'ckpt_${DateTime.now().millisecondsSinceEpoch}';
         botMessage.suggestedActions = [
           '▶ Запустить тесты проекта',
-          '📝 Закоммитить изменения в Git',
-          '🔍 Объяснить архитектуру решения',
+          'Закоммитить изменения в Git',
+          'Объяснить архитектуру решения',
         ];
       } else {
         // Pure text response or question without file changes
@@ -2562,7 +2709,7 @@ $goalsText
         if (!botMessage.text.contains('```question') && !botMessage.text.contains('<question>')) {
           if (currentSessionMode.value == 'task' || currentSessionMode.value == 'ralph') {
             botMessage.suggestedActions = [
-              '🔍 Проверить статус проекта',
+              'Проверить статус проекта',
               '▶ Запустить тесты проекта',
             ];
           } else {
@@ -2590,7 +2737,7 @@ $goalsText
       botMessage.isError = true;
       botMessage.isThinkingFinished = true;
       botMessage.isThinkingExpanded = false;
-      botMessage.text = '⚠️ Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.';
+      botMessage.text = 'Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.';
       isRunning.value = false;
       _saveCurrentSessionState();
       messages.refresh();
@@ -2749,6 +2896,73 @@ $goalsText
         );
       }
     });
+  }
+
+  /// Forks the active session at a specific trajectory step.
+  Future<void> forkSessionAtStep(String stepId) async {
+    try {
+      final res = await httpClient.forkSession(activeSessionId.value, atStepId: stepId);
+      final newId = res?['forked_session_id']?.toString() ?? res?['session_id']?.toString();
+      if (newId != null && newId.isNotEmpty) {
+        switchToSession(newId, title: 'Форк ($stepId)');
+        Get.snackbar(
+          'Сессия разветвлена',
+          'Создана новая сессия: $newId',
+          backgroundColor: const Color(0xFF1E293B),
+          colorText: Colors.white,
+        );
+      }
+    } catch (e) {
+      Get.snackbar(
+        'Ошибка форка',
+        e.toString(),
+        backgroundColor: const Color(0xFF7F1D1D),
+        colorText: Colors.white,
+      );
+    }
+  }
+
+  /// Exports current session trajectory trace for replay or debugging.
+  Future<Map<String, dynamic>?> exportCurrentTrace() async {
+    try {
+      final trace = await httpClient.exportSessionTrace(activeSessionId.value);
+      final count = trace != null ? ((trace['steps'] as List?)?.length ?? 0) : 0;
+      Get.snackbar(
+        'Трассировка экспортирована',
+        'Собрано $count шагов выполнения',
+        backgroundColor: const Color(0xFF1E293B),
+        colorText: Colors.white,
+      );
+      return trace;
+    } catch (e) {
+      Get.snackbar(
+        'Ошибка экспорта трассировки',
+        e.toString(),
+        backgroundColor: const Color(0xFF7F1D1D),
+        colorText: Colors.white,
+      );
+      return null;
+    }
+  }
+
+  /// Replays a session trajectory trace.
+  Future<void> replayTrace(Map<String, dynamic> trace) async {
+    try {
+      final res = await httpClient.replaySessionTrace(trace);
+      Get.snackbar(
+        'Воспроизведение запущено',
+        'Результат: ${res?['status'] ?? 'ok'}',
+        backgroundColor: const Color(0xFF1E293B),
+        colorText: Colors.white,
+      );
+    } catch (e) {
+      Get.snackbar(
+        'Ошибка воспроизведения',
+        e.toString(),
+        backgroundColor: const Color(0xFF7F1D1D),
+        colorText: Colors.white,
+      );
+    }
   }
 
   @override

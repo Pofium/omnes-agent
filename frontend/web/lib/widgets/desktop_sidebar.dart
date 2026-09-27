@@ -463,7 +463,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 ),
               ),
 
-              // 4. Section Header with Add Project (+) or AI Grouping (✨)
+              // 4. Section Header with Add Project (+) or AI Grouping
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
                 child: Row(
@@ -2098,7 +2098,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
   // ==========================================
   void _showAiGroupingDialog() {
     Get.snackbar(
-      '✨ ИИ Группировка',
+      'ИИ Группировка',
       'Агент анализирует несгруппированные сессии и распределяет их по смысловым категориям...',
       backgroundColor: Colors.black87,
       colorText: Colors.white,
@@ -2196,7 +2196,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
           ElevatedButton(
             onPressed: () {
               if (ctrl.text.trim().isNotEmpty) {
-                Get.find<DesktopTaskWorkspaceController>().renameSession(session.id, ctrl.text.trim());
+                Get.find<DesktopTaskWorkspaceController>().renameSession(session.id, ctrl.text.trim(), userInitiated: true);
               }
               Navigator.of(ctx).pop();
             },

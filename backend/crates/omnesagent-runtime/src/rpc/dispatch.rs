@@ -5469,6 +5469,9 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::TrajectoryStep { .. }
+        | TurnEvent::ContextBudgetUpdate { .. }
+        | TurnEvent::GroundingCitation { .. } => return None,
     };
 
     let params = serde_json::to_value(update).ok()?;

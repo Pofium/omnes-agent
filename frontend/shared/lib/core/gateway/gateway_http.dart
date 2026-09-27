@@ -178,6 +178,132 @@ class GatewayHttpClient {
     return null;
   }
 
+  /// Forks a session up to [atStepId] via POST /api/v1/sessions/{id}/fork.
+  Future<Map<String, dynamic>?> forkSession(
+    String sessionId, {
+    String? atStepId,
+    String? newTitle,
+    Map<String, dynamic>? overrides,
+  }) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/v1/sessions/$sessionId/fork');
+      final headers = await _authHeaders();
+      final body = jsonEncode({
+        if (atStepId != null) 'at_step_id': atStepId,
+        if (newTitle != null) 'new_title': newTitle,
+        if (overrides != null) 'overrides': overrides,
+      });
+      final res = await _client
+          .post(uri, headers: headers, body: body)
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Exports session execution trace via GET /api/v1/sessions/{id}/export_trace.
+  Future<Map<String, dynamic>?> exportSessionTrace(String sessionId) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/v1/sessions/$sessionId/export_trace');
+      final headers = await _authHeaders();
+      final res = await _client
+          .get(uri, headers: headers)
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Replays a session trace via POST /api/v1/sessions/replay.
+  Future<Map<String, dynamic>?> replaySessionTrace(
+    Map<String, dynamic> tracePayload,
+  ) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/v1/sessions/replay');
+      final headers = await _authHeaders();
+      final body = jsonEncode(tracePayload);
+      final res = await _client
+          .post(uri, headers: headers, body: body)
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200 || res.statusCode == 202) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Triggers background AST reindexing via POST /api/v1/ast/reindex.
+  Future<bool> reindexAst({String? projectPath}) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/v1/ast/reindex');
+      final headers = await _authHeaders();
+      final body = jsonEncode({
+        if (projectPath != null) 'project_path': projectPath,
+      });
+      final res = await _client
+          .post(uri, headers: headers, body: body)
+          .timeout(const Duration(seconds: 10));
+      return res.statusCode == 200 || res.statusCode == 202;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Fetches System One (S1) status via GET /api/v1/s1/status.
+  Future<Map<String, dynamic>?> getS1Status() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/v1/s1/status');
+      final headers = await _authHeaders();
+      final res = await _client
+          .get(uri, headers: headers)
+          .timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Commands background prefetch of Laya weights via POST /api/v1/s1/download.
+  Future<bool> downloadS1Model() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/v1/s1/download');
+      final headers = await _authHeaders();
+      final res = await _client
+          .post(uri, headers: headers)
+          .timeout(const Duration(seconds: 10));
+      return res.statusCode == 200 || res.statusCode == 202;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Fetches model providers catalog via GET /api/v1/providers.
+  Future<Map<String, dynamic>?> getModelProviders() async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/v1/providers');
+      final headers = await _authHeaders();
+      final res = await _client
+          .get(uri, headers: headers)
+          .timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   /// Lists actively running sessions from GET /api/sessions/running.
   Future<List<Map<String, dynamic>>> getSessionsRunning() async {
     try {

@@ -117,11 +117,25 @@ class GatewayWsClient {
   }
 
   /// Sends a text message to the agent turn loop.
-  bool sendMessage(String content) {
+  bool sendMessage(String content, {String? mode, Map<String, dynamic>? extra}) {
     if (!isConnected) return false;
     final payload = jsonEncode({
       'type': 'message',
       'content': content,
+      if (mode != null) 'mode': mode,
+      if (extra != null) ...extra,
+    });
+    _channel!.sink.add(payload);
+    return true;
+  }
+
+  /// Sends voice barge-in signal to immediately cancel TTS and ongoing model response.
+  bool sendVoiceBargeIn() {
+    if (!isConnected) return false;
+    final payload = jsonEncode({
+      'type': 'voice_barge_in',
+      'session_id': _sessionId,
+      'timestamp': DateTime.now().toUtc().toIso8601String(),
     });
     _channel!.sink.add(payload);
     return true;

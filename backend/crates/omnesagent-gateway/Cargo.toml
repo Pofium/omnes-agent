@@ -19,8 +19,12 @@ omnesagent-providers.workspace = true
 omnesagent-channels = { workspace = true, default-features = false, features = ["channel-acp-server"] }
 omnesagent-runtime.workspace = true
 omnesagent-tools.workspace = true
+omnesagent-editor.workspace = true
 omnesagent-hardware.workspace = true
+omnesagent-kag.workspace = true
+omnesagent-s1.workspace = true
 omnesagent-plugins = { workspace = true, optional = true }
+hf-hub = "0.4"
 
 # HTTP server
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros", "multipart"] }

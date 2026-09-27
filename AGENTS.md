@@ -17,6 +17,18 @@ Do not duplicate state.
 - Frontend client communicates exclusively via `GatewayHttpClient` (`frontend/shared/lib/core/gateway/gateway_http.dart`) and WebSocket (`frontend/shared/lib/core/gateway/gateway_ws.dart`).
 - UI components live in `frontend/shared/lib/design_system/` following the `shadcn/ui + reui` cyber design pattern.
 
+## UI Conventions — Icons (normative)
+
+- **No emoji anywhere in the user interface** — not in labels, buttons, status
+  messages, chat texts, quick prompts, or icon slots. Emoji rendering depends
+  on the platform font and breaks the design system.
+- **Icons are SVG only**, rendered via `flutter_svg`: use the shared inline set
+  `UiIcon` (`frontend/shared/lib/design_system/ui_icons.dart`) for UI glyphs;
+  add new glyphs there as minimal stroke-style SVG strings (24×24 viewBox),
+  never as emoji or icon-font glyphs.
+- Status color (success/warning) must be driven by explicit state (a bool /
+  enum), never by substring-matching a marker character like `✓` in a string.
+
 ## Safety and Privacy
 
 - Never commit secrets, tokens, credentials, personal data, or real identities.

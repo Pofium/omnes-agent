@@ -432,7 +432,7 @@ pub async fn require_web_auth(
     let path = request.uri().path();
 
     // 1. Always permit public endpoints and WebSocket endpoints (which handle their own transport handshake and auth)
-    if is_public_path(path) || path.starts_with("/ws/") {
+    if is_public_path(path) || path.starts_with("/ws/") || path == "/acp" {
         return next.run(request).await;
     }
 

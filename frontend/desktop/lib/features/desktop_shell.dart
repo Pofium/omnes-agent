@@ -16,6 +16,7 @@ import '../utils/desktop_tray_manager.dart';
 import '../widgets/desktop_sidebar.dart';
 import 'automations/automations_view.dart';
 import 'command_palette/command_palette_dialog.dart';
+import 'inspector/editor/image_viewer_pane.dart' show isImagePath;
 import 'inspector/inspector_panel.dart';
 import 'settings/desktop_settings_dialog.dart';
 import 'workspace/task_workspace_controller.dart';
@@ -448,10 +449,12 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
                       },
                       onOpenFile: (filePath) {
                         workspaceController.openProjectFile(filePath);
-                        if (filePath.toLowerCase().endsWith('.md')) {
+                        if (isImagePath(filePath)) {
+                          _openInspectorWithTab(6); // Image viewer tab
+                        } else if (filePath.toLowerCase().endsWith('.md')) {
                           _openInspectorWithTab(2); // Canvas tab
                         } else {
-                          _openInspectorWithTab(5); // File Viewer tab
+                          _openInspectorWithTab(5); // Editor tab
                         }
                       },
                       onSelectInspectorTab: (tabIdx) => _openInspectorWithTab(tabIdx),

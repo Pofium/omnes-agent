@@ -29,6 +29,7 @@ class TaskSession {
   int additions;
   int deletions;
   bool hasGitRepo;
+  bool isCustomNamed;
 
   TaskSession({
     required this.id,
@@ -48,6 +49,7 @@ class TaskSession {
     this.additions = 0,
     this.deletions = 0,
     this.hasGitRepo = false,
+    this.isCustomNamed = false,
   })  : messages = messages ?? [],
         runTimelineSteps = runTimelineSteps ?? [];
 }
@@ -695,11 +697,16 @@ class DesktopTaskWorkspaceController extends GetxController {
   }
 
   String _generateTopicTitle(String prompt) {
-    String clean = prompt.trim().replaceAll(RegExp(r'^(/[\w\-]+|\*+|#+)\s*'), '');
+    String clean = prompt.trim()
+        .replaceAll(RegExp(r'^(/[\w\-]+|\*+|#+|[-*•"«»])\s*'), '')
+        .trim();
     final firstLine = clean.split('\n').first.trim();
     if (firstLine.isEmpty) return 'Новая сессия';
-    if (firstLine.length <= 35) return firstLine;
-    final truncated = firstLine.substring(0, 35);
+    final formatted = firstLine.length > 1
+        ? '${firstLine[0].toUpperCase()}${firstLine.substring(1)}'
+        : firstLine.toUpperCase();
+    if (formatted.length <= 35) return formatted;
+    final truncated = formatted.substring(0, 35);
     final lastSpace = truncated.lastIndexOf(' ');
     if (lastSpace > 12) {
       return '${truncated.substring(0, lastSpace)}...';
@@ -874,11 +881,11 @@ class DesktopTaskWorkspaceController extends GetxController {
         messages.last.isError = true;
         messages.last.isThinkingFinished = true;
         messages.last.isThinkingExpanded = false;
-        messages.last.text += '\n\n⚠️ Ошибка шлюза: ${frame.message}';
+        messages.last.text += '\n\nОшибка шлюза: ${frame.message}';
         messages.refresh();
       } else if (isRunning.value) {
         messages.add(ChatMessage(
-          text: '⚠️ Ошибка шлюза: ${frame.message}',
+          text: 'Ошибка шлюза: ${frame.message}',
           chatMessageType: ChatMessageType.bot,
           isError: true,
         ));
@@ -986,6 +993,7 @@ class DesktopTaskWorkspaceController extends GetxController {
           'deletions': s.deletions,
           'activeModel': s.activeModel,
           'tokenCount': s.tokenCount,
+          'isCustomNamed': s.isCustomNamed,
         };
       }).toList();
       storage.write('desktop_custom_sessions', customList);
@@ -1027,6 +1035,7 @@ class DesktopTaskWorkspaceController extends GetxController {
                 deletions: item['deletions'] as int? ?? 0,
                 activeModel: item['activeModel']?.toString() ?? 'GLM-5.3-Flash',
                 tokenCount: item['tokenCount']?.toString() ?? '28.4k tokens',
+                isCustomNamed: item['isCustomNamed'] == true,
                 messages: msgs,
               );
             }
@@ -1036,10 +1045,13 @@ class DesktopTaskWorkspaceController extends GetxController {
     } catch (_) {}
   }
 
-  Future<void> renameSession(String id, String newTitle) async {
+  Future<void> renameSession(String id, String newTitle, {bool userInitiated = false}) async {
     final s = sessions[id];
     if (s != null) {
       s.title = newTitle;
+      if (userInitiated) {
+        s.isCustomNamed = true;
+      }
       if (activeSessionId.value == id) {
         activeTaskTitle.value = newTitle;
       }
@@ -1530,7 +1542,7 @@ $rulesSection
         : '• Выполнение текущей инженерной задачи';
 
     final summaryMessage = ChatMessage(
-      text: '''📦 **[Контекст сжат и сохранен в памяти]**
+      text: '''**[Контекст сжат и сохранен в памяти]**
 Сжато предыдущих реплик диалога: **$countCompacted**
 Ключевые цели сессии:
 $goalsText
@@ -1776,12 +1788,28 @@ $goalsText
     }
 
     final currentSession = sessions[activeSessionId.value];
-    final isDefaultTitle = currentSession == null ||
-        currentSession.title == 'Новая сессия' ||
-        activeTaskTitle.value == 'Новая сессия' ||
-        isNewTask.value;
+    final hasUserMessages = messages.any((m) => m.chatMessageType == ChatMessageType.user);
+    final title = currentSession?.title.trim() ?? activeTaskTitle.value.trim();
 
-    if (isDefaultTitle && rawText.isNotEmpty) {
+    final isDefaultPattern = title.isEmpty ||
+        title == 'Новая сессия' ||
+        title == 'New Session' ||
+        title == 'Новая задача' ||
+        title == 'New Task' ||
+        title.startsWith('sess_') ||
+        title.startsWith('sess-') ||
+        title.startsWith('session-') ||
+        title.startsWith('session_') ||
+        title.startsWith('gw_') ||
+        title.startsWith('Рабочая область') ||
+        title == activeSessionId.value ||
+        (currentSession != null && title == currentSession.id);
+
+    final shouldAutoRename = isNewTask.value ||
+        isDefaultPattern ||
+        (!hasUserMessages && currentSession?.isCustomNamed != true);
+
+    if (shouldAutoRename && rawText.isNotEmpty) {
       isNewTask.value = false;
       final autoTitle = _generateTopicTitle(rawText);
       activeTaskTitle.value = autoTitle;
@@ -1792,13 +1820,22 @@ $goalsText
         sessions[activeSessionId.value] = TaskSession(
           id: activeSessionId.value,
           title: autoTitle,
+          group: activeGroup.value ?? activeProject.value ?? 'Разное',
           project: activeProject.value,
-          branch: activeBranch.value,
+          projectPath: activeProjectPath.value,
+          branch: activeBranch.value ?? 'main',
           permissionMode: permissionMode.value,
           thoughtLevel: thoughtLevel.value,
           activeModel: activeModel.value,
+          hasGitRepo: hasGitRepo.value,
         );
       }
+
+      if (!openSessionTabs.contains(activeSessionId.value)) {
+        openSessionTabs.add(activeSessionId.value);
+        GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
+      }
+
       renameSession(activeSessionId.value, autoTitle);
       sessions.refresh();
       openSessionTabs.refresh();
@@ -1915,7 +1952,7 @@ $goalsText
           // Timeout with no credentials
           isRunning.value = false;
           messages.add(ChatMessage(
-            text: '⚠️ Шлюз OmnesAgent (127.0.0.1:42617) не ответил вовремя на запрос.\nПроверьте подключение шлюза или настройте прямой API ключ провайдера в Настройках.',
+            text: 'Шлюз OmnesAgent (127.0.0.1:42617) не ответил вовремя на запрос.\nПроверьте подключение шлюза или настройте прямой API ключ провайдера в Настройках.',
             chatMessageType: ChatMessageType.bot,
             isError: true,
           ));
@@ -1938,7 +1975,7 @@ $goalsText
             );
           } else {
             messages.add(ChatMessage(
-              text: '⚠️ Шлюз OmnesAgent не доступен, а для провайдера "$provId" не указан API ключ.\nОткройте Настройки (шестерёнка внизу слева) и укажите ключ для прямого подключения к LLM.',
+              text: 'Шлюз OmnesAgent не доступен, а для провайдера "$provId" не указан API ключ.\nОткройте Настройки (шестерёнка внизу слева) и укажите ключ для прямого подключения к LLM.',
               chatMessageType: ChatMessageType.bot,
               isError: true,
             ));
@@ -2056,7 +2093,7 @@ $goalsText
         botMessage.isError = true;
         botMessage.isThinkingFinished = true;
         botMessage.isThinkingExpanded = false;
-        botMessage.text = '⚠️ Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody';
+        botMessage.text = 'Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody';
         isRunning.value = false;
         thinkingTimer.cancel();
         messages.refresh();
@@ -2148,8 +2185,8 @@ $goalsText
         botMessage.checkpointHash = preExecutionHash ?? 'ckpt_${DateTime.now().millisecondsSinceEpoch}';
         botMessage.suggestedActions = [
           '▶ Запустить тесты проекта',
-          '📝 Закоммитить изменения в Git',
-          '🔍 Объяснить архитектуру решения',
+          'Закоммитить изменения в Git',
+          'Объяснить архитектуру решения',
         ];
       } else {
         // Pure text response or question without file changes
@@ -2159,7 +2196,7 @@ $goalsText
         if (!botMessage.text.contains('```question') && !botMessage.text.contains('<question>')) {
           botMessage.suggestedActions = [
             '▶ Продолжить выполнение',
-            '🔍 Проверить статус проекта',
+            'Проверить статус проекта',
           ];
         }
       }
@@ -2176,7 +2213,7 @@ $goalsText
       botMessage.isError = true;
       botMessage.isThinkingFinished = true;
       botMessage.isThinkingExpanded = false;
-      botMessage.text = '⚠️ Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.';
+      botMessage.text = 'Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.';
       isRunning.value = false;
       _saveCurrentSessionState();
       messages.refresh();

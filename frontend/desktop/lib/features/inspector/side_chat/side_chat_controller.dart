@@ -140,20 +140,64 @@ class SideChatController extends ChangeNotifier {
     }
   }
 
-  /// Adds a branch context message from the main chat.
-  void addBranchContext(String contextText) {
-    final snippet = contextText.length > 300 ? '${contextText.substring(0, 300)}...' : contextText;
+  String? parentTldr;
+  String? parentAnchorId;
+  String? parentQuote;
+  void Function(String anchorId)? onNavigateToAnchor;
+  void Function(String text)? onPromoteToMain;
+  Future<void> Function()? onForkRequested;
+
+  /// Sets up a bound sub-thread context linked to a main chat anchor point.
+  void setParentContext({
+    required String anchorId,
+    required String tldr,
+    String? quote,
+  }) {
+    parentAnchorId = anchorId;
+    parentTldr = tldr;
+    parentQuote = quote;
     _messages.add(SideChatMessage(
-      text: 'Ветка ответа ассистента:\n"$snippet"\n\nКонтекст перенесен в Side Chat. Задайте вопрос или команду по этой ветке.',
+      text: 'Ветка привязана к [#$anchorId]: $tldr\n${quote != null ? '«$quote»\n' : ''}Задавайте уточняющие вопросы по этому фрагменту.',
       isUser: false,
     ));
     notifyListeners();
   }
 
+  /// Clears parent context link.
+  void clearParentContext() {
+    parentAnchorId = null;
+    parentTldr = null;
+    parentQuote = null;
+    notifyListeners();
+  }
+
+  /// Promotes side chat solution back to the main chat session.
+  void promoteSolution(String solutionText) {
+    if (onPromoteToMain != null && solutionText.trim().isNotEmpty) {
+      onPromoteToMain!(solutionText.trim());
+    }
+  }
+
+  /// Adds a branch context message from the main chat.
+  void addBranchContext(String contextText, {String? anchorId}) {
+    final snippet = contextText.length > 300 ? '${contextText.substring(0, 300)}...' : contextText;
+    if (anchorId != null) {
+      setParentContext(anchorId: anchorId, tldr: snippet);
+    } else {
+      _messages.add(SideChatMessage(
+        text: 'Ветка ответа ассистента:\n"$snippet"\n\nКонтекст перенесен в Side Chat. Задайте вопрос или команду по этой ветке.',
+        isUser: false,
+      ));
+      notifyListeners();
+    }
+  }
+
   /// Clears side chat history.
   void clearChat() {
+    clearParentContext();
     _messages.clear();
     _initDefaultMessages();
     notifyListeners();
   }
 }
+

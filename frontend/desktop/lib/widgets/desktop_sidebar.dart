@@ -10,6 +10,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
+import 'package:path/path.dart' as p;
 import 'package:universal_io/io.dart' as universal_io;
 import '../features/onboarding/user_onboarding_dialog.dart';
 import '../features/workspace/task_workspace_controller.dart';
@@ -233,6 +234,368 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     await Future.delayed(const Duration(milliseconds: 300));
     if (mounted) {
       setState(() => isRefreshingTree = false);
+    }
+  }
+
+  bool showHiddenFiles = false;
+  bool showOnlyModifiedFiles = false;
+
+  Future<void> _promptCreateFile(BuildContext context, String targetDir) async {
+    final textCtrl = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF181C24),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: Color(0xFF2B3240)),
+        ),
+        title: Row(
+          children: const [
+            Icon(Icons.note_add_outlined, size: 18, color: Color(0xFF00D2FF)),
+            SizedBox(width: 8),
+            Text('Новый файл', style: TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'В папке: ${p.basename(targetDir)}',
+              style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8), fontFamily: 'Consolas'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: textCtrl,
+              autofocus: true,
+              style: const TextStyle(fontSize: 13, color: Colors.white),
+              decoration: InputDecoration(
+                hintText: 'Имя файла (напр. config.json или lib/app.dart)',
+                hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                filled: true,
+                fillColor: const Color(0xFF0F172A),
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: Color(0xFF334155)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: Color(0xFF00D2FF)),
+                ),
+              ),
+              onSubmitted: (val) => Navigator.of(ctx).pop(val.trim()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF00D2FF),
+              foregroundColor: Colors.black,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
+            child: const Text('Создать', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null && result.isNotEmpty) {
+      try {
+        final filePath = p.normalize(p.join(targetDir, result));
+        final file = universal_io.File(filePath);
+        if (file.existsSync()) {
+          Get.snackbar('Ошибка', 'Файл с таким именем уже существует');
+          return;
+        }
+        final parentDir = file.parent;
+        if (!parentDir.existsSync()) {
+          parentDir.createSync(recursive: true);
+        }
+        file.createSync();
+        expandedProjectDirs.add(parentDir.path);
+        _refreshProjectFiles();
+        widget.onOpenFile?.call(filePath);
+        Get.snackbar('Файл создан', p.basename(filePath));
+      } catch (e) {
+        Get.snackbar('Ошибка создания файла', e.toString());
+      }
+    }
+  }
+
+  Future<void> _promptCreateFolder(BuildContext context, String targetDir) async {
+    final textCtrl = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF181C24),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: Color(0xFF2B3240)),
+        ),
+        title: Row(
+          children: const [
+            Icon(Icons.create_new_folder_outlined, size: 18, color: Color(0xFF00D2FF)),
+            SizedBox(width: 8),
+            Text('Новая папка', style: TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'В папке: ${p.basename(targetDir)}',
+              style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8), fontFamily: 'Consolas'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: textCtrl,
+              autofocus: true,
+              style: const TextStyle(fontSize: 13, color: Colors.white),
+              decoration: InputDecoration(
+                hintText: 'Имя папки (напр. components)',
+                hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                filled: true,
+                fillColor: const Color(0xFF0F172A),
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: Color(0xFF334155)),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: const BorderSide(color: Color(0xFF00D2FF)),
+                ),
+              ),
+              onSubmitted: (val) => Navigator.of(ctx).pop(val.trim()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF00D2FF),
+              foregroundColor: Colors.black,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
+            child: const Text('Создать', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null && result.isNotEmpty) {
+      try {
+        final folderPath = p.normalize(p.join(targetDir, result));
+        final dir = universal_io.Directory(folderPath);
+        if (dir.existsSync()) {
+          Get.snackbar('Ошибка', 'Папка с таким именем уже существует');
+          return;
+        }
+        dir.createSync(recursive: true);
+        expandedProjectDirs.add(folderPath);
+        expandedProjectDirs.add(targetDir);
+        _refreshProjectFiles();
+        Get.snackbar('Папка создана', p.basename(folderPath));
+      } catch (e) {
+        Get.snackbar('Ошибка создания папки', e.toString());
+      }
+    }
+  }
+
+  Future<void> _promptRename(BuildContext context, String currentPath, bool isDir) async {
+    final currentName = p.basename(currentPath);
+    final textCtrl = TextEditingController(text: currentName);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF181C24),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: Color(0xFF2B3240)),
+        ),
+        title: Row(
+          children: [
+            const Icon(Icons.edit_outlined, size: 18, color: Color(0xFF00D2FF)),
+            const SizedBox(width: 8),
+            Text(isDir ? 'Переименовать папку' : 'Переименовать файл',
+                style: const TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: TextField(
+          controller: textCtrl,
+          autofocus: true,
+          style: const TextStyle(fontSize: 13, color: Colors.white),
+          decoration: InputDecoration(
+            hintText: 'Новое имя',
+            hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+            filled: true,
+            fillColor: const Color(0xFF0F172A),
+            isDense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: Color(0xFF334155)),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: Color(0xFF00D2FF)),
+            ),
+          ),
+          onSubmitted: (val) => Navigator.of(ctx).pop(val.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF00D2FF),
+              foregroundColor: Colors.black,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
+            child: const Text('Переименовать', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null && result.isNotEmpty && result != currentName) {
+      try {
+        final parentDir = p.dirname(currentPath);
+        final newPath = p.join(parentDir, result);
+        if (isDir) {
+          final dir = universal_io.Directory(currentPath);
+          dir.renameSync(newPath);
+          if (expandedProjectDirs.contains(currentPath)) {
+            expandedProjectDirs.remove(currentPath);
+            expandedProjectDirs.add(newPath);
+          }
+        } else {
+          final file = universal_io.File(currentPath);
+          file.renameSync(newPath);
+        }
+        _refreshProjectFiles();
+        Get.snackbar('Переименовано', '$currentName -> $result');
+      } catch (e) {
+        Get.snackbar('Ошибка переименования', e.toString());
+      }
+    }
+  }
+
+  Future<void> _confirmDelete(BuildContext context, String targetPath, bool isDir) async {
+    final name = p.basename(targetPath);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF181C24),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: const BorderSide(color: Color(0xFFE11D48)),
+        ),
+        title: Row(
+          children: const [
+            Icon(Icons.warning_amber_rounded, size: 20, color: Color(0xFFE11D48)),
+            SizedBox(width: 8),
+            Text('Подтверждение удаления', style: TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Text(
+          'Вы действительно хотите безвозвратно удалить ${isDir ? 'папку' : 'файл'} "$name"?',
+          style: const TextStyle(fontSize: 13, color: Color(0xFFE2E8F0)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE11D48),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Удалить', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      try {
+        if (isDir) {
+          final dir = universal_io.Directory(targetPath);
+          if (dir.existsSync()) {
+            dir.deleteSync(recursive: true);
+          }
+          expandedProjectDirs.remove(targetPath);
+        } else {
+          final file = universal_io.File(targetPath);
+          if (file.existsSync()) {
+            file.deleteSync();
+          }
+        }
+        _refreshProjectFiles();
+        Get.snackbar('Удалено', name);
+      } catch (e) {
+        Get.snackbar('Ошибка удаления', e.toString());
+      }
+    }
+  }
+
+  void _duplicateFile(String filePath) {
+    try {
+      final file = universal_io.File(filePath);
+      if (!file.existsSync()) return;
+      final dir = p.dirname(filePath);
+      final ext = p.extension(filePath);
+      final base = p.basenameWithoutExtension(filePath);
+      String newPath = p.join(dir, '${base}_copy$ext');
+      int counter = 2;
+      while (universal_io.File(newPath).existsSync()) {
+        newPath = p.join(dir, '${base}_copy$counter$ext');
+        counter++;
+      }
+      file.copySync(newPath);
+      _refreshProjectFiles();
+      Get.snackbar('Копия создана', p.basename(newPath));
+    } catch (e) {
+      Get.snackbar('Ошибка дублирования', e.toString());
+    }
+  }
+
+  void _openInTerminal(String dirPath) {
+    try {
+      if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+        final ctrl = Get.find<DesktopTaskWorkspaceController>();
+        if (!ctrl.isTerminalOpen.value) {
+          ctrl.toggleTerminal();
+        }
+        ctrl.executeTerminalCommand('cd "$dirPath"');
+      } else {
+        ProjectScaffoldingService.openInTerminal(dirPath);
+      }
+      Get.snackbar('Терминал', 'Открыт в: ${p.basename(dirPath)}');
+    } catch (_) {
+      ProjectScaffoldingService.openInTerminal(dirPath);
     }
   }
 
@@ -544,7 +907,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 ),
               ),
 
-              // 4. Section Header with Add Project (+) or AI Grouping (✨)
+              // 4. Section Header with Add Project (+) or AI Grouping
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
                 child: Row(
@@ -1316,6 +1679,90 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           ),
         ),
 
+        // File Tree Action Toolbar
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgSurface,
+            border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle)),
+          ),
+          child: Row(
+            children: [
+              IconButton(
+                icon: const Icon(Icons.note_add_outlined, size: 14),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+                tooltip: 'Создать файл в корне проекта',
+                color: DesktopTheme.accentCyan,
+                onPressed: () => _promptCreateFile(context, proj.path),
+              ),
+              const SizedBox(width: 4),
+              IconButton(
+                icon: const Icon(Icons.create_new_folder_outlined, size: 14),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+                tooltip: 'Создать папку в корне проекта',
+                color: const Color(0xFF38BDF8),
+                onPressed: () => _promptCreateFolder(context, proj.path),
+              ),
+              const SizedBox(width: 4),
+              IconButton(
+                icon: const Icon(Icons.unfold_less, size: 14),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+                tooltip: 'Свернуть все папки',
+                color: DesktopTheme.textMuted,
+                onPressed: () => setState(() => expandedProjectDirs.clear()),
+              ),
+              const SizedBox(width: 4),
+              IconButton(
+                icon: Icon(
+                  showHiddenFiles ? Icons.visibility : Icons.visibility_off_outlined,
+                  size: 14,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+                tooltip: showHiddenFiles ? 'Скрыть служебные файлы' : 'Показать скрытые файлы (.git, .env...)',
+                color: showHiddenFiles ? DesktopTheme.accentCyan : DesktopTheme.textMuted,
+                onPressed: () => setState(() => showHiddenFiles = !showHiddenFiles),
+              ),
+              const SizedBox(width: 4),
+              IconButton(
+                icon: Icon(
+                  showOnlyModifiedFiles ? Icons.change_circle : Icons.change_circle_outlined,
+                  size: 14,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+                tooltip: showOnlyModifiedFiles ? 'Показать все файлы' : 'Показать только измененные (Git)',
+                color: showOnlyModifiedFiles ? const Color(0xFFF59E0B) : DesktopTheme.textMuted,
+                onPressed: () => setState(() => showOnlyModifiedFiles = !showOnlyModifiedFiles),
+              ),
+              const Spacer(),
+              // Git changed files count badge
+              if (Get.isRegistered<DesktopTaskWorkspaceController>()) ...[
+                Obx(() {
+                  final ctrl = Get.find<DesktopTaskWorkspaceController>();
+                  final count = ctrl.gitModifiedFiles.length;
+                  if (count == 0) return const SizedBox.shrink();
+                  return Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF59E0B).withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: const Color(0xFFF59E0B).withOpacity(0.4), width: 0.5),
+                    ),
+                    child: Text(
+                      '$count git',
+                      style: const TextStyle(fontSize: 9, fontFamily: 'Consolas', color: Color(0xFFF59E0B), fontWeight: FontWeight.bold),
+                    ),
+                  );
+                }),
+              ],
+            ],
+          ),
+        ),
+
         // File Search & Filter Bar
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -1412,7 +1859,12 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       final cleanPath = ent.path.replaceAll(r'\', '/');
       final name = cleanPath.split('/').lastWhere((s) => s.isNotEmpty, orElse: () => cleanPath);
 
-      // Apply search filter if active
+      // 1. Hidden files filter (.git, .env, .dart_tool, etc.)
+      if (!showHiddenFiles && name.startsWith('.') && name != '.' && name != '..') {
+        continue;
+      }
+
+      // 2. Search query filter
       if (hasSearch && !isDir) {
         final matchesName = name.toLowerCase().contains(fileTreeSearchQuery);
         final matchesPath = cleanPath.toLowerCase().contains(fileTreeSearchQuery);
@@ -1427,99 +1879,282 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           ? cleanPath.substring(cleanRoot.length).replaceAll(RegExp(r'^/+'), '')
           : name;
 
-      final isUntracked = name.startsWith('.tmp') || (name.endsWith('.json') && name.contains('dump'));
-      final isGitActive = name == '.codegraph' || name == '.tmp-diag' || name == 'logs';
+      // Real Git Status from TaskWorkspaceController
+      bool isGitStaged = false;
+      bool isGitModified = false;
+      bool hasGitChangesInside = false;
+
+      if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+        final ctrl = Get.find<DesktopTaskWorkspaceController>();
+        final normRel = relativePath.replaceAll('\\', '/');
+        isGitStaged = ctrl.gitStagedFiles.any((f) => f.replaceAll('\\', '/') == normRel);
+        isGitModified = ctrl.gitModifiedFiles.any((f) => f.replaceAll('\\', '/') == normRel);
+        if (isDir) {
+          hasGitChangesInside = ctrl.gitModifiedFiles.any((f) => f.replaceAll('\\', '/').startsWith('$normRel/'));
+        }
+      }
+
+      // 3. Git changes only filter
+      if (showOnlyModifiedFiles) {
+        if (!isDir && !isGitModified && !isGitStaged) {
+          continue;
+        }
+        if (isDir && !hasGitChangesInside) {
+          continue;
+        }
+      }
+
+      // 4. File Size & Last Modified date
+      String metadataTooltip = relativePath;
+      String? formattedSize;
+      try {
+        if (!isDir) {
+          final stat = ent.statSync();
+          final bytes = stat.size;
+          if (bytes < 1024) {
+            formattedSize = '$bytes B';
+          } else if (bytes < 1024 * 1024) {
+            formattedSize = '${(bytes / 1024).toStringAsFixed(1)} KB';
+          } else {
+            formattedSize = '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+          }
+          final mod = stat.modified;
+          final modStr = '${mod.year}-${mod.month.toString().padLeft(2, '0')}-${mod.day.toString().padLeft(2, '0')} ${mod.hour.toString().padLeft(2, '0')}:${mod.minute.toString().padLeft(2, '0')}';
+          metadataTooltip = '$relativePath\nРазмер: $formattedSize\nИзменен: $modStr';
+        }
+      } catch (_) {}
 
       widgets.add(
-        GestureDetector(
-          onSecondaryTapDown: (details) {
-            _showFileTreeContextMenu(context, details.globalPosition, ent.path, rootPath, isDir);
-          },
-          child: Tooltip(
-            message: relativePath,
-            waitDuration: const Duration(milliseconds: 600),
-            child: InkWell(
-              onTap: () {
-              if (isDir) {
-                setState(() {
-                  if (expandedProjectDirs.contains(ent.path)) {
-                    expandedProjectDirs.remove(ent.path);
-                  } else {
-                    expandedProjectDirs.add(ent.path);
-                  }
-                });
-              } else {
-                widget.onOpenFile?.call(ent.path);
-              }
-            },
-            borderRadius: BorderRadius.circular(4),
+        Draggable<String>(
+          data: ent.path,
+          feedback: Material(
+            color: Colors.transparent,
             child: Container(
-              padding: EdgeInsets.only(left: 6.0 + depth * 12.0, right: 6, top: 4, bottom: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0F172A).withOpacity(0.92),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF00D2FF), width: 1.5),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF00D2FF).withOpacity(0.35),
+                    blurRadius: 14,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
               child: Row(
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (isDir)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 3),
-                      child: Icon(
-                        isExpanded ? Icons.keyboard_arrow_down : Icons.chevron_right,
-                        size: 13,
-                        color: const Color(0xFF94A3B8),
-                      ),
-                    )
-                  else
-                    const SizedBox(width: 16),
-                  _getFileIcon(name, isDir, isExpanded),
+                  Icon(
+                    isDir ? Icons.folder : Icons.insert_drive_file,
+                    size: 14,
+                    color: const Color(0xFF00D2FF),
+                  ),
                   const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      name,
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontFamily: 'Consolas',
-                        color: isDir
-                            ? DesktopTheme.textPrimary
-                            : (name.endsWith('.md') ? const Color(0xFF38BDF8) : DesktopTheme.textSecondary),
-                        fontWeight: isDir ? FontWeight.w500 : FontWeight.normal,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                  Text(
+                    '@$relativePath',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'Consolas',
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
-                  if (isGitActive)
-                    Container(
-                      width: 6,
-                      height: 6,
-                      margin: const EdgeInsets.only(left: 6),
-                      decoration: const BoxDecoration(
-                        color: Color(0xFF10B981),
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                  if (isUntracked)
-                    Container(
-                      margin: const EdgeInsets.only(left: 6),
-                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF10B981).withOpacity(0.15),
-                        borderRadius: BorderRadius.circular(3),
-                      ),
-                      child: const Text(
-                        'U',
-                        style: TextStyle(
-                          fontSize: 9,
-                          fontFamily: 'Consolas',
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF10B981),
-                        ),
-                      ),
-                    ),
                 ],
               ),
             ),
           ),
+          child: GestureDetector(
+            onSecondaryTapDown: (details) {
+              _showFileTreeContextMenu(context, details.globalPosition, ent.path, rootPath, isDir);
+            },
+            child: Tooltip(
+              message: metadataTooltip,
+              waitDuration: const Duration(milliseconds: 400),
+              child: InkWell(
+                onTap: () {
+                  if (isDir) {
+                    setState(() {
+                      if (expandedProjectDirs.contains(ent.path)) {
+                        expandedProjectDirs.remove(ent.path);
+                      } else {
+                        expandedProjectDirs.add(ent.path);
+                      }
+                    });
+                  } else {
+                    widget.onOpenFile?.call(ent.path);
+                  }
+                },
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  padding: EdgeInsets.only(left: 6.0 + depth * 12.0, right: 6, top: 4, bottom: 4),
+                  child: Row(
+                    children: [
+                      if (isDir)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 3),
+                          child: Icon(
+                            isExpanded ? Icons.keyboard_arrow_down : Icons.chevron_right,
+                            size: 13,
+                            color: const Color(0xFF94A3B8),
+                          ),
+                        )
+                      else
+                        const SizedBox(width: 16),
+                      _getFileIcon(name, isDir, isExpanded),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          name,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontFamily: 'Consolas',
+                            color: isGitStaged
+                                ? const Color(0xFF34D399)
+                                : (isGitModified
+                                    ? const Color(0xFFFBBF24)
+                                    : (isDir
+                                        ? (hasGitChangesInside ? const Color(0xFFFDE68A) : DesktopTheme.textPrimary)
+                                        : (name.endsWith('.md') ? const Color(0xFF38BDF8) : DesktopTheme.textSecondary))),
+                            fontWeight: isDir ? FontWeight.w500 : FontWeight.normal,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      // Size badge for files
+                      if (formattedSize != null)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 4),
+                          child: Text(
+                            formattedSize,
+                            style: TextStyle(fontSize: 9, color: DesktopTheme.textMuted.withOpacity(0.4), fontFamily: 'Consolas'),
+                          ),
+                        ),
+                      // Quick action icon: 'new file' for dir, 'view' for file
+                      if (isDir)
+                        Tooltip(
+                          message: 'Создать файл в этой папке',
+                          waitDuration: const Duration(milliseconds: 300),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(4),
+                            onTap: () => _promptCreateFile(context, ent.path),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                              child: Icon(
+                                Icons.note_add_outlined,
+                                size: 11,
+                                color: DesktopTheme.textMuted.withOpacity(0.5),
+                              ),
+                            ),
+                          ),
+                        )
+                      else
+                        Tooltip(
+                          message: 'Открыть в просмотрщике',
+                          waitDuration: const Duration(milliseconds: 300),
+                          child: InkWell(
+                            borderRadius: BorderRadius.circular(4),
+                            onTap: () => widget.onOpenFile?.call(ent.path),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                              child: Icon(
+                                Icons.open_in_new,
+                                size: 10,
+                                color: DesktopTheme.textMuted.withOpacity(0.5),
+                              ),
+                            ),
+                          ),
+                        ),
+                      const SizedBox(width: 2),
+                      // Quick 1-click button to insert link into prompt (@path)
+                      Tooltip(
+                        message: 'Прикрепить @$relativePath к промпту',
+                        waitDuration: const Duration(milliseconds: 300),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(4),
+                          onTap: () {
+                            final ctrl = Get.isRegistered<DesktopTaskWorkspaceController>()
+                                ? Get.find<DesktopTaskWorkspaceController>()
+                                : null;
+                            if (ctrl != null) {
+                              ctrl.attachPathToPrompt(ent.path);
+                              Get.snackbar(
+                                'Контекст чата',
+                                'Добавлено: @$relativePath',
+                                duration: const Duration(seconds: 2),
+                                snackPosition: SnackPosition.BOTTOM,
+                              );
+                            }
+                          },
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 2),
+                            child: Icon(
+                              Icons.alternate_email,
+                              size: 11,
+                              color: const Color(0xFF00D2FF).withOpacity(0.7),
+                            ),
+                          ),
+                        ),
+                      ),
+                      // Real Git status badges
+                      if (isGitStaged)
+                        Container(
+                          margin: const EdgeInsets.only(left: 4),
+                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF10B981).withOpacity(0.18),
+                            borderRadius: BorderRadius.circular(3),
+                            border: Border.all(color: const Color(0xFF10B981).withOpacity(0.4), width: 0.5),
+                          ),
+                          child: const Text(
+                            'S',
+                            style: TextStyle(
+                              fontSize: 9,
+                              fontFamily: 'Consolas',
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF10B981),
+                            ),
+                          ),
+                        )
+                      else if (isGitModified)
+                        Container(
+                          margin: const EdgeInsets.only(left: 4),
+                          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF59E0B).withOpacity(0.18),
+                            borderRadius: BorderRadius.circular(3),
+                            border: Border.all(color: const Color(0xFFF59E0B).withOpacity(0.4), width: 0.5),
+                          ),
+                          child: const Text(
+                            'M',
+                            style: TextStyle(
+                              fontSize: 9,
+                              fontFamily: 'Consolas',
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFFF59E0B),
+                            ),
+                          ),
+                        )
+                      else if (isDir && hasGitChangesInside)
+                        Container(
+                          width: 6,
+                          height: 6,
+                          margin: const EdgeInsets.only(left: 4),
+                          decoration: const BoxDecoration(
+                            color: Color(0xFFF59E0B),
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
         ),
-      ),
-    );
+      );
 
       if (isDir && isExpanded) {
         widgets.addAll(_buildFileTreeNodes(rootPath, ent.path, depth + 1));
@@ -1530,6 +2165,16 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
 
   Widget _getFileIcon(String name, bool isDir, bool isExpanded) {
     if (isDir) {
+      final lower = name.toLowerCase();
+      if (lower == '.git') {
+        return const Icon(FontAwesomeIcons.gitAlt, size: 12, color: Color(0xFFF43F5E));
+      } else if (lower == 'lib' || lower == 'src' || lower == 'crates') {
+        return const Icon(Icons.folder_special, size: 13, color: Color(0xFF00D2FF));
+      } else if (lower == 'test' || lower == 'tests') {
+        return const Icon(Icons.bug_report_outlined, size: 13, color: Color(0xFF10B981));
+      } else if (lower == 'assets' || lower == 'images') {
+        return const Icon(Icons.photo_library_outlined, size: 13, color: Color(0xFFA855F7));
+      }
       return Icon(
         isExpanded ? Icons.folder_open_outlined : Icons.folder_outlined,
         size: 13,
@@ -1537,7 +2182,25 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       );
     }
     final lower = name.toLowerCase();
-    if (lower.endsWith('.json')) {
+    if (lower.endsWith('.dart')) {
+      return const Icon(Icons.flutter_dash, size: 13, color: Color(0xFF00D2FF));
+    } else if (lower.endsWith('.rs')) {
+      return const Icon(FontAwesomeIcons.gear, size: 11, color: Color(0xFFF97316));
+    } else if (lower.endsWith('.py')) {
+      return const Icon(FontAwesomeIcons.python, size: 12, color: Color(0xFF38BDF8));
+    } else if (lower.endsWith('.js') || lower.endsWith('.jsx')) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        decoration: BoxDecoration(color: const Color(0xFFFACC15), borderRadius: BorderRadius.circular(2)),
+        child: const Text('JS', style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: Colors.black)),
+      );
+    } else if (lower.endsWith('.ts') || lower.endsWith('.tsx')) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        decoration: BoxDecoration(color: const Color(0xFF0284C7), borderRadius: BorderRadius.circular(2)),
+        child: const Text('TS', style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold, color: Colors.white)),
+      );
+    } else if (lower.endsWith('.json')) {
       return const Text(
         '{}',
         style: TextStyle(
@@ -1547,12 +2210,28 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           color: Color(0xFFF59E0B),
         ),
       );
-    } else if (lower.endsWith('.md')) {
+    } else if (lower.endsWith('.yaml') || lower.endsWith('.yml') || lower.endsWith('.toml')) {
+      return const Icon(Icons.settings_outlined, size: 12, color: Color(0xFFA855F7));
+    } else if (lower.endsWith('.md') || lower.endsWith('.txt')) {
       return const Icon(Icons.description_outlined, size: 13, color: Color(0xFF38BDF8));
-    } else if (lower.endsWith('.dart') || lower.endsWith('.rs') || lower.endsWith('.py') || lower.endsWith('.js') || lower.endsWith('.ts')) {
-      return const Icon(Icons.code, size: 13, color: Color(0xFF06B6D4));
-    } else if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.svg') || lower.endsWith('.ico')) {
-      return const Icon(Icons.image_outlined, size: 13, color: Color(0xFFA855F7));
+    } else if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+      return const Icon(Icons.html, size: 14, color: Color(0xFFEF4444));
+    } else if (lower.endsWith('.css') || lower.endsWith('.scss') || lower.endsWith('.sass')) {
+      return const Icon(Icons.css, size: 14, color: Color(0xFF3B82F6));
+    } else if (lower.endsWith('.sh') || lower.endsWith('.ps1') || lower.endsWith('.bat') || lower.endsWith('.cmd')) {
+      return const Icon(Icons.terminal, size: 13, color: Color(0xFF4ADE80));
+    } else if (lower.contains('docker')) {
+      return const Icon(FontAwesomeIcons.docker, size: 12, color: Color(0xFF0284C7));
+    } else if (lower.startsWith('.git')) {
+      return const Icon(FontAwesomeIcons.codeBranch, size: 12, color: Color(0xFFF43F5E));
+    } else if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.svg') || lower.endsWith('.ico') || lower.endsWith('.webp')) {
+      return const Icon(Icons.image_outlined, size: 13, color: Color(0xFFC084FC));
+    } else if (lower.endsWith('.mp3') || lower.endsWith('.wav') || lower.endsWith('.mp4') || lower.endsWith('.mov') || lower.endsWith('.mkv')) {
+      return const Icon(Icons.movie_outlined, size: 13, color: Color(0xFFF43F5E));
+    } else if (lower.endsWith('.zip') || lower.endsWith('.tar') || lower.endsWith('.gz') || lower.endsWith('.7z')) {
+      return const Icon(Icons.archive_outlined, size: 13, color: Color(0xFFF59E0B));
+    } else if (lower.endsWith('.lock')) {
+      return const Icon(Icons.lock_outline, size: 12, color: Color(0xFF64748B));
     } else {
       return const Icon(Icons.insert_drive_file_outlined, size: 13, color: Color(0xFF94A3B8));
     }
@@ -1576,8 +2255,8 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       position: RelativeRect.fromLTRB(
         position.dx,
         position.dy,
-        position.dx + 220,
-        position.dy + 320,
+        position.dx + 240,
+        position.dy + 420,
       ),
       color: const Color(0xFF181C24),
       shape: RoundedRectangleBorder(
@@ -1588,75 +2267,50 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       items: isDir
           ? [
               PopupMenuItem(
-                value: 'reveal_explorer',
+                value: 'new_file',
                 height: 32,
                 child: Row(
                   children: const [
-                    Icon(Icons.folder_outlined, size: 14, color: Color(0xFF94A3B8)),
+                    Icon(Icons.note_add_outlined, size: 14, color: Color(0xFF00D2FF)),
                     SizedBox(width: 10),
-                    Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: Colors.white)),
+                    Text('Создать файл здесь...', style: TextStyle(fontSize: 12, color: Colors.white)),
                   ],
                 ),
               ),
               PopupMenuItem(
-                value: 'copy_path',
+                value: 'new_folder',
                 height: 32,
                 child: Row(
                   children: const [
-                    Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
+                    Icon(Icons.create_new_folder_outlined, size: 14, color: Color(0xFF38BDF8)),
                     SizedBox(width: 10),
-                    Text('Копировать путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                    Text('Создать папку здесь...', style: TextStyle(fontSize: 12, color: Colors.white)),
                   ],
                 ),
               ),
+              const PopupMenuDivider(height: 1),
               PopupMenuItem(
                 value: 'add_to_chat',
                 height: 32,
                 child: Row(
                   children: const [
-                    Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF94A3B8)),
+                    Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF00D2FF)),
                     SizedBox(width: 10),
-                    Text('Добавить в контекст чата', style: TextStyle(fontSize: 12, color: Colors.white)),
+                    Text('Добавить папку в чат (@папка)', style: TextStyle(fontSize: 12, color: Colors.white)),
                   ],
                 ),
               ),
-            ]
-          : [
               PopupMenuItem(
-                value: 'open',
+                value: 'open_terminal',
                 height: 32,
                 child: Row(
                   children: const [
-                    Icon(Icons.open_in_new, size: 13, color: Color(0xFF94A3B8)),
+                    Icon(Icons.terminal, size: 13, color: Color(0xFF4ADE80)),
                     SizedBox(width: 10),
-                    Text('Открыть', style: TextStyle(fontSize: 12, color: Colors.white)),
+                    Text('Открыть в Терминале', style: TextStyle(fontSize: 12, color: Colors.white)),
                   ],
                 ),
               ),
-              const PopupMenuDivider(height: 1),
-              PopupMenuItem(
-                value: 'open_canvas',
-                height: 30,
-                child: Row(
-                  children: const [
-                    Icon(FontAwesomeIcons.wandMagicSparkles, size: 12, color: Color(0xFF00D2FF)),
-                    SizedBox(width: 10),
-                    Text('Открыть в Холсте', style: TextStyle(fontSize: 11.5, color: Colors.white)),
-                  ],
-                ),
-              ),
-              PopupMenuItem(
-                value: 'open_code',
-                height: 30,
-                child: Row(
-                  children: const [
-                    Icon(Icons.code, size: 13, color: Color(0xFF38BDF8)),
-                    SizedBox(width: 10),
-                    Text('Открыть в Редакторе кода', style: TextStyle(fontSize: 11.5, color: Colors.white)),
-                  ],
-                ),
-              ),
-              const PopupMenuDivider(height: 1),
               PopupMenuItem(
                 value: 'reveal_explorer',
                 height: 32,
@@ -1665,6 +2319,18 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     Icon(Icons.folder_outlined, size: 14, color: Color(0xFF94A3B8)),
                     SizedBox(width: 10),
                     Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(height: 1),
+              PopupMenuItem(
+                value: 'copy_rel_path',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.copy_all_outlined, size: 13, color: Color(0xFF94A3B8)),
+                    SizedBox(width: 10),
+                    Text('Копировать относительный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
                   ],
                 ),
               ),
@@ -1679,14 +2345,61 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   ],
                 ),
               ),
+              const PopupMenuDivider(height: 1),
               PopupMenuItem(
-                value: 'copy_rel_path',
+                value: 'rename',
                 height: 32,
                 child: Row(
                   children: const [
-                    Icon(Icons.copy_all_outlined, size: 13, color: Color(0xFF94A3B8)),
+                    Icon(Icons.edit_outlined, size: 13, color: Color(0xFFE2E8F0)),
                     SizedBox(width: 10),
-                    Text('Копировать относительный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                    Text('Переименовать', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'delete',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.delete_outline, size: 14, color: Color(0xFFE11D48)),
+                    SizedBox(width: 10),
+                    Text('Удалить папку', style: TextStyle(fontSize: 12, color: Color(0xFFE11D48))),
+                  ],
+                ),
+              ),
+            ]
+          : [
+              PopupMenuItem(
+                value: 'open',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.open_in_new, size: 13, color: Color(0xFF94A3B8)),
+                    SizedBox(width: 10),
+                    Text('Открыть в Просмотрщике', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'open_code',
+                height: 30,
+                child: Row(
+                  children: const [
+                    Icon(Icons.code, size: 13, color: Color(0xFF38BDF8)),
+                    SizedBox(width: 10),
+                    Text('Открыть в Редакторе кода', style: TextStyle(fontSize: 11.5, color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'open_canvas',
+                height: 30,
+                child: Row(
+                  children: const [
+                    Icon(FontAwesomeIcons.wandMagicSparkles, size: 12, color: Color(0xFF00D2FF)),
+                    SizedBox(width: 10),
+                    Text('Открыть в Холсте', style: TextStyle(fontSize: 11.5, color: Colors.white)),
                   ],
                 ),
               ),
@@ -1698,14 +2411,94 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   children: const [
                     Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF00D2FF)),
                     SizedBox(width: 10),
-                    Text('Добавить в контекст чата', style: TextStyle(fontSize: 12, color: Colors.white)),
+                    Text('Прикрепить к промпту (@файл)', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'reveal_explorer',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.folder_outlined, size: 14, color: Color(0xFF94A3B8)),
+                    SizedBox(width: 10),
+                    Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(height: 1),
+              PopupMenuItem(
+                value: 'duplicate',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.content_copy, size: 13, color: Color(0xFF94A3B8)),
+                    SizedBox(width: 10),
+                    Text('Дублировать файл', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'copy_rel_path',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.copy_all_outlined, size: 13, color: Color(0xFF94A3B8)),
+                    SizedBox(width: 10),
+                    Text('Копировать относительный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'copy_abs_path',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
+                    SizedBox(width: 10),
+                    Text('Копировать абсолютный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              const PopupMenuDivider(height: 1),
+              PopupMenuItem(
+                value: 'rename',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.edit_outlined, size: 13, color: Color(0xFFE2E8F0)),
+                    SizedBox(width: 10),
+                    Text('Переименовать', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'delete',
+                height: 32,
+                child: Row(
+                  children: const [
+                    Icon(Icons.delete_outline, size: 14, color: Color(0xFFE11D48)),
+                    SizedBox(width: 10),
+                    Text('Удалить файл', style: TextStyle(fontSize: 12, color: Color(0xFFE11D48))),
                   ],
                 ),
               ),
             ],
     ).then((val) {
-      if (val == null) return;
-      if (val == 'open') {
+      if (val == null || !mounted) return;
+      if (val == 'new_file') {
+        _promptCreateFile(context, fullPath);
+      } else if (val == 'new_folder') {
+        _promptCreateFolder(context, fullPath);
+      } else if (val == 'open_terminal') {
+        _openInTerminal(fullPath);
+      } else if (val == 'duplicate') {
+        _duplicateFile(fullPath);
+      } else if (val == 'rename') {
+        _promptRename(context, fullPath, isDir);
+      } else if (val == 'delete') {
+        _confirmDelete(context, fullPath, isDir);
+      } else if (val == 'open') {
         widget.onOpenFile?.call(fullPath);
       } else if (val == 'open_canvas') {
         final ctrl = Get.isRegistered<DesktopTaskWorkspaceController>() ? Get.find<DesktopTaskWorkspaceController>() : null;
@@ -1730,9 +2523,8 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       } else if (val == 'add_to_chat') {
         final ctrl = Get.isRegistered<DesktopTaskWorkspaceController>() ? Get.find<DesktopTaskWorkspaceController>() : null;
         if (ctrl != null) {
-          ctrl.addAttachment('@$relativePath');
-          ctrl.inputController.text = '${ctrl.inputController.text.trim()} @$relativePath '.trimLeft();
-          Get.snackbar('Контекст чата', 'Файл @$relativePath добавлен в поле ввода');
+          ctrl.attachPathToPrompt(fullPath);
+          Get.snackbar('Контекст чата', 'Файл @$relativePath добавлен в промпт');
         }
       }
     });
@@ -2560,7 +3352,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
   // ==========================================
   void _showAiGroupingDialog() {
     Get.snackbar(
-      '✨ ИИ Группировка',
+      'ИИ Группировка',
       'Агент анализирует несгруппированные сессии и распределяет их по смысловым категориям...',
       backgroundColor: Colors.black87,
       colorText: Colors.white,

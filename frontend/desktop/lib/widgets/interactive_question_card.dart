@@ -180,7 +180,7 @@ class _InteractiveQuestionCardState extends State<InteractiveQuestionCard> {
                     ),
                   ),
                   child: Text(
-                    answered ? '✓ Отвечено' : 'Ожидает выбора',
+                    answered ? 'Отвечено' : 'Ожидает выбора',
                     style: TextStyle(
                       fontSize: 10,
                       fontWeight: FontWeight.bold,

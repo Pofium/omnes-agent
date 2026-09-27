@@ -610,6 +610,7 @@ async fn handle_socket(
                             return;
                         }
                     };
+                    let mode = parsed["mode"].as_str();
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -620,6 +621,7 @@ async fn handle_socket(
                         &mut ping_interval,
                         &ws_memory,
                         &content,
+                        mode,
                         &session_key,
                         &session_id,
                         auth_subject.as_deref(),
@@ -782,6 +784,7 @@ async fn handle_socket(
                     }
                 };
 
+                let mode = parsed["mode"].as_str();
                 process_chat_message(
                     &state,
                     &mut agent,
@@ -792,6 +795,7 @@ async fn handle_socket(
                     &mut ping_interval,
                     &ws_memory,
                     &content,
+                    mode,
                     &session_key,
                     &session_id,
                         auth_subject.as_deref(),
@@ -996,6 +1000,7 @@ async fn process_chat_message(
     ping_interval: &mut Option<tokio::time::Interval>,
     ws_memory: &Option<Arc<dyn omnesagent_memory::Memory>>,
     content: &str,
+    mode: Option<&str>,
     session_key: &str,
     session_id: &str,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
@@ -1004,6 +1009,16 @@ async fn process_chat_message(
 ) {
     use futures_util::StreamExt as _;
     use omnesagent_runtime::agent::TurnEvent;
+
+    if let Some(mode_str) = mode {
+        let exec_mode = match mode_str {
+            "deep_code" => omnesagent_runtime::agent::context_budget::AgentExecutionMode::DeepCode,
+            "architect" => omnesagent_runtime::agent::context_budget::AgentExecutionMode::Architect,
+            "ralph_loop" => omnesagent_runtime::agent::context_budget::AgentExecutionMode::RalphLoop,
+            _ => omnesagent_runtime::agent::context_budget::AgentExecutionMode::Fast,
+        };
+        agent.set_temperature(Some(exec_mode.default_temperature() as f64));
+    }
 
     let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let provider_label = turn_provider.clone();
@@ -1213,6 +1228,15 @@ async fn process_chat_message(
                                 }
                             }
                         }
+                        Some("voice_barge_in") => {
+                            cancel_token.cancel();
+                            let barge_frame = serde_json::json!({
+                                "type": "voice_barge_in_ack",
+                                "session_id": session_id,
+                            });
+                            let _ = sender.send(Message::Text(barge_frame.to_string().into())).await;
+                            continue;
+                        }
                         _ => {}
                     }
                 }
@@ -1260,10 +1284,19 @@ async fn process_chat_message(
                         }
                         TurnEvent::Chunk { ref delta } => {
                             accumulated_text.push_str(delta);
-                            serde_json::json!({ "type": "chunk", "content": delta })
+                            serde_json::json!({
+                                "type": "agent_chunk",
+                                "delta": delta,
+                                "content": delta,
+                                "is_final": false
+                            })
                         }
                         TurnEvent::Thinking { delta } => {
-                            serde_json::json!({ "type": "thinking", "content": delta })
+                            serde_json::json!({
+                                "type": "thinking_chunk",
+                                "content": delta,
+                                "delta": delta
+                            })
                         }
                         TurnEvent::ToolCall { id, name, args } => {
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
@@ -1293,6 +1326,79 @@ async fn process_chat_message(
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
+                        }),
+                        TurnEvent::TrajectoryStep {
+                            id,
+                            session_id: step_sess_id,
+                            turn_id,
+                            step_index,
+                            parent_step_id,
+                            step_type,
+                            payload_json,
+                            tokens_used,
+                            duration_us,
+                            created_at,
+                        } => {
+                            if let Some(ref backend) = state.session_backend {
+                                let step = omnesagent_infra::session_backend::SessionStep {
+                                    id: id.clone(),
+                                    session_id: step_sess_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    step_index,
+                                    parent_step_id: parent_step_id.clone(),
+                                    step_type: step_type.clone(),
+                                    payload_json: payload_json.clone(),
+                                    tokens_used,
+                                    duration_us,
+                                    created_at: created_at.clone(),
+                                };
+                                let _ = backend.insert_step(&step);
+                            }
+                            let payload_val: serde_json::Value =
+                                serde_json::from_str(&payload_json).unwrap_or_else(|_| serde_json::json!({}));
+                            serde_json::json!({
+                                "type": "trajectory_step",
+                                "id": id,
+                                "session_id": step_sess_id,
+                                "turn_id": turn_id,
+                                "step_index": step_index,
+                                "parent_step_id": parent_step_id,
+                                "step_type": step_type,
+                                "payload": payload_val,
+                                "tokens_used": tokens_used,
+                                "duration_us": duration_us,
+                                "created_at": created_at,
+                            })
+                        }
+                        TurnEvent::ContextBudgetUpdate {
+                            system_tokens,
+                            kag_ast_tokens,
+                            memory_tokens,
+                            dialog_history_tokens,
+                            tool_outputs_tokens,
+                            compression_saved_tokens,
+                            context_limit,
+                        } => serde_json::json!({
+                            "type": "context_budget_update",
+                            "system_tokens": system_tokens,
+                            "kag_ast_tokens": kag_ast_tokens,
+                            "memory_tokens": memory_tokens,
+                            "dialog_history_tokens": dialog_history_tokens,
+                            "tool_outputs_tokens": tool_outputs_tokens,
+                            "compression_saved_tokens": compression_saved_tokens,
+                            "context_limit": context_limit,
+                        }),
+                        TurnEvent::GroundingCitation {
+                            id,
+                            uri,
+                            label,
+                            source_type,
+                        } => serde_json::json!({
+                            "type": "grounding_citation",
+                            "id": id,
+                            "uri": uri,
+                            "label": label,
+                            "source_type": source_type,
                         }),
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;

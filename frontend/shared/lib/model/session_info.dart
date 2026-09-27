@@ -5,6 +5,7 @@ class SessionInfo {
   final String agentAlias;
   final String? workspaceDir;
   final String previewText;
+  final String? name;
   final DateTime createdAt;
   final DateTime lastActivity;
   final int messageCount;
@@ -14,6 +15,7 @@ class SessionInfo {
     required this.agentAlias,
     this.workspaceDir,
     this.previewText = '',
+    this.name,
     required this.createdAt,
     required this.lastActivity,
     required this.messageCount,
@@ -36,11 +38,18 @@ class SessionInfo {
       return DateTime.now();
     }
 
+    final nameStr = (json['name'] ?? json['session_name'] ?? json['title']) as String?;
+    final rawPreview = json['preview_text'] as String? ?? json['preview'] as String? ?? '';
+    final effectivePreview = (nameStr != null && nameStr.trim().isNotEmpty)
+        ? nameStr.trim()
+        : rawPreview;
+
     return SessionInfo(
       sessionId: json['session_id'] as String? ?? '',
       agentAlias: json['agent_alias'] as String? ?? 'chief',
       workspaceDir: json['workspace_dir'] as String? ?? json['workspaceDir'] as String?,
-      previewText: json['preview_text'] as String? ?? json['preview'] as String? ?? '',
+      previewText: effectivePreview,
+      name: nameStr,
       createdAt: parseDate(json['created_at']),
       lastActivity: parseDate(json['last_activity']),
       messageCount: json['message_count'] as int? ?? 0,

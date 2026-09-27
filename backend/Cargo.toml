@@ -1,6 +1,8 @@
 [workspace]
-members = [".", "crates/omnesagent-api", "crates/omnesagent-infra", "crates/omnesagent-config", "crates/omnesagent-log", "crates/omnesagent-log/tests/fixtures/attribution-macro-support", "crates/omnesagent-log/tests/fixtures/attribution-macro-consumer", "crates/omnesagent-tls", "crates/omnesagent-relay-proto", "apps/omnesrelay", "crates/omnesagent-spawn", "crates/omnesagent-commands", "crates/omnesagent-providers", "crates/omnesagent-memory", "crates/omnesagent-kag", "crates/omnesagent-channels", "crates/omnesagent-tools", "crates/omnesagent-sop-graph", "crates/omnesagent-runtime", "crates/omnesagent-eval", "crates/omnesagent-ralph", "apps/omnescode", "crates/omnesagent-plugins", "crates/omnesagent-plugins/tests/fixtures/channel-fixture", "crates/omnesagent-plugins/tests/fixtures/egress-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-timeout-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-secret-fixture", "crates/omnesagent-gateway", "crates/omnesagent-hardware", "crates/omnesagent-tool-call-parser", "crates/omnesagent-macros", "crates/omnesagent-compression", "crates/omnesagent-s1", "tools/fill-translations", "xtask"]
+members = [".", "crates/omnesagent-api", "crates/omnesagent-infra", "crates/omnesagent-config", "crates/omnesagent-log", "crates/omnesagent-log/tests/fixtures/attribution-macro-support", "crates/omnesagent-log/tests/fixtures/attribution-macro-consumer", "crates/omnesagent-tls", "crates/omnesagent-relay-proto", "apps/omnesrelay", "crates/omnesagent-spawn", "crates/omnesagent-commands", "crates/omnesagent-providers", "crates/omnesagent-memory", "crates/omnesagent-kag", "crates/omnesagent-channels", "crates/omnesagent-tools", "crates/omnesagent-editor", "crates/omnesagent-sop-graph", "crates/omnesagent-runtime", "crates/omnesagent-eval", "crates/omnesagent-ralph", "apps/omnescode", "crates/omnesagent-plugins", "crates/omnesagent-plugins/tests/fixtures/channel-fixture", "crates/omnesagent-plugins/tests/fixtures/egress-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-timeout-fixture", "crates/omnesagent-plugins/tests/fixtures/tool-secret-fixture", "crates/omnesagent-gateway", "crates/omnesagent-hardware", "crates/omnesagent-tool-call-parser", "crates/omnesagent-macros", "crates/omnesagent-compression", "crates/omnesagent-s1", "tools/fill-translations", "xtask"]
 resolver = "2"
+# Vendored third-party crates are path dependencies, not workspace members.
+exclude = ["crates/omnesagent-editor/vendor/editor-core"]
 
 [workspace.package]
 version = "0.8.4"
@@ -24,6 +26,7 @@ omnesagent-memory = { path = "crates/omnesagent-memory", version = "0.8.4" }
 omnesagent-kag = { path = "crates/omnesagent-kag", version = "0.8.4" }
 omnesagent-channels = { path = "crates/omnesagent-channels", version = "0.8.4", default-features = false }
 omnesagent-tools = { path = "crates/omnesagent-tools", version = "0.8.4" }
+omnesagent-editor = { path = "crates/omnesagent-editor", version = "0.8.4" }
 omnesagent-sop-graph = { path = "crates/omnesagent-sop-graph", version = "0.8.4", default-features = false }
 omnesagent-runtime = { path = "crates/omnesagent-runtime", version = "0.8.4", default-features = false }
 omnesagent-ralph = { path = "crates/omnesagent-ralph", version = "0.8.4" }

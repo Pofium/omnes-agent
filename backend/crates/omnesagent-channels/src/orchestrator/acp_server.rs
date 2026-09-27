@@ -2530,7 +2530,10 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         // ACP has no `session/update` shape for usage; the cost tracker records
         // it out-of-band. Keep this helper total even if a caller omits its
         // fast-path filter.
-        TurnEvent::Usage { .. } => return None,
+        TurnEvent::Usage { .. }
+        | TurnEvent::TrajectoryStep { .. }
+        | TurnEvent::ContextBudgetUpdate { .. }
+        | TurnEvent::GroundingCitation { .. } => return None,
     })
 }
 

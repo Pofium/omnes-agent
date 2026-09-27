@@ -1,6 +1,15 @@
 // Models for OmnesAgent/ZeroClaw WebSocket Gateway frames.
 // Mirrors web/src/types/api.ts and web/src/contexts/turnStream.logic.ts
 
+import 'trajectory_step.dart';
+import 'context_budget.dart';
+import 'grounding_citation.dart';
+
+export 'trajectory_step.dart';
+export 'context_budget.dart';
+export 'grounding_citation.dart';
+export 'agent_mode.dart';
+
 /// Base sealed class for all frames received over /ws/chat.
 sealed class GatewayFrame {
   final String type;
@@ -10,12 +19,36 @@ sealed class GatewayFrame {
     final type = json['type'] as String? ?? 'unknown';
     switch (type) {
       case 'chunk':
+      case 'agent_chunk':
         return ChunkFrame(
-          content: json['content'] as String? ?? '',
+          content: json['content'] as String? ?? json['delta'] as String? ?? '',
         );
       case 'thinking':
+      case 'thinking_chunk':
         return ThinkingFrame(
-          content: json['content'] as String? ?? '',
+          content: json['content'] as String? ?? json['delta'] as String? ?? '',
+        );
+      case 'trajectory_step':
+        return TrajectoryStepFrame(
+          step: TrajectoryStep.fromJson(json),
+        );
+      case 'context_budget_update':
+        return ContextBudgetFrame(
+          budget: ContextBudgetSnapshot.fromJson(
+            json['snapshot'] as Map<String, dynamic>? ?? json,
+          ),
+        );
+      case 'grounding_citation':
+        return GroundingCitationFrame(
+          citation: GroundingCitation.fromJson(json),
+        );
+      case 's1_event':
+        return S1EventFrame(
+          status: json['status'] as String? ?? '',
+          ready: json['ready'] as bool? ?? false,
+          model: json['model'] as String?,
+          downloadProgress: (json['download_progress'] as num?)?.toDouble(),
+          payload: json,
         );
       case 'chunk_reset':
         return const ChunkResetFrame();
@@ -227,3 +260,38 @@ class RalphProgressFrame extends GatewayFrame {
     required this.totalSteps,
   }) : super('ralph_phase_progress');
 }
+
+/// Emitted for each atomic step in the agent execution trajectory.
+class TrajectoryStepFrame extends GatewayFrame {
+  final TrajectoryStep step;
+  const TrajectoryStepFrame({required this.step}) : super('trajectory_step');
+}
+
+/// Dynamic context budget update frame.
+class ContextBudgetFrame extends GatewayFrame {
+  final ContextBudgetSnapshot budget;
+  const ContextBudgetFrame({required this.budget}) : super('context_budget_update');
+}
+
+/// Structured grounding citation.
+class GroundingCitationFrame extends GatewayFrame {
+  final GroundingCitation citation;
+  const GroundingCitationFrame({required this.citation}) : super('grounding_citation');
+}
+
+/// S1 System One status / weight download event.
+class S1EventFrame extends GatewayFrame {
+  final String status;
+  final bool ready;
+  final String? model;
+  final double? downloadProgress;
+  final Map<String, dynamic> payload;
+  const S1EventFrame({
+    required this.status,
+    this.ready = false,
+    this.model,
+    this.downloadProgress,
+    this.payload = const {},
+  }) : super('s1_event');
+}
+

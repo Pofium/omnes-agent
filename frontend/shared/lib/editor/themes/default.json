@@ -1,0 +1,21 @@
+{
+  "name": "omnes-dark",
+  "styles": [
+    { "name": "text", "fg": "#ABB2BF", "bold": false, "italic": false },
+    { "name": "comment", "fg": "#5C6370", "bold": false, "italic": true },
+    { "name": "keyword", "fg": "#C678DD", "bold": false, "italic": false },
+    { "name": "string", "fg": "#98C379", "bold": false, "italic": false },
+    { "name": "number", "fg": "#D19A66", "bold": false, "italic": false },
+    { "name": "constant", "fg": "#D19A66", "bold": false, "italic": false },
+    { "name": "function", "fg": "#61AFEF", "bold": false, "italic": false },
+    { "name": "type", "fg": "#E5C07B", "bold": false, "italic": false },
+    { "name": "property", "fg": "#E06C75", "bold": false, "italic": false },
+    { "name": "operator", "fg": "#56B6C2", "bold": false, "italic": false },
+    { "name": "punctuation", "fg": "#ABB2BF", "bold": false, "italic": false },
+    { "name": "tag", "fg": "#E06C75", "bold": false, "italic": false },
+    { "name": "attribute", "fg": "#D19A66", "bold": false, "italic": true },
+    { "name": "escape", "fg": "#56B6C2", "bold": false, "italic": false },
+    { "name": "embedded", "fg": "#98C379", "bold": false, "italic": false },
+    { "name": "title", "fg": "#E5C07B", "bold": true, "italic": false }
+  ]
+}

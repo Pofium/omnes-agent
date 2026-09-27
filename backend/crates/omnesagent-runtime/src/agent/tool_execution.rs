@@ -34,6 +34,45 @@ fn maybe_plan_event(
     Some(omnesagent_api::agent::TurnEvent::Plan { entries })
 }
 
+/// Extracts a GroundingCitation from tool arguments if a file path, URI, or memory source is found.
+fn extract_grounding_citation(
+    call_name: &str,
+    call_arguments: &serde_json::Value,
+) -> Option<omnesagent_api::agent::TurnEvent> {
+    let file_uri = call_arguments
+        .get("path")
+        .or_else(|| call_arguments.get("AbsolutePath"))
+        .or_else(|| call_arguments.get("TargetFile"))
+        .or_else(|| call_arguments.get("SearchPath"))
+        .or_else(|| call_arguments.get("file"))
+        .or_else(|| call_arguments.get("uri"))
+        .and_then(|v| v.as_str());
+
+    if let Some(uri) = file_uri {
+        let label = std::path::Path::new(uri)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(uri);
+        return Some(omnesagent_api::agent::TurnEvent::GroundingCitation {
+            id: uuid::Uuid::new_v4().to_string(),
+            uri: uri.to_string(),
+            label: label.to_string(),
+            source_type: "file".to_string(),
+        });
+    }
+
+    if call_name.contains("memory") || call_name.contains("graph") || call_name.contains("ob2h") {
+        return Some(omnesagent_api::agent::TurnEvent::GroundingCitation {
+            id: uuid::Uuid::new_v4().to_string(),
+            uri: format!("memory://{call_name}"),
+            label: format!("Knowledge: {call_name}"),
+            source_type: "memory".to_string(),
+        });
+    }
+
+    None
+}
+
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
@@ -479,6 +518,34 @@ pub(crate) async fn execute_one_tool(
                     .and_then(ToolArtifact::from_delivered_data),
             })
             .await;
+
+        let duration_us = out.duration.as_micros() as u64;
+        let tokens_est = (out.output.len() + 3) / 4;
+        let _ = tx
+            .send(TurnEvent::TrajectoryStep {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: meta.channel_name.to_string(),
+                turn_id: meta.turn_id.to_string(),
+                step_index: 2,
+                parent_step_id: None,
+                step_type: "tool_call".to_string(),
+                payload_json: serde_json::json!({
+                    "tool": call_name,
+                    "arguments": call_arguments,
+                    "output": scrub_credentials(&out.output),
+                    "success": out.success,
+                    "duration_ms": out.duration.as_millis(),
+                })
+                .to_string(),
+                tokens_used: tokens_est,
+                duration_us,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await;
+
+        if let Some(citation) = extract_grounding_citation(call_name, &call_arguments) {
+            let _ = tx.send(citation).await;
+        }
     }
 
     // After the ToolResult card closes, publish the plan if this was a

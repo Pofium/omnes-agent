@@ -12,6 +12,7 @@ pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
 pub mod api_config;
+pub mod api_editor;
 pub mod api_logs;
 pub mod api_pairing;
 pub mod api_personality;
@@ -55,6 +56,7 @@ pub mod voice_duplex;
 mod webhook_ingress;
 pub mod ws;
 pub mod ws_approval;
+pub mod ws_editor;
 pub mod ws_sop_runs;
 pub mod ws_terminal;
 
@@ -480,6 +482,11 @@ pub struct AppState {
     pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
     pub pairing: Arc<PairingGuard>,
+    /// Editor core (`omnesagent-editor`): the gateway-side registry of open
+    /// file buffers, served by `/api/v1/editor/*` and `/ws/editor/{buffer_id}`
+    /// (`BACKEND_SPEC` §9). The gateway is the single owner of buffer state;
+    /// clients are virtual viewports.
+    pub editor: Arc<omnesagent_editor::EditorService>,
     pub admin_auth: Arc<admin_auth::AdminAuthManager>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
@@ -572,6 +579,31 @@ pub struct AppState {
     pub sop_audit: Option<Arc<omnesagent_runtime::sop::SopAuditLogger>>,
 }
 
+/// Atomically write `.omnes/gateway.json` for frontend service discovery.
+fn write_gateway_descriptor(host: &str, port: u16) {
+    let dir = std::path::Path::new(".omnes");
+    let _ = std::fs::create_dir_all(dir);
+    let descriptor = serde_json::json!({
+        "pid": std::process::id(),
+        "port": port,
+        "host": host,
+        "started_at": chrono::Utc::now().to_rfc3339()
+    });
+    let target = dir.join("gateway.json");
+    let tmp = dir.join(format!("gateway.json.tmp.{}", std::process::id()));
+    if let Ok(content) = serde_json::to_string_pretty(&descriptor) {
+        if std::fs::write(&tmp, content).is_ok() {
+            let _ = std::fs::rename(tmp, target);
+        }
+    }
+}
+
+/// Remove `.omnes/gateway.json` on gateway shutdown.
+fn remove_gateway_descriptor() {
+    let target = std::path::Path::new(".omnes").join("gateway.json");
+    let _ = std::fs::remove_file(target);
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
@@ -642,6 +674,7 @@ pub async fn run_gateway(
     let actual_addr = listener.local_addr()?;
     let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
+    write_gateway_descriptor(host, actual_port);
 
     // Seed the install-wide default provider from the first entry that
     // actually declares a `model`. Entries without one cannot serve as the
@@ -1537,6 +1570,7 @@ pub async fn run_gateway(
     }
 
     let state = AppState {
+        editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
         config: config_state,
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         model_provider,
@@ -1885,13 +1919,32 @@ pub async fn run_gateway(
         )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
-        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions", get(api::handle_api_sessions_list).post(api::handle_api_session_create))
+        .route("/api/v1/sessions", get(api::handle_api_sessions_list).post(api::handle_api_session_create))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
             "/api/sessions/{id}/messages",
             get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
         )
-        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename).get(api::handle_api_session_state))
+        .route("/api/v1/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename).get(api::handle_api_session_state))
+        .route("/api/v1/sessions/{id}/fork", post(api::handle_api_session_fork))
+        .route("/api/v1/sessions/{id}/steps", get(api::handle_api_session_steps))
+        .route("/api/v1/sessions/{id}/export_trace", get(api::handle_api_session_export_trace))
+        .route("/api/v1/sessions/replay", post(api::handle_api_session_replay))
+        .route("/api/v1/providers", get(api::handle_api_providers_catalog))
+        .route("/api/v1/ast/reindex", post(api::handle_api_ast_reindex))
+        .route("/api/v1/s1/status", get(api::handle_api_s1_status))
+        .route("/api/v1/s1/download", post(api::handle_api_s1_download))
+        // ── Editor API (BACKEND_SPEC §3.2/§9; phases F0+ of
+        //    PLAN_FILE_EDITOR_ZED) ──
+        .route(
+            "/api/v1/editor/file",
+            get(api_editor::handle_editor_file_get).put(api_editor::handle_editor_file_put),
+        )
+        .route("/api/v1/editor/raw", get(api_editor::handle_editor_file_raw))
+        .route("/api/v1/editor/buffers", get(api_editor::handle_editor_buffers_get))
+        .route("/api/v1/editor/buffer", delete(api_editor::handle_editor_buffer_delete))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
         .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
         // ── Pairing + Device management API ──
@@ -1976,6 +2029,8 @@ pub async fn run_gateway(
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── WebSocket terminal PTY ──
         .route("/ws/terminal/{id}", get(ws_terminal::handle_ws_terminal))
+        // ── WebSocket editor buffer (BACKEND_SPEC §9.9) ──
+        .route("/ws/editor/{buffer_id}", get(ws_editor::handle_ws_editor))
         // ── Administrator Authentication ──
         .route("/api/auth/login", post(admin_auth::handle_auth_login))
         .route("/api/auth/logout", post(admin_auth::handle_auth_logout))
@@ -2148,6 +2203,7 @@ pub async fn run_gateway(
                     });
                 }
                 _ = shutdown_signal.changed() => {
+                    remove_gateway_descriptor();
                     ::omnesagent_log::record!(INFO, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note), "OmnesAgent Gateway shutting down");
                     break;
                 }
@@ -2161,6 +2217,7 @@ pub async fn run_gateway(
         )
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.changed().await;
+            remove_gateway_descriptor();
             ::omnesagent_log::record!(
                 INFO,
                 ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
@@ -4377,6 +4434,7 @@ mod tests {
         };
         let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
         AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
@@ -5287,6 +5345,7 @@ path = "{trigger_path}"
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
@@ -5374,6 +5433,7 @@ path = "{trigger_path}"
 
         let observer: Arc<dyn omnesagent_runtime::observability::Observer> = Arc::new(prom);
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: Arc::new(MockModelProvider::default()),
@@ -6048,6 +6108,7 @@ path = "{trigger_path}"
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -6955,6 +7016,7 @@ path = "{trigger_path}"
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7075,6 +7137,7 @@ path = "{trigger_path}"
         );
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7175,6 +7238,7 @@ path = "{trigger_path}"
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7381,6 +7445,7 @@ path = "{trigger_path}"
         config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7468,6 +7533,7 @@ path = "{trigger_path}"
         config.gateway.webhook_secret = Some(valid_secret.clone());
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7560,6 +7626,7 @@ path = "{trigger_path}"
         config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7657,6 +7724,7 @@ path = "{trigger_path}"
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7752,6 +7820,7 @@ path = "{trigger_path}"
         let invalid_signature = "deadbeef";
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7853,6 +7922,7 @@ path = "{trigger_path}"
         let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -7994,6 +8064,7 @@ path = "{trigger_path}"
         let signature = compute_nextcloud_signature_hex(secret, random, body);
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider: provider,
@@ -8882,6 +8953,7 @@ path = "{trigger_path}"
         }
 
         AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -8968,6 +9040,7 @@ path = "{trigger_path}"
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
@@ -9579,6 +9652,7 @@ path = "{trigger_path}"
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let mem: Arc<dyn Memory> = Arc::new(MockMemory);
         AppState {
+            editor: std::sync::Arc::new(omnesagent_editor::EditorService::new()),
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
