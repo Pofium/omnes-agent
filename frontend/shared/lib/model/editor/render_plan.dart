@@ -11,10 +11,15 @@ class EditorRow {
   final String text;
   final List<List<int>> runs;
 
+  /// Строка открывает свёрнутый диапазон: сколько строк скрыто под маркером
+  /// (null = строка не свёрнута).
+  final int? foldHidden;
+
   const EditorRow({
     required this.row,
     required this.text,
     this.runs = const [],
+    this.foldHidden,
   });
 
   factory EditorRow.fromJson(Map<String, dynamic> json) {
@@ -27,10 +32,14 @@ class EditorRow {
                 [asInt(seg[0]), seg.length > 1 ? asInt(seg[1]) : 0],
           ]
         : const <List<int>>[];
+    final fold = json['fold'];
     return EditorRow(
       row: asInt(json['row']),
       text: (json['text'] as String?) ?? '',
       runs: runs,
+      foldHidden: fold is Map && fold['hidden'] is num
+          ? (fold['hidden'] as num).toInt()
+          : null,
     );
   }
 
@@ -38,6 +47,7 @@ class EditorRow {
         'row': row,
         'text': text,
         'runs': runs,
+        if (foldHidden != null) 'fold': {'hidden': foldHidden},
       };
 }
 

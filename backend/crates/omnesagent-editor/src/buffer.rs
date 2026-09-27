@@ -44,10 +44,8 @@ pub struct EditOp {
     pub text: String,
 }
 
-/// One display row of a `rows_snapshot` / `rows_changed` frame (render plan,
-/// `BACKEND_SPEC` §9.3). Line terminator stripped; `runs` is the run-length
-/// syntax coloring (`(len_utf16, style_id)` segments summing to the row's
-/// UTF-16 length; empty when the language has no highlighter).
+/// Одна отображаемая строка: у строки, открывающей свёрнутый диапазон,
+/// заполнено `fold` (render plan, BACKEND_SPEC §9.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowData {
     /// 0-based buffer row.
@@ -55,6 +53,26 @@ pub struct RowData {
     pub text: String,
     #[serde(default)]
     pub runs: Vec<(u32, u16)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold: Option<FoldInfo>,
+}
+
+/// Свёрнутый диапазон, начинающийся на этой строке.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FoldInfo {
+    /// Сколько строк буфера скрыто под маркером (не считая строку-маркер).
+    pub hidden: u32,
+}
+
+/// Операция над фолдами (`folds`-фрейм, §9.9). Диапазоны — buffer-строки,
+/// [start, end] включительно.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum FoldOp {
+    Fold { start: u32, end: u32 },
+    Unfold { start: u32, end: u32 },
+    FoldAll,
+    UnfoldAll,
 }
 
 /// Page of rows for the viewport (`rows_snapshot` frame payload).
@@ -107,6 +125,9 @@ pub struct EditorBuffer {
     pub(crate) runs_recompute_count: u64,
     #[cfg(not(test))]
     runs_recompute_count: u64,
+    /// Свёрнутые диапазоны (buffer-строки, [start, end] включительно),
+    /// отсортированы и не пересекаются.
+    folds: Vec<(u32, u32)>,
 }
 
 /// Строк в одном чанке подсветки.
@@ -147,6 +168,7 @@ impl EditorBuffer {
             read_only,
             runs_chunks: HashMap::new(),
             runs_recompute_count: 0,
+            folds: Vec::new(),
         }
     }
 
@@ -193,27 +215,36 @@ impl EditorBuffer {
 /// Rows for the viewport. `from`/`count` are clamped to the document.
 /// Syntax runs come lazily from the chunked highlight cache: an edit
 /// re-highlights only the chunk(s) it touched, never the whole document.
-pub fn rows(&mut self, from: u32, count: u32) -> RowsPage {
-    let total = self.num_lines();
-    let from = from.min(total);
-    let remaining = total - from;
-    let count = count.min(remaining);
-    let runs_all = self.runs_for_range(from, count);
-    let mut rows = Vec::with_capacity(count as usize);
-    for (offset, line) in (from..from + count).enumerate() {
-        rows.push(RowData {
-            row: line,
-            text: line_content(&self.buffer, line as usize),
-            runs: runs_all.get(offset).cloned().unwrap_or_default(),
-        });
+    pub fn rows(&mut self, from: u32, count: u32) -> RowsPage {
+        let total = self.num_lines();
+        let from = from.min(total);
+        let remaining = total - from;
+        let count = count.min(remaining);
+        let runs_all = self.runs_for_range(from, count);
+        let mut rows = Vec::with_capacity(count as usize);
+        for (offset, line) in (from..from + count).enumerate() {
+            // Маркер фолда: строка открывает свёрнутый диапазон.
+            let fold = self
+                .folds
+                .iter()
+                .find(|&&(s, _)| s == line)
+                .map(|&(s, e)| FoldInfo {
+                    hidden: e - s,
+                });
+            rows.push(RowData {
+                row: line,
+                text: line_content(&self.buffer, line as usize),
+                runs: runs_all.get(offset).cloned().unwrap_or_default(),
+                fold,
+            });
+        }
+        RowsPage {
+            rev: self.rev(),
+            from,
+            total_lines: total,
+            rows,
+        }
     }
-    RowsPage {
-        rev: self.rev(),
-        from,
-        total_lines: total,
-        rows,
-    }
-}
 
     /// Apply one `edit_ops` frame. All ops are positions in the pre-edit text
     /// and land in a single revision (single undo group). Overlapping ranges
@@ -267,6 +298,7 @@ pub fn rows(&mut self, from: u32, count: u32) -> RowsPage {
         let (_, _, inval) = self.buffer.edit(items, edit_type);
         let inval: InvalInfo = inval.into();
         self.invalidate_runs(inval.start_line, inval.new_count);
+        self.adjust_folds_after_edit(inval.start_line, inval.inval_count, inval.new_count);
 
         Ok(ApplyOutcome {
             rev: self.rev(),
@@ -279,6 +311,7 @@ pub fn rows(&mut self, from: u32, count: u32) -> RowsPage {
     pub fn reload(&mut self, content: String, set_pristine: bool) -> InvalInfo {
         let (_, _, inval) = self.buffer.reload(content.into(), set_pristine);
         self.runs_chunks.clear();
+        self.folds.clear();
         inval.into()
     }
 
@@ -350,6 +383,137 @@ pub fn rows(&mut self, from: u32, count: u32) -> RowsPage {
     pub(crate) fn undo_once(&mut self) -> Option<InvalInfo> {
         let (_, _, inval, _) = self.buffer.do_undo()?;
         Some(inval.into())
+    }
+
+    // ── Фолды (Ф1) ───────────────────────────────────────────────────────
+
+    /// Текущие свёрнутые диапазоны `[start, end]` включительно.
+    pub fn folds(&self) -> &[(u32, u32)] {
+        &self.folds
+    }
+
+    /// Применить операцию фолда; возвращает новое состояние. Диапазоны
+    /// клиппируются к документу, результат нормализован (отсортирован,
+    /// без пересечений).
+    pub fn set_folds(&mut self, op: FoldOp) -> Vec<(u32, u32)> {
+        let last = self.num_lines().saturating_sub(1);
+        match op {
+            FoldOp::Fold { start, end } => {
+                let (start, end) = (start.min(end).min(last), start.max(end).min(last));
+                if start < end {
+                    self.insert_fold(start, end);
+                }
+            }
+            FoldOp::Unfold { start, end } => {
+                let (start, end) = (start.min(end), start.max(end));
+                self.folds.retain(|&(s, e)| e < start || s > end);
+            }
+            FoldOp::FoldAll => {
+                self.folds.clear();
+                for (s, e) in self.fold_candidates() {
+                    self.insert_fold(s, e);
+                }
+            }
+            FoldOp::UnfoldAll => self.folds.clear(),
+        }
+        self.folds.clone()
+    }
+
+    fn insert_fold(&mut self, start: u32, end: u32) {
+        // Расширить до пересечений и слить: новый диапазон поглощает части
+        // существующих, чтобы фолды оставались непересекающимися.
+        let mut start = start;
+        let mut end = end;
+        self.folds.retain(|&(s, e)| {
+            if e + 1 < start || s > end + 1 {
+                true
+            } else {
+                start = start.min(s);
+                end = end.max(e);
+                false
+            }
+        });
+        let pos = self
+            .folds
+            .partition_point(|&(s, _)| s < start);
+        self.folds.insert(pos, (start, end));
+    }
+
+    /// Кандидаты фолдов по индентации: строка L сворачивается, если следующая
+    /// непустая строка имеет больший отступ; диапазон — до последней строки
+    /// блока (пустые строки внутри допускаются).
+    pub fn fold_candidates(&self) -> Vec<(u32, u32)> {
+        let total = self.num_lines() as usize;
+        let indent_of = |line: usize| -> Option<u32> {
+            let text = line_content(&self.buffer, line);
+            if text.trim().is_empty() {
+                return None;
+            }
+            let mut width = 0u32;
+            for ch in text.chars() {
+                match ch {
+                    ' ' => width += 1,
+                    '\t' => width += 4,
+                    _ => break,
+                }
+            }
+            Some(width)
+        };
+
+        let mut candidates = Vec::new();
+        let mut line = 0usize;
+        while line < total {
+            let Some(indent) = indent_of(line) else {
+                line += 1;
+                continue;
+            };
+            // Найти конец блока: последние подряд идущие строки глубже indent.
+            let mut block_end = None;
+            let mut probe = line + 1;
+            while probe < total {
+                match indent_of(probe) {
+                    Some(w) if w > indent => {
+                        block_end = Some(probe);
+                        probe += 1;
+                    }
+                    Some(_) => break,
+                    None => probe += 1, // пустые строки внутри блока
+                }
+            }
+            if let Some(end) = block_end {
+                candidates.push((line as u32, end as u32));
+            }
+            line += 1;
+        }
+        candidates
+    }
+
+    /// Подстройка фолдов под правку: диапазон [start, start+inval_count)
+    /// заменён на new_count строк — пересекающиеся фолды снимаются,
+    /// последующие сдвигаются на дельту.
+    fn adjust_folds_after_edit(&mut self, start: u32, inval_count: u32, new_count: u32) {
+        let replaced_end = start + inval_count;
+        let delta = new_count as i64 - inval_count as i64;
+        let mut adjusted = Vec::with_capacity(self.folds.len());
+        for &(s, e) in &self.folds {
+            if e < start || s >= replaced_end {
+                let ns = if s >= replaced_end {
+                    (s as i64 + delta).max(0) as u32
+                } else {
+                    s
+                };
+                let ne = if e >= replaced_end {
+                    (e as i64 + delta).max(ns as i64) as u32
+                } else {
+                    e
+                };
+                if ns < ne {
+                    adjusted.push((ns, ne));
+                }
+            }
+        }
+        adjusted.sort_unstable();
+        self.folds = adjusted;
     }
 }
 
@@ -535,12 +699,62 @@ mod tests {
 
     #[test]
     fn pos_roundtrip_through_offsets() {
-        let b = buf("Привет\nмир");
+        let mut b = buf("Привет\nмир");
         // Byte offset 6 = after "При" (3 Cyrillic chars, 2 bytes each).
         let (line, col) = pos_utf16_of_offset(&b.buffer, 6);
         assert_eq!((line, col), (0, 3));
         assert_eq!(offset_of_pos_utf16(&b.buffer, line, col), 6);
         // Byte offset 13 = start of "мир" (line 1, col 0).
         assert_eq!(pos_utf16_of_offset(&b.buffer, 13), (1, 0));
+    }
+
+    #[test]
+    fn fold_set_unfold_and_merge() {
+        let mut b = buf("a {\n  b {\n    c\n  }\n  d\n}\ne\n");
+        b.set_folds(FoldOp::Fold { start: 0, end: 2 });
+        b.set_folds(FoldOp::Fold { start: 1, end: 3 });
+        // Пересекающиеся фолды сливаются в один.
+        assert_eq!(b.folds(), &[(0, 3)]);
+        b.set_folds(FoldOp::Unfold { start: 0, end: 3 });
+        assert!(b.folds().is_empty());
+        // Клиппинг к документу.
+        b.set_folds(FoldOp::Fold { start: 5, end: 99 });
+        assert_eq!(b.folds(), &[(5, 7)]);
+    }
+
+    #[test]
+    fn fold_candidates_by_indent() {
+        let b = buf("fn a() {\n  fn b() {\n    x\n  }\n  y\n}\n\nz\n");
+        let candidates = b.fold_candidates();
+        // Строка 3 ("  }") не глубже строки 1 — блок (1,2), не (1,3).
+        assert_eq!(candidates, vec![(0, 4), (1, 2)]);
+    }
+
+    #[test]
+    fn rows_mark_fold_starts() {
+        let mut b = buf("a\nb\nc\nd\n");
+        b.set_folds(FoldOp::Fold { start: 1, end: 2 });
+        let page = b.rows(0, 10);
+        assert!(page.rows[0].fold.is_none());
+        assert_eq!(page.rows[1].fold, Some(FoldInfo { hidden: 1 }));
+        assert!(page.rows[2].fold.is_none());
+    }
+
+    #[test]
+    fn folds_shift_after_edits() {
+        let mut b = buf("l0\nl1\nl2\nl3\nl4\n");
+        b.set_folds(FoldOp::Fold { start: 2, end: 3 });
+        // Вставка строки выше фолда сдвигает его вниз.
+        let base = b.rev();
+        b.apply_ops(
+            base,
+            &[op(0, 0, 0, 0, "new\n")],
+        )
+        .unwrap();
+        assert_eq!(b.folds(), &[(3, 4)]);
+        // Удаление свёрнутого диапазона снимает фолд.
+        let base = b.rev();
+        b.apply_ops(base, &[op(3, 0, 5, 0, "")]).unwrap();
+        assert!(b.folds().is_empty());
     }
 }

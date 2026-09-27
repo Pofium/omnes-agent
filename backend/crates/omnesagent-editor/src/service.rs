@@ -16,24 +16,28 @@ use tokio::sync::broadcast;
 use crate::buffer::{ApplyOutcome, EditOp, EditorBuffer, RowsPage};
 use crate::error::EditorError;
 
-/// Events pushed to every connected client of a buffer. The WS channel maps
-/// these onto `rows_changed` / `save_state` / `remote_ops` frames.
-#[derive(Debug, Clone, Serialize)]
-pub enum BufferEvent {
-    Edited {
-        rev: u64,
-        start_line: u32,
-        inval_count: u32,
-        new_count: u32,
-    },
-    Saved {
-        rev: u64,
-    },
-    Reloaded {
-        rev: u64,
-    },
-    Closed,
-}
+    /// Events pushed to every connected client of a buffer. The WS channel maps
+    /// these onto `rows_changed` / `save_state` / `remote_ops` frames.
+    #[derive(Debug, Clone, Serialize)]
+    pub enum BufferEvent {
+        Edited {
+            rev: u64,
+            start_line: u32,
+            inval_count: u32,
+            new_count: u32,
+        },
+        Saved {
+            rev: u64,
+        },
+        Reloaded {
+            rev: u64,
+        },
+        /// Фолды буфера изменились — клиенты получают `folds_state`.
+        FoldsChanged {
+            folds: Vec<(u32, u32)>,
+        },
+        Closed,
+    }
 
 /// Metadata snapshot served by `GET /api/v1/editor/buffers` and used in the
 /// `hello` frame.
@@ -388,6 +392,41 @@ impl EditorService {
             });
         }
         Ok(fs::read(&canonical)?)
+    }
+
+    /// Применить операцию фолда и разослать новое состояние всем клиентам
+    /// буфера (включая инициатора — состояние единственное).
+    pub fn set_folds(&self, buffer_id: u64, op: crate::buffer::FoldOp) -> Result<Vec<(u32, u32)>, EditorError> {
+        let mut registry = self.registry.lock().expect("registry mutex poisoned");
+        let entry = registry
+            .by_id
+            .get_mut(&buffer_id)
+            .ok_or_else(|| not_found(buffer_id))?;
+        let folds = entry.buffer.set_folds(op);
+        let _ = entry.events.send(BufferEvent::FoldsChanged {
+            folds: folds.clone(),
+        });
+        Ok(folds)
+    }
+
+    /// Текущие свёрнутые диапазоны буфера.
+    pub fn folds(&self, buffer_id: u64) -> Result<Vec<(u32, u32)>, EditorError> {
+        let registry = self.registry.lock().expect("registry mutex poisoned");
+        let entry = registry
+            .by_id
+            .get(&buffer_id)
+            .ok_or_else(|| not_found(buffer_id))?;
+        Ok(entry.buffer.folds().to_vec())
+    }
+
+    /// Кандидаты фолдов по индентации (для «свернуть всё» и UI-подсказок).
+    pub fn fold_candidates(&self, buffer_id: u64) -> Result<Vec<(u32, u32)>, EditorError> {
+        let registry = self.registry.lock().expect("registry mutex poisoned");
+        let entry = registry
+            .by_id
+            .get(&buffer_id)
+            .ok_or_else(|| not_found(buffer_id))?;
+        Ok(entry.buffer.fold_candidates())
     }
 
     /// Subscribe to buffer events (one receiver per WS connection).

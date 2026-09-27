@@ -102,7 +102,8 @@ frontend/
 | `remote_ops` | S $\to$ C | Правки других реплик (агент, второе окно) с автором — никогда не попадают в локальный undo-стек. | [ ] Ф7 |
 | `cursor` / `selection` | C $\to$ S | Позиции курсоров и выделений (якоря). | [ ] Ф7 |
 | `presence` | S $\to$ C | Где работает агент (диапазон, метка сессии) для режима «следовать за агентом». | [ ] |
-| `folds` | C $\to$ S | Свернуть/развернуть диапазон, «свернуть всё». | [ ] |
+| `folds` | C $\to$ S | Свернуть/развернуть диапазон, «свернуть всё». | [x] Ф1 |
+| `folds_state` | S $\to$ C | Полное состояние фолдов буфера `[[start,end],...]` после каждой операции (рассылка всем клиентам). | [x] Ф1 |
 | `diagnostics` | S $\to$ C | Диагностики файла (severity, диапазоны в UTF-16, source). | [ ] |
 | `lsp_request` / `lsp_response` | C $\leftrightarrow$ S | Запросы LSP-фич: completion (+resolve), hover, definition/declaration/references, code_action, signature_help, format, inlay_hints, semantic_tokens, document_symbols. | [ ] |
 | `server_status` / `work_done_progress` | S $\to$ C | Состояние языковых серверов и прогресс длительных операций. | [ ] |
@@ -187,9 +188,9 @@ frontend/
 **Состав модуля** (`frontend/desktop/lib/features/inspector/editor/`):
 
 - [x] `editor_controller.dart` — состояние вьюпорта буфера: видимый диапазон display-строк, кэш строк, курсоры/выделения, undo-стек локальных правок, грязный флаг; подписка на канал через `EditorWsClient`. *(Ф0: одиночный курсор, undo только своих правок; мультикурсор — Ф2.)*
-- [x] `editor_client.dart` — обёртка над `/ws/editor/{buffer_id}`: подписка, отправка `edit_ops`/`cursor`/`selection`/`folds`, буферизация при реконнекте, запрос `rows_snapshot` при рассинхронизации. *(Ф0: `edit_ops` + resync + REST-fallback сохранения; `folds` — Ф1.)*
+- [x] `editor_client.dart` — обёртка над `/ws/editor/{buffer_id}`: подписка, отправка `edit_ops`/`cursor`/`selection`/`folds`, буферизация при реконнекте, запрос `rows_snapshot` при рассинхронизации. *(Ф0+Ф1: `edit_ops` + resync + REST-fallback сохранения + `folds`/`folds_state`.)*
 - [x] `editor_viewport.dart` — виртуализированный вьюпорт на `CustomPaint` + `TextInputClient`: рисуются только видимые строки, шейпинг строк кэшируется (`Paragraph`/`TextPainter` на layout-строку), `RepaintBoundary` на вьюпорт, горизонтальный и вертикальный скролл, курсор с мерцанием, drag-выделение, хит-тест позиции. *(Ф0: моноширинный слой, колесо/скроллбар, IME-ввод через дифф текущей строки. Ф1: покраска `runs` — сегменты `TextSpan` по таблице стилей из `hello.styles`, цвета/жирность/курсив из общей темы шлюза; фолды/инлайны — дальше по фазе.)*
-- [x] `editor_gutter.dart` — номера строк (абсолютные/относительные), маркеры git-диффа, маркеры диагностик и правок агента, индикаторы фолдов. *(Ф0: только абсолютные номера; маркеры/фолды — Ф1/Ф4.)*
+- [x] `editor_gutter.dart` — номера строк (абсолютные/относительные), маркеры git-диффа, маркеры диагностик и правок агента, индикаторы фолдов. *(Ф1: номера + стрелки фолдов (залитая = свёрнут, контурная = кандидат по индентации), клик по стрелке — toggle через `folds`-фрейм, скролл-математика по видимым ординалам; git/диагностики — Ф4/Ф5.)*
 - [ ] `find_replace_bar.dart` — поиск/замена в файле (regex, case, whole word, «заменить все»), результаты как подсветка диапазонов; кнопки «предыдущее/следующее». *(Ф6.)*
 - [ ] `completion_menu.dart`, `hover_popover.dart`, `signature_help.dart` — LSP-UI поверх вьюпорта с привязкой к позиции курсора.
 - [ ] `difficulties_panel.dart` → `diagnostics_panel.dart` — список диагностик файла с переходом к позиции.

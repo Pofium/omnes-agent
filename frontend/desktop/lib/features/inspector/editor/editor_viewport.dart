@@ -455,7 +455,7 @@ class _EditorViewportState extends State<EditorViewport> {
 
   double get _maxScrollY => math.max(
         0,
-        widget.controller.rows.length * widget.metrics.lineHeight -
+        widget.controller.visibleRowCount * widget.metrics.lineHeight -
             (context.size?.height ?? 0) +
             widget.metrics.lineHeight,
       );
@@ -477,7 +477,8 @@ class _EditorViewportState extends State<EditorViewport> {
 
   void _ensureCaretVisible() {
     final m = widget.metrics;
-    final caretTop = widget.controller.caretRow * m.lineHeight;
+    final caretTop =
+        widget.controller.visibleBefore(widget.controller.caretRow) * m.lineHeight;
     final viewportH = context.size?.height ?? 400;
     if (caretTop < _scrollY) {
       setState(() => _scrollY = caretTop);
@@ -499,7 +500,10 @@ class _EditorViewportState extends State<EditorViewport> {
   (int, int) _hitTest(Offset local) {
     final m = widget.metrics;
     final maxRow = math.max(0, widget.controller.rows.length - 1);
-    final row = (((_scrollY + local.dy) / m.lineHeight).floor().clamp(0, maxRow)).toInt();
+    final ordinal =
+        (((_scrollY + local.dy) / m.lineHeight).floor().clamp(0, math.max(0, widget.controller.visibleRowCount - 1)))
+            .toInt();
+    final row = widget.controller.rowAtVisible(ordinal).clamp(0, maxRow);
     final maxCol = widget.controller.rows.isEmpty ? 0 : widget.controller.rows[row].length;
     final col = (((_scrollX + local.dx) / m.charWidth).round().clamp(0, maxCol)).toInt();
     return (row, col);
@@ -584,7 +588,7 @@ class _EditorViewportState extends State<EditorViewport> {
 
   Widget _buildScrollbarOverlay(BoxConstraints constraints, ThemeData theme) {
     final viewportH = constraints.maxHeight;
-    final docH = widget.controller.rows.length * widget.metrics.lineHeight;
+    final docH = widget.controller.visibleRowCount * widget.metrics.lineHeight;
     if (docH <= viewportH) return const SizedBox.expand();
     final thumbH = math.max(32.0, viewportH * viewportH / docH);
     final maxY = docH - viewportH;
@@ -717,18 +721,25 @@ class _EditorPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(Offset.zero & size, Paint()..color = background);
     final m = metrics;
-    final firstRow = math.max(0, (scrollY / m.lineHeight).floor());
-    final visibleCount = (size.height / m.lineHeight).ceil() + 1;
-    final lastRow = math.min(controller.rows.length - 1, firstRow + visibleCount);
     if (controller.rows.isEmpty) return;
 
     final sel = controller.selectionRange;
     final style = m.textStyle(textColor);
     final revKey = controller.rev;
 
-    for (var row = firstRow; row <= lastRow; row++) {
+    // Обход видимых строк: скрытые пропускаются, на строке-маркере фолда
+    // рисуется «… N строк», затем прыжок к концу диапазона.
+    final ordinal0 = ((scrollY / m.lineHeight)
+            .floor()
+            .clamp(0, math.max(0, controller.visibleRowCount - 1)))
+        .toInt();
+    var y = ordinal0 * m.lineHeight - scrollY;
+    var row = controller.rowAtVisible(ordinal0);
+    final maxRow = controller.rows.length - 1;
+
+    while (row <= maxRow && y < size.height + m.lineHeight) {
       final text = controller.rows[row];
-      final y = row * m.lineHeight - scrollY;
+      final fold = controller.foldEndForRow(row);
       if (row == controller.caretRow && !controller.hasSelection) {
         canvas.drawRect(
           Rect.fromLTWH(0, y, size.width, m.lineHeight),
@@ -749,34 +760,47 @@ class _EditorPainter extends CustomPainter {
           );
         }
       }
-      if (text.isEmpty) continue;
-      final runs = controller.rowRuns(row, revKey);
-      final runsKey = '$revKey|${runs.map((s) => '${s[0]}:${s[1]}').join(',')}';
-      if (_painterKeys[row] == runsKey && _painterCache[row] != null) {
-        // Cache hit — repaint the cached painter.
-        canvas.save();
-        canvas.translate(-scrollX, y);
-        _painterCache[row]!.paint(canvas, Offset.zero);
-        canvas.restore();
-        continue;
+      _paintRowText(canvas, row, text, style, revKey, -scrollX, y);
+      if (fold != null) {
+        final marker = TextPainter(
+          text: TextSpan(
+            text: '  … ${fold - row} строк скрыто',
+            style: m.textStyle(textColor.withOpacity(0.4)).copyWith(fontStyle: FontStyle.italic),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        marker.paint(canvas, Offset(text.length * m.charWidth - scrollX + 6, y));
       }
-      final tp = _painterFor(row, _rowSpan(text, style, runs));
-      _painterKeys[row] = runsKey;
-      canvas.save();
-      canvas.translate(-scrollX, y);
-      tp.paint(canvas, Offset.zero);
-      canvas.restore();
+
+      y += m.lineHeight;
+      row = fold != null ? fold + 1 : row + 1;
     }
 
     // Caret.
     if (showCaret) {
       final cx = controller.caretCol * m.charWidth - scrollX;
-      final cy = controller.caretRow * m.lineHeight - scrollY;
+      final cy = controller.visibleBefore(controller.caretRow) * m.lineHeight - scrollY;
       canvas.drawRect(
         Rect.fromLTWH(cx, cy, 2, m.lineHeight),
         Paint()..color = caretColor,
       );
     }
+  }
+
+  /// Отрисовка текста строки с кэшем пейнтеров (ключ — ревизия + runs).
+  void _paintRowText(Canvas canvas, int row, String text, TextStyle style,
+      int revKey, double dx, double dy) {
+    final runs = controller.rowRuns(row, revKey);
+    final runsKey = '$revKey|${runs.map((s) => '${s[0]}:${s[1]}').join(',')}';
+    var tp = _painterCache[row];
+    if (tp == null || _painterKeys[row] != runsKey) {
+      tp = _painterFor(row, _rowSpan(text, style, runs));
+      _painterKeys[row] = runsKey;
+    }
+    canvas.save();
+    canvas.translate(dx, dy);
+    tp.paint(canvas, Offset.zero);
+    canvas.restore();
   }
 
   TextPainter _painterFor(int row, TextSpan span) {

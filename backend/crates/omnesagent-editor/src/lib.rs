@@ -19,7 +19,9 @@ pub mod highlight;
 pub mod language;
 pub mod service;
 
-pub use buffer::{ApplyOutcome, EditOp, EditorBuffer, EditorPos, InvalInfo, RowData, RowsPage};
+pub use buffer::{
+    ApplyOutcome, EditOp, EditorBuffer, EditorPos, FoldInfo, FoldOp, InvalInfo, RowData, RowsPage,
+};
 pub use error::EditorError;
 pub use language::language_id_from_path;
 pub use service::{BufferEvent, BufferInfo, EditorService};

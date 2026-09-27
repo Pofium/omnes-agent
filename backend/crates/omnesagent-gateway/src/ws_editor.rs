@@ -105,6 +105,7 @@ async fn handle_editor_socket(
         "encoding": "utf-8",
         "read_only": info.read_only,
         "total_lines": info.num_lines,
+        "folds": editor.folds(buffer_id).unwrap_or_default(),
         "settings": {
             "tab_size": 4,
             "hard_tabs": false,
@@ -148,6 +149,14 @@ async fn handle_editor_socket(
                                 last_sent_rev = rev;
                             }
                         }
+                    }
+                    Ok(BufferEvent::FoldsChanged { folds }) => {
+                        let frame = json!({
+                            "type": "folds_state",
+                            "rev": last_sent_rev,
+                            "folds": folds,
+                        });
+                        if tx.send(frame.to_string()).await.is_err() { break; }
                     }
                     Ok(BufferEvent::Saved { rev }) => {
                         let frame = json!({
@@ -260,6 +269,21 @@ async fn handle_editor_socket(
                                     Err(e) => {
                                         let _ = tx.send(json!({
                                             "type": "error", "code": "save_failed",
+                                            "message": format!("{e}"),
+                                        }).to_string()).await;
+                                    }
+                                }
+                            }
+                            Some("folds") => {
+                                match serde_json::from_value::<omnesagent_editor::FoldOp>(frame) {
+                                    Ok(op) => {
+                                        let _ = editor.set_folds(buffer_id, op);
+                                        // Новое состояние уходит всем через
+                                        // событие FoldsChanged (включая автора).
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(json!({
+                                            "type": "error", "code": "bad_folds",
                                             "message": format!("{e}"),
                                         }).to_string()).await;
                                     }

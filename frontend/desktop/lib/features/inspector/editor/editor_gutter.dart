@@ -1,6 +1,6 @@
-// Editor gutter: line numbers for the visible window, current-row highlight.
-// FRONTEND_SPEC.md §5.5 (editor_gutter.dart). Git/diagnostic/agent markers and
-// fold indicators arrive with F1/F4 (BACKEND_SPEC §9.3, §9.8).
+// Editor gutter: line numbers, current-row highlight and fold triangles
+// (click — свернуть/развернуть кандидат; FRONTEND_SPEC §5.5). Git/diagnostic
+// маркеры arrive with F4.
 
 import 'dart:math' as math;
 
@@ -29,22 +29,41 @@ class EditorGutter extends StatelessWidget {
     final isDark = theme.brightness == Brightness.dark;
     final bg = isDark ? const Color(0xFF0B1120) : const Color(0xFFF1F5F9);
     final border = isDark ? const Color(0xFF1E293B) : const Color(0xFFE2E8F0);
-    final muted = theme.colorScheme.outline;
-    final active = theme.colorScheme.onSurface;
 
     return ListenableBuilder(
       listenable: controller,
       builder: (context, _) {
-        return CustomPaint(
-          size: Size(width, double.infinity),
-          painter: _GutterPainter(
-            controller: controller,
-            metrics: metrics,
-            scrollY: scrollY,
-            background: bg,
-            borderColor: border,
-            mutedColor: muted,
-            activeColor: active,
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapUp: (details) {
+            // Клик по стрелке фолда — сворачивание/разворачивание.
+            final m = metrics;
+            final ordinal =
+                (((scrollY + details.localPosition.dy) / m.lineHeight).floor())
+                    .clamp(0, math.max(0, controller.visibleRowCount - 1))
+                    .toInt();
+            final row = controller.rowAtVisible(ordinal);
+            final isFoldCandidate = controller.foldEndForRow(row) != null ||
+                controller.foldCandidates.any((c) => c[0] == row);
+            if (isFoldCandidate) {
+              controller.toggleFoldAt(row);
+            } else {
+              // Клик по номеру строки — просто каретка.
+              controller.setSelection(row: row, col: 0);
+            }
+          },
+          child: CustomPaint(
+            size: Size(width, double.infinity),
+            painter: _GutterPainter(
+              controller: controller,
+              metrics: metrics,
+              scrollY: scrollY,
+              background: bg,
+              borderColor: border,
+              mutedColor: theme.colorScheme.outline,
+              activeColor: theme.colorScheme.onSurface,
+              foldColor: theme.colorScheme.primary,
+            ),
           ),
         );
       },
@@ -60,6 +79,7 @@ class _GutterPainter extends CustomPainter {
   final Color borderColor;
   final Color mutedColor;
   final Color activeColor;
+  final Color foldColor;
 
   _GutterPainter({
     required this.controller,
@@ -69,6 +89,7 @@ class _GutterPainter extends CustomPainter {
     required this.borderColor,
     required this.mutedColor,
     required this.activeColor,
+    required this.foldColor,
   });
 
   @override
@@ -82,9 +103,12 @@ class _GutterPainter extends CustomPainter {
 
     if (controller.rows.isEmpty) return;
     final m = metrics;
-    final firstRow = math.max(0, (scrollY / m.lineHeight).floor());
-    final visibleCount = (size.height / m.lineHeight).ceil() + 1;
-    final lastRow = math.min(controller.rows.length - 1, firstRow + visibleCount);
+    final ordinal0 =
+        ((scrollY / m.lineHeight).floor().clamp(0, math.max(0, controller.visibleRowCount - 1)))
+            .toInt();
+    var y = ordinal0 * m.lineHeight - scrollY;
+    var row = controller.rowAtVisible(ordinal0);
+    final maxRow = controller.rows.length - 1;
 
     final baseStyle = TextStyle(
       fontFamily: 'Consolas',
@@ -98,15 +122,44 @@ class _GutterPainter extends CustomPainter {
       color: activeColor,
     );
 
-    for (var row = firstRow; row <= lastRow; row++) {
-      final y = row * m.lineHeight - scrollY;
+    while (row <= maxRow && y < size.height + m.lineHeight) {
       final isActive = row == controller.caretRow;
       final tp = TextPainter(
         text: TextSpan(text: '${row + 1}', style: isActive ? activeStyle : baseStyle),
         textDirection: TextDirection.ltr,
       )..layout();
-      tp.paint(canvas, Offset(size.width - tp.width - 10, y + (m.lineHeight - tp.height) / 2));
+      tp.paint(canvas, Offset(size.width - tp.width - 22, y + (m.lineHeight - tp.height) / 2));
+
+      // Стрелка фолда: залитая у свёрнутых, контурная у кандидатов.
+      final foldEnd = controller.foldEndForRow(row);
+      final isCandidate =
+          foldEnd != null || controller.foldCandidates.any((c) => c[0] == row);
+      if (isCandidate) {
+        _drawFoldArrow(canvas, Offset(size.width - 10, y + m.lineHeight / 2),
+            filled: foldEnd != null);
+      }
+
+      y += m.lineHeight;
+      final nextFold = controller.foldEndForRow(row);
+      row = nextFold != null ? nextFold + 1 : row + 1;
     }
+  }
+
+  void _drawFoldArrow(Canvas canvas, Offset center, {required bool filled}) {
+    final w = 4.0;
+    final h = 4.5;
+    final path = Path()
+      ..moveTo(center.dx - w / 2, center.dy - h / 2)
+      ..lineTo(center.dx + w / 2, center.dy)
+      ..lineTo(center.dx - w / 2, center.dy + h / 2)
+      ..close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = filled ? foldColor : foldColor.withOpacity(0.5)
+        ..style = filled ? PaintingStyle.fill : PaintingStyle.stroke
+        ..strokeWidth = 1.2,
+    );
   }
 
   @override

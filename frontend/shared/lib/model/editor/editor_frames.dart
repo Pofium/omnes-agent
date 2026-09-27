@@ -73,6 +73,9 @@ class EditorFrame {
   final EditorSettings? settings;
   final List<EditorStyleEntry> styles;
 
+  /// Свёрнутые диапазоны буфера [[start, end], ...] (hello / folds_state).
+  final List<List<int>> folds;
+
   const EditorFrame({
     required this.type,
     this.bufferId,
@@ -97,6 +100,7 @@ class EditorFrame {
     this.rows = const [],
     this.settings,
     this.styles = const [],
+    this.folds = const [],
   });
 
   factory EditorFrame.fromJson(Map<String, dynamic> json) {
@@ -136,6 +140,18 @@ class EditorFrame {
               .map(EditorStyleEntry.fromJson)
               .toList(growable: false) ??
           const [],
+      folds: (json['folds'] as List?)
+              ?.whereType<List>()
+              .map((pair) => [
+                    (pair.length > 0 ? pair[0] : 0) is num
+                        ? (pair[0] as num).toInt()
+                        : 0,
+                    pair.length > 1
+                        ? ((pair[1] as num?)?.toInt() ?? 0)
+                        : 0,
+                  ])
+              .toList(growable: false) ??
+          const [],
     );
   }
 }
@@ -163,6 +179,20 @@ Map<String, dynamic> editorSaveFrame() => {'type': 'save'};
 
 Map<String, dynamic> editorCursorFrame({required int line, required int col}) {
   return {'type': 'cursor', 'line': line, 'col': col};
+}
+
+/// Фрейм `folds` (C→S, §9.9): op = fold|unfold (start/end) | fold_all | unfold_all.
+Map<String, dynamic> editorFoldsFrame({
+  required String op,
+  int? start,
+  int? end,
+}) {
+  return {
+    'type': 'folds',
+    'op': op,
+    if (start != null) 'start': start,
+    if (end != null) 'end': end,
+  };
 }
 
 Map<String, dynamic> editorPingFrame() => {'type': 'ping'};

@@ -17,6 +17,7 @@ class EditorClient {
   EditorWsClient? _ws;
   StreamSubscription<EditorFrame>? _frameSub;
   StreamSubscription<EditorEditOp>? _opSub;
+  StreamSubscription<Map<String, dynamic>>? _cmdSub;
   int _opSeq = 0;
 
   /// Optimistically sent, not-yet-confirmed edits as (opId, baseRev) pairs.
@@ -61,6 +62,9 @@ class EditorClient {
     _ws = ws;
     _frameSub = ws.stream.listen(_onFrame);
     _opSub ??= controller.opStream.listen(_onLocalOp);
+    _cmdSub ??= controller.frameStream.listen((frame) {
+      ws.send(frame);
+    });
     await ws.connect();
     if (!ws.isConnected) {
       controller.markOffline();
@@ -105,6 +109,8 @@ class EditorClient {
         }
       case 'save_state':
         controller.applySaveState(frame);
+      case 'folds_state':
+        controller.applyFoldsState(frame);
       case 'error':
         if (frame.code == 'buffer_closed') {
           controller.markClosed();
@@ -163,6 +169,7 @@ class EditorClient {
   void dispose() {
     _frameSub?.cancel();
     _opSub?.cancel();
+    _cmdSub?.cancel();
     _ws?.dispose();
   }
 }

@@ -91,6 +91,20 @@ class EditorBufferController extends ChangeNotifier {
   /// (BACKEND_SPEC §9.4 — одна тема для шлюза и клиента).
   final List<EditorStyleEntry> styleTable = <EditorStyleEntry>[];
 
+  /// Свёрнутые диапазоны [[start, end], ...] — buffer-строки включительно,
+  /// отсортированы. Единственный источник — шлюз (folds_state).
+  final List<List<int>> folds = <List<int>>[];
+
+  /// Кандидаты фолдов по индентации (для стрелок в гуттере), пересчитываются
+  /// вместе с размерами строк.
+  final List<List<int>> foldCandidates = <List<int>>[];
+
+  /// Команды фолдов и прочие сырые фреймы → EditorClient → шлюз.
+  final StreamController<Map<String, dynamic>> _frameSink =
+      StreamController<Map<String, dynamic>>.broadcast();
+
+  Stream<Map<String, dynamic>> get frameStream => _frameSink.stream;
+
   // ── Caret / selection ────────────────────────────────────────────────
   int caretRow = 0;
   int caretCol = 0;
@@ -147,6 +161,9 @@ class EditorBufferController extends ChangeNotifier {
     caretCol = 0;
     anchorRow = null;
     anchorCol = null;
+    folds.clear();
+    _runsByRow.clear();
+    _runsRev = rev;
     _undoStack.clear();
     _redoStack.clear();
     _recomputeMaxRowLen();
@@ -169,8 +186,153 @@ class EditorBufferController extends ChangeNotifier {
       // Buffer moved on while we were opening — full resync.
       rev = frame.rev!;
     }
+    if (frame.folds.isNotEmpty || frame.type == 'hello') {
+      folds
+        ..clear()
+        ..addAll(frame.folds);
+    }
     lastError = null;
     notifyListeners();
+  }
+
+  /// `folds_state`: новое состояние фолдов от шлюза. Каретка, попавшая в
+  /// скрытую область, подтягивается к началу диапазона.
+  void applyFoldsState(EditorFrame frame) {
+    folds
+      ..clear()
+      ..addAll(frame.folds);
+    _clampCaret();
+    notifyListeners();
+  }
+
+  // ── Фолды: видимая геометрия ─────────────────────────────────────────
+
+  bool isRowHidden(int row) {
+    for (final f in folds) {
+      if (row > f[0] && row <= f[1]) return true;
+      if (f[0] >= row) break;
+    }
+    return false;
+  }
+
+  /// Конец свёрнутого диапазона, если [row] — строка-маркер, иначе null.
+  int? foldEndForRow(int row) {
+    for (final f in folds) {
+      if (f[0] == row) return f[1];
+      if (f[0] > row) break;
+    }
+    return null;
+  }
+
+  /// Сколько скрытых строк выше [row] (не считая самой строки).
+  int _hiddenAbove(int row) {
+    var hidden = 0;
+    for (final f in folds) {
+      if (f[0] >= row) break;
+      hidden += (f[1] < row ? f[1] : row - 1) - f[0] + 1;
+    }
+    return hidden;
+  }
+
+  /// Видимый ординал строки (сколько видимых строк выше неё).
+  int visibleBefore(int row) => row - _hiddenAbove(row);
+
+  /// Buffer-строка по видимому ординалу; ординал внутри свёрнутого диапазона
+  /// схлопывается к его концу.
+  int rowAtVisible(int ordinal) {
+    var r = ordinal;
+    for (final f in folds) {
+      if (r >= f[0]) {
+        r = f[1] + 1 + (r - f[0]);
+      } else {
+        break;
+      }
+    }
+    return r.clamp(0, rows.isEmpty ? 0 : rows.length - 1);
+  }
+
+  int get hiddenRowCount {
+    var hidden = 0;
+    for (final f in folds) {
+      hidden += f[1] - f[0] + 1;
+    }
+    return hidden;
+  }
+
+  int get visibleRowCount => rows.length - hiddenRowCount;
+
+  /// Пересчитать кандидатов фолдов по индентации (вызывается из
+  /// [_recomputeMaxRowLen]).
+  void _recomputeFoldCandidates() {
+    foldCandidates.clear();
+    int? indentOf(int line) {
+      if (line >= rows.length) return null;
+      final text = rows[line];
+      if (text.trim().isEmpty) return null;
+      var width = 0;
+      for (final cu in text.codeUnits) {
+        if (cu == 0x20) {
+          width++;
+        } else if (cu == 0x09) {
+          width += 4;
+        } else {
+          break;
+        }
+      }
+      return width;
+    }
+    var line = 0;
+    while (line < rows.length) {
+      final indent = indentOf(line);
+      if (indent == null) {
+        line++;
+        continue;
+      }
+      int? blockEnd;
+      var probe = line + 1;
+      while (probe < rows.length) {
+        final w = indentOf(probe);
+        if (w != null && w > indent) {
+          blockEnd = probe;
+          probe++;
+        } else if (w == null) {
+          probe++;
+        } else {
+          break;
+        }
+      }
+      if (blockEnd != null) {
+        foldCandidates.add([line, blockEnd]);
+      }
+      line++;
+    }
+  }
+
+  /// Свернуть/развернуть кандидат на [row]; отправляет `folds` на шлюз —
+  /// состояние вернётся рассылкой `folds_state`.
+  void toggleFoldAt(int row) {
+    if (readOnly || rows.isEmpty) return;
+    // Уже свёрнут здесь — развернуть.
+    for (final f in folds) {
+      if (f[0] == row) {
+        if (!_frameSink.isClosed) {
+          _frameSink.add(editorFoldsFrame(op: 'unfold', start: f[0], end: f[1]));
+        }
+        return;
+      }
+    }
+    for (final c in foldCandidates) {
+      if (c[0] == row) {
+        // Каретка внутрь свёрнутого не должна проваливаться.
+        if (caretRow > row && caretRow <= c[1]) {
+          setSelection(row: row, col: caretCol.clamp(0, rows[row].length));
+        }
+        if (!_frameSink.isClosed) {
+          _frameSink.add(editorFoldsFrame(op: 'fold', start: c[0], end: c[1]));
+        }
+        return;
+      }
+    }
   }
 
   void applySnapshot(EditorFrame frame) {
@@ -252,7 +414,17 @@ class EditorBufferController extends ChangeNotifier {
   /// Vertical caret movement preserving a "goal column" is handled by the
   /// viewport (it owns pixel metrics); here we only shift by rows.
   void moveCaret({required int deltaRow, int? targetCol, required bool extend}) {
-    final newRow = (caretRow + deltaRow).clamp(0, rows.isEmpty ? 0 : rows.length - 1);
+    var newRow = (caretRow + deltaRow).clamp(0, rows.isEmpty ? 0 : rows.length - 1);
+    // Не заезжать в свёрнутую область — подтягиваемся к началу фолда.
+    if (isRowHidden(newRow)) {
+      for (final f in folds) {
+        if (newRow > f[0] && newRow <= f[1]) {
+          newRow = deltaRow > 0 ? f[1] + 1 : f[0];
+          break;
+        }
+      }
+      newRow = newRow.clamp(0, rows.isEmpty ? 0 : rows.length - 1);
+    }
     final col = (targetCol ?? caretCol).clamp(0, rows[newRow].length);
     if (extend && anchorRow == null) {
       anchorRow = caretRow;
@@ -511,10 +683,24 @@ class EditorBufferController extends ChangeNotifier {
       return;
     }
     caretRow = caretRow.clamp(0, rows.length - 1);
+    // Каретка не остаётся в свёрнутой области — подтягивается к началу фолда.
+    if (isRowHidden(caretRow)) {
+      for (final f in folds) {
+        if (caretRow > f[0] && caretRow <= f[1]) {
+          caretRow = f[0];
+          break;
+        }
+      }
+    }
     caretCol = caretCol.clamp(0, rows[caretRow].length);
     if (anchorRow != null) {
       anchorRow = anchorRow!.clamp(0, rows.length - 1);
-      anchorCol = anchorCol!.clamp(0, rows[anchorRow!].length);
+      if (isRowHidden(anchorRow!)) {
+        anchorRow = null;
+        anchorCol = null;
+      } else {
+        anchorCol = anchorCol!.clamp(0, rows[anchorRow!].length);
+      }
     }
   }
 
@@ -524,6 +710,7 @@ class EditorBufferController extends ChangeNotifier {
       if (row.length > maxLen) maxLen = row.length;
     }
     maxRowLen = maxLen;
+    _recomputeFoldCandidates();
   }
 
   @override
