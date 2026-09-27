@@ -89,6 +89,7 @@ class DesktopTaskWorkspaceController extends GetxController {
 
   // Gateway Clients & Connectivity
   final GatewayHttpClient httpClient = GatewayHttpClient();
+  final EditorApi editorApi = EditorApi();
   GatewayWsClient? _wsClient;
   StreamSubscription<GatewayFrame>? _wsSubscription;
   StreamSubscription<GatewaySystemEvent>? _sseSubscription;
@@ -558,21 +559,20 @@ class DesktopTaskWorkspaceController extends GetxController {
     }
   }
 
-  void openProjectFile(String path, [String? content]) {
+  Future<void> openProjectFile(String path, [String? content]) async {
     selectedFilePath.value = path;
     if (content != null) {
       selectedFileContent.value = content;
-    } else {
-      try {
-        final f = universal_io.File(path);
-        if (f.existsSync()) {
-          selectedFileContent.value = f.readAsStringSync();
-        } else {
-          selectedFileContent.value = '// Файл не найден: $path';
-        }
-      } catch (e) {
-        selectedFileContent.value = '// Ошибка чтения файла: $e';
-      }
+      return;
+    }
+    try {
+      final res = await editorApi.openFile(
+        path: path,
+        root: activeProjectPath.value,
+      );
+      selectedFileContent.value = res.content;
+    } catch (e) {
+      selectedFileContent.value = '// Ошибка открытия файла через шлюз: $e';
     }
   }
 

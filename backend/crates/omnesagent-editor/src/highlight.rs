@@ -149,7 +149,7 @@ fn class_id_for_capture(name: &str) -> u16 {
             "text.emphasis" | "text.strong" | "text.strike" => 0,
             // Generic classes.
             "comment" | "line_comment" | "block_comment" | "documentation" => 1,
-            "keyword" | "include" | "module" | "label" | "keyword.function" => 2,
+            "keyword" | "include" | "module" | "keyword.function" => 2,
             "string" => 3,
             "number" | "integer" | "float" => 4,
             "constant" | "boolean" | "character" => 5,

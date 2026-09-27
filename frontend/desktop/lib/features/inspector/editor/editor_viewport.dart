@@ -10,7 +10,7 @@ import 'dart:math' as math;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:omnes_shared/omnes_shared.dart' show EditorStyleEntry;
+import 'package:omnes_shared/omnes_shared.dart' show EditorPosition, EditorStyleEntry;
 
 import 'editor_client.dart';
 import 'editor_controller.dart';
@@ -313,6 +313,8 @@ class _EditorViewportState extends State<EditorViewport> {
     final ctrl = HardwareKeyboard.instance.isControlPressed;
     final shift = HardwareKeyboard.instance.isShiftPressed;
 
+    final alt = HardwareKeyboard.instance.isAltPressed;
+
     if (ctrl) {
       switch (key) {
         case LogicalKeyboardKey.keyS:
@@ -342,8 +344,70 @@ class _EditorViewportState extends State<EditorViewport> {
         case LogicalKeyboardKey.keyV:
           _paste();
           return KeyEventResult.handled;
+        case LogicalKeyboardKey.keyD:
+          c.selectNextOccurrence();
+          return KeyEventResult.handled;
+        case LogicalKeyboardKey.slash:
+          c.toggleComment();
+          _pushEditingState(force: true);
+          return KeyEventResult.handled;
+        case LogicalKeyboardKey.arrowLeft:
+          _moveWordHorizontal(-1, extend: shift);
+          return KeyEventResult.handled;
+        case LogicalKeyboardKey.arrowRight:
+          _moveWordHorizontal(1, extend: shift);
+          return KeyEventResult.handled;
         default:
           return KeyEventResult.ignored;
+      }
+    }
+
+    if (alt) {
+      if (key == LogicalKeyboardKey.arrowUp) {
+        shift ? c.duplicateLines(delta: -1) : c.moveLines(delta: -1);
+        _pushEditingState(force: true);
+        _ensureCaretVisible();
+        return KeyEventResult.handled;
+      } else if (key == LogicalKeyboardKey.arrowDown) {
+        shift ? c.duplicateLines(delta: 1) : c.moveLines(delta: 1);
+        _pushEditingState(force: true);
+        _ensureCaretVisible();
+        return KeyEventResult.handled;
+      }
+    }
+
+    final ch = event.character;
+    if (!ctrl && !alt && ch != null && ch.isNotEmpty) {
+      if (c.hasSelection && (ch == '(' || ch == '[' || ch == '{' || ch == '"' || ch == "'" || ch == '`')) {
+        final pair = _matchingPair(ch);
+        _wrapSelection(ch, pair);
+        return KeyEventResult.handled;
+      }
+      if (!c.hasSelection) {
+        if (ch == '(' || ch == '[' || ch == '{') {
+          final pair = _matchingPair(ch);
+          c.insertText('$ch$pair', pushUndo: true);
+          c.setSelection(row: c.caretRow, col: c.caretCol - 1);
+          _pushEditingState(force: true);
+          _ensureCaretVisible();
+          return KeyEventResult.handled;
+        }
+        if (ch == ')' || ch == ']' || ch == '}' || ch == '"' || ch == "'" || ch == '`') {
+          final row = c.rows.isEmpty ? '' : c.rows[c.caretRow];
+          if (c.caretCol < row.length && row[c.caretCol] == ch) {
+            c.setSelection(row: c.caretRow, col: c.caretCol + 1);
+            _pushEditingState(force: true);
+            _ensureCaretVisible();
+            return KeyEventResult.handled;
+          }
+          if (ch == '"' || ch == "'" || ch == '`') {
+            c.insertText('$ch$ch', pushUndo: true);
+            c.setSelection(row: c.caretRow, col: c.caretCol - 1);
+            _pushEditingState(force: true);
+            _ensureCaretVisible();
+            return KeyEventResult.handled;
+          }
+        }
       }
     }
 
@@ -363,12 +427,7 @@ class _EditorViewportState extends State<EditorViewport> {
         _ensureCaretVisible();
         return KeyEventResult.handled;
       case LogicalKeyboardKey.home:
-        c.setSelection(
-          row: c.caretRow,
-          col: 0,
-          keepAnchor: shift,
-        );
-        _ensureCaretVisible();
+        _handleHome(extend: shift);
         return KeyEventResult.handled;
       case LogicalKeyboardKey.end:
         c.setSelection(
@@ -388,9 +447,7 @@ class _EditorViewportState extends State<EditorViewport> {
         _ensureCaretVisible();
         return KeyEventResult.handled;
       case LogicalKeyboardKey.backspace:
-        c.backspace();
-        _pushEditingState(force: true);
-        _ensureCaretVisible();
+        _handleBackspace();
         return KeyEventResult.handled;
       case LogicalKeyboardKey.delete:
         c.deleteForward();
@@ -398,20 +455,170 @@ class _EditorViewportState extends State<EditorViewport> {
         return KeyEventResult.handled;
       case LogicalKeyboardKey.enter:
       case LogicalKeyboardKey.numpadEnter:
-        c.insertText('\n', pushUndo: true);
+        _handleEnter();
+        return KeyEventResult.handled;
+      case LogicalKeyboardKey.tab:
+        if (shift) {
+          c.outdentSelection();
+        } else if (c.hasSelection && c.selectionRange!.$1.line != c.selectionRange!.$2.line) {
+          c.indentSelection();
+        } else {
+          c.insertText('    ', pushUndo: true);
+        }
         _pushEditingState(force: true);
         _ensureCaretVisible();
         return KeyEventResult.handled;
-      case LogicalKeyboardKey.tab:
-        c.insertText('    ', pushUndo: true);
-        _pushEditingState(force: true);
-        return KeyEventResult.handled;
       case LogicalKeyboardKey.escape:
-        _focusNode.unfocus();
+        if (c.secondarySelections.isNotEmpty) {
+          c.removeSecondaryCursors();
+        } else {
+          _focusNode.unfocus();
+        }
         return KeyEventResult.handled;
       default:
         return KeyEventResult.ignored;
     }
+  }
+
+  static String _matchingPair(String ch) {
+    switch (ch) {
+      case '(':
+        return ')';
+      case '[':
+        return ']';
+      case '{':
+        return '}';
+      case '"':
+        return '"';
+      case "'":
+        return "'";
+      case '`':
+        return '`';
+      default:
+        return '';
+    }
+  }
+
+  void _wrapSelection(String open, String close) {
+    final c = widget.controller;
+    final sel = c.selectionRange;
+    if (sel == null) return;
+    final startFlat = c.posToFlat(sel.$1);
+    final endFlat = c.posToFlat(sel.$2);
+    final text = c.joinedText().substring(startFlat, endFlat);
+    c.insertText('$open$text$close', pushUndo: true);
+    final newStart = sel.$1;
+    final newEnd = EditorPosition(line: sel.$2.line, col: sel.$2.col + 1);
+    c.setSelection(row: newEnd.line, col: newEnd.col);
+    c.anchorRow = newStart.line;
+    c.anchorCol = newStart.col + 1;
+    _pushEditingState(force: true);
+    _ensureCaretVisible();
+  }
+
+  void _handleEnter() {
+    final c = widget.controller;
+    if (c.readOnly || c.rows.isEmpty) return;
+    final row = c.rows[c.caretRow];
+    final col = c.caretCol.clamp(0, row.length);
+    final wsCount = row.length - row.trimLeft().length;
+    var indent = row.substring(0, math.min(wsCount, col));
+
+    final charBefore = col > 0 ? row[col - 1] : '';
+    final charAfter = col < row.length ? row[col] : '';
+
+    if (charBefore == '{' && charAfter == '}') {
+      final insert = '\n$indent    \n$indent';
+      c.insertText(insert, pushUndo: true);
+      c.setSelection(row: c.caretRow - 1, col: '$indent    '.length);
+      _pushEditingState(force: true);
+      _ensureCaretVisible();
+      return;
+    }
+
+    if (charBefore == '{' || charBefore == '[' || charBefore == '(' || charBefore == ':') {
+      indent += '    ';
+    }
+
+    c.insertText('\n$indent', pushUndo: true);
+    _pushEditingState(force: true);
+    _ensureCaretVisible();
+  }
+
+  void _handleBackspace() {
+    final c = widget.controller;
+    if (c.readOnly || c.rows.isEmpty) return;
+    if (!c.hasSelection && c.caretCol > 0) {
+      final row = c.rows[c.caretRow];
+      if (c.caretCol < row.length) {
+        final before = row[c.caretCol - 1];
+        final after = row[c.caretCol];
+        if ((before == '(' && after == ')') ||
+            (before == '[' && after == ']') ||
+            (before == '{' && after == '}') ||
+            (before == '"' && after == '"') ||
+            (before == "'" && after == "'") ||
+            (before == '`' && after == '`')) {
+          c.setSelection(row: c.caretRow, col: c.caretCol + 1);
+          c.backspace();
+          c.backspace();
+          _pushEditingState(force: true);
+          _ensureCaretVisible();
+          return;
+        }
+      }
+    }
+    c.backspace();
+    _pushEditingState(force: true);
+    _ensureCaretVisible();
+  }
+
+  void _handleHome({required bool extend}) {
+    final c = widget.controller;
+    if (c.rows.isEmpty) return;
+    final row = c.rows[c.caretRow];
+    final firstNonWs = row.indexOf(RegExp(r'\S'));
+    final targetCol = (firstNonWs >= 0 && c.caretCol != firstNonWs) ? firstNonWs : 0;
+    c.setSelection(row: c.caretRow, col: targetCol, keepAnchor: extend);
+    _ensureCaretVisible();
+  }
+
+  void _moveWordHorizontal(int direction, {required bool extend}) {
+    final c = widget.controller;
+    if (c.rows.isEmpty) return;
+    final row = c.rows[c.caretRow];
+    var col = c.caretCol;
+    bool isWord(String ch) => RegExp(r'^[a-zA-Z0-9_]$').hasMatch(ch);
+    if (direction < 0) {
+      if (col == 0) {
+        if (c.caretRow > 0) {
+          c.setSelection(row: c.caretRow - 1, col: c.rows[c.caretRow - 1].length, keepAnchor: extend);
+        }
+        return;
+      }
+      col--;
+      while (col > 0 && !isWord(row[col])) {
+        col--;
+      }
+      while (col > 0 && isWord(row[col - 1])) {
+        col--;
+      }
+    } else {
+      if (col >= row.length) {
+        if (c.caretRow < c.rows.length - 1) {
+          c.setSelection(row: c.caretRow + 1, col: 0, keepAnchor: extend);
+        }
+        return;
+      }
+      while (col < row.length && isWord(row[col])) {
+        col++;
+      }
+      while (col < row.length && !isWord(row[col])) {
+        col++;
+      }
+    }
+    c.setSelection(row: c.caretRow, col: col, keepAnchor: extend);
+    _ensureCaretVisible();
   }
 
   void _moveHorizontal(int delta, {required bool extend}) {
@@ -529,7 +736,13 @@ class _EditorViewportState extends State<EditorViewport> {
         onTapDown: (d) {
           _focusNode.requestFocus();
           final (row, col) = _hitTest(d.localPosition);
-          widget.controller.setSelection(row: row, col: col);
+          final alt = HardwareKeyboard.instance.isAltPressed;
+          if (alt) {
+            widget.controller.addCursor(row, col);
+          } else {
+            widget.controller.removeSecondaryCursors();
+            widget.controller.setSelection(row: row, col: col);
+          }
           _pushEditingState(force: true);
           _ensureCaretVisible();
         },
@@ -723,7 +936,6 @@ class _EditorPainter extends CustomPainter {
     final m = metrics;
     if (controller.rows.isEmpty) return;
 
-    final sel = controller.selectionRange;
     final style = m.textStyle(textColor);
     final revKey = controller.rev;
 
@@ -746,18 +958,21 @@ class _EditorPainter extends CustomPainter {
           Paint()..color = currentLineColor,
         );
       }
-      if (sel != null) {
-        final startRow = sel.$1.line;
-        final endRow = sel.$2.line;
-        if (row >= startRow && row <= endRow) {
-          final startCol = row == startRow ? sel.$1.col : 0;
-          final endCol = row == endRow ? sel.$2.col : text.length;
-          final x1 = startCol * m.charWidth - scrollX;
-          final x2 = endCol * m.charWidth - scrollX;
-          canvas.drawRect(
-            Rect.fromLTWH(x1, y, math.max(2, x2 - x1), m.lineHeight),
-            Paint()..color = selectionColor,
-          );
+      for (final s in controller.allSelections) {
+        final sRange = s.getRange(controller);
+        if (sRange != null) {
+          final startRow = sRange.$1.line;
+          final endRow = sRange.$2.line;
+          if (row >= startRow && row <= endRow) {
+            final startCol = row == startRow ? sRange.$1.col : 0;
+            final endCol = row == endRow ? sRange.$2.col : text.length;
+            final x1 = startCol * m.charWidth - scrollX;
+            final x2 = endCol * m.charWidth - scrollX;
+            canvas.drawRect(
+              Rect.fromLTWH(x1, y, math.max(2, x2 - x1), m.lineHeight),
+              Paint()..color = selectionColor,
+            );
+          }
         }
       }
       _paintRowText(canvas, row, text, style, revKey, -scrollX, y);
@@ -776,14 +991,18 @@ class _EditorPainter extends CustomPainter {
       row = fold != null ? fold + 1 : row + 1;
     }
 
-    // Caret.
+    // Carets.
     if (showCaret) {
-      final cx = controller.caretCol * m.charWidth - scrollX;
-      final cy = controller.visibleBefore(controller.caretRow) * m.lineHeight - scrollY;
-      canvas.drawRect(
-        Rect.fromLTWH(cx, cy, 2, m.lineHeight),
-        Paint()..color = caretColor,
-      );
+      for (final s in controller.allSelections) {
+        if (!controller.isRowHidden(s.caretRow)) {
+          final cx = s.caretCol * m.charWidth - scrollX;
+          final cy = controller.visibleBefore(s.caretRow) * m.lineHeight - scrollY;
+          canvas.drawRect(
+            Rect.fromLTWH(cx, cy, 2, m.lineHeight),
+            Paint()..color = caretColor,
+          );
+        }
+      }
     }
   }
 
@@ -824,7 +1043,8 @@ class _EditorPainter extends CustomPainter {
         oldDelegate.scrollX != scrollX ||
         oldDelegate.showCaret != showCaret ||
         oldDelegate.controller != controller ||
-        oldDelegate.selectionColor != selectionColor;
+        oldDelegate.selectionColor != selectionColor ||
+        oldDelegate.controller.secondarySelections.length != controller.secondarySelections.length;
   }
 }
 

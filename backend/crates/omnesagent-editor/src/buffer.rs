@@ -44,17 +44,21 @@ pub struct EditOp {
     pub text: String,
 }
 
-/// Одна отображаемая строка: у строки, открывающей свёрнутый диапазон,
-/// заполнено `fold` (render plan, BACKEND_SPEC §9.3).
+/// Одна отображаемая строка (render plan, BACKEND_SPEC §9.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowData {
-    /// 0-based buffer row.
+    /// 0-based display row.
     pub row: u32,
+    /// 0-based buffer line index in the source file.
+    #[serde(default)]
+    pub buffer_row: u32,
     pub text: String,
     #[serde(default)]
     pub runs: Vec<(u32, u16)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fold: Option<FoldInfo>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_wrap_continuation: bool,
 }
 
 /// Свёрнутый диапазон, начинающийся на этой строке.
@@ -128,6 +132,8 @@ pub struct EditorBuffer {
     /// Свёрнутые диапазоны (buffer-строки, [start, end] включительно),
     /// отсортированы и не пересекаются.
     folds: Vec<(u32, u32)>,
+    /// Display-map settings (tabs, wrap).
+    pub settings: crate::display_map::DisplayMapSettings,
 }
 
 /// Строк в одном чанке подсветки.
@@ -169,6 +175,7 @@ impl EditorBuffer {
             runs_chunks: HashMap::new(),
             runs_recompute_count: 0,
             folds: Vec::new(),
+            settings: crate::display_map::DisplayMapSettings::default(),
         }
     }
 
@@ -212,9 +219,6 @@ impl EditorBuffer {
         self.buffer.text().to_string()
     }
 
-/// Rows for the viewport. `from`/`count` are clamped to the document.
-/// Syntax runs come lazily from the chunked highlight cache: an edit
-/// re-highlights only the chunk(s) it touched, never the whole document.
     pub fn rows(&mut self, from: u32, count: u32) -> RowsPage {
         let total = self.num_lines();
         let from = from.min(total);
@@ -222,6 +226,7 @@ impl EditorBuffer {
         let count = count.min(remaining);
         let runs_all = self.runs_for_range(from, count);
         let mut rows = Vec::with_capacity(count as usize);
+        let mut display_row = from;
         for (offset, line) in (from..from + count).enumerate() {
             // Маркер фолда: строка открывает свёрнутый диапазон.
             let fold = self
@@ -231,12 +236,18 @@ impl EditorBuffer {
                 .map(|&(s, e)| FoldInfo {
                     hidden: e - s,
                 });
-            rows.push(RowData {
-                row: line,
-                text: line_content(&self.buffer, line as usize),
-                runs: runs_all.get(offset).cloned().unwrap_or_default(),
+            let raw_text = line_content(&self.buffer, line as usize);
+            let raw_runs = runs_all.get(offset).cloned().unwrap_or_default();
+            let transformed = crate::display_map::transform_row(
+                line,
+                &raw_text,
+                &raw_runs,
                 fold,
-            });
+                &self.settings,
+                display_row,
+            );
+            display_row += transformed.len() as u32;
+            rows.extend(transformed);
         }
         RowsPage {
             rev: self.rev(),
@@ -699,7 +710,7 @@ mod tests {
 
     #[test]
     fn pos_roundtrip_through_offsets() {
-        let mut b = buf("Привет\nмир");
+        let b = buf("Привет\nмир");
         // Byte offset 6 = after "При" (3 Cyrillic chars, 2 bytes each).
         let (line, col) = pos_utf16_of_offset(&b.buffer, 6);
         assert_eq!((line, col), (0, 3));
@@ -756,5 +767,31 @@ mod tests {
         let base = b.rev();
         b.apply_ops(base, &[op(3, 0, 5, 0, "")]).unwrap();
         assert!(b.folds().is_empty());
+    }
+
+    #[test]
+    fn tab_expansion_in_rows() {
+        let mut b = buf("\tfn main() {\n\t\tprintln!();\n\t}");
+        b.settings.tab_size = 4;
+        let page = b.rows(0, 10);
+        assert_eq!(page.rows[0].text, "    fn main() {");
+        assert_eq!(page.rows[1].text, "        println!();");
+        assert_eq!(page.rows[2].text, "    }");
+    }
+
+    #[test]
+    fn soft_wrap_in_rows() {
+        let mut b = buf("short line\nthis is a very long line that exceeds the wrap limit and must be wrapped into multiple display rows\nend");
+        b.settings.soft_wrap = crate::display_map::SoftWrap::Bounded;
+        b.settings.wrap_column = 35;
+        let page = b.rows(0, 10);
+        assert!(page.rows.len() > 3);
+        assert_eq!(page.rows[0].buffer_row, 0);
+        assert_eq!(page.rows[0].is_wrap_continuation, false);
+
+        assert_eq!(page.rows[1].buffer_row, 1);
+        assert_eq!(page.rows[1].is_wrap_continuation, false);
+        assert_eq!(page.rows[2].buffer_row, 1);
+        assert_eq!(page.rows[2].is_wrap_continuation, true);
     }
 }

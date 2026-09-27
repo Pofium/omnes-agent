@@ -129,8 +129,13 @@ async fn handle_editor_socket(
         }
     });
 
+    let mut drift_ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+
     loop {
         tokio::select! {
+            _ = drift_ticker.tick() => {
+                let _ = editor.check_drift(buffer_id);
+            }
             event = events.recv() => {
                 match event {
                     Ok(BufferEvent::Edited { rev, start_line, inval_count, new_count }) => {
@@ -185,6 +190,15 @@ async fn handle_editor_socket(
                             last_sent_rev = rev;
                         }
                     }
+                    Ok(BufferEvent::ExternalChange { rev }) => {
+                        let frame = json!({
+                            "type": "save_state",
+                            "rev": rev,
+                            "dirty": true,
+                            "external_change": true,
+                        });
+                        if tx.send(frame.to_string()).await.is_err() { break; }
+                    }
                     Ok(BufferEvent::Closed) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Buffer closed (or we lagged) — end the session; the
                         // client reconnects and re-resyncs if needed.
@@ -210,6 +224,22 @@ async fn handle_editor_socket(
                             Some("rows_request") => {
                                 let from = frame.get("from").and_then(Value::as_u64).unwrap_or(0) as u32;
                                 let count = frame.get("count").and_then(Value::as_u64).unwrap_or(200) as u32;
+                                if let Some(settings_val) = frame.get("settings") {
+                                    let tab_size = settings_val.get("tab_size").and_then(Value::as_u64).unwrap_or(4) as usize;
+                                    let wrap_str = settings_val.get("soft_wrap").and_then(Value::as_str).unwrap_or("none");
+                                    let wrap_col = settings_val.get("wrap_column").and_then(Value::as_u64).unwrap_or(80) as usize;
+                                    let soft_wrap = match wrap_str {
+                                        "bounded" => omnesagent_editor::SoftWrap::Bounded,
+                                        "editor_width" => omnesagent_editor::SoftWrap::EditorWidth,
+                                        _ => omnesagent_editor::SoftWrap::None,
+                                    };
+                                    let _ = editor.set_display_settings(buffer_id, omnesagent_editor::DisplayMapSettings {
+                                        tab_size,
+                                        hard_tabs: false,
+                                        soft_wrap,
+                                        wrap_column: wrap_col,
+                                    });
+                                }
                                 if let Ok(page) = editor.rows(buffer_id, from, count) {
                                     let resp = json!({
                                         "type": "rows_snapshot",
@@ -221,6 +251,22 @@ async fn handle_editor_socket(
                                     if tx.send(resp.to_string()).await.is_err() { break; }
                                     last_sent_rev = last_sent_rev.max(page.rev);
                                 }
+                            }
+                            Some("settings") => {
+                                let tab_size = frame.get("tab_size").and_then(Value::as_u64).unwrap_or(4) as usize;
+                                let wrap_str = frame.get("soft_wrap").and_then(Value::as_str).unwrap_or("none");
+                                let wrap_col = frame.get("wrap_column").and_then(Value::as_u64).unwrap_or(80) as usize;
+                                let soft_wrap = match wrap_str {
+                                    "bounded" => omnesagent_editor::SoftWrap::Bounded,
+                                    "editor_width" => omnesagent_editor::SoftWrap::EditorWidth,
+                                    _ => omnesagent_editor::SoftWrap::None,
+                                };
+                                let _ = editor.set_display_settings(buffer_id, omnesagent_editor::DisplayMapSettings {
+                                    tab_size,
+                                    hard_tabs: false,
+                                    soft_wrap,
+                                    wrap_column: wrap_col,
+                                });
                             }
                             Some("edit_ops") => {
                                 let base_rev = frame.get("base_rev").and_then(Value::as_u64).unwrap_or(0);

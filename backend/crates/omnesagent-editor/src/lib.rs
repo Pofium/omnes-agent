@@ -14,6 +14,7 @@
 
 pub mod buffer;
 pub mod coords;
+pub mod display_map;
 pub mod error;
 pub mod highlight;
 pub mod language;
@@ -22,9 +23,10 @@ pub mod service;
 pub use buffer::{
     ApplyOutcome, EditOp, EditorBuffer, EditorPos, FoldInfo, FoldOp, InvalInfo, RowData, RowsPage,
 };
+pub use display_map::{DisplayMapSettings, SoftWrap};
 pub use error::EditorError;
 pub use language::language_id_from_path;
-pub use service::{BufferEvent, BufferInfo, EditorService};
+pub use service::{BufferEvent, BufferInfo, DriftStatus, EditorService};
 
 /// Identifier of an open buffer. Assigned by the gateway; stable for the
 /// lifetime of the buffer (one buffer per canonical path, `BACKEND_SPEC` §9.1).

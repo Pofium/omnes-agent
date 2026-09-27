@@ -69,6 +69,7 @@ class EditorFrame {
   final String? message;
   final String? reason;
   final String? savedAt;
+  final bool? externalChange;
   final List<EditorRow> rows;
   final EditorSettings? settings;
   final List<EditorStyleEntry> styles;
@@ -97,6 +98,7 @@ class EditorFrame {
     this.message,
     this.reason,
     this.savedAt,
+    this.externalChange,
     this.rows = const [],
     this.settings,
     this.styles = const [],
@@ -133,6 +135,7 @@ class EditorFrame {
       message: json['message'] as String?,
       reason: json['reason'] as String?,
       savedAt: json['saved_at'] as String?,
+      externalChange: json['external_change'] as bool?,
       rows: parseRows(json['rows']),
       settings: EditorSettings.fromJson(json['settings'] as Map<String, dynamic>?),
       styles: (json['styles'] as List?)

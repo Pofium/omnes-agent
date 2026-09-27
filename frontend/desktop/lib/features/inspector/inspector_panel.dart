@@ -283,8 +283,6 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
           steps: widget.controller.trajectorySteps,
           onForkAtStep: (step) => widget.controller.forkSessionAtStep(step.id),
         );
-      case 'file':
-        return _buildFileViewerTab();
       case 'editor':
         return _buildEditorTab();
       case 'image':
@@ -379,10 +377,6 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         return ('Боковой чат', FontAwesomeIcons.comments);
       case 'trajectory':
         return ('Траектория', Icons.hub_outlined);
-      case 'file':
-        final path = widget.controller.selectedFilePath.value;
-        final name = path != null ? path.split(RegExp(r'[\\/]')).last : 'Файл';
-        return (name, Icons.code);
       case 'editor':
         final path = widget.controller.selectedFilePath.value;
         final name = path != null ? path.split(RegExp(r'[\\/]')).last : 'Редактор';
@@ -434,101 +428,6 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       filePath: path,
       projectRoot: widget.controller.activeProjectPath.value,
     );
-  }
-
-  Widget _buildFileViewerTab() {
-    return Obx(() {
-      final path = widget.controller.selectedFilePath.value;
-      final content = widget.controller.selectedFileContent.value;
-      if (path == null || content == null) {
-        return Center(
-          child: Text(
-            'Файл не выбран\nВыберите файл в дереве проекта',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: DesktopTheme.textMuted, fontSize: 13),
-          ),
-        );
-      }
-
-      final lines = content.split('\n');
-
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // File Breadcrumb Bar
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            decoration: BoxDecoration(
-              color: DesktopTheme.bgSurface,
-              border: Border(bottom: BorderSide(color: DesktopTheme.borderSubtle, width: 0.8)),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.insert_drive_file_outlined, size: 14, color: DesktopTheme.accentSky),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    path,
-                    style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.textSecondary),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                Text(
-                  '${lines.length} строк',
-                  style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted),
-                ),
-              ],
-            ),
-          ),
-
-          // Code Viewer with line numbers
-          Expanded(
-            child: Container(
-              color: DesktopTheme.bgCanvas,
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(12),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Line numbers
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        for (int i = 1; i <= lines.length; i++)
-                          Text(
-                            '$i ',
-                            style: const TextStyle(
-                              fontFamily: 'Consolas',
-                              fontSize: 11,
-                              color: Color(0xFF64748B),
-                              height: 1.4,
-                            ),
-                          ),
-                      ],
-                    ),
-                    const SizedBox(width: 12),
-                    Container(width: 1, height: lines.length * 15.4, color: DesktopTheme.borderSubtle),
-                    const SizedBox(width: 12),
-                    // Code content
-                    Expanded(
-                      child: SelectableText(
-                        content,
-                        style: TextStyle(
-                          fontFamily: 'Consolas',
-                          fontSize: 11,
-                          color: DesktopTheme.textPrimary,
-                          height: 1.4,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      );
-    });
   }
 
   // ==========================================
@@ -646,19 +545,6 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                   setState(() {
                     if (!openTabKeys.contains('editor')) openTabKeys.add('editor');
                     activeTabKey = 'editor';
-                    showTabChooser = false;
-                  });
-                },
-              ),
-              const SizedBox(height: 10),
-              _buildChooserCard(
-                icon: Icons.code,
-                label: 'Файл: ${widget.controller.selectedFilePath.value!.split(RegExp(r"[\\/]")).last}',
-                subtitle: widget.controller.selectedFilePath.value!,
-                onTap: () {
-                  setState(() {
-                    if (!openTabKeys.contains('file')) openTabKeys.add('file');
-                    activeTabKey = 'file';
                     showTabChooser = false;
                   });
                 },

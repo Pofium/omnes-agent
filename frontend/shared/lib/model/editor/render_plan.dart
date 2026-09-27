@@ -2,12 +2,15 @@
 // BACKEND_SPEC.md §9.3 (render plan) and FRONTEND_SPEC.md §5.5.
 // F0: rows only; syntax `runs` arrive with F1 (server-side tree-sitter).
 
-/// One display row of the buffer. `row` is the 0-based buffer line index;
+/// One display row of the buffer. `row` is the 0-based display row index;
+/// `bufferRow` is the source buffer line index; `isWrapContinuation` indicates
+/// visual continuation rows caused by soft-wrapping (BACKEND_SPEC §9.3).
 /// `text` carries no line terminator. `runs` is the run-length syntax
 /// coloring: segments of `(lengthUtf16, styleId)` summing to the row's
-/// UTF-16 length (BACKEND_SPEC §9.3); empty when there is no highlighter.
+/// UTF-16 length; empty when there is no highlighter.
 class EditorRow {
   final int row;
+  final int bufferRow;
   final String text;
   final List<List<int>> runs;
 
@@ -15,12 +18,17 @@ class EditorRow {
   /// (null = строка не свёрнута).
   final int? foldHidden;
 
+  /// Строка является продолжением предыдущей буферной строки из-за переноса.
+  final bool isWrapContinuation;
+
   const EditorRow({
     required this.row,
+    int? bufferRow,
     required this.text,
     this.runs = const [],
     this.foldHidden,
-  });
+    this.isWrapContinuation = false,
+  }) : bufferRow = bufferRow ?? row;
 
   factory EditorRow.fromJson(Map<String, dynamic> json) {
     int asInt(dynamic v) => v is num ? v.toInt() : 0;
@@ -33,21 +41,31 @@ class EditorRow {
           ]
         : const <List<int>>[];
     final fold = json['fold'];
+    final row = asInt(json['row']);
+    final bufferRow = json['buffer_row'] is num
+        ? (json['buffer_row'] as num).toInt()
+        : row;
+    final isContinuation = (json['is_wrap_continuation'] as bool?) ?? false;
+
     return EditorRow(
-      row: asInt(json['row']),
+      row: row,
+      bufferRow: bufferRow,
       text: (json['text'] as String?) ?? '',
       runs: runs,
       foldHidden: fold is Map && fold['hidden'] is num
           ? (fold['hidden'] as num).toInt()
           : null,
+      isWrapContinuation: isContinuation,
     );
   }
 
   Map<String, dynamic> toJson() => {
         'row': row,
+        'buffer_row': bufferRow,
         'text': text,
         'runs': runs,
         if (foldHidden != null) 'fold': {'hidden': foldHidden},
+        if (isWrapContinuation) 'is_wrap_continuation': true,
       };
 }
 
@@ -56,11 +74,13 @@ class EditorSettings {
   final int tabSize;
   final bool hardTabs;
   final String softWrap;
+  final int wrapColumn;
 
   const EditorSettings({
     this.tabSize = 4,
     this.hardTabs = false,
     this.softWrap = 'none',
+    this.wrapColumn = 80,
   });
 
   factory EditorSettings.fromJson(Map<String, dynamic>? json) {
@@ -69,6 +89,7 @@ class EditorSettings {
       tabSize: (json['tab_size'] as num?)?.toInt() ?? 4,
       hardTabs: (json['hard_tabs'] as bool?) ?? false,
       softWrap: (json['soft_wrap'] as String?) ?? 'none',
+      wrapColumn: (json['wrap_column'] as num?)?.toInt() ?? 80,
     );
   }
 }

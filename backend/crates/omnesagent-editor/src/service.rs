@@ -32,12 +32,24 @@ use crate::error::EditorError;
         Reloaded {
             rev: u64,
         },
+        ExternalChange {
+            rev: u64,
+        },
         /// Фолды буфера изменились — клиенты получают `folds_state`.
         FoldsChanged {
             folds: Vec<(u32, u32)>,
         },
         Closed,
     }
+
+/// Drift status reported by `check_drift` (§9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DriftStatus {
+    /// File changed on disk while buffer was clean; auto-reloaded.
+    AutoReloaded { new_rev: u64 },
+    /// File changed on disk while buffer was dirty; external conflict.
+    ExternalConflict,
+}
 
 /// Metadata snapshot served by `GET /api/v1/editor/buffers` and used in the
 /// `hello` frame.
@@ -121,7 +133,7 @@ impl EditorService {
             .collect()
     }
 
-    fn ensure_in_roots(&self, path: &Path) -> Result<PathBuf, EditorError> {
+    pub fn ensure_in_roots(&self, path: &Path) -> Result<PathBuf, EditorError> {
         let canonical = normalize_path(path)?;
         let roots = self.roots.lock().expect("roots mutex poisoned");
         if roots.iter().any(|r| canonical.starts_with(r)) {
@@ -129,6 +141,21 @@ impl EditorService {
         } else {
             Err(EditorError::NotInRoot { path: canonical })
         }
+    }
+
+    /// Configure display-map settings (tabs, soft-wrap) for an open buffer.
+    pub fn set_display_settings(
+        &self,
+        buffer_id: u64,
+        settings: crate::display_map::DisplayMapSettings,
+    ) -> Result<(), EditorError> {
+        let mut reg = self.registry.lock().expect("registry mutex poisoned");
+        let entry = reg
+            .by_id
+            .get_mut(&buffer_id)
+            .ok_or_else(|| EditorError::NotFound(format!("buffer {buffer_id}")))?;
+        entry.buffer.settings = settings;
+        Ok(())
     }
 
     /// Validate a possibly not-yet-existing target path for a write: the
@@ -358,10 +385,70 @@ impl EditorService {
             .get_mut(&buffer_id)
             .ok_or_else(|| not_found(buffer_id))?;
         let content = fs::read_to_string(&entry.buffer.path)?;
+        let mtime = fs::metadata(&entry.buffer.path).ok().and_then(|m| m.modified().ok());
         entry.buffer.reload(content, true);
+        if mtime.is_some() {
+            entry.buffer.mtime_at_open = mtime;
+        }
         let info = buffer_info(&entry.buffer);
         let _ = entry.events.send(BufferEvent::Reloaded { rev: info.rev });
         Ok(info)
+    }
+
+    /// Check for external changes on disk for an open buffer.
+    /// If file mtime is newer than buffer's mtime_at_open:
+    /// - If buffer is clean: auto-reload from disk and broadcast `Reloaded`.
+    /// - If buffer is dirty: broadcast `ExternalChange`.
+    pub fn check_drift(&self, buffer_id: u64) -> Result<Option<DriftStatus>, EditorError> {
+        let (path, mtime_at_open, dirty) = {
+            let registry = self.registry.lock().expect("registry mutex poisoned");
+            let entry = registry
+                .by_id
+                .get(&buffer_id)
+                .ok_or_else(|| not_found(buffer_id))?;
+            (
+                entry.buffer.path.clone(),
+                entry.buffer.mtime_at_open,
+                entry.buffer.is_dirty(),
+            )
+        };
+
+        let disk_mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let has_drift = match (mtime_at_open, disk_mtime) {
+            (Some(at_open), Some(on_disk)) => on_disk > at_open,
+            _ => false,
+        };
+
+        if !has_drift {
+            return Ok(None);
+        }
+
+        if !dirty {
+            let info = self.reload_from_disk(buffer_id)?;
+            Ok(Some(DriftStatus::AutoReloaded { new_rev: info.rev }))
+        } else {
+            let registry = self.registry.lock().expect("registry mutex poisoned");
+            if let Some(entry) = registry.by_id.get(&buffer_id) {
+                let rev = entry.buffer.rev();
+                let _ = entry.events.send(BufferEvent::ExternalChange { rev });
+            }
+            Ok(Some(DriftStatus::ExternalConflict))
+        }
+    }
+
+    /// Check drift across all open buffers.
+    pub fn check_all_drifts(&self) -> Vec<(u64, DriftStatus)> {
+        let buffer_ids: Vec<u64> = {
+            let registry = self.registry.lock().expect("registry mutex poisoned");
+            registry.by_id.keys().copied().collect()
+        };
+        let mut results = Vec::new();
+        for id in buffer_ids {
+            if let Ok(Some(status)) = self.check_drift(id) {
+                results.push((id, status));
+            }
+        }
+        results
     }
 
     /// Read raw (binary) bytes of a file inside the registered roots — the

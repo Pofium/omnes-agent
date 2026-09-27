@@ -43,6 +43,10 @@ class EditorGutter extends StatelessWidget {
                     .clamp(0, math.max(0, controller.visibleRowCount - 1))
                     .toInt();
             final row = controller.rowAtVisible(ordinal);
+            if (controller.isRowContinuation(row)) {
+              controller.setSelection(row: row, col: 0);
+              return;
+            }
             final isFoldCandidate = controller.foldEndForRow(row) != null ||
                 controller.foldCandidates.any((c) => c[0] == row);
             if (isFoldCandidate) {
@@ -123,20 +127,31 @@ class _GutterPainter extends CustomPainter {
     );
 
     while (row <= maxRow && y < size.height + m.lineHeight) {
-      final isActive = row == controller.caretRow;
+      final isContinuation = controller.isRowContinuation(row);
+      final bufferRow = controller.bufferRowFor(row);
+      final isActive = !isContinuation && bufferRow == controller.bufferRowFor(controller.caretRow);
+      final lineLabel = isContinuation ? '↳' : '${bufferRow + 1}';
+
       final tp = TextPainter(
-        text: TextSpan(text: '${row + 1}', style: isActive ? activeStyle : baseStyle),
+        text: TextSpan(
+          text: lineLabel,
+          style: isContinuation
+              ? baseStyle.copyWith(color: mutedColor.withOpacity(0.45))
+              : (isActive ? activeStyle : baseStyle),
+        ),
         textDirection: TextDirection.ltr,
       )..layout();
       tp.paint(canvas, Offset(size.width - tp.width - 22, y + (m.lineHeight - tp.height) / 2));
 
-      // Стрелка фолда: залитая у свёрнутых, контурная у кандидатов.
-      final foldEnd = controller.foldEndForRow(row);
-      final isCandidate =
-          foldEnd != null || controller.foldCandidates.any((c) => c[0] == row);
-      if (isCandidate) {
-        _drawFoldArrow(canvas, Offset(size.width - 10, y + m.lineHeight / 2),
-            filled: foldEnd != null);
+      // Стрелка фолда: только на основных строках (не на продолжениях переноса)
+      if (!isContinuation) {
+        final foldEnd = controller.foldEndForRow(row);
+        final isCandidate =
+            foldEnd != null || controller.foldCandidates.any((c) => c[0] == row);
+        if (isCandidate) {
+          _drawFoldArrow(canvas, Offset(size.width - 10, y + m.lineHeight / 2),
+              filled: foldEnd != null);
+        }
       }
 
       y += m.lineHeight;
