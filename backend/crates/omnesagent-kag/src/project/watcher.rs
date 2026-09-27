@@ -27,7 +27,9 @@ pub fn is_code_file(path: &Path) -> bool {
         matches!(
             ext_lower.as_str(),
             "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "sql"
-            | "c" | "cpp" | "h" | "hpp" | "php" | "dart" | "java"
+            | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" | "hxx" | "php" | "dart" | "java"
+            | "cs" | "kt" | "kts" | "swift" | "rb"
+            | "vue" | "svelte" | "scala" | "lua" | "ex" | "exs" | "sh" | "bash"
         )
     } else {
         false
