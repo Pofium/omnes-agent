@@ -26,6 +26,7 @@ class DesktopTaskWorkspaceView extends StatefulWidget {
   final VoidCallback? onOpenCanvas;
   final void Function(String? text)? onBranchSideChat;
   final VoidCallback? onReviewChanges;
+  final VoidCallback? onOpenTrajectory;
   final bool isToolsOpen;
   final bool isSidebarVisible;
   final VoidCallback? onToggleSidebar;
@@ -39,6 +40,7 @@ class DesktopTaskWorkspaceView extends StatefulWidget {
     this.onOpenCanvas,
     this.onBranchSideChat,
     this.onReviewChanges,
+    this.onOpenTrajectory,
     this.isToolsOpen = false,
     this.isSidebarVisible = true,
     this.onToggleSidebar,
@@ -839,6 +841,69 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 ),
               ),
             ),
+            const SizedBox(width: 8),
+
+            // Right side: 3. Trajectory Badge / Button (opens inspector trajectory tab in side window)
+            Tooltip(
+              message: 'Открыть траекторию выполнения в боковом окне',
+              child: InkWell(
+                onTap: widget.onOpenTrajectory,
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.bgSurfaceElevated,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: DesktopTheme.borderSubtle,
+                      width: 0.8,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.hub_outlined,
+                        size: 13,
+                        color: Color(0xFF00E5FF),
+                      ),
+                      const SizedBox(width: 5),
+                      const Text(
+                        'Траектория',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: DesktopTheme.textSecondary,
+                        ),
+                      ),
+                      Obx(() {
+                        final count = widget.controller.trajectorySteps.length;
+                        if (count == 0) return const SizedBox.shrink();
+                        return Padding(
+                          padding: const EdgeInsets.only(left: 5),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF00E5FF).withOpacity(0.15),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              '$count',
+                              style: const TextStyle(
+                                fontSize: 10,
+                                fontFamily: 'Consolas',
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFF00E5FF),
+                              ),
+                            ),
+                          ),
+                        );
+                      }),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           ],
         ),
       );
@@ -1036,55 +1101,6 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             }),
           ),
 
-          const SizedBox(width: 8),
-
-          // To-Do / TaskBar dropdown toggle
-          Tooltip(
-            message: 'To-Do / Таск-бар сессии',
-            child: InkWell(
-              onTap: () => setState(() => isTaskBarOpen = !isTaskBarOpen),
-              borderRadius: BorderRadius.circular(4),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                decoration: BoxDecoration(
-                  color: isTaskBarOpen
-                      ? const Color(0xFF00D2FF).withOpacity(0.18)
-                      : DesktopTheme.bgSurfaceElevated,
-                  borderRadius: BorderRadius.circular(5),
-                  border: Border.all(
-                    color: isTaskBarOpen ? const Color(0xFF00D2FF) : Colors.transparent,
-                    width: 0.8,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.checklist_rounded,
-                      size: 13,
-                      color: isTaskBarOpen ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
-                    ),
-                    const SizedBox(width: 4),
-                    Obx(() {
-                      final steps = widget.controller.runTimelineSteps;
-                      final doneCount = steps.where((s) => s['status'] == 'done' || s['status'] == 'completed').length;
-                      final totalCount = steps.length;
-                      final label = totalCount > 0 ? '$doneCount/$totalCount' : 'Todo';
-                      return Text(
-                        label,
-                        style: TextStyle(
-                          fontSize: 10.5,
-                          fontFamily: 'Consolas',
-                          fontWeight: FontWeight.w600,
-                          color: isTaskBarOpen ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
-                        ),
-                      );
-                    }),
-                  ],
-                ),
-              ),
-            ),
-          ),
           const SizedBox(width: 8),
 
           // Terminal quick toggle (>_)
@@ -1991,7 +2007,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 // Mode Switcher (Fast, DeepCode, Architect, RalphLoop)
                 Obx(() => AgentModeSwitcher(
                   currentMode: widget.controller.currentExecutionMode.value,
-                  onModeChanged: (mode) => widget.controller.currentExecutionMode.value = mode,
+                  onModeChanged: widget.controller.setExecutionMode,
                 )),
                 const Spacer(),
                 // Top-right corner: System file icon (AGENTS.md) + Circular progress context indicator
@@ -2087,11 +2103,15 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             );
           }),
 
+          // 2.1 Pending Queued Prompt Bar if any
+          _buildQueuedPromptBar(),
+
           // 3. Multi-line Input field
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             child: TextField(
               controller: widget.controller.inputController,
+              focusNode: widget.controller.inputFocusNode,
               maxLines: isHero ? 4 : 3,
               minLines: isHero ? 2 : 1,
               style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, height: 1.4),
@@ -2379,7 +2399,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                     onPressed: () => widget.controller.approveAction(idx),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFF10B981),
-                      foregroundColor: Colors.black,
+                      foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                     ),
                     child: Text(DesktopI18n.tr('Разрешить', 'Approve'), style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
@@ -2499,7 +2519,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                     width: 22,
                     height: 22,
                     decoration: BoxDecoration(
-                      color: isUser ? const Color(0xFF333842) : const Color(0xFF00D2FF).withOpacity(0.2),
+                      color: isUser ? (DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155)) : const Color(0xFF00D2FF).withOpacity(0.2),
                       borderRadius: BorderRadius.circular(4),
                     ),
                     child: Center(
@@ -2526,6 +2546,57 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       child: Text(
                         widget.controller.activeModel.value,
                         style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted, fontFamily: 'Consolas'),
+                      ),
+                    ),
+                  ],
+                  if (isUser) ...[
+                    const Spacer(),
+                    Tooltip(
+                      message: 'Повторить сообщение в диалоговом окне',
+                      child: InkWell(
+                        onTap: () => widget.controller.repeatMessage(msg),
+                        borderRadius: BorderRadius.circular(4),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.replay, size: 13, color: DesktopTheme.textMuted),
+                              const SizedBox(width: 4),
+                              Text(
+                                'Повторить',
+                                style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted, fontWeight: FontWeight.w500),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Tooltip(
+                      message: 'Откатить диалог и файлы к этому сообщению',
+                      child: InkWell(
+                        onTap: () => _confirmRollbackToUserMessage(context, msg),
+                        borderRadius: BorderRadius.circular(4),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF59E0B).withOpacity(0.12),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: const Color(0xFFF59E0B).withOpacity(0.35), width: 0.8),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.history, size: 12, color: Color(0xFFF59E0B)),
+                              SizedBox(width: 4),
+                              Text(
+                                'Откатить сюда',
+                                style: TextStyle(fontSize: 11, color: Color(0xFFF59E0B), fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     ),
                   ],
@@ -2610,21 +2681,16 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       ),
 
 
-                    // Live Project Changes Review Pill (e.g. "4 files changed +129 -1 > [Review]")
+                    // Detailed File Changes Summary Card (collapsible list of changed files with diff, Review, Open dropdown, and Undo)
                     if (!isUser && msg.filesChangedCount != null && msg.filesChangedCount! > 0)
-                      _buildReviewPill(
-                        context,
-                        files: msg.filesChangedCount!,
-                        additions: msg.additions ?? 0,
-                        deletions: msg.deletions ?? 0,
-                      ),
+                      _buildFileChangesCard(context, msg),
 
-                    // Message Reactions Row (Image 2 match: [Copy] [Like] [Dislike] [Branch] 9/5, 10:07 AM)
-                    if (!isUser)
+                    // Message Reactions Row (shown once response is completed, not while streaming/thinking)
+                    if (!isUser && !msg.isStreaming && msg.text.trim().isNotEmpty)
                       _buildMessageReactionsRow(context, msg),
 
-                    // Follow-up Action Chips (1-click suggestions)
-                    if (!isUser)
+                    // Follow-up Action Chips (1-click suggestions, shown once complete)
+                    if (!isUser && !msg.isStreaming && msg.text.trim().isNotEmpty)
                       _buildFollowUpActionChips(context, msg),
                   ],
                 ),
@@ -2748,7 +2814,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
-  Widget _buildSingleActionRow(AgentActionStep step, {VoidCallback? onToggle}) {
+  Widget _buildSingleActionRow(
+    AgentActionStep step, {
+    bool isParentStreaming = true,
+    VoidCallback? onToggle,
+  }) {
     final Widget iconWidget;
     final String actionLabel;
     Widget? secondaryIcon;
@@ -2863,7 +2933,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 ),
               ),
             ],
-            if (step.isRunning) ...[
+            if (step.isRunning && isParentStreaming) ...[
               const SizedBox(width: 6),
               const SizedBox(
                 width: 10,
@@ -3067,9 +3137,13 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _buildSingleActionRow(step, onToggle: () {
-                    setStepState(() => step.isExpanded = !step.isExpanded);
-                  }),
+                  _buildSingleActionRow(
+                    step,
+                    isParentStreaming: msg.isStreaming,
+                    onToggle: () {
+                      setStepState(() => step.isExpanded = !step.isExpanded);
+                    },
+                  ),
                   if (step.isExpanded && step.details != null && step.details!.isNotEmpty)
                     _buildActionStepDetails(step.details!),
                 ],
@@ -3081,88 +3155,367 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
-  Widget _buildReviewPill(BuildContext context, {required int files, required int additions, required int deletions}) {
+  Widget _buildFileChangesCard(BuildContext context, ChatMessage msg) {
+    final filesCount = msg.filesChangedCount ?? 0;
+    final additions = msg.additions ?? 0;
+    final deletions = msg.deletions ?? 0;
+    final rawList = msg.metadata?['changed_files'];
+    final List<Map<String, dynamic>> changedFiles = rawList is List
+        ? rawList.map((e) => Map<String, dynamic>.from(e as Map)).toList()
+        : [];
+
+    final isExpanded = msg.metadata?['is_changed_files_expanded'] != false;
+
     return Container(
-      margin: const EdgeInsets.only(top: 10, bottom: 4),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      margin: const EdgeInsets.only(top: 12, bottom: 6),
       decoration: BoxDecoration(
-        color: const Color(0xFF16181D),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF282D37), width: 1),
+        color: DesktopTheme.isDark ? const Color(0xFF16181D) : const Color(0xFFF8FAFC),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: DesktopTheme.borderSubtle, width: 1.0),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.3),
-            blurRadius: 6,
-            offset: const Offset(0, 2),
+            color: Colors.black.withOpacity(DesktopTheme.isDark ? 0.35 : 0.08),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
           ),
         ],
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.max,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Text(
-            '$files ${files == 1 ? "file" : "files"} changed ',
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w400,
-              color: Color(0xFFE2E8F0),
-            ),
-          ),
-          Text(
-            '+$additions ',
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w500,
-              color: Color(0xFF4ADE80),
-              fontFamily: 'Consolas',
-            ),
-          ),
-          Text(
-            '-$deletions ',
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w500,
-              color: Color(0xFFF87171),
-              fontFamily: 'Consolas',
-            ),
-          ),
-          const SizedBox(width: 2),
-          const Icon(
-            Icons.chevron_right,
-            size: 14,
-            color: Color(0xFF64748B),
-          ),
-          const Spacer(),
-          InkWell(
-            onTap: () {
-              widget.onReviewChanges?.call();
-            },
-            borderRadius: BorderRadius.circular(6),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-              decoration: BoxDecoration(
-                color: const Color(0xFF222732),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF333A48)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: const [
-                  Icon(Icons.description_outlined, size: 13, color: Color(0xFFCBD5E1)),
-                  SizedBox(width: 6),
-                  Text(
-                    'Review',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w500,
-                      color: Color(0xFFE2E8F0),
+          // Header: [ ⌄ 9 files changed +166 -11 ] ... [ ↶ Undo ]
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            child: Row(
+              children: [
+                InkWell(
+                  onTap: () {
+                    setState(() {
+                      msg.metadata = {
+                        ...?msg.metadata,
+                        'is_changed_files_expanded': !isExpanded,
+                      };
+                    });
+                  },
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          isExpanded ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_right,
+                          size: 18,
+                          color: const Color(0xFF94A3B8),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          '$filesCount ${filesCount == 1 ? "file" : "files"} changed',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.bold,
+                            color: DesktopTheme.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          '+$additions',
+                          style: const TextStyle(
+                            fontSize: 12.5,
+                            fontFamily: 'Consolas',
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF10B981),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          '-$deletions',
+                          style: const TextStyle(
+                            fontSize: 12.5,
+                            fontFamily: 'Consolas',
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFEF4444),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                ],
-              ),
+                ),
+                const Spacer(),
+                Tooltip(
+                  message: 'Откатить изменения файлов этого хода',
+                  child: InkWell(
+                    onTap: () => _confirmRollbackToUserMessage(context, msg),
+                    borderRadius: BorderRadius.circular(4),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.undo, size: 14, color: DesktopTheme.textMuted),
+                          const SizedBox(width: 5),
+                          Text(
+                            'Undo',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: DesktopTheme.textSecondary,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
+
+          // File List when expanded
+          if (isExpanded && changedFiles.isNotEmpty) ...[
+            Divider(height: 1, color: DesktopTheme.borderSubtle),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: changedFiles.length,
+                separatorBuilder: (_, __) => const SizedBox(height: 2),
+                itemBuilder: (context, idx) {
+                  final f = changedFiles[idx];
+                  final name = f['name']?.toString() ?? '';
+                  final dir = f['dir']?.toString() ?? '';
+                  final relPath = f['path']?.toString() ?? name;
+                  final ins = (f['additions'] as int?) ?? 0;
+                  final del = (f['deletions'] as int?) ?? 0;
+
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                    child: Row(
+                      children: [
+                        // Language/Extension Badge (php, py, dart, md, rs, etc.)
+                        _buildFileExtBadge(name),
+                        const SizedBox(width: 10),
+
+                        // File name & dir
+                        Expanded(
+                          child: Row(
+                            children: [
+                              Text(
+                                name,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
+                                  fontFamily: 'Consolas',
+                                  color: DesktopTheme.textPrimary,
+                                ),
+                              ),
+                              if (dir.isNotEmpty) ...[
+                                const SizedBox(width: 8),
+                                Flexible(
+                                  child: Text(
+                                    dir,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontFamily: 'Consolas',
+                                      color: DesktopTheme.textMuted,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
+
+                        // Diff stats: +X -Y
+                        if (ins > 0)
+                          Text(
+                            '+$ins',
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              fontFamily: 'Consolas',
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF10B981),
+                            ),
+                          ),
+                        if (del > 0) ...[
+                          const SizedBox(width: 5),
+                          Text(
+                            '-$del',
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              fontFamily: 'Consolas',
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFFEF4444),
+                            ),
+                          ),
+                        ],
+                        const SizedBox(width: 12),
+
+                        // Review button
+                        Tooltip(
+                          message: 'Просмотреть diff в инспекторе',
+                          child: InkWell(
+                            onTap: () {
+                              widget.controller.openProjectFile(relPath);
+                              widget.onReviewChanges?.call();
+                            },
+                            borderRadius: BorderRadius.circular(4),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: DesktopTheme.isDark ? const Color(0xFF222732) : const Color(0xFFE2E8F0),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(color: DesktopTheme.borderSubtle),
+                              ),
+                              child: Text(
+                                'Review',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w500,
+                                  color: DesktopTheme.textPrimary,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+
+                        // Open ⌄ dropdown menu
+                        Builder(
+                          builder: (btnCtx) => InkWell(
+                            onTap: () async {
+                              final action = await _showAnchoredCyberMenu<String>(
+                                buttonContext: btnCtx,
+                                estimatedHeight: 120,
+                                minWidth: 200,
+                                items: [
+                                  PopupMenuItem(
+                                    value: 'editor',
+                                    height: 32,
+                                    child: Row(
+                                      children: [
+                                        Icon(Icons.edit_note, size: 14, color: DesktopTheme.accentCyan),
+                                        const SizedBox(width: 8),
+                                        Text('Открыть в ADE Editor', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+                                      ],
+                                    ),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 'explorer',
+                                    height: 32,
+                                    child: Row(
+                                      children: [
+                                        Icon(Icons.folder_open, size: 14, color: DesktopTheme.textSecondary),
+                                        const SizedBox(width: 8),
+                                        Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+                                      ],
+                                    ),
+                                  ),
+                                  PopupMenuItem(
+                                    value: 'copy',
+                                    height: 32,
+                                    child: Row(
+                                      children: [
+                                        Icon(Icons.copy, size: 14, color: DesktopTheme.textSecondary),
+                                        const SizedBox(width: 8),
+                                        Text('Скопировать путь', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              );
+                              if (action == 'editor') {
+                                widget.controller.openProjectFile(relPath);
+                                widget.onReviewChanges?.call();
+                              } else if (action == 'explorer') {
+                                widget.controller.showFileInExplorer(relPath);
+                              } else if (action == 'copy') {
+                                Clipboard.setData(ClipboardData(text: relPath));
+                              }
+                            },
+                            borderRadius: BorderRadius.circular(4),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: DesktopTheme.isDark ? const Color(0xFF222732) : const Color(0xFFE2E8F0),
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(color: DesktopTheme.borderSubtle),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    'Open',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w500,
+                                      color: DesktopTheme.textPrimary,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 2),
+                                  Icon(Icons.keyboard_arrow_down, size: 12, color: DesktopTheme.textMuted),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
         ],
+      ),
+    );
+  }
+
+  Widget _buildFileExtBadge(String filename) {
+    final ext = filename.contains('.') ? filename.split('.').last.toLowerCase() : '';
+    Color color = const Color(0xFF94A3B8);
+    Color bg = const Color(0xFF334155).withOpacity(0.3);
+
+    if (ext == 'php') {
+      color = const Color(0xFF60A5FA);
+      bg = const Color(0xFF2563EB).withOpacity(0.2);
+    } else if (ext == 'py') {
+      color = const Color(0xFFFBBF24);
+      bg = const Color(0xFFD97706).withOpacity(0.2);
+    } else if (ext == 'dart') {
+      color = const Color(0xFF00D2FF);
+      bg = const Color(0xFF00D2FF).withOpacity(0.2);
+    } else if (ext == 'rs') {
+      color = const Color(0xFFF97316);
+      bg = const Color(0xFFEA580C).withOpacity(0.2);
+    } else if (ext == 'md' || ext == 'txt') {
+      color = const Color(0xFF38BDF8);
+      bg = const Color(0xFF0284C7).withOpacity(0.2);
+    } else if (ext == 'js' || ext == 'ts') {
+      color = const Color(0xFFFACC15);
+      bg = const Color(0xFFCA8A04).withOpacity(0.2);
+    }
+
+    return Container(
+      width: 28,
+      height: 18,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withOpacity(0.4), width: 0.8),
+      ),
+      child: Text(
+        ext.isEmpty ? 'file' : ext,
+        style: TextStyle(
+          fontSize: 9,
+          fontWeight: FontWeight.bold,
+          fontFamily: 'Consolas',
+          color: color,
+        ),
       ),
     );
   }
@@ -3869,7 +4222,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 return Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    _buildSingleActionRow(s, onToggle: () => setStepState(() => s.isExpanded = !s.isExpanded)),
+                    _buildSingleActionRow(s, isParentStreaming: msg.isStreaming, onToggle: () => setStepState(() => s.isExpanded = !s.isExpanded)),
                     if (s.isExpanded && s.details != null && s.details!.isNotEmpty)
                       _buildActionStepDetails(s.details!),
                   ],
@@ -4031,6 +4384,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
+  String _formatMessageTimestamp(DateTime? dt) {
+    final target = dt ?? DateTime.now();
+    final hour = target.hour > 12 ? target.hour - 12 : (target.hour == 0 ? 12 : target.hour);
+    final period = target.hour >= 12 ? 'PM' : 'AM';
+    final minute = target.minute.toString().padLeft(2, '0');
+    return '${target.month}/${target.day}, $hour:$minute $period';
+  }
+
   Widget _buildMessageReactionsRow(BuildContext context, ChatMessage msg) {
     bool isLiked = false;
     bool isDisliked = false;
@@ -4144,9 +4505,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 ),
               ],
 
-              const Text(
-                '9/5, 10:07 AM',
-                style: TextStyle(fontSize: 11, color: Color(0xFF64748B), fontFamily: 'Consolas'),
+              Text(
+                _formatMessageTimestamp(msg.createdAt),
+                style: const TextStyle(fontSize: 11, color: Color(0xFF64748B), fontFamily: 'Consolas'),
               ),
             ],
           ),
@@ -4226,9 +4587,85 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             },
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFFF59E0B),
-              foregroundColor: Colors.black,
+              foregroundColor: const Color(0xFF0F172A),
             ),
             child: const Text('Откатить', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Confirmation dialog before rolling back conversation and files to this user message
+  void _confirmRollbackToUserMessage(BuildContext context, ChatMessage msg) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DesktopTheme.bgSurface,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: DesktopTheme.borderSubtle),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.history, size: 20, color: Color(0xFFF59E0B)),
+            SizedBox(width: 8),
+            Text('Откат к сообщению', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Вы собираетесь откатить диалог и файлы проекта до состояния этого сообщения.\n'
+              'Все последующие ответы агента и несохраненные правки в коде будут отменены.',
+              style: TextStyle(fontSize: 12, height: 1.4),
+            ),
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurfaceElevated,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: DesktopTheme.borderSubtle),
+              ),
+              child: Text(
+                msg.text.length > 140 ? '${msg.text.substring(0, 140)}...' : msg.text,
+                style: TextStyle(fontSize: 11.5, fontFamily: 'Consolas', color: DesktopTheme.textMuted),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
+          ),
+          OutlinedButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              widget.controller.rollbackToMessage(msg, putTextInInput: false);
+            },
+            style: OutlinedButton.styleFrom(
+              foregroundColor: DesktopTheme.textPrimary,
+              side: BorderSide(color: DesktopTheme.borderSubtle),
+            ),
+            child: const Text('Откатить и оставить'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              widget.controller.rollbackToMessage(msg, putTextInInput: true);
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFF59E0B),
+              foregroundColor: const Color(0xFF0F172A),
+            ),
+            child: const Text('Откатить и редактировать', style: TextStyle(fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -4518,10 +4955,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             width: 28,
             height: 28,
             decoration: BoxDecoration(
-              color: const Color(0xFF282D36),
+              color: DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155),
               borderRadius: BorderRadius.circular(6),
             ),
-            child: const Icon(Icons.add, size: 16, color: Color(0xFFCBD5E1)),
+            child: const Icon(Icons.add, size: 16, color: Colors.white),
           ),
         ),
       ),
@@ -4580,7 +5017,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: const Color(0xFF282D36),
+                color: DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155),
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Row(
@@ -4716,7 +5153,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: const Color(0xFF282D36),
+                color: DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155),
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Row(
@@ -4811,6 +5248,17 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                           _buildModelItem(m, active == m),
                         const PopupMenuDivider(height: 1),
                         PopupMenuItem(
+                          value: 'refresh',
+                          height: 36,
+                          child: Row(
+                            children: const [
+                              Icon(Icons.sync, size: 14, color: Color(0xFF00D2FF)),
+                              SizedBox(width: 8),
+                              Text('Загрузить модели с BASE_URL', style: TextStyle(fontSize: 12, color: Color(0xFF00D2FF))),
+                            ],
+                          ),
+                        ),
+                        PopupMenuItem(
                           value: 'manage',
                           height: 36,
                           child: Row(
@@ -4825,6 +5273,8 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               );
               if (val == 'manage') {
                 widget.onOpenSettings?.call();
+              } else if (val == 'refresh') {
+                widget.controller.fetchModelsForProvider(widget.controller.activeProvider.value, notify: true);
               } else if (val != null) {
                 widget.controller.setModel(val);
               }
@@ -4833,7 +5283,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: const Color(0xFF282D36),
+                color: DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155),
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Row(
@@ -4894,7 +5344,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
               decoration: BoxDecoration(
-                color: const Color(0xFF282D36),
+                color: DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF334155),
                 borderRadius: BorderRadius.circular(6),
               ),
               child: Row(
@@ -4914,20 +5364,182 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     });
   }
 
-  Widget _buildSendButton() {
-    return InkWell(
-      onTap: widget.controller.sendMessage,
-      borderRadius: BorderRadius.circular(6),
-      child: Container(
-        width: 30,
-        height: 30,
+  Widget _buildQueuedPromptBar() {
+    return Obx(() {
+      final queued = widget.controller.queuedPrompt.value;
+      if (queued == null || queued.trim().isEmpty) return const SizedBox.shrink();
+
+      final preview = queued.replaceAll(RegExp(r'\s+'), ' ').trim();
+      final displayPrompt = preview.length > 75 ? '${preview.substring(0, 75)}…' : preview;
+
+      return Container(
+        margin: const EdgeInsets.fromLTRB(14, 6, 14, 4),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
-          color: const Color(0xFFE2E8F0),
-          borderRadius: BorderRadius.circular(6),
+          color: DesktopTheme.isDark ? const Color(0xFF161B26) : const Color(0xFFEFF6FF),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: const Color(0xFF00D2FF).withOpacity(0.4),
+            width: 0.9,
+          ),
         ),
-        child: const Icon(Icons.arrow_upward, size: 16, color: Color(0xFF0F172A)),
-      ),
-    );
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: const Color(0xFF00D2FF).withOpacity(0.18),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.schedule, size: 12, color: Color(0xFF00D2FF)),
+                  SizedBox(width: 4),
+                  Text(
+                    'В очереди',
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.bold,
+                      fontFamily: 'Consolas',
+                      color: Color(0xFF00D2FF),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                displayPrompt,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: DesktopTheme.textPrimary,
+                  fontFamily: 'Consolas',
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Tooltip(
+              message: 'Вернуть в поле ввода для правки',
+              child: InkWell(
+                onTap: widget.controller.editQueuedPrompt,
+                borderRadius: BorderRadius.circular(4),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.edit_outlined, size: 12, color: DesktopTheme.textSecondary),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Исправить',
+                        style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Tooltip(
+              message: 'Остановить текущий шаг и отправить сразу',
+              child: InkWell(
+                onTap: widget.controller.forceSendQueuedPrompt,
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF00D2FF).withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(4),
+                    border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4), width: 0.8),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.bolt, size: 12, color: Color(0xFF00D2FF)),
+                      SizedBox(width: 3),
+                      Text(
+                        'Отправить сейчас',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF00D2FF),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Tooltip(
+              message: 'Отменить ожидающий промпт',
+              child: InkWell(
+                onTap: widget.controller.cancelQueuedPrompt,
+                borderRadius: BorderRadius.circular(4),
+                child: Padding(
+                  padding: const EdgeInsets.all(3),
+                  child: Icon(Icons.close, size: 13, color: DesktopTheme.textMuted),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    });
+  }
+
+  Widget _buildSendButton() {
+    return Obx(() {
+      final running = widget.controller.isRunning.value;
+      if (running) {
+        return Tooltip(
+          message: DesktopI18n.tr('Остановить генерацию (Stop)', 'Stop generation'),
+          child: InkWell(
+            onTap: widget.controller.abortRun,
+            borderRadius: BorderRadius.circular(6),
+            child: Container(
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                color: const Color(0xFFEF4444).withOpacity(0.18),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFFEF4444), width: 1.2),
+              ),
+              child: const Icon(
+                Icons.stop_rounded,
+                size: 16,
+                color: Color(0xFFEF4444),
+              ),
+            ),
+          ),
+        );
+      }
+
+      return Tooltip(
+        message: DesktopI18n.tr('Отправить сообщение (Enter)', 'Send message (Enter)'),
+        child: InkWell(
+          onTap: widget.controller.sendMessage,
+          borderRadius: BorderRadius.circular(6),
+          child: Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              color: DesktopTheme.isDark ? const Color(0xFFE2E8F0) : const Color(0xFF334155),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Icon(
+              Icons.arrow_upward,
+              size: 16,
+              color: DesktopTheme.isDark ? const Color(0xFF0F172A) : Colors.white,
+            ),
+          ),
+        ),
+      );
+    });
   }
 
   Widget _buildVoiceInputButton() {

@@ -119,7 +119,7 @@ class AgentActionStep {
     ),
     filePath: json['filePath']?.toString(),
     details: json['details']?.toString(),
-    isRunning: json['isRunning'] == true,
+    isRunning: false, // Persisted steps must never be loaded as running
     isError: json['isError'] == true,
     isExpanded: json['isExpanded'] == true,
     additions: json['additions'] as int?,
@@ -178,11 +178,13 @@ class ChatMessage {
     this.checkpointHash,
     List<String>? suggestedActions,
     this.metadata,
+    DateTime? createdAt,
   })  : toolCalls = toolCalls ?? [],
         steps = steps ?? [],
         todoBlocks = todoBlocks ?? [],
         citations = citations ?? [],
-        suggestedActions = suggestedActions ?? [];
+        suggestedActions = suggestedActions ?? [],
+        createdAt = createdAt ?? DateTime.now();
 
   String text;
   final ChatMessageType chatMessageType;
@@ -203,6 +205,7 @@ class ChatMessage {
   String? checkpointHash;
   List<String> suggestedActions;
   Map<String, dynamic>? metadata;
+  DateTime createdAt;
 
   Map<String, dynamic> toJson() => {
     'text': text,
@@ -220,6 +223,7 @@ class ChatMessage {
     'checkpointHash': checkpointHash,
     'suggestedActions': suggestedActions,
     'metadata': metadata,
+    'createdAt': createdAt.toIso8601String(),
   };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) => ChatMessage(
@@ -249,5 +253,8 @@ class ChatMessage {
     checkpointHash: json['checkpointHash'] as String?,
     suggestedActions: (json['suggestedActions'] as List?)?.map((e) => e.toString()).toList() ?? [],
     metadata: json['metadata'] is Map ? Map<String, dynamic>.from(json['metadata'] as Map) : null,
+    createdAt: json['createdAt'] != null
+        ? DateTime.tryParse(json['createdAt'].toString())
+        : null,
   );
 }

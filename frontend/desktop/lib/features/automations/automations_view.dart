@@ -937,7 +937,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                       Get.snackbar(
                         'Шаг отклонен',
                         'Выполнение остановлено оператором.',
-                        backgroundColor: const Color(0xFF0F172A),
+                        backgroundColor: DesktopTheme.isDark ? const Color(0xFF0F172A) : const Color(0xFF1E293B),
                         colorText: const Color(0xFFEF4444),
                         snackPosition: SnackPosition.BOTTOM,
                       );
@@ -1645,14 +1645,14 @@ class _AutomationsViewState extends State<AutomationsView> {
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Create scheduled task (white card button with dropdown arrow)
+              // Create scheduled task (primary button)
               InkWell(
                 onTap: () => _showCreateTaskDialog(isIdleTime: false),
                 borderRadius: BorderRadius.circular(8),
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: DesktopTheme.btnPrimaryBg,
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Row(
@@ -1660,37 +1660,37 @@ class _AutomationsViewState extends State<AutomationsView> {
                     children: [
                       Text(
                         DesktopI18n.createScheduledTask,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 12.5,
                           fontWeight: FontWeight.w600,
-                          color: Color(0xFF0F172A),
+                          color: DesktopTheme.btnPrimaryFg,
                         ),
                       ),
                       const SizedBox(width: 6),
-                      const Icon(Icons.keyboard_arrow_down, size: 14, color: Color(0xFF0F172A)),
+                      Icon(Icons.keyboard_arrow_down, size: 14, color: DesktopTheme.btnPrimaryFg),
                     ],
                   ),
                 ),
               ),
               const SizedBox(width: 12),
 
-              // Create idle-time task (dark card button)
+              // Create idle-time task (secondary button)
               InkWell(
                 onTap: () => _showCreateTaskDialog(isIdleTime: true),
                 borderRadius: BorderRadius.circular(8),
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF232731),
+                    color: DesktopTheme.btnSecondaryBg,
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: const Color(0xFF333846)),
+                    border: Border.all(color: DesktopTheme.borderSubtle),
                   ),
                   child: Text(
                     DesktopI18n.createIdleTask,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 12.5,
                       fontWeight: FontWeight.w500,
-                      color: Color(0xFFE2E8F0),
+                      color: DesktopTheme.btnSecondaryFg,
                     ),
                   ),
                 ),

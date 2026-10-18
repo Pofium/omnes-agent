@@ -151,20 +151,21 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
   }
 
   Future<void> _handleUninstallHandy() async {
+    final isLight = Theme.of(context).brightness == Brightness.light;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1E1E1E),
+        backgroundColor: isLight ? Colors.white : const Color(0xFF1E1E1E),
         title: Text(
           DesktopI18n.tr('Удалить Handy?', 'Uninstall Handy?'),
-          style: const TextStyle(color: Colors.white),
+          style: TextStyle(color: isLight ? const Color(0xFF020617) : Colors.white),
         ),
         content: Text(
           DesktopI18n.tr(
             'Вы уверены, что хотите удалить приложение Handy? Локальные модели и диктовка станут недоступны.',
             'Are you sure you want to uninstall Handy? Offline models and dictation will become unavailable.',
           ),
-          style: const TextStyle(color: Color(0xFFCCCCCC), fontSize: 13),
+          style: TextStyle(color: isLight ? const Color(0xFF334155) : const Color(0xFFCCCCCC), fontSize: 13),
         ),
         actions: [
           TextButton(
@@ -241,6 +242,10 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
 
   @override
   Widget build(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final textPrimary = isLight ? const Color(0xFF020617) : Colors.white;
+    final textMuted = isLight ? const Color(0xFF334155) : const Color(0xFF888888);
+
     return SingleChildScrollView(
       padding: const EdgeInsets.only(bottom: 24),
       child: Column(
@@ -252,7 +257,7 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
               const SizedBox(width: 8),
               Text(
                 DesktopI18n.tr('Голосовой ввод и диктовка', 'Voice Input & Dictation'),
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: textPrimary),
               ),
             ],
           ),
@@ -262,7 +267,7 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
               'Настройка локальной офлайн-диктовки (Handy), калибровка микрофона и облачные провайдеры STT.',
               'Configure local offline dictation (Handy), calibrate your microphone, and manage cloud STT providers.',
             ),
-            style: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
+            style: TextStyle(fontSize: 12, color: textMuted),
           ),
           const SizedBox(height: 20),
 
@@ -344,12 +349,21 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
   }
 
   Widget _buildCloudSttCard() {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final cardBg = isLight ? const Color(0xFFFFFFFF) : const Color(0xFF141414);
+    final inputBg = isLight ? const Color(0xFFF8FAFC) : const Color(0xFF1E1E1E);
+    final borderCol = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF262626);
+    final inputBorder = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF333333);
+    final textPrimary = isLight ? const Color(0xFF020617) : Colors.white;
+    final textSecondary = isLight ? const Color(0xFF1E293B) : Colors.white;
+    final textMuted = isLight ? const Color(0xFF334155) : const Color(0xFF888888);
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF141414),
+        color: cardBg,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF262626)),
+        border: Border.all(color: borderCol),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -360,7 +374,7 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
               const SizedBox(width: 8),
               Text(
                 DesktopI18n.tr('STT-провайдер (Облако / Сервер)', 'STT Provider (Cloud / Server)'),
-                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white),
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: textPrimary),
               ),
             ],
           ),
@@ -370,28 +384,28 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
               'Для голосовых сообщений и фоновой транскрипции больших аудиофайлов.',
               'For voice messages and background transcription of large audio files.',
             ),
-            style: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
+            style: TextStyle(fontSize: 12, color: textMuted),
           ),
           const SizedBox(height: 16),
 
           Text(
             DesktopI18n.tr('Провайдер STT:', 'STT Provider:'),
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.white),
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: textSecondary),
           ),
           const SizedBox(height: 6),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
             decoration: BoxDecoration(
-              color: const Color(0xFF1E1E1E),
+              color: inputBg,
               borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: const Color(0xFF333333)),
+              border: Border.all(color: inputBorder),
             ),
             child: DropdownButtonHideUnderline(
               child: DropdownButton<String>(
                 value: _sttProvider,
                 isExpanded: true,
-                dropdownColor: const Color(0xFF1E1E1E),
-                style: const TextStyle(fontSize: 13, color: Colors.white),
+                dropdownColor: inputBg,
+                style: TextStyle(fontSize: 13, color: textPrimary),
                 items: const [
                   DropdownMenuItem(value: 'groq', child: Text('Groq Whisper (Сверхбыстрый LPU)')),
                   DropdownMenuItem(value: 'openai', child: Text('OpenAI Whisper (whisper-1)')),
@@ -424,18 +438,20 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
 
           Text(
             DesktopI18n.tr('URL эндпоинта STT:', 'STT Endpoint URL:'),
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.white),
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: textSecondary),
           ),
           const SizedBox(height: 6),
           TextField(
             controller: _sttUrlController,
-            style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+            style: TextStyle(fontSize: 12, color: textPrimary, fontFamily: 'Consolas'),
             decoration: InputDecoration(
               isDense: true,
               hintText: 'https://...',
+              hintStyle: TextStyle(color: textMuted),
               filled: true,
-              fillColor: const Color(0xFF1E1E1E),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Color(0xFF333333))),
+              fillColor: inputBg,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
             ),
             onChanged: (_) {
               setState(() => _isSttVerified = false);
@@ -446,19 +462,21 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
 
           Text(
             DesktopI18n.tr('API Ключ:', 'API Key:'),
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.white),
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: textSecondary),
           ),
           const SizedBox(height: 6),
           TextField(
             controller: _sttKeyController,
             obscureText: true,
-            style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+            style: TextStyle(fontSize: 12, color: textPrimary, fontFamily: 'Consolas'),
             decoration: InputDecoration(
               isDense: true,
               hintText: 'gsk_... / sk-...',
+              hintStyle: TextStyle(color: textMuted),
               filled: true,
-              fillColor: const Color(0xFF1E1E1E),
-              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Color(0xFF333333))),
+              fillColor: inputBg,
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
+              enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
             ),
             onChanged: (_) {
               setState(() => _isSttVerified = false);
@@ -475,17 +493,18 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
                   children: [
                     Text(
                       DesktopI18n.tr('Модель:', 'Model:'),
-                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.white),
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: textSecondary),
                     ),
                     const SizedBox(height: 6),
                     TextField(
                       controller: _sttModelController,
-                      style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+                      style: TextStyle(fontSize: 12, color: textPrimary, fontFamily: 'Consolas'),
                       decoration: InputDecoration(
                         isDense: true,
                         filled: true,
-                        fillColor: const Color(0xFF1E1E1E),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Color(0xFF333333))),
+                        fillColor: inputBg,
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
+                        enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
                       ),
                       onChanged: (_) => _saveCloudStt(),
                     ),
@@ -499,18 +518,20 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
                   children: [
                     Text(
                       DesktopI18n.tr('Язык:', 'Language:'),
-                      style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.white),
+                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: textSecondary),
                     ),
                     const SizedBox(height: 6),
                     TextField(
                       controller: _sttLangController,
-                      style: const TextStyle(fontSize: 12, color: Colors.white, fontFamily: 'Consolas'),
+                      style: TextStyle(fontSize: 12, color: textPrimary, fontFamily: 'Consolas'),
                       decoration: InputDecoration(
                         isDense: true,
                         hintText: 'ru, en, auto',
+                        hintStyle: TextStyle(color: textMuted),
                         filled: true,
-                        fillColor: const Color(0xFF1E1E1E),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: const BorderSide(color: Color(0xFF333333))),
+                        fillColor: inputBg,
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
+                        enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(6), borderSide: BorderSide(color: inputBorder)),
                       ),
                       onChanged: (_) => _saveCloudStt(),
                     ),

@@ -31,6 +31,7 @@ class DesktopProject {
   String iconName;
   bool gitInitialized;
   bool ob2hIndexed;
+  bool codeGraphIndexed;
 
   DesktopProject({
     required this.id,
@@ -45,6 +46,7 @@ class DesktopProject {
     this.iconName = 'code',
     this.gitInitialized = false,
     this.ob2hIndexed = false,
+    this.codeGraphIndexed = false,
   });
 
   IconData get resolvedIcon => resolveIcon(iconName);
@@ -93,6 +95,7 @@ class DesktopProject {
         'iconName': iconName,
         'gitInitialized': gitInitialized,
         'ob2hIndexed': ob2hIndexed,
+        'codeGraphIndexed': codeGraphIndexed,
       };
 
   factory DesktopProject.fromJson(Map<String, dynamic> j) => DesktopProject(
@@ -108,6 +111,7 @@ class DesktopProject {
         iconName: j['iconName']?.toString() ?? 'code',
         gitInitialized: j['gitInitialized'] == true,
         ob2hIndexed: j['ob2hIndexed'] == true,
+        codeGraphIndexed: j['codeGraphIndexed'] == true,
       );
 }
 
@@ -245,16 +249,16 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     final result = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF181C24),
+        backgroundColor: DesktopTheme.bgSurface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: Color(0xFF2B3240)),
+          side: BorderSide(color: DesktopTheme.borderSubtle),
         ),
         title: Row(
-          children: const [
-            Icon(Icons.note_add_outlined, size: 18, color: Color(0xFF00D2FF)),
-            SizedBox(width: 8),
-            Text('Новый файл', style: TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+          children: [
+            const Icon(Icons.note_add_outlined, size: 18, color: Color(0xFF00D2FF)),
+            const SizedBox(width: 8),
+            Text('Новый файл', style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, fontWeight: FontWeight.bold)),
           ],
         ),
         content: Column(
@@ -263,23 +267,23 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           children: [
             Text(
               'В папке: ${p.basename(targetDir)}',
-              style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8), fontFamily: 'Consolas'),
+              style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted, fontFamily: 'Consolas'),
             ),
             const SizedBox(height: 10),
             TextField(
               controller: textCtrl,
               autofocus: true,
-              style: const TextStyle(fontSize: 13, color: Colors.white),
+              style: TextStyle(fontSize: 13, color: DesktopTheme.textPrimary),
               decoration: InputDecoration(
                 hintText: 'Имя файла (напр. config.json или lib/app.dart)',
-                hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                hintStyle: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
                 filled: true,
-                fillColor: const Color(0xFF0F172A),
+                fillColor: DesktopTheme.bgSurfaceElevated,
                 isDense: true,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
-                  borderSide: const BorderSide(color: Color(0xFF334155)),
+                  borderSide: BorderSide(color: DesktopTheme.borderSubtle),
                 ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
@@ -293,12 +297,12 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF00D2FF),
-              foregroundColor: Colors.black,
+              foregroundColor: const Color(0xFF0F172A),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
             ),
             onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
@@ -336,16 +340,16 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     final result = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF181C24),
+        backgroundColor: DesktopTheme.bgSurface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: Color(0xFF2B3240)),
+          side: BorderSide(color: DesktopTheme.borderSubtle),
         ),
         title: Row(
-          children: const [
-            Icon(Icons.create_new_folder_outlined, size: 18, color: Color(0xFF00D2FF)),
-            SizedBox(width: 8),
-            Text('Новая папка', style: TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+          children: [
+            const Icon(Icons.create_new_folder_outlined, size: 18, color: Color(0xFF00D2FF)),
+            const SizedBox(width: 8),
+            Text('Новая папка', style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, fontWeight: FontWeight.bold)),
           ],
         ),
         content: Column(
@@ -354,23 +358,23 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
           children: [
             Text(
               'В папке: ${p.basename(targetDir)}',
-              style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8), fontFamily: 'Consolas'),
+              style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted, fontFamily: 'Consolas'),
             ),
             const SizedBox(height: 10),
             TextField(
               controller: textCtrl,
               autofocus: true,
-              style: const TextStyle(fontSize: 13, color: Colors.white),
+              style: TextStyle(fontSize: 13, color: DesktopTheme.textPrimary),
               decoration: InputDecoration(
                 hintText: 'Имя папки (напр. components)',
-                hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                hintStyle: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
                 filled: true,
-                fillColor: const Color(0xFF0F172A),
+                fillColor: DesktopTheme.bgSurfaceElevated,
                 isDense: true,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
-                  borderSide: const BorderSide(color: Color(0xFF334155)),
+                  borderSide: BorderSide(color: DesktopTheme.borderSubtle),
                 ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
@@ -384,12 +388,12 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF00D2FF),
-              foregroundColor: Colors.black,
+              foregroundColor: const Color(0xFF0F172A),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
             ),
             onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
@@ -424,33 +428,33 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     final result = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF181C24),
+        backgroundColor: DesktopTheme.bgSurface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: Color(0xFF2B3240)),
+          side: BorderSide(color: DesktopTheme.borderSubtle),
         ),
         title: Row(
           children: [
             const Icon(Icons.edit_outlined, size: 18, color: Color(0xFF00D2FF)),
             const SizedBox(width: 8),
             Text(isDir ? 'Переименовать папку' : 'Переименовать файл',
-                style: const TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+                style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, fontWeight: FontWeight.bold)),
           ],
         ),
         content: TextField(
           controller: textCtrl,
           autofocus: true,
-          style: const TextStyle(fontSize: 13, color: Colors.white),
+          style: TextStyle(fontSize: 13, color: DesktopTheme.textPrimary),
           decoration: InputDecoration(
             hintText: 'Новое имя',
-            hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+            hintStyle: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
             filled: true,
-            fillColor: const Color(0xFF0F172A),
+            fillColor: DesktopTheme.bgSurfaceElevated,
             isDense: true,
             contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
             enabledBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(8),
-              borderSide: const BorderSide(color: Color(0xFF334155)),
+              borderSide: BorderSide(color: DesktopTheme.borderSubtle),
             ),
             focusedBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(8),
@@ -462,12 +466,12 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF00D2FF),
-              foregroundColor: Colors.black,
+              foregroundColor: const Color(0xFF0F172A),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
             ),
             onPressed: () => Navigator.of(ctx).pop(textCtrl.text.trim()),
@@ -505,26 +509,26 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF181C24),
+        backgroundColor: DesktopTheme.bgSurface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
           side: const BorderSide(color: Color(0xFFE11D48)),
         ),
         title: Row(
-          children: const [
-            Icon(Icons.warning_amber_rounded, size: 20, color: Color(0xFFE11D48)),
-            SizedBox(width: 8),
-            Text('Подтверждение удаления', style: TextStyle(fontSize: 14, color: Colors.white, fontWeight: FontWeight.bold)),
+          children: [
+            const Icon(Icons.warning_amber_rounded, size: 20, color: Color(0xFFE11D48)),
+            const SizedBox(width: 8),
+            Text('Подтверждение удаления', style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, fontWeight: FontWeight.bold)),
           ],
         ),
         content: Text(
           'Вы действительно хотите безвозвратно удалить ${isDir ? 'папку' : 'файл'} "$name"?',
-          style: const TextStyle(fontSize: 13, color: Color(0xFFE2E8F0)),
+          style: TextStyle(fontSize: 13, color: DesktopTheme.textSecondary),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
-            child: const Text('Отмена', style: TextStyle(color: Color(0xFF94A3B8))),
+            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
@@ -1244,7 +1248,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                         Get.snackbar(
                           'OB2H AST-сканирование',
                           'Индексация проекта запущена в фоновом режиме',
-                          backgroundColor: const Color(0xFF0F172A),
+                          backgroundColor: DesktopTheme.isDark ? const Color(0xFF0F172A) : const Color(0xFF1E293B),
                           colorText: const Color(0xFFA855F7),
                           snackPosition: SnackPosition.BOTTOM,
                         );
@@ -2011,12 +2015,16 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                             fontSize: 11,
                             fontFamily: 'Consolas',
                             color: isGitStaged
-                                ? const Color(0xFF34D399)
+                                ? (DesktopTheme.isDark ? const Color(0xFF34D399) : const Color(0xFF047857))
                                 : (isGitModified
-                                    ? const Color(0xFFFBBF24)
+                                    ? (DesktopTheme.isDark ? const Color(0xFFFBBF24) : const Color(0xFFB45309))
                                     : (isDir
-                                        ? (hasGitChangesInside ? const Color(0xFFFDE68A) : DesktopTheme.textPrimary)
-                                        : (name.endsWith('.md') ? const Color(0xFF38BDF8) : DesktopTheme.textSecondary))),
+                                        ? (hasGitChangesInside
+                                            ? (DesktopTheme.isDark ? const Color(0xFFFDE68A) : const Color(0xFF92400E))
+                                            : DesktopTheme.textPrimary)
+                                        : (name.endsWith('.md')
+                                            ? (DesktopTheme.isDark ? const Color(0xFF38BDF8) : const Color(0xFF0284C7))
+                                            : DesktopTheme.textSecondary))),
                             fontWeight: isDir ? FontWeight.w500 : FontWeight.normal,
                           ),
                           maxLines: 1,
@@ -2258,10 +2266,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
         position.dx + 240,
         position.dy + 420,
       ),
-      color: const Color(0xFF181C24),
+      color: DesktopTheme.bgSurface,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(8),
-        side: const BorderSide(color: Color(0xFF2B3240), width: 1),
+        side: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
       ),
       elevation: 8,
       items: isDir
@@ -2270,10 +2278,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'new_file',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.note_add_outlined, size: 14, color: Color(0xFF00D2FF)),
-                    SizedBox(width: 10),
-                    Text('Создать файл здесь...', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.note_add_outlined, size: 14, color: Color(0xFF00D2FF)),
+                    const SizedBox(width: 10),
+                    Text('Создать файл здесь...', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2281,10 +2289,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'new_folder',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.create_new_folder_outlined, size: 14, color: Color(0xFF38BDF8)),
-                    SizedBox(width: 10),
-                    Text('Создать папку здесь...', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.create_new_folder_outlined, size: 14, color: Color(0xFF38BDF8)),
+                    const SizedBox(width: 10),
+                    Text('Создать папку здесь...', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2293,10 +2301,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'add_to_chat',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF00D2FF)),
-                    SizedBox(width: 10),
-                    Text('Добавить папку в чат (@папка)', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF00D2FF)),
+                    const SizedBox(width: 10),
+                    Text('Добавить папку в чат (@папка)', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2304,10 +2312,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'open_terminal',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.terminal, size: 13, color: Color(0xFF4ADE80)),
-                    SizedBox(width: 10),
-                    Text('Открыть в Терминале', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.terminal, size: 13, color: Color(0xFF4ADE80)),
+                    const SizedBox(width: 10),
+                    Text('Открыть в Терминале', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2315,10 +2323,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'reveal_explorer',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.folder_outlined, size: 14, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.folder_outlined, size: 14, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2327,10 +2335,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'copy_rel_path',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.copy_all_outlined, size: 13, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Копировать относительный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.copy_all_outlined, size: 13, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Копировать относительный путь', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2338,10 +2346,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'copy_abs_path',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Копировать абсолютный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Копировать абсолютный путь', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2350,10 +2358,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'rename',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.edit_outlined, size: 13, color: Color(0xFFE2E8F0)),
-                    SizedBox(width: 10),
-                    Text('Переименовать', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    Icon(Icons.edit_outlined, size: 13, color: DesktopTheme.textSecondary),
+                    const SizedBox(width: 10),
+                    Text('Переименовать', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2374,10 +2382,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'open',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.open_in_new, size: 13, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Открыть в Просмотрщике', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.open_in_new, size: 13, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Открыть в Просмотрщике', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2385,10 +2393,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'open_code',
                 height: 30,
                 child: Row(
-                  children: const [
-                    Icon(Icons.code, size: 13, color: Color(0xFF38BDF8)),
-                    SizedBox(width: 10),
-                    Text('Открыть в Редакторе кода', style: TextStyle(fontSize: 11.5, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.code, size: 13, color: Color(0xFF38BDF8)),
+                    const SizedBox(width: 10),
+                    Text('Открыть в Редакторе кода', style: TextStyle(fontSize: 11.5, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2396,10 +2404,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'open_canvas',
                 height: 30,
                 child: Row(
-                  children: const [
-                    Icon(FontAwesomeIcons.wandMagicSparkles, size: 12, color: Color(0xFF00D2FF)),
-                    SizedBox(width: 10),
-                    Text('Открыть в Холсте', style: TextStyle(fontSize: 11.5, color: Colors.white)),
+                  children: [
+                    const Icon(FontAwesomeIcons.wandMagicSparkles, size: 12, color: Color(0xFF00D2FF)),
+                    const SizedBox(width: 10),
+                    Text('Открыть в Холсте', style: TextStyle(fontSize: 11.5, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2408,10 +2416,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'add_to_chat',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF00D2FF)),
-                    SizedBox(width: 10),
-                    Text('Прикрепить к промпту (@файл)', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF00D2FF)),
+                    const SizedBox(width: 10),
+                    Text('Прикрепить к промпту (@файл)', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2419,10 +2427,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'reveal_explorer',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.folder_outlined, size: 14, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.folder_outlined, size: 14, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2431,10 +2439,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'duplicate',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.content_copy, size: 13, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Дублировать файл', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.content_copy, size: 13, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Дублировать файл', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2442,10 +2450,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'copy_rel_path',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.copy_all_outlined, size: 13, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Копировать относительный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.copy_all_outlined, size: 13, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Копировать относительный путь', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2453,10 +2461,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'copy_abs_path',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
-                    SizedBox(width: 10),
-                    Text('Копировать абсолютный путь', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    const Icon(Icons.copy, size: 13, color: Color(0xFF94A3B8)),
+                    const SizedBox(width: 10),
+                    Text('Копировать абсолютный путь', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2465,10 +2473,10 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 value: 'rename',
                 height: 32,
                 child: Row(
-                  children: const [
-                    Icon(Icons.edit_outlined, size: 13, color: Color(0xFFE2E8F0)),
-                    SizedBox(width: 10),
-                    Text('Переименовать', style: TextStyle(fontSize: 12, color: Colors.white)),
+                  children: [
+                    Icon(Icons.edit_outlined, size: 13, color: DesktopTheme.textSecondary),
+                    const SizedBox(width: 10),
+                    Text('Переименовать', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                   ],
                 ),
               ),
@@ -2636,6 +2644,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
     bool createAgentsMd = true;
     bool createReadme = true;
     bool runOb2hScan = true;
+    bool initCodeGraph = true;
     String selectedColor = '#00D2FF';
     String selectedIcon = 'code';
     bool isScaffolding = false;
@@ -3000,6 +3009,14 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                             value: runOb2hScan,
                             onChanged: (v) => setDlgState(() => runOb2hScan = v ?? true),
                           ),
+                          Divider(height: 8, color: DesktopTheme.borderSubtle.withOpacity(0.4)),
+                          _buildScaffoldCheckbox(
+                            title: 'Инициализировать CodeGraph (.codegraph/)',
+                            subtitle: 'AST-граф символов, трассировка вызовов и синергия с KAG',
+                            tooltip: 'CodeGraph индексирует функции, классы, вызовы (callers/callees) и зависимости проекта в локальную базу SQLite (.codegraph/codegraph.db).\nЭто позволяет OmnesAgent мгновенно ориентироваться в архитектуре без перечитывания сотен файлов и экономит тысячи токенов LLM при каждом запросе.',
+                            value: initCodeGraph,
+                            onChanged: (v) => setDlgState(() => initCodeGraph = v ?? true),
+                          ),
                         ],
                       ),
                     ),
@@ -3137,6 +3154,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                             createAgentsMd: createAgentsMd,
                             createReadme: createReadme,
                             runOb2hScan: runOb2hScan,
+                            initCodeGraph: initCodeGraph,
                             customInstructions: instructionsCtrl.text.trim().isNotEmpty ? instructionsCtrl.text.trim() : null,
                             colorHex: selectedColor,
                             iconName: selectedIcon,
@@ -3161,6 +3179,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                             iconName: selectedIcon,
                             gitInitialized: initGit || scaffoldRes.analysis.hasGit,
                             ob2hIndexed: runOb2hScan,
+                            codeGraphIndexed: initCodeGraph,
                           );
 
                           if (mounted) {
@@ -3178,7 +3197,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                           Get.snackbar(
                             'Проект подключен',
                             scaffoldRes.message,
-                            backgroundColor: const Color(0xFF0F172A),
+                            backgroundColor: DesktopTheme.isDark ? const Color(0xFF0F172A) : const Color(0xFF1E293B),
                             colorText: const Color(0xFF00D2FF),
                             icon: const Icon(Icons.check_circle_outline, color: Color(0xFF00D2FF)),
                             snackPosition: SnackPosition.BOTTOM,
@@ -3212,6 +3231,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
     required String subtitle,
     required bool value,
     required ValueChanged<bool?> onChanged,
+    String? tooltip,
   }) {
     return InkWell(
       onTap: () => onChanged(!value),
@@ -3235,7 +3255,33 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(title, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textPrimary)),
+                  Row(
+                    children: [
+                      Text(title, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: DesktopTheme.textPrimary)),
+                      if (tooltip != null) ...[
+                        const SizedBox(width: 6),
+                        Tooltip(
+                          message: tooltip,
+                          preferBelow: false,
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E293B),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5)),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.4),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          textStyle: const TextStyle(fontSize: 11, color: Color(0xFFF1F5F9), height: 1.35),
+                          child: const Icon(Icons.help_outline_rounded, size: 14, color: Color(0xFF00D2FF)),
+                        ),
+                      ],
+                    ],
+                  ),
                   Text(subtitle, style: TextStyle(fontSize: 10, color: DesktopTheme.textMuted)),
                 ],
               ),
@@ -3354,8 +3400,8 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
     Get.snackbar(
       'ИИ Группировка',
       'Агент анализирует несгруппированные сессии и распределяет их по смысловым категориям...',
-      backgroundColor: Colors.black87,
-      colorText: Colors.white,
+      backgroundColor: DesktopTheme.bgSurfaceElevated,
+      colorText: DesktopTheme.textPrimary,
       duration: const Duration(seconds: 3),
       snackPosition: SnackPosition.BOTTOM,
     );
@@ -3716,7 +3762,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                                 Get.snackbar(
                                   'Папка создана',
                                   'Папка успешно создана на диске',
-                                  backgroundColor: const Color(0xFF0F172A),
+                                  backgroundColor: DesktopTheme.isDark ? const Color(0xFF0F172A) : const Color(0xFF1E293B),
                                   colorText: const Color(0xFF00D2FF),
                                   snackPosition: SnackPosition.BOTTOM,
                                 );

@@ -20,6 +20,7 @@ class DesktopInspectorPanel extends StatefulWidget {
   final double? width;
   final DesktopTaskWorkspaceController controller;
   final int initialTabIndex;
+  final String? initialTabKey;
   final String? initialSideChatText;
   final VoidCallback? onClose;
 
@@ -28,6 +29,7 @@ class DesktopInspectorPanel extends StatefulWidget {
     this.width,
     required this.controller,
     this.initialTabIndex = 0,
+    this.initialTabKey,
     this.initialSideChatText,
     this.onClose,
   });
@@ -111,13 +113,21 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       sideChatLogicController.addBranchContext(widget.initialSideChatText!);
     }
 
-    if (widget.initialTabIndex == 5) {
+    if (widget.initialTabKey != null && widget.initialTabKey!.isNotEmpty) {
+      if (!openTabKeys.contains(widget.initialTabKey!)) openTabKeys.add(widget.initialTabKey!);
+      activeTabKey = widget.initialTabKey!;
+      showTabChooser = false;
+    } else if (widget.initialTabIndex == 5) {
       if (!openTabKeys.contains('editor')) openTabKeys.add('editor');
       activeTabKey = 'editor';
       showTabChooser = false;
     } else if (widget.initialTabIndex == 6) {
       if (!openTabKeys.contains('image')) openTabKeys.add('image');
       activeTabKey = 'image';
+      showTabChooser = false;
+    } else if (widget.initialTabIndex == 7) {
+      if (!openTabKeys.contains('trajectory')) openTabKeys.add('trajectory');
+      activeTabKey = 'trajectory';
       showTabChooser = false;
     } else if (widget.initialTabIndex >= 0 && widget.initialTabIndex < 5) {
       final defaultKeys = ['browser', 'terminal', 'canvas', 'preview', 'side_chat'];
@@ -138,14 +148,22 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
   @override
   void didUpdateWidget(DesktopInspectorPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.initialTabIndex != oldWidget.initialTabIndex) {
-      if (widget.initialTabIndex == 5) {
+    if (widget.initialTabIndex != oldWidget.initialTabIndex || widget.initialTabKey != oldWidget.initialTabKey) {
+      if (widget.initialTabKey != null && widget.initialTabKey!.isNotEmpty) {
+        if (!openTabKeys.contains(widget.initialTabKey!)) openTabKeys.add(widget.initialTabKey!);
+        activeTabKey = widget.initialTabKey!;
+        showTabChooser = false;
+      } else if (widget.initialTabIndex == 5) {
         if (!openTabKeys.contains('editor')) openTabKeys.add('editor');
         activeTabKey = 'editor';
         showTabChooser = false;
       } else if (widget.initialTabIndex == 6) {
         if (!openTabKeys.contains('image')) openTabKeys.add('image');
         activeTabKey = 'image';
+        showTabChooser = false;
+      } else if (widget.initialTabIndex == 7) {
+        if (!openTabKeys.contains('trajectory')) openTabKeys.add('trajectory');
+        activeTabKey = 'trajectory';
         showTabChooser = false;
       } else if (widget.initialTabIndex >= 0 && widget.initialTabIndex < 5) {
         final defaultKeys = ['browser', 'terminal', 'canvas', 'preview', 'side_chat'];
@@ -279,10 +297,10 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       case 'side_chat':
         return _buildSideChatTab();
       case 'trajectory':
-        return TrajectoryInspectorPanel(
-          steps: widget.controller.trajectorySteps,
+        return Obx(() => TrajectoryInspectorPanel(
+          steps: widget.controller.trajectorySteps.toList(),
           onForkAtStep: (step) => widget.controller.forkSessionAtStep(step.id),
-        );
+        ));
       case 'editor':
         return _buildEditorTab();
       case 'image':
@@ -983,7 +1001,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
 
   Widget _buildBrowserStandbyView() {
     return Container(
-      color: const Color(0xFF0F172A),
+      color: DesktopTheme.bgSurface,
       padding: const EdgeInsets.all(24),
       child: Center(
         child: Column(
@@ -991,9 +1009,9 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
           children: [
             const Icon(FontAwesomeIcons.globe, size: 36, color: Color(0xFF00D2FF)),
             const SizedBox(height: 16),
-            const Text(
+            Text(
               'Microsoft Edge WebView2',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
             ),
             const SizedBox(height: 8),
             Text(
@@ -1717,7 +1735,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         padding: const EdgeInsets.only(top: 12, bottom: 4),
         child: SelectableText(
           line.substring(3),
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
         ),
       );
     } else if (line.startsWith('### ')) {
@@ -1725,7 +1743,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         padding: const EdgeInsets.only(top: 10, bottom: 3),
         child: SelectableText(
           line.substring(4),
-          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF38BDF8)),
+          style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: DesktopTheme.isDark ? const Color(0xFF38BDF8) : const Color(0xFF0284C7)),
         ),
       );
     } else if (line.startsWith('- [ ] ') || line.startsWith('* [ ] ')) {
@@ -1734,12 +1752,12 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Icon(Icons.check_box_outline_blank, size: 14, color: Color(0xFF94A3B8)),
+            Icon(Icons.check_box_outline_blank, size: 14, color: DesktopTheme.textMuted),
             const SizedBox(width: 8),
             Expanded(
               child: SelectableText(
                 line.substring(6),
-                style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0)),
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
               ),
             ),
           ],
@@ -1756,7 +1774,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
             Expanded(
               child: SelectableText(
                 line.substring(6),
-                style: const TextStyle(fontSize: 12, color: Color(0xFF94A3B8), decoration: TextDecoration.lineThrough),
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted, decoration: TextDecoration.lineThrough),
               ),
             ),
           ],
@@ -1775,7 +1793,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
             Expanded(
               child: SelectableText(
                 line.substring(2),
-                style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0), height: 1.4),
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary, height: 1.4),
               ),
             ),
           ],
@@ -1785,13 +1803,13 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       return Container(
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        decoration: const BoxDecoration(
-          border: Border(left: BorderSide(color: Color(0xFF00D2FF), width: 3)),
-          color: Color(0xFF0F172A),
+        decoration: BoxDecoration(
+          border: const Border(left: BorderSide(color: Color(0xFF00D2FF), width: 3)),
+          color: DesktopTheme.bgSurfaceElevated,
         ),
         child: SelectableText(
           line.substring(2),
-          style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: Color(0xFF94A3B8)),
+          style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: DesktopTheme.textSecondary),
         ),
       );
     } else if (line.startsWith('```')) {
@@ -1800,19 +1818,19 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.all(8),
         decoration: BoxDecoration(
-          color: const Color(0xFF050811),
+          color: DesktopTheme.isDark ? const Color(0xFF050811) : const Color(0xFFF1F5F9),
           borderRadius: BorderRadius.circular(5),
-          border: Border.all(color: const Color(0xFF1E293B)),
+          border: Border.all(color: DesktopTheme.borderSubtle),
         ),
         child: SelectableText(
           line,
-          style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF38BDF8)),
+          style: TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.isDark ? const Color(0xFF38BDF8) : const Color(0xFF0369A1)),
         ),
       );
     } else if (line == '---' || line == '***') {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 8),
-        child: Divider(color: Color(0xFF334155), height: 1),
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Divider(color: DesktopTheme.borderSubtle, height: 1),
       );
     } else if (line.isEmpty) {
       return const SizedBox(height: 6);
@@ -1821,7 +1839,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         padding: const EdgeInsets.symmetric(vertical: 1.5),
         child: SelectableText(
           line,
-          style: const TextStyle(fontSize: 12, color: Color(0xFFE2E8F0), height: 1.45),
+          style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary, height: 1.45),
         ),
       );
     }
@@ -1834,16 +1852,16 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
         decoration: BoxDecoration(
-          color: const Color(0xFF1E293B),
+          color: DesktopTheme.bgSurfaceElevated,
           borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: const Color(0xFF334155)),
+          border: Border.all(color: DesktopTheme.borderSubtle),
         ),
         child: Text(
           label,
-          style: const TextStyle(
+          style: TextStyle(
             fontSize: 10,
             fontFamily: 'Consolas',
-            color: Color(0xFF94A3B8),
+            color: DesktopTheme.textSecondary,
           ),
         ),
       ),

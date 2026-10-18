@@ -14,6 +14,7 @@ pub mod api_browse;
 pub mod api_config;
 pub mod api_editor;
 pub mod api_logs;
+pub mod api_memory;
 pub mod api_pairing;
 pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
@@ -580,15 +581,20 @@ pub struct AppState {
 }
 
 /// Atomically write `.omnes/gateway.json` for frontend service discovery.
-fn write_gateway_descriptor(host: &str, port: u16) {
+fn write_gateway_descriptor(host: &str, port: u16, token: Option<&str>) {
     let dir = std::path::Path::new(".omnes");
     let _ = std::fs::create_dir_all(dir);
-    let descriptor = serde_json::json!({
+    let mut descriptor = serde_json::json!({
         "pid": std::process::id(),
         "port": port,
         "host": host,
         "started_at": chrono::Utc::now().to_rfc3339()
     });
+    if let Some(tok) = token {
+        if !tok.trim().is_empty() {
+            descriptor["token"] = serde_json::Value::String(tok.trim().to_string());
+        }
+    }
     let target = dir.join("gateway.json");
     let tmp = dir.join(format!("gateway.json.tmp.{}", std::process::id()));
     if let Ok(content) = serde_json::to_string_pretty(&descriptor) {
@@ -674,7 +680,8 @@ pub async fn run_gateway(
     let actual_addr = listener.local_addr()?;
     let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
-    write_gateway_descriptor(host, actual_port);
+    let initial_token = config.gateway.paired_tokens.first().map(|s| s.as_str());
+    write_gateway_descriptor(host, actual_port, initial_token);
 
     // Seed the install-wide default provider from the first entry that
     // actually declares a `model`. Entries without one cannot serve as the
@@ -1579,7 +1586,7 @@ pub async fn run_gateway(
         mem,
         memory_strategy,
         auto_save: config.memory.auto_save,
-        pairing,
+        pairing: pairing.clone(),
         admin_auth,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
@@ -1930,6 +1937,7 @@ pub async fn run_gateway(
         .route("/api/v1/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename).get(api::handle_api_session_state))
         .route("/api/v1/sessions/{id}/fork", post(api::handle_api_session_fork))
         .route("/api/v1/sessions/{id}/steps", get(api::handle_api_session_steps))
+        .route("/api/sessions/{id}/steps", get(api::handle_api_session_steps))
         .route("/api/v1/sessions/{id}/export_trace", get(api::handle_api_session_export_trace))
         .route("/api/v1/sessions/replay", post(api::handle_api_session_replay))
         .route("/api/v1/providers", get(api::handle_api_providers_catalog))
@@ -2144,6 +2152,11 @@ pub async fn run_gateway(
     if let Some(readiness) = readiness {
         readiness.report_ready(actual_addr);
     }
+
+    let discovery_token = pairing.tokens().into_iter().next().or_else(|| {
+        config.gateway.paired_tokens.first().cloned()
+    });
+    write_gateway_descriptor(host, actual_port, discovery_token.as_deref());
 
     if let Some(tls_acceptor) = tls_acceptor {
         // Manual TLS accept loop — serves each connection via hyper.

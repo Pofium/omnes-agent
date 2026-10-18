@@ -8,6 +8,7 @@ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:omnes_shared/omnes_shared.dart';
+import 'package:universal_io/io.dart' as universal_io;
 
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
@@ -836,11 +837,23 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       final savedUrl = _storage.read<String>('provider_url_$id') ?? (p['url'] as String);
       final savedModel = _storage.read<String>('provider_model_$id') ?? (p['defaultModel'] as String);
 
-      final isOllamaEnabled = _storage.read<bool>('provider_enabled_ollama') ?? false;
+      final envKey = universal_io.Platform.environment['${id.toUpperCase()}_API_KEY'] ??
+          (id == 'qwen' ? universal_io.Platform.environment['DASHSCOPE_API_KEY'] : null) ??
+          (id == 'moonshot' ? universal_io.Platform.environment['KIMI_API_KEY'] : null) ?? '';
+      final hasEnvKey = envKey.trim().isNotEmpty;
+      p['hasEnvKey'] = hasEnvKey;
+
+      final isExplicitlyEnabled = _storage.read<bool>('provider_enabled_$id');
       if (id == 'ollama') {
-        p['isConfigured'] = isOllamaEnabled;
+        p['isConfigured'] = isExplicitlyEnabled ?? false;
+      } else if (p['isCustom'] == true) {
+        p['isConfigured'] = isExplicitlyEnabled ?? (savedKey.trim().isNotEmpty || savedUrl.trim().isNotEmpty);
       } else {
-        p['isConfigured'] = savedKey.trim().isNotEmpty;
+        if (isExplicitlyEnabled != null) {
+          p['isConfigured'] = isExplicitlyEnabled;
+        } else {
+          p['isConfigured'] = savedKey.trim().isNotEmpty;
+        }
       }
 
       _apiKeyControllers[id] = TextEditingController(text: savedKey);
@@ -859,6 +872,9 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     _storage.write('provider_key_$id', key);
     _storage.write('provider_url_$id', url);
     _storage.write('provider_model_$id', model);
+    if (key.isNotEmpty) {
+      _storage.write('provider_enabled_$id', true);
+    }
 
     final p = providers.firstWhereOrNull((item) => item['id'] == id);
     if (p != null) {
@@ -910,38 +926,81 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     }
   }
 
-  void _testProviderConnection(String id) {
+  Future<void> _testProviderConnection(String id) async {
     setState(() {
-      _testStatusMap[id] = (ok: false, text: 'Проверка подключения...');
+      _testStatusMap[id] = (ok: false, text: 'Проверка подключения и запрос моделей...');
     });
 
-    Future.delayed(const Duration(milliseconds: 600), () {
-      if (!mounted) return;
-      final key = _apiKeyControllers[id]?.text.trim() ?? '';
+    final key = _apiKeyControllers[id]?.text.trim() ?? '';
+    final url = _urlControllers[id]?.text.trim() ?? '';
+
+    if (key.isEmpty && id != 'ollama' && id != 'lmstudio') {
       setState(() {
-        if (id == 'ollama') {
-          _testStatusMap[id] = (ok: true, text: 'Подключение успешно (Ollama daemon live, 14ms)');
-        } else if (key.isEmpty) {
-          _testStatusMap[id] = (ok: false, text: 'API ключ не указан');
-        } else {
-          _testStatusMap[id] = (ok: true, text: 'Соединение установлено (HTTP 200, 52ms)');
-        }
+        _testStatusMap[id] = (ok: false, text: 'API ключ не указан');
       });
-    });
+      return;
+    }
+
+    try {
+      final fetchedModels = await DesktopTaskWorkspaceController.fetchModelsFromBaseUrl(url, apiKey: key);
+      if (!mounted) return;
+      if (fetchedModels.isNotEmpty) {
+        _storage.write('provider_models_$id', fetchedModels);
+        final p = providers.firstWhereOrNull((item) => item['id'] == id);
+        if (p != null) {
+          p['models'] = fetchedModels;
+          if (_modelControllers[id] != null &&
+              (_modelControllers[id]!.text.isEmpty || _modelControllers[id]!.text == 'default')) {
+            _modelControllers[id]!.text = fetchedModels.first;
+            _storage.write('provider_model_$id', fetchedModels.first);
+          }
+        }
+        setState(() {
+          _testStatusMap[id] = (ok: true, text: 'Подключено: доступно ${fetchedModels.length} моделей (HTTP 200)');
+        });
+        if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+          Get.find<DesktopTaskWorkspaceController>().loadConfiguredProviders();
+        }
+      } else {
+        setState(() {
+          _testStatusMap[id] = (ok: true, text: 'Соединение установлено (HTTP 200)');
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _testStatusMap[id] = (ok: false, text: 'Ошибка подключения: $e');
+      });
+    }
   }
 
-  void _saveCustomProvider() {
+  Future<void> _saveCustomProvider() async {
     if (customNameController.text.trim().isEmpty) return;
     final newId = 'custom_${DateTime.now().millisecondsSinceEpoch}';
 
     final name = customNameController.text.trim();
     final url = customUrlController.text.trim().isEmpty ? 'http://localhost:8000/v1' : customUrlController.text.trim();
-    final model = customModelController.text.trim().isEmpty ? 'default' : customModelController.text.trim();
+    var model = customModelController.text.trim();
     final key = customKeyController.text.trim();
+
+    // Auto-fetch available models from BASE_URL if possible
+    List<String> discoveredModels = [];
+    try {
+      discoveredModels = await DesktopTaskWorkspaceController.fetchModelsFromBaseUrl(url, apiKey: key);
+    } catch (_) {}
+
+    if (discoveredModels.isNotEmpty && (model.isEmpty || model == 'default')) {
+      model = discoveredModels.first;
+    } else if (model.isEmpty) {
+      model = 'default';
+    }
+
+    final finalModels = discoveredModels.isNotEmpty ? discoveredModels : [model];
 
     _storage.write('provider_key_$newId', key);
     _storage.write('provider_url_$newId', url);
     _storage.write('provider_model_$newId', model);
+    _storage.write('provider_models_$newId', finalModels);
 
     final item = {
       'id': newId,
@@ -949,7 +1008,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       'type': 'custom',
       'url': url,
       'defaultModel': model,
-      'models': [model],
+      'models': finalModels,
       'isCustom': true,
     };
 
@@ -972,6 +1031,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       }
     } catch (_) {}
 
+    if (!mounted) return;
     setState(() {
       final newP = {
         'id': newId,
@@ -979,7 +1039,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         'type': 'custom',
         'url': url,
         'defaultModel': model,
-        'models': [model],
+        'models': finalModels,
         'isConfigured': key.isNotEmpty || url.isNotEmpty,
         'isCustom': true,
         'isExpanded': false,
@@ -1786,8 +1846,33 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                 ),
                 const SizedBox(height: 14),
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.end,
                   children: [
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.sync, size: 14, color: Color(0xFF00D2FF)),
+                      label: const Text('Загрузить модели с BASE_URL', style: TextStyle(fontSize: 12, color: Color(0xFF00D2FF))),
+                      onPressed: () async {
+                        final url = customUrlController.text.trim();
+                        final key = customKeyController.text.trim();
+                        if (url.isEmpty) return;
+                        final fetched = await DesktopTaskWorkspaceController.fetchModelsFromBaseUrl(url, apiKey: key);
+                        if (fetched.isNotEmpty && mounted) {
+                          setState(() {
+                            customModelController.text = fetched.first;
+                          });
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text('Успешно загружено ${fetched.length} моделей: ${fetched.take(3).join(", ")}${fetched.length > 3 ? "..." : ""}'),
+                              duration: const Duration(seconds: 3),
+                            ),
+                          );
+                        }
+                      },
+                      style: OutlinedButton.styleFrom(
+                        side: const BorderSide(color: Color(0xFF00D2FF)),
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      ),
+                    ),
+                    const Spacer(),
                     TextButton(
                       onPressed: () => setState(() => isAddingProvider = false),
                       child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted)),
@@ -1885,6 +1970,17 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                                     ),
                                     child: const Text('CUSTOM', style: TextStyle(fontSize: 9, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold)),
                                   ),
+                                ] else if (p['hasEnvKey'] == true) ...[
+                                  const SizedBox(width: 6),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF38BDF8).withOpacity(0.12),
+                                      borderRadius: BorderRadius.circular(4),
+                                      border: Border.all(color: const Color(0xFF38BDF8).withOpacity(0.3)),
+                                    ),
+                                    child: const Text('ENV KEY', style: TextStyle(fontSize: 9, color: Color(0xFF38BDF8), fontWeight: FontWeight.bold)),
+                                  ),
                                 ],
                               ],
                             ),
@@ -1902,7 +1998,11 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                         value: isConfigured,
                         activeColor: const Color(0xFF00D2FF),
                         onChanged: (val) {
+                          _storage.write('provider_enabled_$id', val);
                           setState(() => p['isConfigured'] = val);
+                          if (Get.isRegistered<DesktopTaskWorkspaceController>()) {
+                            Get.find<DesktopTaskWorkspaceController>().loadConfiguredProviders();
+                          }
                         },
                       ),
                       const SizedBox(width: 8),
@@ -2300,7 +2400,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: DesktopTheme.accentCyan,
-                    foregroundColor: Colors.black,
+                    foregroundColor: const Color(0xFF0F172A),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                   ),
                 ),
@@ -2390,7 +2490,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       },
                       style: ElevatedButton.styleFrom(
                         backgroundColor: DesktopTheme.accentCyan,
-                        foregroundColor: Colors.black,
+                        foregroundColor: const Color(0xFF0F172A),
                       ),
                       child: Text(isCreatingNewSkill ? 'Создать' : 'Сохранить', style: const TextStyle(fontWeight: FontWeight.bold)),
                     ),
@@ -2866,7 +2966,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               label: const Text('Сохранить в шлюз', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
               style: ElevatedButton.styleFrom(
                 backgroundColor: DesktopTheme.accentCyan,
-                foregroundColor: Colors.black,
+                foregroundColor: const Color(0xFF0F172A),
               ),
               onPressed: _savePersonalityFile,
             ),
@@ -2885,7 +2985,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
           height: 380,
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
-            color: const Color(0xFF0F172A),
+            color: DesktopTheme.bgSurfaceElevated,
             borderRadius: BorderRadius.circular(8),
             border: Border.all(color: DesktopTheme.borderSubtle),
           ),
@@ -2893,16 +2993,16 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             controller: personalityContentController,
             maxLines: null,
             expands: true,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 12.5,
               fontFamily: 'Consolas',
-              color: Colors.white,
+              color: DesktopTheme.textPrimary,
               height: 1.45,
             ),
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               border: InputBorder.none,
               hintText: 'Введите инструкции личности агента...',
-              hintStyle: TextStyle(color: Color(0xFF64748B)),
+              hintStyle: TextStyle(color: DesktopTheme.textMuted),
             ),
           ),
         ),
@@ -2966,7 +3066,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
           label: const Text('Применить и завершить Quickstart', style: TextStyle(fontWeight: FontWeight.bold)),
           style: ElevatedButton.styleFrom(
             backgroundColor: DesktopTheme.accentCyan,
-            foregroundColor: Colors.black,
+            foregroundColor: const Color(0xFF0F172A),
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
           ),
           onPressed: () async {
@@ -3078,7 +3178,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     label: const Text('Проверить обновления', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: DesktopTheme.accentCyan,
-                      foregroundColor: Colors.black,
+                      foregroundColor: const Color(0xFF0F172A),
                     ),
                     onPressed: _checkGatewayVersion,
                   ),
@@ -3623,7 +3723,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     const SizedBox(width: 8),
                     ElevatedButton(
                       onPressed: _createFolderSubmit,
-                      style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: Colors.black),
+                      style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: const Color(0xFF0F172A)),
                       child: const Text('Создать'),
                     ),
                   ],
@@ -3881,7 +3981,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   ElevatedButton.icon(
                     icon: const Icon(Icons.upload_file, size: 14),
                     label: const Text('Загрузить .wasm плагин'),
-                    style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: Colors.black),
+                    style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: const Color(0xFF0F172A)),
                     onPressed: () {
                       setState(() => pluginsStatusMsg = 'Загрузка плагинов доступна через /api/plugins шлюза');
                     },
@@ -4212,7 +4312,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                   ElevatedButton.icon(
                     icon: const Icon(Icons.add, size: 14),
                     label: const Text('Зарегистрировать ключ'),
-                    style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: Colors.black),
+                    style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: const Color(0xFF0F172A)),
                     onPressed: _registerWebauthn,
                   ),
                 ],

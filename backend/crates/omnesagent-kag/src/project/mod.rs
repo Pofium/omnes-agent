@@ -1,6 +1,7 @@
 //! Сервис управления проектами и проектной AST-памятью.
 
 pub mod watcher;
+pub mod codegraph_bridge;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 pub use watcher::ProjectWatcher;
+pub use codegraph_bridge::{sync_codegraph_db, CodeGraphSyncResult};
 use crate::ast::{AstCodeExtractor, AstScanResult};
 use crate::models::ProjectRecord;
 use crate::vector::similarity::top_k;
@@ -569,8 +571,19 @@ impl ProjectService {
 
         tx.commit()?;
 
-        // Обновляем God Nodes
-        let conn_ref = self.conn.lock();
+        // Гибридная синергия: если в корне проекта присутствует .codegraph/codegraph.db,
+        // автоматически импортируем подробные символы и связи в граф KAG
+        let mut conn_ref = self.conn.lock();
+        if let Ok(cg_res) = codegraph_bridge::sync_codegraph_db(project_id, path_obj, &mut conn_ref) {
+            if cg_res.nodes_synced > 0 {
+                info!(
+                    "Гибридная синергия: обогащен граф KAG из CodeGraph ({} узлов, {} связей)",
+                    cg_res.nodes_synced, cg_res.edges_synced
+                );
+            }
+        }
+
+        // Обновляем God Nodes с учетом объединенного графа (AST + CodeGraph)
         let _ = crate::graph::GraphAnalytics::update_god_nodes(&conn_ref, project_id);
         drop(conn_ref);
 
@@ -580,6 +593,19 @@ impl ProjectService {
         );
 
         Ok(scan_res)
+    }
+
+    /// Выполняет явную синхронизацию графа символов из .codegraph/codegraph.db в KAG.
+    pub fn sync_codegraph(&self, project_id: &str) -> anyhow::Result<CodeGraphSyncResult> {
+        let project = self.get_project(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("Проект с ID '{}' не найден", project_id))?;
+        let root = Path::new(&project.root_path);
+        let mut conn = self.conn.lock();
+        let res = codegraph_bridge::sync_codegraph_db(project_id, root, &mut conn)?;
+        if res.nodes_synced > 0 {
+            let _ = crate::graph::GraphAnalytics::update_god_nodes(&conn, project_id);
+        }
+        Ok(res)
     }
 
     /// Гибридный семантический поиск по символам и коду проекта

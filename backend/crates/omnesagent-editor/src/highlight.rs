@@ -152,7 +152,7 @@ fn class_id_for_capture(name: &str) -> u16 {
             "keyword" | "include" | "module" | "keyword.function" => 2,
             "string" => 3,
             "number" | "integer" | "float" => 4,
-            "constant" | "boolean" | "character" => 5,
+            "constant" | "boolean" | "character" | "symbol" | "atom" => 5,
             "function" | "method" | "constructor" | "call" => 6,
             "type" | "class" | "enum" | "struct" | "interface" | "namespace"
             | "record" | "trait" => 7,
@@ -192,7 +192,8 @@ fn inkjet_language(language_id: &str) -> Option<inkjet::Language> {
         "python" => L::Python,
         "typescript" => L::Typescript,
         "tsx" => L::Tsx,
-        "javascript" | "jsx" => L::Javascript,
+        "javascript" => L::Javascript,
+        "jsx" => L::Jsx,
         "html" => L::Html,
         "css" => L::Css,
         "scss" => L::Scss,
@@ -206,6 +207,14 @@ fn inkjet_language(language_id: &str) -> Option<inkjet::Language> {
         "java" => L::Java,
         "kotlin" => L::Kotlin,
         "php" => L::Php,
+        "csharp" | "cs" => L::CSharp,
+        "swift" => L::Swift,
+        "ruby" => L::Ruby,
+        "lua" => L::Lua,
+        "elixir" => L::Elixir,
+        "scala" => L::Scala,
+        "svelte" => L::Svelte,
+        "vue" => L::Html,
         _ => return None,
     })
 }
@@ -571,5 +580,56 @@ mod tests {
             "comment must end: runs={:?}",
             row.runs
         );
+    }
+
+    #[test]
+    fn highlights_all_ast_supported_languages() {
+        use crate::buffer::EditorBuffer;
+        use std::path::PathBuf;
+
+        let samples: &[(&str, &str)] = &[
+            ("test.rs", "fn main() { println!(\"Hello\"); }"),
+            ("test.py", "def greet(name: str) -> str:\n    return f\"Hi, {name}\""),
+            ("test.ts", "const add = (a: number, b: number): number => a + b;"),
+            ("test.tsx", "export const Widget = () => <div className=\"box\">Hello</div>;"),
+            ("test.js", "function sum(a, b) { return a + b; }"),
+            ("test.jsx", "export default function App() { return <span>OK</span>; }"),
+            ("test.go", "package main\n\nfunc main() {\n\tprintln(\"go\")\n}"),
+            ("test.sql", "SELECT id, name FROM users WHERE active = 1;"),
+            ("test.php", "<?php\nfunction test(): int {\n    return 42;\n}"),
+            ("test.dart", "void main() {\n  final msg = 'dart';\n  print(msg);\n}"),
+            ("test.java", "public class Main {\n    public static void main(String[] args) {}\n}"),
+            ("test.cs", "using System;\npublic class App {\n    public static void Main() {}\n}"),
+            ("test.c", "#include <stdio.h>\nint main(void) {\n    return 0;\n}"),
+            ("test.cpp", "#include <iostream>\nint main() {\n    std::cout << 42 << std::endl;\n    return 0;\n}"),
+            ("test.kt", "fun main() {\n    val greeting = \"kotlin\"\n    println(greeting)\n}"),
+            ("test.swift", "import Foundation\nfunc greet(name: String) -> String {\n    return name\n}"),
+            ("test.rb", "def hello_world\n  puts 'hello ruby'\nend"),
+            ("test.lua", "local function add(a, b)\n  return a + b\nend"),
+            ("test.ex", "defmodule Core.App do\n  def start do\n    :ok\n  end\nend"),
+            ("test.scala", "object Main extends App {\n  val x: Int = 10\n}"),
+            ("test.svelte", "<script>\n  let count = 0;\n</script>\n<button on:click>{count}</button>"),
+            ("test.vue", "<template>\n  <div class=\"view\">{{ title }}</div>\n</template>"),
+            ("test.sh", "#!/bin/bash\nfunction run_task() {\n    echo \"running\"\n}"),
+        ];
+
+        for (filename, code) in samples {
+            let mut b = EditorBuffer::from_text(
+                1,
+                PathBuf::from(filename),
+                code.to_string(),
+                false,
+            );
+            let page = b.rows(0, 50);
+            assert!(
+                !page.rows.is_empty(),
+                "File {filename} produced no rows"
+            );
+            let total_runs: usize = page.rows.iter().map(|r| r.runs.len()).sum();
+            assert!(
+                total_runs > 0,
+                "Language for {filename} produced 0 runs! Plaintext fallback detected."
+            );
+        }
     }
 }

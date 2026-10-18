@@ -9,121 +9,41 @@ import 'package:path/path.dart' as p;
 import 'package:universal_io/io.dart';
 import 'package:universal_io/io.dart' as universal_io;
 
-/// Represents an independent chat session in OmnesAgent ADE
-class TaskSession {
-  final String id;
-  String title;
-  String group;
-  String? project;
-  String? projectPath;
-  String? branch;
-  List<ChatMessage> messages;
-  PermissionMode permissionMode;
-  String thoughtLevel;
-  String activeModel;
-  String tokenCount;
-  GoalStatus? activeGoal;
-  List<Map<String, dynamic>> runTimelineSteps;
-  bool isTerminalOpen;
-  int additions;
-  int deletions;
-  bool hasGitRepo;
-  bool isCustomNamed;
+import 'task_session.dart';
+import 'workspace_git_helper.dart';
+import 'workspace_stream_coordinator.dart';
+import 'workspace_terminal_controller.dart';
 
-  TaskSession({
-    required this.id,
-    required this.title,
-    this.group = 'Разное',
-    this.project,
-    this.projectPath,
-    this.branch,
-    List<ChatMessage>? messages,
-    this.permissionMode = PermissionMode.fullAccess,
-    this.thoughtLevel = 'Max',
-    this.activeModel = 'GLM-5.3-Flash',
-    this.tokenCount = '28.4k tokens',
-    this.activeGoal,
-    List<Map<String, dynamic>>? runTimelineSteps,
-    this.isTerminalOpen = false,
-    this.additions = 0,
-    this.deletions = 0,
-    this.hasGitRepo = false,
-    this.isCustomNamed = false,
-  })  : messages = messages ?? [],
-        runTimelineSteps = runTimelineSteps ?? [];
-}
+export 'task_session.dart';
+export 'workspace_git_helper.dart';
+export 'workspace_stream_coordinator.dart';
+export 'workspace_terminal_controller.dart';
 
-class DesktopTaskWorkspaceController extends GetxController {
+class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingObserver {
 
   final inputController = TextEditingController();
+  final inputFocusNode = FocusNode();
   final scrollController = ScrollController();
   final isAutoScrollEnabled = true.obs;
   final isScrolledUp = false.obs;
 
   /// Resolves the initial project root path dynamically.
-  static String resolveInitialProjectPath() {
-    try {
-      final envPath = universal_io.Platform.environment['OMNES_WORKSPACE_ROOT'];
-      if (envPath != null && envPath.trim().isNotEmpty && universal_io.Directory(envPath).existsSync()) {
-        return envPath.trim();
-      }
-      final currentDir = universal_io.Directory.current.path;
-      if (currentDir.isNotEmpty && universal_io.Directory(currentDir).existsSync()) {
-        return currentDir;
-      }
-      final userProfile = universal_io.Platform.environment['USERPROFILE'] ?? universal_io.Platform.environment['HOME'];
-      if (userProfile != null && userProfile.isNotEmpty) {
-        final devDir = universal_io.Directory(p.join(userProfile, 'Projects'));
-        if (devDir.existsSync()) return devDir.path;
-        return userProfile;
-      }
-    } catch (_) {}
-    return universal_io.Directory.current.path;
-  }
+  static String resolveInitialProjectPath() => WorkspaceGitHelper.resolveInitialProjectPath();
 
   /// Resolves the initial project name dynamically from the directory path.
-  static String resolveInitialProjectName([String? projectPath]) {
-    final targetPath = projectPath ?? resolveInitialProjectPath();
-    final name = p.basename(targetPath);
-    return name.isNotEmpty ? name : 'Мой проект';
-  }
+  static String resolveInitialProjectName([String? projectPath]) =>
+      WorkspaceGitHelper.resolveInitialProjectName(projectPath);
 
   /// Synchronously reads current Git branch from .git/HEAD in 0ms without running sub-processes.
-  static String? readGitHeadBranchSync(String? projectPath) {
-    if (projectPath == null || projectPath.isEmpty) return null;
-    try {
-      final headFile = universal_io.File(p.join(projectPath, '.git', 'HEAD'));
-      if (!headFile.existsSync()) return null;
-      final headContent = headFile.readAsStringSync().trim();
-      if (headContent.startsWith('ref: refs/heads/')) {
-        return headContent.substring('ref: refs/heads/'.length).trim();
-      }
-      if (headContent.length >= 7) {
-        return headContent.substring(0, 7);
-      }
-    } catch (_) {}
-    return null;
-  }
+  static String? readGitHeadBranchSync(String? projectPath) =>
+      WorkspaceGitHelper.readGitHeadBranchSync(projectPath);
 
   /// Synchronously reads available local branches from .git/refs/heads in 0ms.
-  static List<String> readGitLocalBranchesSync(String? projectPath) {
-    if (projectPath == null || projectPath.isEmpty) return [];
-    try {
-      final headsDir = universal_io.Directory(p.join(projectPath, '.git', 'refs', 'heads'));
-      if (!headsDir.existsSync()) return [];
-      final branches = <String>[];
-      for (final entity in headsDir.listSync(recursive: true)) {
-        if (entity is universal_io.File) {
-          final relative = p.relative(entity.path, from: headsDir.path);
-          branches.add(relative.replaceAll('\\', '/'));
-        }
-      }
-      return branches;
-    } catch (_) {}
-    return [];
-  }
+  static List<String> readGitLocalBranchesSync(String? projectPath) =>
+      WorkspaceGitHelper.readGitLocalBranchesSync(projectPath);
 
   final isRunning = false.obs;
+  DateTime? _lastStreamChunkTime;
 
   // Active Session info
   final activeSessionId = 'session-init'.obs;
@@ -162,11 +82,12 @@ class DesktopTaskWorkspaceController extends GetxController {
   // Gateway Clients & Connectivity
   final GatewayHttpClient httpClient = GatewayHttpClient();
   final EditorApi editorApi = EditorApi();
-  GatewayWsClient? _wsClient;
-  StreamSubscription<GatewayFrame>? _wsSubscription;
-  StreamSubscription<GatewaySystemEvent>? _sseSubscription;
+  late final WorkspaceStreamCoordinator streamCoordinator = WorkspaceStreamCoordinator(
+    onFrameReceived: _handleGatewayFrame,
+    onSseReceived: _handleSseEvent,
+  );
 
-  final wsStatus = 'disconnected'.obs; // 'disconnected', 'connecting', 'connected', 'error'
+  RxString get wsStatus => streamCoordinator.wsStatus;
   final isGatewayHealthy = false.obs;
   final backendSessions = <SessionInfo>[].obs;
 
@@ -197,114 +118,27 @@ class DesktopTaskWorkspaceController extends GetxController {
   final currentSessionMode = 'chat'.obs;
   final showTodoWidget = false.obs;
 
-  final isTerminalOpen = false.obs;
-  final terminalLines = <String>[
-    'OmnesAgent ADE Terminal ready. Enter a command below:',
-  ].obs;
-  final isTerminalRunning = false.obs;
-  universal_io.Process? _activeTerminalProcess;
-  StreamSubscription? _termStdoutSub;
-  StreamSubscription? _termStderrSub;
-
-  void toggleTerminal() {
-    isTerminalOpen.value = !isTerminalOpen.value;
-    final current = sessions[activeSessionId.value];
-    if (current != null) {
-      current.isTerminalOpen = isTerminalOpen.value;
-    }
-  }
-
-  Future<void> executeTerminalCommand(String rawCmd) async {
-    final cmd = rawCmd.trim();
-    if (cmd.isEmpty) return;
-
-    // Route input to live stdin if a process is already running
-    if (_activeTerminalProcess != null && isTerminalRunning.value) {
-      sendTerminalStdin(cmd);
-      return;
-    }
-
-    terminalLines.add('> $cmd');
-    isTerminalRunning.value = true;
-    try {
-      final currentSession = sessions[activeSessionId.value];
-      final workDir = currentSession?.projectPath ?? activeProjectPath.value ?? universal_io.Directory.current.path;
-
-      if (cmd == 'cls' || cmd == 'clear') {
-        clearTerminal();
-        return;
+  late final WorkspaceTerminalController terminalController = WorkspaceTerminalController(
+    getWorkingDirectory: () =>
+        sessions[activeSessionId.value]?.projectPath ??
+        activeProjectPath.value ??
+        universal_io.Directory.current.path,
+    onTerminalToggled: (isOpen) {
+      final current = sessions[activeSessionId.value];
+      if (current != null) {
+        current.isTerminalOpen = isOpen;
       }
+    },
+  );
 
-      try {
-        final isWin = universal_io.Platform.isWindows;
-        final exe = isWin ? 'powershell.exe' : 'bash';
-        final args = isWin ? ['-NoLogo', '-Command', cmd] : ['-c', cmd];
+  RxBool get isTerminalOpen => terminalController.isTerminalOpen;
+  RxList<String> get terminalLines => terminalController.terminalLines;
+  RxBool get isTerminalRunning => terminalController.isTerminalRunning;
 
-        final process = await universal_io.Process.start(
-          exe,
-          args,
-          workingDirectory: workDir,
-          runInShell: true,
-        );
-        _activeTerminalProcess = process;
-
-        _termStdoutSub?.cancel();
-        _termStdoutSub = process.stdout
-            .transform(utf8.decoder)
-            .transform(const LineSplitter())
-            .listen((line) {
-          if (line.isNotEmpty) {
-            terminalLines.add(line);
-          }
-        });
-
-        _termStderrSub?.cancel();
-        _termStderrSub = process.stderr
-            .transform(utf8.decoder)
-            .transform(const LineSplitter())
-            .listen((line) {
-          if (line.isNotEmpty) {
-            terminalLines.add('[STDERR] $line');
-          }
-        });
-
-        process.exitCode.then((code) {
-          if (_activeTerminalProcess == process) {
-            _activeTerminalProcess = null;
-            isTerminalRunning.value = false;
-            if (code != 0) {
-              terminalLines.add('[Код завершения: $code]');
-            }
-          }
-        }).catchError((_) {
-          if (_activeTerminalProcess == process) {
-            _activeTerminalProcess = null;
-            isTerminalRunning.value = false;
-          }
-        });
-      } catch (procErr) {
-        terminalLines.add('[Terminal] Команда обработана: $cmd ($procErr)');
-        isTerminalRunning.value = false;
-        _activeTerminalProcess = null;
-      }
-    } catch (e) {
-      terminalLines.add('[ОШИБКА] $e');
-      isTerminalRunning.value = false;
-      _activeTerminalProcess = null;
-    }
-  }
-
-  void clearTerminal() {
-    if (_activeTerminalProcess != null) {
-      try {
-        _activeTerminalProcess!.kill();
-      } catch (_) {}
-      _activeTerminalProcess = null;
-    }
-    isTerminalRunning.value = false;
-    terminalLines.clear();
-    terminalLines.add('OmnesAgent ADE Terminal очищен.');
-  }
+  void toggleTerminal() => terminalController.toggleTerminal();
+  Future<void> executeTerminalCommand(String rawCmd) =>
+      terminalController.executeTerminalCommand(rawCmd);
+  void clearTerminal() => terminalController.clearTerminal();
 
   // Voice Duplex Mode State
   final isVoiceDuplexActive = false.obs;
@@ -325,6 +159,10 @@ class DesktopTaskWorkspaceController extends GetxController {
   // Attachments & Mentions (@file, #chat, chips)
   final attachments = <String>[].obs;
 
+  // Pending prompt queued while agent is running
+  final queuedPrompt = Rxn<String>();
+  http.Client? _activeDirectClient;
+
   final messages = <ChatMessage>[].obs;
   final pendingApprovals = <Map<String, dynamic>>[].obs;
   final runTimelineSteps = <Map<String, dynamic>>[].obs;
@@ -335,6 +173,7 @@ class DesktopTaskWorkspaceController extends GetxController {
   @override
   void onInit() {
     super.onInit();
+    WidgetsBinding.instance.addObserver(this);
     scrollController.addListener(_onScrollChanged);
     final isSeeded = GetStorage().read<bool>('desktop_sessions_seeded') ?? false;
     if (!isSeeded) {
@@ -345,6 +184,10 @@ class DesktopTaskWorkspaceController extends GetxController {
     loadConfiguredProviders();
     _loadSttSettings();
     loadProjectRules();
+    final savedMode = GetStorage().read<String>('desktop_execution_mode');
+    if (savedMode != null) {
+      currentExecutionMode.value = AgentExecutionMode.fromId(savedMode);
+    }
     final savedTabs = GetStorage().read<List>('desktop_open_tabs');
     if (savedTabs != null && savedTabs.isNotEmpty) {
       final validTabs = savedTabs
@@ -374,7 +217,51 @@ class DesktopTaskWorkspaceController extends GetxController {
       GetStorage().write('desktop_open_tabs', openSessionTabs.toList());
     }
     refreshGitStatus();
+    _sanitizeAllSessionMessages();
     initGatewayConnection();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _handleAppResume();
+    }
+  }
+
+  /// Cleans up any zombie streams or hanging spinners after system wake-up from sleep/hibernate
+  void _handleAppResume() {
+    if (isRunning.value) {
+      if (_lastStreamChunkTime == null ||
+          DateTime.now().difference(_lastStreamChunkTime!).inSeconds > 20) {
+        abortRun();
+      }
+    } else {
+      _sanitizeAllSessionMessages();
+      messages.refresh();
+    }
+  }
+
+  /// Sanitizes all session messages, ensuring no lingering streaming flags or running spinners persist across launches
+  void _sanitizeAllSessionMessages() {
+    for (final session in sessions.values) {
+      for (final msg in session.messages) {
+        msg.isStreaming = false;
+        msg.isThinkingFinished = true;
+        msg.isThinkingExpanded = false;
+        for (final step in msg.steps) {
+          step.isRunning = false;
+        }
+      }
+    }
+    for (final msg in messages) {
+      msg.isStreaming = false;
+      msg.isThinkingFinished = true;
+      msg.isThinkingExpanded = false;
+      for (final step in msg.steps) {
+        step.isRunning = false;
+      }
+    }
+    isRunning.value = false;
   }
 
   /// Initializes live gateway connection (Health, SSE, Sessions, and active WS).
@@ -384,11 +271,7 @@ class DesktopTaskWorkspaceController extends GetxController {
       isGatewayHealthy.value = healthy;
 
       // Start global SSE stream
-      GatewaySseClient.instance.connect();
-      _sseSubscription?.cancel();
-      _sseSubscription = GatewaySseClient.instance.events.listen((event) {
-        _handleSseEvent(event);
-      });
+      streamCoordinator.startSse();
 
       // Load backend sessions
       await fetchBackendSessions();
@@ -565,6 +448,7 @@ class DesktopTaskWorkspaceController extends GetxController {
     gitAdditions.value = session.additions;
     gitDeletions.value = session.deletions;
     permissionMode.value = session.permissionMode;
+    currentExecutionMode.value = session.executionMode;
     thoughtLevel.value = session.thoughtLevel;
     activeModel.value = (configuredModels.contains(session.activeModel))
           ? session.activeModel
@@ -635,6 +519,28 @@ class DesktopTaskWorkspaceController extends GetxController {
     }
   }
 
+  /// Sets the active agent execution mode, updating current session and persistent storage
+  void setExecutionMode(AgentExecutionMode mode) {
+    currentExecutionMode.value = mode;
+    final currentSession = sessions[activeSessionId.value];
+    if (currentSession != null) {
+      currentSession.executionMode = mode;
+    }
+    GetStorage().write('desktop_execution_mode', mode.id);
+  }
+
+  /// Shows file in Windows Explorer
+  Future<void> showFileInExplorer(String path) async {
+    final projPath = sessions[activeSessionId.value]?.projectPath ?? activeProjectPath.value;
+    String fullPath = path;
+    if (projPath != null && !path.contains(':')) {
+      fullPath = '$projPath\\$path'.replaceAll('/', '\\');
+    }
+    if (universal_io.Platform.isWindows) {
+      await Process.run('explorer.exe', ['/select,', fullPath]);
+    }
+  }
+
   /// Extensions served as binary previews (image viewer) — never read as text.
   static const Set<String> _kBinaryPreviewExtensions = {
     'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'wbmp', 'avif', 'svg',
@@ -687,40 +593,69 @@ class DesktopTaskWorkspaceController extends GetxController {
 
       for (final p in standardDefs) {
         final id = p['id'] as String;
-        var key = storage.read<String>('provider_key_$id') ?? '';
+        final isExplicitlyEnabled = storage.read<bool>('provider_enabled_$id');
+        if (isExplicitlyEnabled == false) {
+          continue; // User explicitly disabled this provider
+        }
+
+        final savedKey = storage.read<String>('provider_key_$id') ?? '';
+        final hasSavedKey = savedKey.trim().isNotEmpty;
+
+        var key = savedKey;
+        final bool isFromEnv;
         if (key.trim().isEmpty) {
           key = universal_io.Platform.environment['${id.toUpperCase()}_API_KEY'] ??
               (id == 'qwen' ? universal_io.Platform.environment['DASHSCOPE_API_KEY'] : null) ??
               (id == 'moonshot' ? universal_io.Platform.environment['KIMI_API_KEY'] : null) ?? '';
+          isFromEnv = key.trim().isNotEmpty;
+        } else {
+          isFromEnv = false;
         }
-        if (key.trim().isNotEmpty) {
+
+        final shouldInclude = (hasSavedKey && isExplicitlyEnabled != false) ||
+            (isFromEnv && isExplicitlyEnabled == true);
+
+        if (shouldInclude && key.trim().isNotEmpty) {
+          final cachedModels = storage.read<List>('provider_models_$id');
+          final modelsList = cachedModels != null && cachedModels.isNotEmpty
+              ? List<String>.from(cachedModels.map((e) => e.toString()))
+              : List<String>.from(p['models'] as List);
+
           providersList.add({
             'id': id,
             'name': p['name'] as String,
-            'models': List<String>.from(p['models'] as List),
+            'models': modelsList,
             'isCustom': false,
           });
         }
       }
 
-      final hasOllamaEnv = universal_io.Platform.environment['OLLAMA_HOST'] != null || universal_io.Platform.environment['OLLAMA_BASE_URL'] != null;
-      final ollamaEnabled = storage.read<bool>('provider_enabled_ollama') ?? hasOllamaEnv;
+      final ollamaEnabled = storage.read<bool>('provider_enabled_ollama') ?? false;
       if (ollamaEnabled) {
+        final cachedModels = storage.read<List>('provider_models_ollama');
+        final modelsList = cachedModels != null && cachedModels.isNotEmpty
+            ? List<String>.from(cachedModels.map((e) => e.toString()))
+            : ['qwen2.5-coder:32b', 'deepseek-r1:14b', 'llama3.2'];
+
         providersList.add({
           'id': 'ollama',
           'name': 'Ollama (Local)',
-          'models': ['qwen2.5-coder:32b', 'deepseek-r1:14b', 'llama3.2'],
+          'models': modelsList,
           'isCustom': false,
         });
       }
 
-      final hasLmStudioEnv = universal_io.Platform.environment['LMSTUDIO_BASE_URL'] != null;
-      final lmStudioEnabled = storage.read<bool>('provider_enabled_lmstudio') ?? hasLmStudioEnv;
+      final lmStudioEnabled = storage.read<bool>('provider_enabled_lmstudio') ?? false;
       if (lmStudioEnabled) {
+        final cachedModels = storage.read<List>('provider_models_lmstudio');
+        final modelsList = cachedModels != null && cachedModels.isNotEmpty
+            ? List<String>.from(cachedModels.map((e) => e.toString()))
+            : ['local-model', 'qwen2.5-coder-7b-instruct', 'deepseek-r1-distill-qwen-7b'];
+
         providersList.add({
           'id': 'lmstudio',
           'name': 'LM Studio (Local)',
-          'models': ['local-model', 'qwen2.5-coder-7b-instruct', 'deepseek-r1-distill-qwen-7b'],
+          'models': modelsList,
           'isCustom': false,
         });
       }
@@ -729,11 +664,17 @@ class DesktopTaskWorkspaceController extends GetxController {
       for (final item in savedCustom) {
         if (item is Map) {
           final id = item['id']?.toString() ?? '';
+          final isEnabled = storage.read<bool>('provider_enabled_$id') ?? true;
+          if (!isEnabled) continue;
+
           final name = item['name']?.toString() ?? 'Custom';
           final key = storage.read<String>('provider_key_$id') ?? item['key']?.toString() ?? '';
           final url = storage.read<String>('provider_url_$id') ?? item['url']?.toString() ?? '';
           final defaultModel = storage.read<String>('provider_model_$id') ?? item['defaultModel']?.toString() ?? 'custom-model';
-          final customModels = item['models'] is List ? List<String>.from(item['models'] as List) : [defaultModel];
+          final cachedModels = storage.read<List>('provider_models_$id');
+          final customModels = cachedModels != null && cachedModels.isNotEmpty
+              ? List<String>.from(cachedModels.map((e) => e.toString()))
+              : (item['models'] is List ? List<String>.from(item['models'] as List) : [defaultModel]);
           if (!customModels.contains(defaultModel) && defaultModel.isNotEmpty) {
             customModels.insert(0, defaultModel);
           }
@@ -765,6 +706,11 @@ class DesktopTaskWorkspaceController extends GetxController {
       }
 
       _updateModelsForActiveProvider();
+
+      // Automatically query BASE_URL in background to discover live models without blocking
+      if (activeProvider.value.isNotEmpty) {
+        fetchModelsForProvider(activeProvider.value);
+      }
     } catch (_) {}
   }
 
@@ -799,6 +745,206 @@ class DesktopTaskWorkspaceController extends GetxController {
       current.activeModel = activeModel.value;
     }
     update();
+    // Auto-fetch latest models from the provider's BASE_URL in background
+    fetchModelsForProvider(providerId);
+  }
+
+  /// Fetches the list of models from an OpenAI-compatible /v1/models or Ollama /api/tags endpoint.
+  static Future<List<String>> fetchModelsFromBaseUrl(String baseUrl, {String? apiKey}) async {
+    if (baseUrl.trim().isEmpty) return [];
+    try {
+      var clean = baseUrl.trim();
+      while (clean.endsWith('/')) {
+        clean = clean.substring(0, clean.length - 1);
+      }
+      if (clean.endsWith('/chat/completions')) {
+        clean = clean.substring(0, clean.length - '/chat/completions'.length);
+      }
+      while (clean.endsWith('/')) {
+        clean = clean.substring(0, clean.length - 1);
+      }
+
+      final uri = Uri.parse(clean.endsWith('/models') ? clean : '$clean/models');
+      final headers = <String, String>{
+        'Accept': 'application/json',
+        if (apiKey != null && apiKey.trim().isNotEmpty) 'Authorization': 'Bearer ${apiKey.trim()}',
+      };
+
+      final client = http.Client();
+      final res = await client.get(uri, headers: headers).timeout(const Duration(seconds: 12));
+      if (res.statusCode == 200) {
+        final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+        final result = <String>[];
+        if (decoded is Map<String, dynamic>) {
+          if (decoded['data'] is List) {
+            for (final item in decoded['data'] as List) {
+              if (item is Map && item['id'] != null) {
+                result.add(item['id'].toString());
+              } else if (item is String) {
+                result.add(item);
+              }
+            }
+          } else if (decoded['models'] is List) {
+            for (final item in decoded['models'] as List) {
+              if (item is Map && (item['name'] != null || item['id'] != null)) {
+                result.add((item['name'] ?? item['id']).toString());
+              } else if (item is String) {
+                result.add(item);
+              }
+            }
+          }
+        } else if (decoded is List) {
+          for (final item in decoded) {
+            if (item is Map && item['id'] != null) {
+              result.add(item['id'].toString());
+            } else if (item is String) {
+              result.add(item);
+            }
+          }
+        }
+        if (result.isNotEmpty) {
+          return result.toSet().toList();
+        }
+      }
+
+      // Fallback for Ollama if /models returned non-200 or empty
+      if (clean.contains(':11434') || clean.contains('ollama')) {
+        final ollamaUri = Uri.parse('$clean/api/tags');
+        final ollamaRes = await client.get(ollamaUri).timeout(const Duration(seconds: 8));
+        if (ollamaRes.statusCode == 200) {
+          final decoded = jsonDecode(utf8.decode(ollamaRes.bodyBytes));
+          if (decoded is Map && decoded['models'] is List) {
+            final result = <String>[];
+            for (final item in decoded['models'] as List) {
+              if (item is Map && item['name'] != null) {
+                result.add(item['name'].toString());
+              }
+            }
+            if (result.isNotEmpty) return result.toSet().toList();
+          }
+        }
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  /// Discovers and updates available models for a provider using its configured BASE_URL.
+  Future<List<String>> fetchModelsForProvider(String providerId, {bool notify = false}) async {
+    if (providerId.isEmpty) return [];
+    final storage = GetStorage();
+
+    String customKey = (storage.read<String>('provider_key_$providerId') ?? '').trim();
+    String customUrl = (storage.read<String>('provider_url_$providerId') ?? '').trim();
+
+    // Check custom providers registry
+    final savedCustom = storage.read<List>('custom_providers_registry') ?? [];
+    for (final item in savedCustom) {
+      if (item is Map && (item['id'] == providerId || item['name'] == providerId)) {
+        if (customKey.isEmpty) customKey = (item['key']?.toString() ?? '').trim();
+        if (customUrl.isEmpty) customUrl = (item['url']?.toString() ?? '').trim();
+      }
+    }
+
+    if (customKey.isEmpty) {
+      if (providerId == 'openai') {
+        customKey = universal_io.Platform.environment['OPENAI_API_KEY'] ?? '';
+      } else if (providerId == 'deepseek') {
+        customKey = universal_io.Platform.environment['DEEPSEEK_API_KEY'] ?? '';
+      } else if (providerId == 'anthropic') {
+        customKey = universal_io.Platform.environment['ANTHROPIC_API_KEY'] ?? '';
+      } else if (providerId == 'gemini') {
+        customKey = universal_io.Platform.environment['GEMINI_API_KEY'] ?? '';
+      } else if (providerId == 'groq') {
+        customKey = universal_io.Platform.environment['GROQ_API_KEY'] ?? '';
+      } else if (providerId == 'openrouter') {
+        customKey = universal_io.Platform.environment['OPENROUTER_API_KEY'] ?? '';
+      } else if (providerId == 'mistral') {
+        customKey = universal_io.Platform.environment['MISTRAL_API_KEY'] ?? '';
+      } else if (providerId == 'moonshot') {
+        customKey = universal_io.Platform.environment['MOONSHOT_API_KEY'] ?? universal_io.Platform.environment['KIMI_API_KEY'] ?? '';
+      } else if (providerId == 'qwen') {
+        customKey = universal_io.Platform.environment['QWEN_API_KEY'] ?? universal_io.Platform.environment['DASHSCOPE_API_KEY'] ?? '';
+      }
+    }
+
+    if (customUrl.isEmpty) {
+      if (providerId == 'deepseek') {
+        customUrl = universal_io.Platform.environment['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com/v1';
+      } else if (providerId == 'openai') {
+        customUrl = universal_io.Platform.environment['OPENAI_BASE_URL'] ?? 'https://api.openai.com/v1';
+      } else if (providerId == 'anthropic') {
+        customUrl = universal_io.Platform.environment['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com/v1';
+      } else if (providerId == 'glm') {
+        customUrl = 'https://open.bigmodel.cn/api/paas/v4';
+      } else if (providerId == 'groq') {
+        customUrl = 'https://api.groq.com/openai/v1';
+      } else if (providerId == 'openrouter') {
+        customUrl = universal_io.Platform.environment['OPENROUTER_BASE_URL'] ?? 'https://openrouter.ai/api/v1';
+      } else if (providerId == 'mistral') {
+        customUrl = 'https://api.mistral.ai/v1';
+      } else if (providerId == 'moonshot') {
+        customUrl = 'https://api.moonshot.cn/v1';
+      } else if (providerId == 'qwen') {
+        customUrl = universal_io.Platform.environment['QWEN_BASE_URL'] ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+      } else if (providerId == 'ollama') {
+        customUrl = universal_io.Platform.environment['OLLAMA_HOST'] ??
+            universal_io.Platform.environment['OLLAMA_BASE_URL'] ??
+            'http://localhost:11434/v1';
+      } else if (providerId == 'lmstudio' || providerId == 'local') {
+        customUrl = universal_io.Platform.environment['LMSTUDIO_BASE_URL'] ??
+            'http://localhost:1234/v1';
+      }
+    }
+
+    if (customUrl.isEmpty) return [];
+
+    final fetchedModels = await fetchModelsFromBaseUrl(customUrl, apiKey: customKey);
+    if (fetchedModels.isNotEmpty) {
+      storage.write('provider_models_$providerId', fetchedModels);
+
+      for (final p in configuredProviders) {
+        if (p['id'] == providerId) {
+          p['models'] = fetchedModels;
+        }
+      }
+
+      final rawRegistry = storage.read<List>('custom_providers_registry') ?? [];
+      final registry = List<Map<String, dynamic>>.from(
+        rawRegistry.whereType<Map>().map((m) => Map<String, dynamic>.from(m)),
+      );
+      bool regUpdated = false;
+      for (final item in registry) {
+        if (item['id'] == providerId) {
+          item['models'] = fetchedModels;
+          regUpdated = true;
+        }
+      }
+      if (regUpdated) {
+        storage.write('custom_providers_registry', registry);
+      }
+
+      if (activeProvider.value == providerId) {
+        configuredModels.assignAll(fetchedModels);
+        if (!configuredModels.contains(activeModel.value)) {
+          activeModel.value = configuredModels.first;
+          final current = sessions[activeSessionId.value];
+          if (current != null) {
+            current.activeModel = activeModel.value;
+          }
+        }
+      }
+
+      if (notify) {
+        Get.snackbar(
+          'Модели обновлены',
+          'Получено ${fetchedModels.length} моделей от провайдера $providerId',
+          snackPosition: SnackPosition.BOTTOM,
+          duration: const Duration(seconds: 3),
+        );
+      }
+      return fetchedModels;
+    }
+    return [];
   }
 
   String _generateTopicTitle(String prompt) {
@@ -820,6 +966,33 @@ class DesktopTaskWorkspaceController extends GetxController {
   }
 
   List<Map<String, dynamic>> _generateDynamicStepsForPrompt(String prompt) {
+    if (currentExecutionMode.value == AgentExecutionMode.ralphLoop) {
+      return [
+        {'title': 'Ralph: Анализ контекста и AST-зависимостей', 'status': 'running'},
+        {'title': 'Ralph: Формулирование верификационного теста', 'status': 'pending'},
+        {'title': 'Ralph: Итеративная разработка и правка кода', 'status': 'pending'},
+        {'title': 'Ralph: Проверка регрессий и вердикт L0/L1/L2', 'status': 'pending'},
+      ];
+    }
+
+    if (currentExecutionMode.value == AgentExecutionMode.architect) {
+      return [
+        {'title': 'Architect: Системный анализ и границы модулей', 'status': 'running'},
+        {'title': 'Architect: Проектирование контрактов и схем', 'status': 'pending'},
+        {'title': 'Architect: Оценка рисков и компромиссов (Trade-offs)', 'status': 'pending'},
+        {'title': 'Architect: Формирование архитектурной спецификации', 'status': 'pending'},
+      ];
+    }
+
+    if (currentExecutionMode.value == AgentExecutionMode.deepCode) {
+      return [
+        {'title': 'DeepCode: Сканирование кодовой базы и AST', 'status': 'running'},
+        {'title': 'DeepCode: Анализ краевых случаев и зависимостей', 'status': 'pending'},
+        {'title': 'DeepCode: Комплексная реализация решения', 'status': 'pending'},
+        {'title': 'DeepCode: Верификация компиляции и типов', 'status': 'pending'},
+      ];
+    }
+
     final lower = prompt.toLowerCase();
 
     if (lower.contains('тест') || lower.contains('test') || lower.contains('spec')) {
@@ -911,31 +1084,7 @@ class DesktopTaskWorkspaceController extends GetxController {
 
   /// Connects WebSocket to the active session and handles streaming frames.
   Future<void> _connectWebSocket(String sessionId) async {
-    await _wsSubscription?.cancel();
-    _wsSubscription = null;
-    await _wsClient?.disconnect();
-
-    _wsClient = GatewayWsClient(
-      sessionId: sessionId,
-      agentAlias: GatewayConfig.getAgentAlias(),
-    );
-
-    wsStatus.value = 'connecting';
-
-    _wsSubscription = _wsClient!.stream.listen(
-      _handleGatewayFrame,
-      onError: (err) {
-        wsStatus.value = 'error';
-      },
-      onDone: () {
-        wsStatus.value = 'disconnected';
-      },
-    );
-
-    await _wsClient!.connect();
-    if (_wsClient!.isConnected) {
-      wsStatus.value = 'connected';
-    }
+    await streamCoordinator.connectWebSocket(sessionId);
   }
 
   /// Handles incoming streaming frames from Gateway WebSocket.
@@ -1113,6 +1262,7 @@ class DesktopTaskWorkspaceController extends GetxController {
       isRunning.value = false;
       _saveCurrentSessionState();
       _scrollToBottom();
+      _checkAndExecuteQueuedPrompt();
     } else if (frame is AbortedFrame) {
       if (messages.isNotEmpty && messages.last.isStreaming) {
         messages.last.isStreaming = false;
@@ -1344,6 +1494,10 @@ class DesktopTaskWorkspaceController extends GetxController {
         }
         _scrollToBottom();
       }
+      final steps = await httpClient.getSessionSteps(sessionId);
+      if (steps.isNotEmpty) {
+        trajectorySteps.assignAll(steps);
+      }
     } catch (_) {}
   }
 
@@ -1375,6 +1529,7 @@ class DesktopTaskWorkspaceController extends GetxController {
     if (current != null) {
       current.messages = List.from(messages);
       current.permissionMode = permissionMode.value;
+      current.executionMode = currentExecutionMode.value;
       current.thoughtLevel = thoughtLevel.value;
       current.activeModel = activeModel.value;
       current.activeGoal = activeGoal.value;
@@ -1399,6 +1554,7 @@ class DesktopTaskWorkspaceController extends GetxController {
           'hasGitRepo': s.hasGitRepo,
           'additions': s.additions,
           'deletions': s.deletions,
+          'executionMode': s.executionMode.id,
           'activeModel': s.activeModel,
           'tokenCount': s.tokenCount,
           'isCustomNamed': s.isCustomNamed,
@@ -1425,7 +1581,14 @@ class DesktopTaskWorkspaceController extends GetxController {
                 for (final m in msgRaw) {
                   if (m is Map) {
                     try {
-                      msgs.add(ChatMessage.fromJson(Map<String, dynamic>.from(m)));
+                      final chatMsg = ChatMessage.fromJson(Map<String, dynamic>.from(m));
+                      chatMsg.isStreaming = false;
+                      chatMsg.isThinkingFinished = true;
+                      chatMsg.isThinkingExpanded = false;
+                      for (final s in chatMsg.steps) {
+                        s.isRunning = false;
+                      }
+                      msgs.add(chatMsg);
                     } catch (_) {}
                   }
                 }
@@ -1441,6 +1604,7 @@ class DesktopTaskWorkspaceController extends GetxController {
                 hasGitRepo: item['hasGitRepo'] == true,
                 additions: item['additions'] as int? ?? 0,
                 deletions: item['deletions'] as int? ?? 0,
+                executionMode: AgentExecutionMode.fromId(item['executionMode']?.toString() ?? 'fast'),
                 activeModel: item['activeModel']?.toString() ?? 'GLM-5.3-Flash',
                 tokenCount: item['tokenCount']?.toString() ?? '28.4k tokens',
                 isCustomNamed: item['isCustomNamed'] == true,
@@ -1667,6 +1831,42 @@ if (\$img) {
         break;
     }
 
+    final execMode = currentExecutionMode.value;
+    String execModeInstructions = '';
+    switch (execMode) {
+      case AgentExecutionMode.ralphLoop:
+        execModeInstructions = '''
+## ACTIVE AGENT EXECUTION PROFILE: RALPH LOOP (Автономный TDD-цикл разработки)
+- YOU ARE OPERATING IN RALPH ORCHESTRATOR MODE (RalphLoop).
+- Follow the strict Ralph Loop methodology for every task:
+  1. [Ralph Phase 1: Problem Analysis & AST Mapping]: Deeply explore the codebase, check dependencies, and identify the root cause or target feature.
+  2. [Ralph Phase 2: Test-First Formulation]: Formulate explicit verification tests, checks, or assertions BEFORE modifying production code.
+  3. [Ralph Phase 3: Minimal Diff Implementation]: Apply precise, atomic code edits.
+  4. [Ralph Phase 4: Self-Verification & AST Check]: Validate types, syntax, and logic against the target tests.
+  5. [Ralph Phase 5: Verdict & Zero-Debt Audit]: Conclude with a clear Ralph Verdict (L0/L1/L2 Pass) and verify zero regressions.
+- Explicitly structure your output around these Ralph phases!
+''';
+        break;
+      case AgentExecutionMode.deepCode:
+        execModeInstructions = '''
+## ACTIVE AGENT EXECUTION PROFILE: DEEP CODE (Глубокий анализ и разработка)
+- Perform comprehensive codebase exploration, deep AST navigation, edge-case analysis, and end-to-end implementation with syntax checks.
+''';
+        break;
+      case AgentExecutionMode.architect:
+        execModeInstructions = '''
+## ACTIVE AGENT EXECUTION PROFILE: ARCHITECT / COT (Системное проектирование)
+- Focus on high-level architecture, module boundaries, data structures, trade-offs, and RFC specifications before low-level details.
+''';
+        break;
+      case AgentExecutionMode.fast:
+        execModeInstructions = '''
+## ACTIVE AGENT EXECUTION PROFILE: SPEED / FAST (Быстрый лаконичный ответ)
+- Provide concise, targeted solutions and direct code snippets without unnecessary verbosity.
+''';
+        break;
+    }
+
     final rulesSection = isProjectRulesEnabled.value && projectRulesContent.value.trim().isNotEmpty
         ? '''
 
@@ -1691,6 +1891,8 @@ You have direct, full, and unrestricted access to the project workspace and ADE 
   * Workspace configuration: `~/.omnesagent/config.toml`.
 
 $modeInstructions
+
+$execModeInstructions
 
 ## INTERACTIVE USER QUESTIONS (КАРТОЧКА ВОПРОСА В ЧАТЕ)
 When you need to ask the user a question, clarify ambiguous requirements, or offer choices, ALWAYS format your question in an interactive block so ADE can render clickable buttons for the user:
@@ -1740,34 +1942,7 @@ $rulesSection
   }
 
   /// Sends stdin input to the active terminal process or executes command
-  void sendTerminalStdin(String input) {
-    if (input == '^C' || input == 'Ctrl+C' || input == 'SIGINT') {
-      terminalLines.add('^C');
-      if (_activeTerminalProcess != null) {
-        try {
-          _activeTerminalProcess!.kill(universal_io.ProcessSignal.sigint);
-        } catch (_) {
-          _activeTerminalProcess!.kill();
-        }
-        _activeTerminalProcess = null;
-        isTerminalRunning.value = false;
-      }
-      return;
-    }
-
-    if (_activeTerminalProcess != null && isTerminalRunning.value) {
-      if (input.isNotEmpty) {
-        terminalLines.add(input);
-      }
-      try {
-        _activeTerminalProcess!.stdin.writeln(input);
-      } catch (e) {
-        terminalLines.add('[Ошибка отправки stdin: $e]');
-      }
-    } else {
-      executeTerminalCommand(input);
-    }
-  }
+  void sendTerminalStdin(String input) => terminalController.sendTerminalStdin(input);
 
   /// Creates a real Git commit/stash checkpoint for a message
   Future<String?> createCheckpointForMessage(ChatMessage msg) async {
@@ -2167,7 +2342,14 @@ $goalsText
       final raw = storage.read<List>('session_messages_$sessionId');
       if (raw != null && raw.isNotEmpty) {
         final loaded = raw.map((item) {
-          return ChatMessage.fromJson(Map<String, dynamic>.from(item as Map));
+          final m = ChatMessage.fromJson(Map<String, dynamic>.from(item as Map));
+          m.isStreaming = false;
+          m.isThinkingFinished = true;
+          m.isThinkingExpanded = false;
+          for (final s in m.steps) {
+            s.isRunning = false;
+          }
+          return m;
         }).where((m) {
           // Filter out unwanted background socket connection errors that were previously saved
           if (m.isError &&
@@ -2265,11 +2447,65 @@ $goalsText
     addAttachment(chip);
   }
 
-  void sendMessage() {
-    final rawText = inputController.text.trim();
-    if (rawText.isEmpty && attachments.isEmpty) return;
+  /// Edits the queued prompt by restoring it to the input field
+  void editQueuedPrompt() {
+    final prompt = queuedPrompt.value;
+    if (prompt == null) return;
+    queuedPrompt.value = null;
+    inputController.text = prompt;
+    inputController.selection = TextSelection.fromPosition(
+      TextPosition(offset: prompt.length),
+    );
+    inputFocusNode.requestFocus();
+  }
+
+  /// Cancels the queued prompt
+  void cancelQueuedPrompt() {
+    queuedPrompt.value = null;
+  }
+
+  /// Forces immediate execution of the queued prompt by aborting active run
+  void forceSendQueuedPrompt() {
+    final prompt = queuedPrompt.value;
+    if (prompt == null || prompt.trim().isEmpty) return;
+    queuedPrompt.value = null;
+    abortRun();
+    Future.delayed(const Duration(milliseconds: 150), () {
+      sendMessage(prompt);
+    });
+  }
+
+  /// Auto-executes queued prompt if any after current task finishes
+  void _checkAndExecuteQueuedPrompt() {
+    final nextPrompt = queuedPrompt.value;
+    if (nextPrompt != null && nextPrompt.trim().isNotEmpty) {
+      queuedPrompt.value = null;
+      Future.microtask(() {
+        sendMessage(nextPrompt);
+      });
+    }
+  }
+
+  void sendMessage([String? overrideText]) {
+    final rawText = (overrideText ?? inputController.text).trim();
+    if (rawText.isEmpty && (overrideText == null ? attachments.isEmpty : false)) return;
     if (rawText.length > 50000) {
       Get.snackbar('Ошибка', 'Сообщение превышает лимит в 50 000 символов');
+      return;
+    }
+
+    if (isRunning.value) {
+      // Put prompt into pending queue instead of sending
+      String pendingMessage = rawText;
+      if (overrideText == null && attachments.isNotEmpty) {
+        final attachList = attachments.map((a) => '- $a').join('\n');
+        pendingMessage = '$rawText\n\nКонтекстные вложения:\n$attachList';
+      }
+      queuedPrompt.value = pendingMessage;
+      if (overrideText == null) {
+        inputController.clear();
+        attachments.clear();
+      }
       return;
     }
 
@@ -2330,13 +2566,15 @@ $goalsText
     // Check if input is a /goal command
     if (rawText.startsWith('/goal')) {
       _handleGoalCommand(rawText);
-      inputController.clear();
+      if (overrideText == null) {
+        inputController.clear();
+      }
       return;
     }
 
     // Compose final message with attachments if any
     String fullMessage = rawText;
-    if (attachments.isNotEmpty) {
+    if (overrideText == null && attachments.isNotEmpty) {
       final attachList = attachments.map((a) => '- $a').join('\n');
       fullMessage = '$rawText\n\nКонтекстные вложения:\n$attachList';
     }
@@ -2353,8 +2591,10 @@ $goalsText
     isTaskBarExpanded.value = true;
     runTimelineSteps.assignAll(_generateDynamicStepsForPrompt(rawText));
 
-    inputController.clear();
-    attachments.clear();
+    if (overrideText == null) {
+      inputController.clear();
+      attachments.clear();
+    }
     isRunning.value = true;
 
     final storage = GetStorage();
@@ -2430,7 +2670,7 @@ $goalsText
         !configuredProviders.any((p) => p['id'] == provId && p['isCustom'] == false);
 
     // If custom provider or gateway is not connected, stream directly via SSE!
-    if (hasDirectCredentials && (isCustomProvider || !(_wsClient?.isConnected ?? false))) {
+    if (hasDirectCredentials && (isCustomProvider || !streamCoordinator.isConnected)) {
       _streamFromProviderDirectly(
         prompt: fullMessage,
         providerId: provId,
@@ -2443,9 +2683,9 @@ $goalsText
     }
 
     // Try Gateway WebSocket if connected
-    if (_wsClient != null && _wsClient!.isConnected) {
+    if (streamCoordinator.isConnected) {
       final initialMessageCount = messages.length;
-      _wsClient!.sendMessage(fullMessage, mode: currentExecutionMode.value.id);
+      streamCoordinator.sendMessage(fullMessage, mode: currentExecutionMode.value.id);
 
       // Fallback timer: if after 5 seconds the gateway hasn't emitted any answer or thinking, and we have direct credentials, switch to direct stream!
       Future.delayed(const Duration(seconds: 5), () {
@@ -2473,7 +2713,7 @@ $goalsText
     } else {
       // Gateway not connected, try connecting
       _connectWebSocket(activeSessionId.value).then((_) {
-        final sent = _wsClient?.sendMessage(fullMessage, mode: currentExecutionMode.value.id) ?? false;
+        final sent = streamCoordinator.sendMessage(fullMessage, mode: currentExecutionMode.value.id);
         if (!sent) {
           if (hasDirectCredentials) {
             _streamFromProviderDirectly(
@@ -2539,12 +2779,50 @@ $goalsText
       isThinkingFinished: false,
       isThinkingExpanded: true,
       steps: [initialActionStep],
+      createdAt: DateTime.now(),
     );
     messages.add(botMessage);
     messages.refresh();
     _scrollToBottom();
 
+    // Populate initial trajectory steps for Direct Chat mode
+    final turnId = 'turn_${DateTime.now().millisecondsSinceEpoch}';
+    final sessId = activeSessionId.value;
+    trajectorySteps.clear();
+    trajectorySteps.add(TrajectoryStep(
+      id: 'step_${DateTime.now().millisecondsSinceEpoch}_0',
+      sessionId: sessId,
+      turnId: turnId,
+      stepIndex: 0,
+      stepType: 's1_gate',
+      payloadJson: jsonEncode({
+        'decision': 'direct_stream',
+        'provider': providerId,
+        'model': model,
+        'prompt_preview': prompt.length > 100 ? '${prompt.substring(0, 100)}...' : prompt,
+      }),
+      tokensUsed: ((prompt.length + 3) ~/ 4),
+      durationUs: 15000,
+      createdAt: DateTime.now().toUtc().toIso8601String(),
+    ));
+    trajectorySteps.add(TrajectoryStep(
+      id: 'step_${DateTime.now().millisecondsSinceEpoch}_1',
+      sessionId: sessId,
+      turnId: turnId,
+      stepIndex: 1,
+      stepType: 'context_inject',
+      payloadJson: jsonEncode({
+        'project': activeProject.value,
+        'workspace': activeProjectPath.value ?? resolveInitialProjectPath(),
+      }),
+      tokensUsed: 64,
+      durationUs: 8000,
+      createdAt: DateTime.now().toUtc().toIso8601String(),
+    ));
+    trajectorySteps.refresh();
+
     final stopwatch = Stopwatch()..start();
+    _lastStreamChunkTime = DateTime.now();
     Timer? thinkingTimer;
     thinkingTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (botMessage.isStreaming && !botMessage.isThinkingFinished) {
@@ -2587,6 +2865,7 @@ $goalsText
       };
 
       final client = http.Client();
+      _activeDirectClient = client;
       final request = http.Request('POST', Uri.parse(endpoint));
       request.headers.addAll({
         'Content-Type': 'application/json; charset=utf-8',
@@ -2595,7 +2874,7 @@ $goalsText
       });
       request.body = jsonEncode(payload);
 
-      final streamedResponse = await client.send(request).timeout(const Duration(seconds: 12));
+      final streamedResponse = await client.send(request).timeout(const Duration(seconds: 120));
 
       if (streamedResponse.statusCode != 200) {
         final errBody = await streamedResponse.stream.bytesToString();
@@ -2603,9 +2882,32 @@ $goalsText
         botMessage.isError = true;
         botMessage.isThinkingFinished = true;
         botMessage.isThinkingExpanded = false;
-        botMessage.text = 'Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody';
+        if (streamedResponse.statusCode == 401) {
+          botMessage.text = 'Ошибка авторизации (HTTP 401): Неверный API ключ для провайдера ($providerId).\nПроверьте настройки API ключа в диалоге Настроек.';
+        } else if (streamedResponse.statusCode == 404) {
+          botMessage.text = 'Ошибка (HTTP 404): Модель "$model" или эндпоинт не найден на сервере провайдера ($providerId).\nBASE_URL: $endpoint\nОтвет: $errBody';
+        } else if (streamedResponse.statusCode == 429) {
+          botMessage.text = 'Превышен лимит запросов (HTTP 429): Quota exceeded / Rate limit на стороне провайдера ($providerId).\n$errBody';
+        } else {
+          botMessage.text = 'Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody';
+        }
         isRunning.value = false;
         thinkingTimer.cancel();
+        trajectorySteps.add(TrajectoryStep(
+          id: 'step_${DateTime.now().millisecondsSinceEpoch}_err',
+          sessionId: sessId,
+          turnId: turnId,
+          stepIndex: trajectorySteps.length,
+          stepType: 'synthesis',
+          payloadJson: jsonEncode({
+            'status': 'error',
+            'error': 'HTTP ${streamedResponse.statusCode}',
+          }),
+          tokensUsed: 0,
+          durationUs: stopwatch.elapsedMicroseconds,
+          createdAt: DateTime.now().toUtc().toIso8601String(),
+        ));
+        trajectorySteps.refresh();
         messages.refresh();
         _saveCurrentSessionState();
         _scrollToBottom();
@@ -2614,7 +2916,16 @@ $goalsText
 
       bool inThinkTag = false;
 
-      await for (final line in streamedResponse.stream.transform(utf8.decoder).transform(const LineSplitter())) {
+      final lineStream = streamedResponse.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .timeout(
+            const Duration(seconds: 40),
+            onTimeout: (sink) => sink.close(),
+          );
+
+      await for (final line in lineStream) {
+        _lastStreamChunkTime = DateTime.now();
         final trimmed = line.trim();
         if (!trimmed.startsWith('data:')) continue;
         final data = trimmed.substring(5).trim();
@@ -2676,6 +2987,24 @@ $goalsText
       if (botMessage.steps.isNotEmpty) {
         botMessage.steps.first.isRunning = false;
       }
+      if (botMessage.thinking != null && botMessage.thinking!.isNotEmpty) {
+        trajectorySteps.add(TrajectoryStep(
+          id: 'step_${DateTime.now().millisecondsSinceEpoch}_cot',
+          sessionId: sessId,
+          turnId: turnId,
+          stepIndex: trajectorySteps.length,
+          stepType: 'cot_thinking',
+          payloadJson: jsonEncode({
+            'duration_seconds': botMessage.thinkingSeconds,
+            'summary': botMessage.thinking!.length > 150
+                ? '${botMessage.thinking!.substring(0, 150)}...'
+                : botMessage.thinking!,
+          }),
+          tokensUsed: ((botMessage.thinking!.length + 3) ~/ 4),
+          durationUs: botMessage.thinkingSeconds * 1000000,
+          createdAt: DateTime.now().toUtc().toIso8601String(),
+        ));
+      }
       if (botMessage.text.contains('```')) {
         botMessage.steps.add(AgentActionStep(
           title: 'Генерация кода и артефактов решения',
@@ -2683,40 +3012,43 @@ $goalsText
           isRunning: false,
           details: 'Сформированы исполняемые блоки кода и артефакты',
         ));
+        trajectorySteps.add(TrajectoryStep(
+          id: 'step_${DateTime.now().millisecondsSinceEpoch}_tool',
+          sessionId: sessId,
+          turnId: turnId,
+          stepIndex: trajectorySteps.length,
+          stepType: 'tool_call',
+          payloadJson: jsonEncode({
+            'action': 'generate_artifacts',
+            'blocks_count': RegExp(r'```').allMatches(botMessage.text).length ~/ 2,
+          }),
+          tokensUsed: 32,
+          durationUs: 20000,
+          createdAt: DateTime.now().toUtc().toIso8601String(),
+        ));
       }
-      await refreshGitStatus();
-      // Isolate changes strictly to this message execution
-      final taskModifiedFiles = gitModifiedFiles.where((f) => !initialSnapshotFiles.contains(f)).toList();
-      final taskAdditions = (gitAdditions.value - initialAdditions).clamp(0, 999999).toInt();
-      final taskDeletions = (gitDeletions.value - initialDeletions).clamp(0, 999999).toInt();
-
-      // Only assign change metrics if actual project files were altered during THIS task
-      if (taskModifiedFiles.isNotEmpty || (taskAdditions > 0 && initialSnapshotFiles.length != gitModifiedFiles.length)) {
-        botMessage.filesChangedCount = taskModifiedFiles.isNotEmpty ? taskModifiedFiles.length : 1;
-        botMessage.additions = taskAdditions > 0 ? taskAdditions : 1;
-        botMessage.deletions = taskDeletions;
-        botMessage.checkpointHash = preExecutionHash ?? 'ckpt_${DateTime.now().millisecondsSinceEpoch}';
-        botMessage.suggestedActions = [
-          '▶ Запустить тесты проекта',
-          'Закоммитить изменения в Git',
-          'Объяснить архитектуру решения',
-        ];
-      } else {
-        // Pure text response or question without file changes
-        botMessage.filesChangedCount = null;
-        botMessage.additions = null;
-        botMessage.deletions = null;
-        if (!botMessage.text.contains('```question') && !botMessage.text.contains('<question>')) {
-          if (currentSessionMode.value == 'task' || currentSessionMode.value == 'ralph') {
-            botMessage.suggestedActions = [
-              'Проверить статус проекта',
-              '▶ Запустить тесты проекта',
-            ];
-          } else {
-            botMessage.suggestedActions = [];
-          }
-        }
-      }
+      trajectorySteps.add(TrajectoryStep(
+        id: 'step_${DateTime.now().millisecondsSinceEpoch}_synth',
+        sessionId: sessId,
+        turnId: turnId,
+        stepIndex: trajectorySteps.length,
+        stepType: 'synthesis',
+        payloadJson: jsonEncode({
+          'status': 'completed',
+          'response_length': botMessage.text.length,
+        }),
+        tokensUsed: ((botMessage.text.length + 3) ~/ 4),
+        durationUs: stopwatch.elapsedMicroseconds,
+        createdAt: DateTime.now().toUtc().toIso8601String(),
+      ));
+      trajectorySteps.refresh();
+      await _updateMessageFileChanges(
+        botMessage,
+        initialFiles: initialSnapshotFiles,
+        initialAdditions: initialAdditions,
+        initialDeletions: initialDeletions,
+        preExecutionHash: preExecutionHash,
+      );
       if (botMessage.text.trim().isEmpty && (botMessage.thinking?.trim().isNotEmpty ?? false)) {
         botMessage.text = botMessage.thinking!.trim();
       }
@@ -2731,18 +3063,107 @@ $goalsText
       _saveSessionMessages(activeSessionId.value);
       messages.refresh();
       _scrollToBottom();
+      _checkAndExecuteQueuedPrompt();
     } catch (e) {
       thinkingTimer.cancel();
       botMessage.isStreaming = false;
       botMessage.isError = true;
       botMessage.isThinkingFinished = true;
       botMessage.isThinkingExpanded = false;
-      botMessage.text = 'Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.';
+      if (e is TimeoutException || e.toString().contains('TimeoutException')) {
+        botMessage.text = 'Превышен таймаут ответа от модели ($providerId / $model, лимит 120 секунд).\n'
+            'Сервер провайдера перегружен или модель генерирует очень длинную цепочку рассуждений (CoT).\n'
+            'Попробуйте повторить запрос кнопкой "Повторить" ниже или переключитесь на другую модель.';
+      } else {
+        botMessage.text = 'Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.';
+      }
       isRunning.value = false;
       _saveCurrentSessionState();
       messages.refresh();
       _scrollToBottom();
+    } finally {
+      _activeDirectClient = null;
+      thinkingTimer.cancel();
+      isRunning.value = false;
+      botMessage.isStreaming = false;
+      botMessage.isThinkingFinished = true;
+      botMessage.isThinkingExpanded = false;
+      for (final s in botMessage.steps) {
+        s.isRunning = false;
+      }
+      messages.refresh();
     }
+  }
+
+  /// Analyzes git numstat diff and updates message with changed files details
+  Future<void> _updateMessageFileChanges(
+    ChatMessage botMessage, {
+    List<String>? initialFiles,
+    int initialAdditions = 0,
+    int initialDeletions = 0,
+    String? preExecutionHash,
+  }) async {
+    try {
+      await refreshGitStatus();
+      final currentSession = sessions[activeSessionId.value];
+      final projPath = currentSession?.projectPath ?? activeProjectPath.value ?? resolveInitialProjectPath();
+      if (projPath.isEmpty || !Directory(projPath).existsSync()) return;
+
+      final numstatRes = await Process.run('git', ['diff', 'HEAD', '--numstat'], workingDirectory: projPath);
+      final changedFilesList = <Map<String, dynamic>>[];
+      if (numstatRes.exitCode == 0) {
+        final lines = (numstatRes.stdout as String).split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty);
+        for (final l in lines) {
+          final parts = l.split(RegExp(r'\s+'));
+          if (parts.length >= 3) {
+            final ins = int.tryParse(parts[0]) ?? 0;
+            final del = int.tryParse(parts[1]) ?? 0;
+            final relPath = parts.sublist(2).join(' ').replaceAll('/', '\\');
+            final name = relPath.contains('\\') ? relPath.split('\\').last : relPath;
+            final dir = relPath.length > name.length ? relPath.substring(0, relPath.length - name.length) : '';
+            changedFilesList.add({
+              'path': relPath,
+              'name': name,
+              'dir': dir,
+              'additions': ins,
+              'deletions': del,
+            });
+          }
+        }
+      }
+
+      final taskModifiedFiles = gitModifiedFiles.where((f) => initialFiles == null || !initialFiles.contains(f)).toList();
+      final taskAdditions = (gitAdditions.value - initialAdditions).clamp(0, 999999).toInt();
+      final taskDeletions = (gitDeletions.value - initialDeletions).clamp(0, 999999).toInt();
+
+      if (changedFilesList.isNotEmpty || taskModifiedFiles.isNotEmpty || (taskAdditions > 0 && (initialFiles?.length ?? 0) != gitModifiedFiles.length)) {
+        final totalIns = changedFilesList.isNotEmpty
+            ? changedFilesList.fold<int>(0, (sum, f) => sum + (f['additions'] as int? ?? 0))
+            : (taskAdditions > 0 ? taskAdditions : 1);
+        final totalDel = changedFilesList.isNotEmpty
+            ? changedFilesList.fold<int>(0, (sum, f) => sum + (f['deletions'] as int? ?? 0))
+            : taskDeletions;
+
+        botMessage.metadata = {
+          ...?botMessage.metadata,
+          'changed_files': changedFilesList,
+          'is_changed_files_expanded': true,
+        };
+        botMessage.filesChangedCount = changedFilesList.isNotEmpty ? changedFilesList.length : taskModifiedFiles.length;
+        botMessage.additions = totalIns;
+        botMessage.deletions = totalDel;
+        botMessage.checkpointHash = preExecutionHash ?? 'ckpt_${DateTime.now().millisecondsSinceEpoch}';
+        botMessage.suggestedActions = [
+          'Запустить тесты проекта',
+          'Закоммитить изменения в Git',
+          'Объяснить архитектуру решения',
+        ];
+      } else {
+        botMessage.filesChangedCount = null;
+        botMessage.additions = null;
+        botMessage.deletions = null;
+      }
+    } catch (_) {}
   }
 
   /// Retries the last user message after an error.
@@ -2764,6 +3185,74 @@ $goalsText
       }
       inputController.text = lastUserText;
       sendMessage();
+    }
+  }
+
+  /// Rolls back project files and truncates dialog messages up to [targetMsg].
+  Future<void> rollbackToMessage(ChatMessage targetMsg, {bool putTextInInput = true}) async {
+    final idx = messages.indexOf(targetMsg);
+    if (idx < 0) return;
+
+    // 1. Revert git changes if repository exists
+    try {
+      final projPath = sessions[activeSessionId.value]?.projectPath ?? activeProjectPath.value;
+      if (projPath != null && universal_io.Directory(projPath).existsSync()) {
+        // Discard uncommitted changes created after this point
+        await universal_io.Process.run('git', ['restore', '--staged', '--worktree', '.'], workingDirectory: projPath);
+        await universal_io.Process.run('git', ['checkout', '--', '.'], workingDirectory: projPath);
+        await universal_io.Process.run('git', ['clean', '-fd'], workingDirectory: projPath);
+
+        // If target message or previous message had a checkpoint hash, restore to it
+        if (targetMsg.checkpointHash != null && !targetMsg.checkpointHash!.startsWith('ckpt_')) {
+          await universal_io.Process.run('git', ['checkout', targetMsg.checkpointHash!, '--', '.'], workingDirectory: projPath);
+        }
+        await refreshGitStatus();
+      }
+    } catch (_) {}
+
+    // 2. Truncate messages list: keep up to targetMsg (or remove subsequent)
+    final savedText = targetMsg.text;
+    final isUser = targetMsg.chatMessageType == ChatMessageType.user;
+
+    // Remove all messages after targetMsg
+    while (messages.length > idx + 1) {
+      messages.removeLast();
+    }
+
+    if (putTextInInput && isUser) {
+      // Also remove targetMsg from chat and put in input for editing and resending
+      messages.removeLast();
+      inputController.text = savedText;
+      inputFocusNode.requestFocus();
+    }
+
+    messages.refresh();
+    _saveCurrentSessionState();
+    _saveSessionMessages(activeSessionId.value);
+
+    Get.snackbar(
+      'Откат выполнен',
+      isUser && putTextInInput
+          ? 'Диалог и файлы возвращены к сообщению. Текст помещен в поле ввода.'
+          : 'Диалог и файлы успешно возвращены к выбранной точке.',
+      snackPosition: SnackPosition.BOTTOM,
+      duration: const Duration(seconds: 3),
+    );
+  }
+
+  /// Repeats a user message (loads it into the input box and optionally sends immediately).
+  void repeatMessage(ChatMessage msg, {bool autoSend = false}) {
+    inputController.text = msg.text;
+    inputFocusNode.requestFocus();
+    if (autoSend) {
+      sendMessage();
+    } else {
+      Get.snackbar(
+        'Сообщение в поле ввода',
+        'Текст сообщения загружен в диалоговое окно для редактирования или повторной отправки.',
+        snackPosition: SnackPosition.BOTTOM,
+        duration: const Duration(seconds: 2),
+      );
     }
   }
 
@@ -2815,13 +3304,37 @@ $goalsText
 
   /// Aborts active generation both on WebSocket and via REST endpoint.
   void abortRun() {
-    _wsClient?.abort();
+    streamCoordinator.abort();
     httpClient.abortSession(activeSessionId.value);
+    _activeDirectClient?.close();
+    _activeDirectClient = null;
     isRunning.value = false;
-    if (messages.isNotEmpty && messages.last.isStreaming) {
-      messages.last.isStreaming = false;
-      messages.refresh();
+    for (final m in messages) {
+      if (m.isStreaming) {
+        m.isStreaming = false;
+        m.isThinkingFinished = true;
+        m.isThinkingExpanded = false;
+      }
+      for (final step in m.steps) {
+        step.isRunning = false;
+      }
     }
+    final curSess = sessions[activeSessionId.value];
+    if (curSess != null) {
+      for (final m in curSess.messages) {
+        if (m.isStreaming) {
+          m.isStreaming = false;
+          m.isThinkingFinished = true;
+          m.isThinkingExpanded = false;
+        }
+        for (final step in m.steps) {
+          step.isRunning = false;
+        }
+      }
+    }
+    messages.refresh();
+    _saveCurrentSessionState();
+    _saveSessionMessages(activeSessionId.value);
   }
 
   void addDomSelectorChip(String selector) {
@@ -2833,7 +3346,7 @@ $goalsText
       final item = pendingApprovals[index];
       final reqId = item['request_id']?.toString() ?? '';
       if (reqId.isNotEmpty) {
-        _wsClient?.sendApprovalResponse(reqId, 'approve');
+        streamCoordinator.sendApprovalResponse(reqId, 'approve');
       }
       pendingApprovals.removeAt(index);
     }
@@ -2844,7 +3357,7 @@ $goalsText
       final item = pendingApprovals[index];
       final reqId = item['request_id']?.toString() ?? '';
       if (reqId.isNotEmpty) {
-        _wsClient?.sendApprovalResponse(reqId, 'deny');
+        streamCoordinator.sendApprovalResponse(reqId, 'deny');
       }
       pendingApprovals.removeAt(index);
     }
@@ -2967,19 +3480,13 @@ $goalsText
 
   @override
   void onClose() {
+    WidgetsBinding.instance.removeObserver(this);
     scrollController.removeListener(_onScrollChanged);
-    _termStdoutSub?.cancel();
-    _termStderrSub?.cancel();
-    try {
-      _activeTerminalProcess?.kill();
-    } catch (_) {}
-    _activeTerminalProcess = null;
-    _wsSubscription?.cancel();
-    _sseSubscription?.cancel();
-    _wsClient?.disconnect();
-    _wsClient?.dispose();
+    terminalController.dispose();
+    streamCoordinator.dispose();
     httpClient.dispose();
     inputController.dispose();
+    inputFocusNode.dispose();
     scrollController.dispose();
     super.onClose();
   }

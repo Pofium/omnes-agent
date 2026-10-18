@@ -17,30 +17,36 @@ class AgentModeSwitcher extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: AgentExecutionMode.values.map((mode) {
           final isSelected = mode == currentMode;
+          final unselectedBg = isLight ? const Color(0xFF334155) : const Color(0xFF282D37);
+          final unselectedFg = Colors.white;
+          final unselectedBorder = isLight ? const Color(0xFF334155) : const Color(0xFF384152);
+
           return Padding(
             padding: const EdgeInsets.only(right: 6),
             child: Tooltip(
               message: mode.description,
               preferBelow: false,
-              textStyle: const TextStyle(
-                color: Color(0xFFF8FAFC),
+              textStyle: TextStyle(
+                color: isLight ? const Color(0xFF020617) : const Color(0xFFF8FAFC),
                 fontSize: 11,
                 fontFamily: 'Segoe UI',
                 fontWeight: FontWeight.w500,
               ),
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: const Color(0xFF131A29),
+                color: isLight ? Colors.white : const Color(0xFF131A29),
                 borderRadius: BorderRadius.circular(6),
                 border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.6), width: 0.8),
-                boxShadow: const [
-                  BoxShadow(color: Color(0x66000000), blurRadius: 10, offset: Offset(0, 3)),
+                boxShadow: [
+                  BoxShadow(color: isLight ? Colors.black.withOpacity(0.1) : const Color(0x66000000), blurRadius: 10, offset: const Offset(0, 3)),
                 ],
               ),
               child: InkWell(
@@ -51,13 +57,13 @@ class AgentModeSwitcher extends StatelessWidget {
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                   decoration: BoxDecoration(
                     color: isSelected
-                        ? ShadcnColors.primary.withOpacity(0.15)
-                        : ShadcnColors.card,
+                        ? (isLight ? const Color(0xFF00D2FF).withOpacity(0.18) : ShadcnColors.primary.withOpacity(0.15))
+                        : unselectedBg,
                     borderRadius: BorderRadius.circular(6),
                     border: Border.all(
                       color: isSelected
-                          ? ShadcnColors.primary
-                          : ShadcnColors.border,
+                          ? (isLight ? const Color(0xFF0284C7) : ShadcnColors.primary)
+                          : unselectedBorder,
                       width: 1,
                     ),
                     boxShadow: isSelected
@@ -76,8 +82,8 @@ class AgentModeSwitcher extends StatelessWidget {
                         mode.icon,
                         size: 12,
                         color: isSelected
-                            ? ShadcnColors.primary
-                            : ShadcnColors.foregroundMuted,
+                            ? (isLight ? const Color(0xFF0284C7) : ShadcnColors.primary)
+                            : unselectedFg,
                       ),
                       const SizedBox(width: 5),
                       Text(
@@ -86,8 +92,8 @@ class AgentModeSwitcher extends StatelessWidget {
                           fontSize: 11,
                           fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
                           color: isSelected
-                              ? ShadcnColors.primary
-                              : ShadcnColors.foregroundMuted,
+                              ? (isLight ? const Color(0xFF0284C7) : ShadcnColors.primary)
+                              : unselectedFg,
                           fontFamily: 'JetBrains Mono',
                         ),
                       ),

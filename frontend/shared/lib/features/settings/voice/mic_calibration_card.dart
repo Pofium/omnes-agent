@@ -124,12 +124,21 @@ class _MicCalibrationCardState extends State<MicCalibrationCard> {
 
   @override
   Widget build(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final cardBg = isLight ? Colors.white : const Color(0xFF141414);
+    final cardBorder = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF262626);
+    final inputBg = isLight ? const Color(0xFFF8FAFC) : const Color(0xFF1E1E1E);
+    final inputBorder = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF333333);
+    final textPrimary = isLight ? const Color(0xFF020617) : Colors.white;
+    final textMuted = isLight ? const Color(0xFF334155) : const Color(0xFF888888);
+    final meterBg = isLight ? const Color(0xFFE2E8F0) : const Color(0xFF222222);
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF141414),
+        color: cardBg,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF262626)),
+        border: Border.all(color: cardBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -140,10 +149,10 @@ class _MicCalibrationCardState extends State<MicCalibrationCard> {
               const SizedBox(width: 8),
               Text(
                 DesktopI18n.tr('Микрофон', 'Microphone'),
-                style: const TextStyle(
+                style: TextStyle(
                   fontSize: 15,
                   fontWeight: FontWeight.w600,
-                  color: Colors.white,
+                  color: textPrimary,
                 ),
               ),
             ],
@@ -153,22 +162,22 @@ class _MicCalibrationCardState extends State<MicCalibrationCard> {
           // Device dropdown
           Text(
             DesktopI18n.tr('Устройство ввода', 'Input device'),
-            style: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
+            style: TextStyle(fontSize: 12, color: textMuted),
           ),
           const SizedBox(height: 6),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
             decoration: BoxDecoration(
-              color: const Color(0xFF1E1E1E),
+              color: inputBg,
               borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: const Color(0xFF333333)),
+              border: Border.all(color: inputBorder),
             ),
             child: DropdownButtonHideUnderline(
               child: DropdownButton<String>(
                 value: _selectedDevice,
                 isExpanded: true,
-                dropdownColor: const Color(0xFF1E1E1E),
-                style: const TextStyle(fontSize: 13, color: Colors.white),
+                dropdownColor: inputBg,
+                style: TextStyle(fontSize: 13, color: textPrimary),
                 items: _devices.map((device) {
                   return DropdownMenuItem<String>(
                     value: device,
@@ -213,7 +222,7 @@ class _MicCalibrationCardState extends State<MicCalibrationCard> {
                         Container(
                           height: 10,
                           decoration: BoxDecoration(
-                            color: const Color(0xFF222222),
+                            color: meterBg,
                             borderRadius: BorderRadius.circular(5),
                           ),
                         ),
@@ -239,18 +248,18 @@ class _MicCalibrationCardState extends State<MicCalibrationCard> {
                           _isTesting
                               ? '${_currentDbfs.toStringAsFixed(1)} dBFS'
                               : '-60 dBFS',
-                          style: const TextStyle(
+                          style: TextStyle(
                             fontFamily: 'Consolas',
                             fontSize: 11,
-                            color: Color(0xFF888888),
+                            color: textMuted,
                           ),
                         ),
-                        const Text(
+                        Text(
                           '0 dBFS',
                           style: TextStyle(
                             fontFamily: 'Consolas',
                             fontSize: 11,
-                            color: Color(0xFF888888),
+                            color: textMuted,
                           ),
                         ),
                       ],
@@ -273,7 +282,7 @@ class _MicCalibrationCardState extends State<MicCalibrationCard> {
               'Подсказка: то же устройство выберите в настройках Handy для синхронной диктовки.',
               'Tip: Select the same device in Handy settings for dictation.',
             ),
-            style: const TextStyle(fontSize: 12, color: Color(0xFF777777)),
+            style: TextStyle(fontSize: 12, color: textMuted),
           ),
         ],
       ),

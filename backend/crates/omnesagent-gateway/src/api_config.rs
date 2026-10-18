@@ -2522,24 +2522,26 @@ fn cached_schema() -> (&'static serde_json::Value, &'static str) {
     use std::sync::OnceLock;
     static CACHE: OnceLock<(serde_json::Value, String)> = OnceLock::new();
     let entry = CACHE.get_or_init(|| {
-        let body = schema_body_value();
+        let body = generate_schema_body();
         let etag = build_etag_for(&body);
         (body, etag)
     });
     (&entry.0, entry.1.as_str())
 }
 
-#[cfg(feature = "schema-export")]
-fn schema_body_value() -> serde_json::Value {
-    let schema = schemars::schema_for!(omnesagent_config::schema::Config);
-    serde_json::to_value(schema).unwrap_or(serde_json::Value::Null)
-}
-
-#[cfg(not(feature = "schema-export"))]
-fn schema_body_value() -> serde_json::Value {
-    serde_json::json!({
-        "error": "schema-export feature not enabled in this build",
-    })
+/// Чистая генерация JSON-схемы без дублирования символов для AST-сканера.
+fn generate_schema_body() -> serde_json::Value {
+    #[cfg(feature = "schema-export")]
+    {
+        let schema = schemars::schema_for!(omnesagent_config::schema::Config);
+        serde_json::to_value(schema).unwrap_or(serde_json::Value::Null)
+    }
+    #[cfg(not(feature = "schema-export"))]
+    {
+        serde_json::json!({
+            "error": "schema-export feature not enabled in this build",
+        })
+    }
 }
 
 /// Stable ETag derived from the rendered schema bytes. Computed once via

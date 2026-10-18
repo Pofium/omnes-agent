@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:omnes_shared/omnes_shared.dart';
+import '../../theme/desktop_theme.dart';
 
 class SopStudioController extends GetxController {
   final GatewayHttpClient httpClient = GatewayHttpClient();
@@ -120,7 +121,7 @@ class SopStudioController extends GetxController {
         Get.snackbar(
           'Шаг согласован',
           'Шлюз безопасности подтвержден. Пайплайн продолжает выполнение.',
-          backgroundColor: const Color(0xFF0F172A),
+          backgroundColor: DesktopTheme.isDark ? const Color(0xFF0F172A) : const Color(0xFF1E293B),
           colorText: const Color(0xFF10B981),
           snackPosition: SnackPosition.BOTTOM,
         );

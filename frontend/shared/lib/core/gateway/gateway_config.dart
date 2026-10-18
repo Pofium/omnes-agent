@@ -118,13 +118,29 @@ class GatewayConfig {
   }
 
   /// Retrieves Bearer token for gateway auth.
+  /// Retrieves Bearer token for gateway auth with dynamic discovery.
   static Future<String> getToken() async {
     if (_overrideToken != null) return _overrideToken!;
     try {
-      return _box.read<String>(_tokenKey) ?? defaultToken;
-    } catch (_) {
-      return defaultToken;
+      final stored = _box.read<String>(_tokenKey);
+      if (stored != null && stored.trim().isNotEmpty) return stored.trim();
+    } catch (_) {}
+
+    if (!kIsWeb) {
+      try {
+        final envToken = universal_io.Platform.environment['OMNES_GATEWAY_TOKEN'];
+        if (envToken != null && envToken.trim().isNotEmpty) return envToken.trim();
+
+        final discFile = universal_io.File('.omnes/gateway.json');
+        if (discFile.existsSync()) {
+          final parsed = jsonDecode(discFile.readAsStringSync());
+          if (parsed is Map && parsed['token'] != null && (parsed['token'] as String).trim().isNotEmpty) {
+            return (parsed['token'] as String).trim();
+          }
+        }
+      } catch (_) {}
     }
+    return defaultToken;
   }
 
   /// Stores Bearer token.

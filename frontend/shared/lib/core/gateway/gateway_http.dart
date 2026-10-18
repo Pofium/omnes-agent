@@ -5,11 +5,30 @@ import '../../model/workspace_entry.dart';
 import '../../model/session_info.dart';
 import 'gateway_config.dart';
 import 'quickstart_submission.dart';
+import 'models/trajectory_step.dart';
+import 'api/api.dart';
+
+export 'api/api.dart';
 
 class GatewayHttpClient {
   final http.Client _client;
+  late final GatewayHttpTransport transport;
 
-  GatewayHttpClient({http.Client? client}) : _client = client ?? http.Client();
+  // Domain API clients
+  late final SessionApiClient sessionsClient;
+  late final ConfigApiClient configClient;
+  late final MemoryApiClient memoryClient;
+  late final ToolsApiClient toolsClient;
+  late final SystemApiClient systemClient;
+
+  GatewayHttpClient({http.Client? client}) : _client = client ?? http.Client() {
+    transport = GatewayHttpTransport(client: _client);
+    sessionsClient = SessionApiClient(transport: transport);
+    configClient = ConfigApiClient(transport: transport);
+    memoryClient = MemoryApiClient(transport: transport);
+    toolsClient = ToolsApiClient(transport: transport);
+    systemClient = SystemApiClient(transport: transport);
+  }
 
   /// Headers with bearer authentication.
   Future<Map<String, String>> _authHeaders() async {
@@ -122,6 +141,11 @@ class GatewayHttpClient {
       }
     } catch (_) {}
     return [];
+  }
+
+  /// Fetches recorded trajectory steps for a specific session from /api/v1/sessions/{id}/steps.
+  Future<List<TrajectoryStep>> getSessionSteps(String sessionId) async {
+    return sessionsClient.getSessionSteps(sessionId);
   }
 
   /// Deletes a session from /api/sessions/{id}.

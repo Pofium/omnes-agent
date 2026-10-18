@@ -38,11 +38,17 @@ class _HandyInstallDialogState extends State<HandyInstallDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final dialogBg = isLight ? Colors.white : ShadcnColors.card;
+    final dialogBorder = isLight ? const Color(0xFFCBD5E1) : ShadcnColors.border;
+    final fg = isLight ? const Color(0xFF020617) : ShadcnColors.foreground;
+    final fgMuted = isLight ? const Color(0xFF334155) : ShadcnColors.foregroundMuted;
+
     return Dialog(
-      backgroundColor: ShadcnColors.card,
+      backgroundColor: dialogBg,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(14),
-        side: BorderSide(color: ShadcnColors.border),
+        side: BorderSide(color: dialogBorder),
       ),
       insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
       child: Container(
@@ -61,7 +67,7 @@ class _HandyInstallDialogState extends State<HandyInstallDialog> {
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
                     fontSize: 18,
-                    color: ShadcnColors.foreground,
+                    color: fg,
                   ),
                 ),
               ],
@@ -76,7 +82,7 @@ class _HandyInstallDialogState extends State<HandyInstallDialog> {
                 'The agent will download the official release from GitHub (~20 MB) and silently install it for the current user without administrator privileges.\n\n'
                 'Audio is processed completely locally on your computer and never leaves it.',
               ),
-              style: TextStyle(fontSize: 13, height: 1.5, color: ShadcnColors.foregroundMuted),
+              style: TextStyle(fontSize: 13, height: 1.5, color: fgMuted),
             ),
             const SizedBox(height: 16),
             Row(
@@ -94,7 +100,7 @@ class _HandyInstallDialogState extends State<HandyInstallDialog> {
                 Expanded(
                   child: Text(
                     DesktopI18n.tr('Больше не спрашивать (автоустановка)', "Don't ask again (auto-install)"),
-                    style: TextStyle(fontSize: 12, color: ShadcnColors.foregroundMuted),
+                    style: TextStyle(fontSize: 12, color: fgMuted),
                   ),
                 ),
               ],

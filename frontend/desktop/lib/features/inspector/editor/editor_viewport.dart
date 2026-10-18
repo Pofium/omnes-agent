@@ -14,6 +14,7 @@ import 'package:omnes_shared/omnes_shared.dart' show EditorPosition, EditorStyle
 
 import 'editor_client.dart';
 import 'editor_controller.dart';
+import '../../../theme/desktop_theme.dart';
 
 /// Shared text metrics for the viewport and the gutter.
 class EditorMetrics {
@@ -900,8 +901,28 @@ class _EditorPainter extends CustomPainter {
 
   final Map<int, TextStyle> _styleCache = {};
 
+  static Color _adaptSyntaxColor(Color color, bool isDark) {
+    if (isDark) return color;
+    final hsl = HSLColor.fromColor(color);
+    if (hsl.saturation < 0.15 && hsl.lightness > 0.55) {
+      // Pale grey text/punctuation -> Slate 800
+      return const Color(0xFF1E293B);
+    }
+    if (hsl.hue >= 30 && hsl.hue <= 65) {
+      // Yellow / Gold / Amber -> Deep bronze / amber 800 (high contrast on white)
+      return hsl.withLightness(0.30).withSaturation(0.95).toColor();
+    }
+    if (hsl.lightness > 0.45) {
+      // Any other light color (green, blue, magenta, orange) -> Darken to ~0.35 lightness
+      return hsl.withLightness(0.35).toColor();
+    }
+    return color;
+  }
+
   TextStyle _styleForId(int styleId, TextStyle base) {
-    final cached = _styleCache[styleId];
+    final isDark = DesktopTheme.isDark;
+    final cacheKey = (styleId << 1) | (isDark ? 1 : 0);
+    final cached = _styleCache[cacheKey];
     if (cached != null) return cached;
     EditorStyleEntry? entry;
     for (final s in controller.styleTable) {
@@ -912,14 +933,15 @@ class _EditorPainter extends CustomPainter {
     }
     TextStyle style = base;
     if (entry != null && entry.fg != null) {
-      final fg = _parseHex(entry.fg!);
+      final rawFg = _parseHex(entry.fg!);
+      final fg = rawFg != null ? _adaptSyntaxColor(rawFg, isDark) : null;
       style = style.copyWith(
         color: fg ?? base.color,
         fontWeight: entry.bold ? FontWeight.bold : null,
         fontStyle: entry.italic ? FontStyle.italic : null,
       );
     }
-    _styleCache[styleId] = style;
+    _styleCache[cacheKey] = style;
     return style;
   }
 

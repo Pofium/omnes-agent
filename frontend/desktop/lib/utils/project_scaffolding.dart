@@ -292,6 +292,7 @@ class ProjectScaffoldOptions {
   final bool createAgentsMd;
   final bool createReadme;
   final bool runOb2hScan;
+  final bool initCodeGraph;
   final String? customInstructions;
   final String colorHex;
   final String iconName;
@@ -301,6 +302,7 @@ class ProjectScaffoldOptions {
     this.createAgentsMd = true,
     this.createReadme = true,
     this.runOb2hScan = true,
+    this.initCodeGraph = true,
     this.customInstructions,
     this.colorHex = '#00D2FF',
     this.iconName = 'code',
@@ -369,6 +371,11 @@ class ProjectScaffoldingService {
     // 5. OB2H Code Intelligence indexing
     if (options.runOb2hScan) {
       runOb2hScanAsync(projectPath);
+    }
+
+    // 6. CodeGraph Deep AST and Call Graph Indexing (.codegraph/)
+    if (options.initCodeGraph) {
+      initCodeGraphAsync(projectPath);
     }
 
     return ProjectScaffoldingResult(
@@ -523,6 +530,25 @@ $customSection
           break;
         } catch (_) {}
       }
+    } catch (_) {}
+  }
+
+  /// Triggers asynchronous CodeGraph initialization and indexing (.codegraph/)
+  static void initCodeGraphAsync(String projectPath) {
+    try {
+      final isWin = Platform.isWindows;
+      final cmd = isWin ? 'codegraph.cmd' : 'codegraph';
+      Process.start(
+        cmd,
+        ['init', projectPath],
+        runInShell: true,
+      ).catchError((_) {
+        return Process.start(
+          'codegraph',
+          ['init', projectPath],
+          runInShell: true,
+        );
+      });
     } catch (_) {}
   }
 }

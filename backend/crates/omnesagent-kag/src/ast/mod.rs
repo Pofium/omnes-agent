@@ -1,6 +1,13 @@
 //! Высокопроизводительный статический AST/код-парсер репозиториев (Rust, Python, TS/JS, Go, SQL,
-//! PHP, Dart, Java, C#, C/C++, Kotlin, Swift, Ruby, Vue/Svelte, Scala, Lua, Elixir, Shell).
+//! PHP, Dart, Java, C#, C/C++, Kotlin, Swift, Ruby, Vue/Svelte, Scala, Lua, Elixir, Shell,
+//! HTML, CSS/SCSS, Protobuf, GraphQL, OpenAPI, Terraform, Docker, K8s, Manifests, Jupyter, Solidity, Zig).
 //! Работает полностью детерминированно и локально, без вызовов LLM и без расхода токенов.
+
+pub mod iac;
+pub mod languages;
+pub mod manifests;
+pub mod schemas;
+pub mod web;
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -175,6 +182,13 @@ pub struct AstCodeExtractor {
     sh_fn_paren_re: Regex,
     sh_fn_kw_re: Regex,
     sh_source_re: Regex,
+
+    // Фаза 6: Экстракторы специализированных форматов и языков
+    pub web: web::WebExtractor,
+    pub schemas: schemas::SchemaExtractor,
+    pub iac: iac::IacExtractor,
+    pub manifests: manifests::ManifestExtractor,
+    pub languages: languages::LanguageExtractor,
 }
 
 impl Default for AstCodeExtractor {
@@ -294,6 +308,13 @@ impl AstCodeExtractor {
             sh_fn_paren_re: Regex::new(r"(?m)^\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s*\(\s*\)\s*\{?").unwrap(),
             sh_fn_kw_re: Regex::new(r"(?m)^\s*function\s+([a-zA-Z_][a-zA-Z0-9_-]*)").unwrap(),
             sh_source_re: Regex::new(r#"(?m)^\s*(?:source|\.)\s+([^"'`\s;|&]+)"#).unwrap(),
+
+            // Фаза 6: Инициализация специализированных экстракторов
+            web: web::WebExtractor::new(),
+            schemas: schemas::SchemaExtractor::new(),
+            iac: iac::IacExtractor::new(),
+            manifests: manifests::ManifestExtractor::new(),
+            languages: languages::LanguageExtractor::new(),
         }
     }
 
@@ -374,53 +395,100 @@ impl AstCodeExtractor {
             }
 
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    let ext_lower = ext.to_lowercase();
-                    if matches!(
-                        ext_lower.as_str(),
-                        "rs" | "py"
-                            | "ts"
-                            | "tsx"
-                            | "js"
-                            | "jsx"
-                            | "go"
-                            | "sql"
-                            | "c"
-                            | "cpp"
-                            | "cc"
-                            | "cxx"
-                            | "h"
-                            | "hpp"
-                            | "hxx"
-                            | "php"
-                            | "dart"
-                            | "java"
-                            | "cs"
-                            | "kt"
-                            | "kts"
-                            | "swift"
-                            | "rb"
-                            | "vue"
-                            | "svelte"
-                            | "scala"
-                            | "lua"
-                            | "ex"
-                            | "exs"
-                            | "sh"
-                            | "bash"
-                    ) {
-                        if let Ok(rel) = path.strip_prefix(root) {
-                            let rel_str = rel.to_string_lossy().replace('\\', "/");
-                            // Дополнительная проверка, чтобы не попасть в поддиректории исключений
-                            if !rel_str.contains("/target/")
-                                && !rel_str.contains("/node_modules/")
-                                && !rel_str.contains("/venv/")
-                                && !rel_str.contains("/.venv/")
-                                && !rel_str.contains("/vendor/")
-                                && !rel_str.contains("/data/")
-                            {
-                                out.push((rel_str, path.to_path_buf()));
-                            }
+                let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let ext_lower = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                let is_manifest = matches!(
+                    file_name,
+                    "Cargo.toml"
+                        | "package.json"
+                        | "pyproject.toml"
+                        | "requirements.txt"
+                        | "go.mod"
+                        | "pubspec.yaml"
+                        | "composer.json"
+                        | "Dockerfile"
+                        | "docker-compose.yml"
+                        | "docker-compose.yaml"
+                        | "compose.yml"
+                        | "compose.yaml"
+                ) || file_name.starts_with("Dockerfile.")
+                    || file_name.ends_with(".dockerfile");
+
+                let is_openapi = file_name.ends_with(".openapi.json")
+                    || file_name.ends_with(".openapi.yaml")
+                    || file_name.ends_with(".openapi.yml")
+                    || file_name == "openapi.json"
+                    || file_name == "openapi.yaml"
+                    || file_name == "openapi.yml"
+                    || file_name == "swagger.json"
+                    || file_name == "swagger.yaml";
+
+                let is_supported_ext = matches!(
+                    ext_lower.as_str(),
+                    "rs" | "py"
+                        | "ts"
+                        | "tsx"
+                        | "js"
+                        | "jsx"
+                        | "go"
+                        | "sql"
+                        | "c"
+                        | "cpp"
+                        | "cc"
+                        | "cxx"
+                        | "h"
+                        | "hpp"
+                        | "hxx"
+                        | "php"
+                        | "dart"
+                        | "java"
+                        | "cs"
+                        | "kt"
+                        | "kts"
+                        | "swift"
+                        | "rb"
+                        | "vue"
+                        | "svelte"
+                        | "scala"
+                        | "lua"
+                        | "ex"
+                        | "exs"
+                        | "sh"
+                        | "bash"
+                        // Фаза 6: Новые расширения
+                        | "html"
+                        | "htm"
+                        | "css"
+                        | "scss"
+                        | "proto"
+                        | "graphql"
+                        | "gql"
+                        | "tf"
+                        | "hcl"
+                        | "ipynb"
+                        | "sol"
+                        | "zig"
+                        | "yaml"
+                        | "yml"
+                );
+
+                if is_manifest || is_openapi || is_supported_ext {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        // Дополнительная проверка, чтобы не попасть в поддиректории исключений
+                        if !rel_str.contains("/target/")
+                            && !rel_str.contains("/node_modules/")
+                            && !rel_str.contains("/venv/")
+                            && !rel_str.contains("/.venv/")
+                            && !rel_str.contains("/vendor/")
+                            && !rel_str.contains("/data/")
+                        {
+                            out.push((rel_str, path.to_path_buf()));
                         }
                     }
                 }
@@ -442,6 +510,56 @@ impl AstCodeExtractor {
             line_start: 1,
             line_end: content.lines().count().max(1),
         });
+
+        let file_name = Path::new(rel_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        // 1. Диспетчеризация по манифестам и именам файлов
+        if file_name == "Cargo.toml" {
+            self.manifests.parse_cargo_toml(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name == "package.json" {
+            self.manifests.parse_package_json(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name == "pyproject.toml" || file_name == "requirements.txt" {
+            self.manifests.parse_python_manifest(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name == "go.mod" {
+            self.manifests.parse_go_mod(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name == "pubspec.yaml" {
+            self.manifests.parse_pubspec_yaml(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name == "composer.json" {
+            self.manifests.parse_composer_json(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name == "Dockerfile"
+            || file_name.starts_with("Dockerfile.")
+            || file_name.ends_with(".dockerfile")
+        {
+            self.iac.parse_dockerfile(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name == "docker-compose.yml"
+            || file_name == "docker-compose.yaml"
+            || file_name == "compose.yml"
+            || file_name == "compose.yaml"
+        {
+            self.iac.parse_docker_compose(rel_path, &file_node_id, content, out);
+            return;
+        } else if file_name.ends_with(".openapi.json")
+            || file_name.ends_with(".openapi.yaml")
+            || file_name.ends_with(".openapi.yml")
+            || file_name == "openapi.json"
+            || file_name == "openapi.yaml"
+            || file_name == "openapi.yml"
+            || file_name == "swagger.json"
+            || file_name == "swagger.yaml"
+        {
+            self.schemas.parse_openapi(rel_path, &file_node_id, content, out);
+            return;
+        }
 
         let ext = Path::new(rel_path)
             .extension()
@@ -472,6 +590,29 @@ impl AstCodeExtractor {
             "lua" => self.parse_lua(rel_path, &file_node_id, content, out),
             "ex" | "exs" => self.parse_elixir(rel_path, &file_node_id, content, out),
             "sh" | "bash" => self.parse_shell(rel_path, &file_node_id, content, out),
+
+            // Фаза 6: Новые форматы
+            "html" | "htm" => self.web.parse_html(rel_path, &file_node_id, content, out),
+            "css" | "scss" => self.web.parse_css_scss(rel_path, &file_node_id, content, out),
+            "proto" => self.schemas.parse_proto(rel_path, &file_node_id, content, out),
+            "graphql" | "gql" => self.schemas.parse_graphql(rel_path, &file_node_id, content, out),
+            "tf" | "hcl" => self.iac.parse_terraform(rel_path, &file_node_id, content, out),
+            "yaml" | "yml" => {
+                if content.contains("apiVersion:") && content.contains("kind:") {
+                    self.iac.parse_kubernetes(rel_path, &file_node_id, content, out);
+                }
+            }
+            "ipynb" => {
+                self.languages.parse_ipynb(
+                    rel_path,
+                    &file_node_id,
+                    content,
+                    |rp, fni, c, o| self.parse_python(rp, fni, c, o),
+                    out,
+                );
+            }
+            "sol" => self.languages.parse_solidity(rel_path, &file_node_id, content, out),
+            "zig" => self.languages.parse_zig(rel_path, &file_node_id, content, out),
             _ => {}
         }
     }

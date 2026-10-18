@@ -6,9 +6,8 @@ import 'package:get_storage/get_storage.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 import 'package:window_manager/window_manager.dart';
 
-import 'features/desktop_shell.dart';
+import 'features/splash/desktop_splash_screen.dart';
 import 'theme/desktop_theme.dart';
-import 'utils/desktop_backend_manager.dart';
 import 'utils/desktop_i18n.dart';
 
 void main() async {
@@ -18,18 +17,13 @@ void main() async {
   DesktopI18n.init();
   Get.put(DesktopThemeController());
 
-  // Automatically start backend gateway if not running
-  try {
-    await DesktopBackendManager.startBackendIfNeeded().timeout(const Duration(seconds: 4));
-  } catch (_) {}
-
   runApp(const OmnesDesktopApp());
 
   const windowOptions = WindowOptions(
     size: Size(1360, 860),
     minimumSize: Size(1024, 640),
     center: true,
-    backgroundColor: Colors.transparent,
+    backgroundColor: Color(0xFF090D16),
     skipTaskbar: false,
     titleBarStyle: TitleBarStyle.normal,
     title: 'OmnesAgent Desktop ADE',
@@ -57,7 +51,7 @@ class OmnesDesktopApp extends StatelessWidget {
       translations: LocalString(),
       locale: const Locale('ru', 'RU'),
       fallbackLocale: const Locale('en', 'US'),
-      home: const DesktopShell(),
+      home: const DesktopSplashScreen(),
     );
   }
 }

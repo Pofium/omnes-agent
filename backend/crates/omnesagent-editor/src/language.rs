@@ -29,12 +29,18 @@ pub fn language_id_from_path(path: &Path) -> &'static str {
         "css" => "css",
         "scss" => "scss",
         "c" | "h" => "c",
-        "cpp" | "hpp" | "cc" | "hh" => "cpp",
+        "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" => "cpp",
         "go" => "go",
         "java" => "java",
+        "cs" => "csharp",
         "kt" | "kts" => "kotlin",
         "swift" => "swift",
         "rb" => "ruby",
+        "lua" => "lua",
+        "ex" | "exs" => "elixir",
+        "scala" => "scala",
+        "svelte" => "svelte",
+        "vue" => "vue",
         "php" => "php",
         "xml" | "svg" => "xml",
         "sql" => "sql",
@@ -55,6 +61,15 @@ mod tests {
         assert_eq!(language_id_from_path(Path::new("Cargo.TOML")), "toml");
         assert_eq!(language_id_from_path(Path::new("README.md")), "markdown");
         assert_eq!(language_id_from_path(Path::new("run.sh")), "shell");
+        assert_eq!(language_id_from_path(Path::new("Program.cs")), "csharp");
+        assert_eq!(language_id_from_path(Path::new("App.swift")), "swift");
+        assert_eq!(language_id_from_path(Path::new("script.rb")), "ruby");
+        assert_eq!(language_id_from_path(Path::new("init.lua")), "lua");
+        assert_eq!(language_id_from_path(Path::new("mix.exs")), "elixir");
+        assert_eq!(language_id_from_path(Path::new("Main.scala")), "scala");
+        assert_eq!(language_id_from_path(Path::new("App.svelte")), "svelte");
+        assert_eq!(language_id_from_path(Path::new("Component.vue")), "vue");
+        assert_eq!(language_id_from_path(Path::new("native.cxx")), "cpp");
     }
 
     #[test]

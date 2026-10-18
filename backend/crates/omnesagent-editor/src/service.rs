@@ -88,10 +88,12 @@ pub struct EditorService {
 }
 
 impl EditorService {
+    /// Вторичный конструктор со стандартным лимитом по умолчанию (MAX_BUFFER_BYTES).
     pub fn new() -> Self {
         Self::with_limit(crate::MAX_BUFFER_BYTES)
     }
 
+    /// Первичный канонический конструктор сервиса с явным ограничением размера буфера.
     pub fn with_limit(max_buffer_bytes: u64) -> Self {
         Self {
             registry: Mutex::new(Registry {

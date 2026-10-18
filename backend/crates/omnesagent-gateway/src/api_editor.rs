@@ -328,7 +328,7 @@ pub(crate) fn editor_error_response(err: EditorError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::{delete as axum_delete, get as axum_get, put as axum_put};
+    use axum::routing::{delete as axum_delete, get as axum_get};
     use tower::ServiceExt;
 
     fn editor_router(state: AppState) -> axum::Router {

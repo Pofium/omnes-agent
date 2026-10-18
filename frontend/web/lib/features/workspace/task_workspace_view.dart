@@ -2110,12 +2110,12 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         deletions: msg.deletions ?? 0,
                       ),
 
-                    // Message Reactions Row (Image 2 match: [Copy] [Like] [Dislike] [Branch] 9/5, 10:07 AM)
-                    if (!isUser)
+                    // Message Reactions Row (shown once response is completed, not while streaming/thinking)
+                    if (!isUser && !msg.isStreaming && msg.text.trim().isNotEmpty)
                       _buildMessageReactionsRow(context, msg),
 
-                    // Follow-up Action Chips (1-click suggestions)
-                    if (!isUser)
+                    // Follow-up Action Chips (1-click suggestions, shown once complete)
+                    if (!isUser && !msg.isStreaming && msg.text.trim().isNotEmpty)
                       _buildFollowUpActionChips(context, msg),
                   ],
                 ),
@@ -3056,6 +3056,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     );
   }
 
+  String _formatMessageTimestamp(DateTime? dt) {
+    final target = dt ?? DateTime.now();
+    final hour = target.hour > 12 ? target.hour - 12 : (target.hour == 0 ? 12 : target.hour);
+    final period = target.hour >= 12 ? 'PM' : 'AM';
+    final minute = target.minute.toString().padLeft(2, '0');
+    return '${target.month}/${target.day}, $hour:$minute $period';
+  }
+
   Widget _buildMessageReactionsRow(BuildContext context, ChatMessage msg) {
     bool isLiked = false;
     bool isDisliked = false;
@@ -3169,9 +3177,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 ),
               ],
 
-              const Text(
-                '9/5, 10:07 AM',
-                style: TextStyle(fontSize: 11, color: Color(0xFF64748B), fontFamily: 'Consolas'),
+              Text(
+                _formatMessageTimestamp(msg.createdAt),
+                style: const TextStyle(fontSize: 11, color: Color(0xFF64748B), fontFamily: 'Consolas'),
               ),
             ],
           ),

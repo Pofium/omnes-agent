@@ -44,6 +44,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
   bool isCenterCollapsed = false; // When true, inspector occupies the entire middle area
   static const double targetCenterWidth = 650.0;
   int inspectorTabIndex = -1; // -1 opens the 'Open tab' chooser from Screenshot 2
+  String? inspectorTabKey;
   String? sideChatInitialText;
   Key inspectorKey = UniqueKey();
 
@@ -59,6 +60,14 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
     windowManager.addListener(this);
     _initTray();
     _checkInitialState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        final isMax = await windowManager.isMaximized();
+        if (!isMax) {
+          await windowManager.maximize();
+        }
+      } catch (_) {}
+    });
   }
 
   @override
@@ -274,12 +283,13 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
     } catch (_) {}
   }
 
-  void _openInspectorWithTab(int index, {String? sideChatText}) {
+  void _openInspectorWithTab(int index, {String? tabKey, String? sideChatText}) {
     setState(() {
       isInspectorOpen = true;
       isCenterCollapsed = false;
       centerWidth = targetCenterWidth;
       inspectorTabIndex = index;
+      inspectorTabKey = tabKey;
       sideChatInitialText = sideChatText;
       inspectorKey = UniqueKey();
     });
@@ -292,6 +302,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
         isCenterCollapsed = false;
         centerWidth = targetCenterWidth;
         inspectorTabIndex = -1; // Show Open Tab Chooser
+        inspectorTabKey = null;
         inspectorKey = UniqueKey();
       }
     });
@@ -490,6 +501,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
                                     onOpenCanvas: () => _openInspectorWithTab(2),
                                     onBranchSideChat: (text) => _openInspectorWithTab(4, sideChatText: text),
                                     onReviewChanges: () => _openInspectorWithTab(3),
+                                    onOpenTrajectory: () => _openInspectorWithTab(7, tabKey: 'trajectory'),
                                     onOpenSettings: () => _openSettingsDialog('Провайдеры'),
                                   ),
                           )
@@ -510,6 +522,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
                                       onOpenCanvas: () => _openInspectorWithTab(2),
                                       onBranchSideChat: (text) => _openInspectorWithTab(4, sideChatText: text),
                                       onReviewChanges: () => _openInspectorWithTab(3),
+                                      onOpenTrajectory: () => _openInspectorWithTab(7, tabKey: 'trajectory'),
                                       onOpenSettings: () => _openSettingsDialog('Провайдеры'),
                                     ),
                             ),
@@ -545,6 +558,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
                               key: inspectorKey,
                               controller: workspaceController,
                               initialTabIndex: inspectorTabIndex,
+                              initialTabKey: inspectorTabKey,
                               initialSideChatText: sideChatInitialText,
                               onClose: () => setState(() {
                                 isInspectorOpen = false;
@@ -577,49 +591,25 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
       ),
       child: Row(
         children: [
-          InkWell(
-            onTap: () {
-              setState(() {
-                isCenterCollapsed = false;
-                centerWidth = targetCenterWidth;
-              });
-            },
-            borderRadius: BorderRadius.circular(6),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              decoration: BoxDecoration(
-                color: const Color(0xFF00D2FF).withOpacity(0.12),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5), width: 1),
+          Tooltip(
+            message: 'Открыть диалоговую область',
+            child: InkWell(
+              onTap: () {
+                setState(() {
+                  isCenterCollapsed = false;
+                  centerWidth = targetCenterWidth;
+                });
+              },
+              borderRadius: BorderRadius.circular(6),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF00D2FF).withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5), width: 1),
+                ),
+                child: const Icon(Icons.view_sidebar_outlined, size: 16, color: Color(0xFF00D2FF)),
               ),
-              child: const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.view_sidebar_outlined, size: 15, color: Color(0xFF00D2FF)),
-                  SizedBox(width: 8),
-                  Text(
-                    'Открыть рабочую область (650 px)',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF00D2FF),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const Spacer(),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: DesktopTheme.bgSurface,
-              borderRadius: BorderRadius.circular(4),
-              border: Border.all(color: DesktopTheme.borderSubtle, width: 0.8),
-            ),
-            child: Text(
-              'Инспектор на всю ширину',
-              style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
             ),
           ),
         ],

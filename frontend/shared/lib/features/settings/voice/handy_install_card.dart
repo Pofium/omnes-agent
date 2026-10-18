@@ -33,6 +33,12 @@ class HandyInstallCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final cardBg = isLight ? Colors.white : const Color(0xFF141414);
+    final cardBorder = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF262626);
+    final textPrimary = isLight ? const Color(0xFF020617) : Colors.white;
+    final textMuted = isLight ? const Color(0xFF334155) : const Color(0xFF888888);
+
     final st = status;
     final isSupported = st?.supported ?? true;
     final isInstalled = st?.installed ?? false;
@@ -44,9 +50,9 @@ class HandyInstallCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF141414),
+        color: cardBg,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF262626)),
+        border: Border.all(color: cardBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -62,10 +68,10 @@ class HandyInstallCard extends StatelessWidget {
                   children: [
                     Text(
                       DesktopI18n.tr('Диктовка (Handy)', 'Dictation (Handy)'),
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 15,
                         fontWeight: FontWeight.w600,
-                        color: Colors.white,
+                        color: textPrimary,
                       ),
                     ),
                     Text(
@@ -73,7 +79,7 @@ class HandyInstallCard extends StatelessWidget {
                         'Офлайн-распознавание речи сторонним приложением',
                         'Offline speech recognition via a third-party app',
                       ),
-                      style: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
+                      style: TextStyle(fontSize: 12, color: textMuted),
                     ),
                   ],
                 ),
@@ -93,7 +99,7 @@ class HandyInstallCard extends StatelessWidget {
               variant: ShadcnBadgeVariant.neutral,
             ),
           ] else if (inProgress) ...[
-            _buildInstallingState(job),
+            _buildInstallingState(context, job),
           ] else if (!isInstalled) ...[
             _buildNotInstalledState(context),
           ] else ...[
@@ -105,12 +111,18 @@ class HandyInstallCard extends StatelessWidget {
   }
 
   Widget _buildNotInstalledState(BuildContext context) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final subCardBg = isLight ? const Color(0xFFF8FAFC) : const Color(0xFF1E1E1E);
+    final subCardBorder = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF2E2E2E);
+    final textPrimary = isLight ? const Color(0xFF020617) : Colors.white;
+    final textSubtle = isLight ? const Color(0xFF475569) : const Color(0xFFAAAAAA);
+
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E1E1E),
+        color: subCardBg,
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFF2E2E2E)),
+        border: Border.all(color: subCardBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -121,7 +133,7 @@ class HandyInstallCard extends StatelessWidget {
               const SizedBox(width: 6),
               Text(
                 DesktopI18n.tr('Handy не установлен', 'Handy is not installed'),
-                style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 13, color: Colors.white),
+                style: TextStyle(fontWeight: FontWeight.w500, fontSize: 13, color: textPrimary),
               ),
             ],
           ),
@@ -131,7 +143,7 @@ class HandyInstallCard extends StatelessWidget {
               'Для диктовки требуется бесплатное локальное приложение Handy (~20 МБ, офлайн-распознавание).',
               'Handy is a free offline dictation app (~20 MB, offline recognition).',
             ),
-            style: const TextStyle(fontSize: 12, color: Color(0xFFAAAAAA)),
+            style: TextStyle(fontSize: 12, color: textSubtle),
           ),
           const SizedBox(height: 12),
           Row(
@@ -150,15 +162,20 @@ class HandyInstallCard extends StatelessWidget {
     );
   }
 
-  Widget _buildInstallingState(HandyJobStatusDto job) {
+  Widget _buildInstallingState(BuildContext context, HandyJobStatusDto job) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final subCardBg = isLight ? const Color(0xFFF8FAFC) : const Color(0xFF1E1E1E);
+    final subCardBorder = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF2E2E2E);
+    final textPrimary = isLight ? const Color(0xFF020617) : Colors.white;
+
     final pct = job.percent.clamp(0, 100);
 
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E1E1E),
+        color: subCardBg,
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFF2E2E2E)),
+        border: Border.all(color: subCardBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -168,7 +185,7 @@ class HandyInstallCard extends StatelessWidget {
             children: [
               Text(
                 job.message.isNotEmpty ? job.message : DesktopI18n.tr('Установка...', 'Installing...'),
-                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.white),
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: textPrimary),
               ),
               Text(
                 '$pct%',
@@ -179,7 +196,7 @@ class HandyInstallCard extends StatelessWidget {
           const SizedBox(height: 8),
           LinearProgressIndicator(
             value: pct / 100.0,
-            backgroundColor: const Color(0xFF2E2E2E),
+            backgroundColor: isLight ? const Color(0xFFE2E8F0) : const Color(0xFF2E2E2E),
             valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00D2FF)),
           ),
           const SizedBox(height: 12),
@@ -203,12 +220,20 @@ class HandyInstallCard extends StatelessWidget {
     bool updateAvailable,
     bool autoStartWithOs,
   ) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final subCardBg = isLight ? const Color(0xFFF8FAFC) : const Color(0xFF1E1E1E);
+    final subCardBorder = isLight ? const Color(0xFFCBD5E1) : const Color(0xFF2E2E2E);
+    final textPrimary = isLight ? const Color(0xFF020617) : Colors.white;
+    final textSubtle = isLight ? const Color(0xFF475569) : const Color(0xFFAAAAAA);
+    final textMuted = isLight ? const Color(0xFF334155) : const Color(0xFF888888);
+    final hotkeyBg = isLight ? const Color(0xFFE2E8F0) : const Color(0xFF262626);
+
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E1E1E),
+        color: subCardBg,
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: const Color(0xFF2E2E2E)),
+        border: Border.all(color: subCardBorder),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -217,7 +242,7 @@ class HandyInstallCard extends StatelessWidget {
             children: [
               Text(
                 'Handy v$version',
-                style: const TextStyle(fontFamily: 'Consolas', fontWeight: FontWeight.w600, fontSize: 13, color: Colors.white),
+                style: TextStyle(fontFamily: 'Consolas', fontWeight: FontWeight.w600, fontSize: 13, color: textPrimary),
               ),
               const SizedBox(width: 8),
               if (isRunning)
@@ -245,17 +270,17 @@ class HandyInstallCard extends StatelessWidget {
             children: [
               Text(
                 DesktopI18n.tr('Горячая клавиша диктовки: ', 'Dictation hotkey: '),
-                style: const TextStyle(fontSize: 12, color: Color(0xFFAAAAAA)),
+                style: TextStyle(fontSize: 12, color: textSubtle),
               ),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF262626),
+                  color: hotkeyBg,
                   borderRadius: BorderRadius.circular(4),
                 ),
                 child: const Text(
                   'Ctrl+Space',
-                  style: TextStyle(fontFamily: 'Consolas', fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFF00D2FF)),
+                  style: TextStyle(fontFamily: 'Consolas', fontSize: 11, fontWeight: FontWeight.w600, color: Color(0xFF0284C7)),
                 ),
               ),
             ],
@@ -311,7 +336,7 @@ class HandyInstallCard extends StatelessWidget {
               ),
               Text(
                 DesktopI18n.tr('Запускать вместе с Windows', 'Start with Windows'),
-                style: const TextStyle(fontSize: 12, color: Color(0xFF888888)),
+                style: TextStyle(fontSize: 12, color: textMuted),
               ),
             ],
           ),

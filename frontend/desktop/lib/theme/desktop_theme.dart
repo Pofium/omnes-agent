@@ -28,19 +28,20 @@ class DesktopTheme {
   static const Color textSecondaryDark = Color(0xFFCBD5E1);
   static const Color textMutedDark = Color(0xFF8B949E);
 
-  // Light Palette (DESIGN_DESKTOP.md Light lines 98-111)
+  // Light Palette (DESIGN_DESKTOP.md Light - High Contrast)
   static const Color bgCanvasLight = Color(0xFFFFFFFF);
   static const Color bgSurfaceLight = Color(0xFFF8FAFC);
   static const Color bgSurfaceElevatedLight = Color(0xFFFFFFFF);
   static const Color bgSidebarLight = Color(0xFFF1F5F9);
 
-  static const Color borderSubtleLight = Color(0xFFE2E8F0);
-  static const Color borderMediumLight = Color(0xFFCBD5E1);
+  static const Color borderSubtleLight = Color(0xFFCBD5E1); // Slate 300 (четкая граница)
+  static const Color borderMediumLight = Color(0xFF94A3B8); // Slate 400
   static const Color borderFocusLight = Color(0xFF0284C7);
 
-  static const Color textPrimaryLight = Color(0xFF0F172A);
-  static const Color textSecondaryLight = Color(0xFF475569);
-  static const Color textMutedLight = Color(0xFF64748B);
+  // Контрастные, насыщенные шрифты (не блеклые!)
+  static const Color textPrimaryLight = Color(0xFF020617); // Slate 950 (глубокий сланцевый)
+  static const Color textSecondaryLight = Color(0xFF1E293B); // Slate 800 (четкий, контрастный)
+  static const Color textMutedLight = Color(0xFF334155); // Slate 700 (читабельный)
 
   // Brand Accents
   static const Color accentCyan = Color(0xFF00D2FF);
@@ -78,9 +79,11 @@ class DesktopTheme {
       isDark ? textSecondaryDark : textSecondaryLight;
   static Color get textMuted => isDark ? textMutedDark : textMutedLight;
 
-  // Button styling (shadcn/ui style: sleek dark-gray in light mode, elevated surface in dark mode)
+  // Button styling (shadcn/ui style: благородный темно-серый Slate 700 в светлой теме, не чисто черный)
   static Color get btnPrimaryBg => isDark ? const Color(0xFF282D37) : const Color(0xFF334155);
   static Color get btnPrimaryFg => Colors.white;
+  static Color get btnSecondaryBg => isDark ? const Color(0xFF20242D) : const Color(0xFFE2E8F0);
+  static Color get btnSecondaryFg => isDark ? Colors.white : const Color(0xFF0F172A);
 
   static ThemeData get darkTheme {
     return ThemeData(
