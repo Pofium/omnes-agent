@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:http/http.dart' as http;
@@ -9,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:universal_io/io.dart';
 import 'package:universal_io/io.dart' as universal_io;
 
+import '../../utils/desktop_i18n.dart';
 import 'task_session.dart';
 import 'workspace_git_helper.dart';
 import 'workspace_stream_coordinator.dart';
@@ -47,7 +49,7 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
 
   // Active Session info
   final activeSessionId = 'session-init'.obs;
-  late final activeTaskTitle = RxString('Рабочая область ${resolveInitialProjectName()}');
+  late final activeTaskTitle = RxString('${DesktopI18n.tr('Рабочая область', 'Workspace')} ${resolveInitialProjectName()}');
   late final activeGroup = RxnString(resolveInitialProjectName());
   late final activeProject = RxnString(resolveInitialProjectName());
   late final activeProjectPath = RxnString(resolveInitialProjectPath());
@@ -94,7 +96,7 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
   // OmnesAgent ADE Core State
   final permissionMode = PermissionMode.fullAccess.obs;
   final thoughtLevel = 'Max'.obs;
-    final activeModel = 'Провайдер не настроен'.obs;
+  final activeModel = DesktopI18n.tr('Провайдер не настроен', 'Provider not configured').obs;
   final activeProvider = ''.obs;
   final configuredProviders = <Map<String, dynamic>>[].obs;
   final isSttConfiguredAndEnabled = false.obs;
@@ -142,14 +144,14 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
 
   // Voice Duplex Mode State
   final isVoiceDuplexActive = false.obs;
-  final voiceStatusText = 'Голосовой дуплекс готов'.obs;
+  final voiceStatusText = DesktopI18n.tr('Голосовой дуплекс готов', 'Voice duplex ready').obs;
 
   void toggleVoiceDuplex() {
     isVoiceDuplexActive.value = !isVoiceDuplexActive.value;
     if (isVoiceDuplexActive.value) {
-      voiceStatusText.value = 'Слушаю... (голосовой поток в шлюз активен)';
+      voiceStatusText.value = DesktopI18n.tr('Слушаю... (голосовой поток в шлюз активен)', 'Listening... (audio stream to gateway active)');
     } else {
-      voiceStatusText.value = 'Голосовой дуплекс отключен';
+      voiceStatusText.value = DesktopI18n.tr('Голосовой дуплекс отключен', 'Voice duplex disabled');
     }
   }
 
@@ -173,6 +175,16 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
   @override
   void onInit() {
     super.onInit();
+    inputFocusNode.onKeyEvent = (node, event) {
+      if (event is KeyDownEvent &&
+          (event.logicalKey == LogicalKeyboardKey.enter ||
+           event.logicalKey == LogicalKeyboardKey.numpadEnter) &&
+          !HardwareKeyboard.instance.isShiftPressed) {
+        sendMessage();
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    };
     WidgetsBinding.instance.addObserver(this);
     scrollController.addListener(_onScrollChanged);
     final isSeeded = GetStorage().read<bool>('desktop_sessions_seeded') ?? false;
@@ -968,71 +980,71 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
   List<Map<String, dynamic>> _generateDynamicStepsForPrompt(String prompt) {
     if (currentExecutionMode.value == AgentExecutionMode.ralphLoop) {
       return [
-        {'title': 'Ralph: Анализ контекста и AST-зависимостей', 'status': 'running'},
-        {'title': 'Ralph: Формулирование верификационного теста', 'status': 'pending'},
-        {'title': 'Ralph: Итеративная разработка и правка кода', 'status': 'pending'},
-        {'title': 'Ralph: Проверка регрессий и вердикт L0/L1/L2', 'status': 'pending'},
+        {'title': DesktopI18n.tr('Ralph: Анализ контекста и AST-зависимостей', 'Ralph: Context & AST dependency analysis'), 'status': 'running'},
+        {'title': DesktopI18n.tr('Ralph: Формулирование верификационного теста', 'Ralph: Verification test formulation'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Ralph: Итеративная разработка и правка кода', 'Ralph: Iterative coding & patch loop'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Ralph: Проверка регрессий и вердикт L0/L1/L2', 'Ralph: Regression check & L0/L1/L2 verdict'), 'status': 'pending'},
       ];
     }
 
     if (currentExecutionMode.value == AgentExecutionMode.architect) {
       return [
-        {'title': 'Architect: Системный анализ и границы модулей', 'status': 'running'},
-        {'title': 'Architect: Проектирование контрактов и схем', 'status': 'pending'},
-        {'title': 'Architect: Оценка рисков и компромиссов (Trade-offs)', 'status': 'pending'},
-        {'title': 'Architect: Формирование архитектурной спецификации', 'status': 'pending'},
+        {'title': DesktopI18n.tr('Architect: Системный анализ и границы модулей', 'Architect: System analysis & module boundaries'), 'status': 'running'},
+        {'title': DesktopI18n.tr('Architect: Проектирование контрактов и схем', 'Architect: Contracts & schema design'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Architect: Оценка рисков и компромиссов (Trade-offs)', 'Architect: Risk & trade-off evaluation'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Architect: Формирование архитектурной спецификации', 'Architect: Architectural specification synthesis'), 'status': 'pending'},
       ];
     }
 
     if (currentExecutionMode.value == AgentExecutionMode.deepCode) {
       return [
-        {'title': 'DeepCode: Сканирование кодовой базы и AST', 'status': 'running'},
-        {'title': 'DeepCode: Анализ краевых случаев и зависимостей', 'status': 'pending'},
-        {'title': 'DeepCode: Комплексная реализация решения', 'status': 'pending'},
-        {'title': 'DeepCode: Верификация компиляции и типов', 'status': 'pending'},
+        {'title': DesktopI18n.tr('DeepCode: Сканирование кодовой базы и AST', 'DeepCode: Codebase & AST deep scan'), 'status': 'running'},
+        {'title': DesktopI18n.tr('DeepCode: Анализ краевых случаев и зависимостей', 'DeepCode: Edge cases & dependency analysis'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('DeepCode: Комплексная реализация решения', 'DeepCode: End-to-end implementation'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('DeepCode: Верификация компиляции и типов', 'DeepCode: Compilation & type verification'), 'status': 'pending'},
       ];
     }
 
     final lower = prompt.toLowerCase();
 
     if (lower.contains('тест') || lower.contains('test') || lower.contains('spec')) {
-      String target = 'модуля';
+      String target = DesktopI18n.tr('модуля', 'module');
       final match = RegExp(r'([\w_]+(?:_service|_controller|_repository|\.dart|\.rs))', caseSensitive: false).firstMatch(prompt);
       if (match != null) {
         target = match.group(1)!;
       }
       return [
-        {'title': 'Анализ спецификаций и кода $target', 'status': 'running'},
-        {'title': 'Проверка Git-ветки и тестового окружения', 'status': 'pending'},
-        {'title': 'Реализация тестовых сценариев и моков', 'status': 'pending'},
-        {'title': 'Запуск тестов и валидация результатов', 'status': 'pending'},
+        {'title': DesktopI18n.tr('Анализ спецификаций и кода $target', 'Analyzing specifications & code of $target'), 'status': 'running'},
+        {'title': DesktopI18n.tr('Проверка Git-ветки и тестового окружения', 'Verifying Git branch & test environment'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Реализация тестовых сценариев и моков', 'Implementing test suites & mock fixtures'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Запуск тестов и валидация результатов', 'Running test suites & validating results'), 'status': 'pending'},
       ];
     }
 
     if (lower.contains('исправ') || lower.contains('fix') || lower.contains('ошибк') || lower.contains('баг') || lower.contains('bug')) {
       return [
-        {'title': 'Локализация проблемы и анализ зависимостей', 'status': 'running'},
-        {'title': 'Подготовка целевого патча решения', 'status': 'pending'},
-        {'title': 'Применение правок в кодовой базе', 'status': 'pending'},
-        {'title': 'Проверка компиляции и регрессионный контроль', 'status': 'pending'},
+        {'title': DesktopI18n.tr('Локализация проблемы и анализ зависимостей', 'Isolating root cause & analyzing dependencies'), 'status': 'running'},
+        {'title': DesktopI18n.tr('Подготовка целевого патча решения', 'Preparing targeted solution patch'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Применение правок в кодовой базе', 'Applying code changes to project codebase'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Проверка компиляции и регрессионный контроль', 'Verifying compilation & regression testing'), 'status': 'pending'},
       ];
     }
 
     if (lower.contains('созда') || lower.contains('добав') || lower.contains('новый') || lower.contains('feat') || lower.contains('реализ')) {
       return [
-        {'title': 'Проектирование структуры и интерфейсов', 'status': 'running'},
-        {'title': 'Генерация кода и реализация компонентов', 'status': 'pending'},
-        {'title': 'Интеграция с архитектурой проекта', 'status': 'pending'},
-        {'title': 'Верификация целостности артефактов', 'status': 'pending'},
+        {'title': DesktopI18n.tr('Проектирование структуры и интерфейсов', 'Designing structure & public interfaces'), 'status': 'running'},
+        {'title': DesktopI18n.tr('Генерация кода и реализация компонентов', 'Generating code & component implementation'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Интеграция с архитектурой проекта', 'Integrating with existing project architecture'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Верификация целостности артефактов', 'Verifying artifact integrity & build'), 'status': 'pending'},
       ];
     }
 
     if (lower.contains('рефактор') || lower.contains('оптимиз') || lower.contains('ревью') || lower.contains('review')) {
       return [
-        {'title': 'Анализ архитектуры и выявление узких мест', 'status': 'running'},
-        {'title': 'Рефакторинг структур данных и логики', 'status': 'pending'},
-        {'title': 'Проверка сборки и совместимости', 'status': 'pending'},
-        {'title': 'Формирование итогового отчёта изменений', 'status': 'pending'},
+        {'title': DesktopI18n.tr('Анализ архитектуры и выявление узких мест', 'Analyzing architecture & identifying bottlenecks'), 'status': 'running'},
+        {'title': DesktopI18n.tr('Рефакторинг структур данных и логики', 'Refactoring data structures & business logic'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Проверка сборки и совместимости', 'Checking project build & backwards compatibility'), 'status': 'pending'},
+        {'title': DesktopI18n.tr('Формирование итогового отчёта изменений', 'Synthesizing final changelog summary'), 'status': 'pending'},
       ];
     }
 
@@ -1040,13 +1052,13 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
     if (cleanQuery.length > 38) {
       cleanQuery = '${cleanQuery.substring(0, 35)}...';
     }
-    if (cleanQuery.isEmpty) cleanQuery = 'задачи';
+    if (cleanQuery.isEmpty) cleanQuery = DesktopI18n.tr('задачи', 'task');
 
     return [
-      {'title': 'Анализ запроса: $cleanQuery', 'status': 'running'},
-      {'title': 'Инспекция контекста и релевантных файлов', 'status': 'pending'},
-      {'title': 'Выполнение операций и подготовка решения', 'status': 'pending'},
-      {'title': 'Формирование итоговых артефактов', 'status': 'pending'},
+      {'title': DesktopI18n.tr('Анализ запроса: $cleanQuery', 'Analyzing request: $cleanQuery'), 'status': 'running'},
+      {'title': DesktopI18n.tr('Инспекция контекста и релевантных файлов', 'Inspecting workspace context & relevant files'), 'status': 'pending'},
+      {'title': DesktopI18n.tr('Выполнение операций и подготовка решения', 'Executing operations & preparing solution'), 'status': 'pending'},
+      {'title': DesktopI18n.tr('Формирование итоговых артефактов', 'Synthesizing output artifacts'), 'status': 'pending'},
     ];
   }
 
@@ -2764,10 +2776,10 @@ $goalsText
     } catch (_) {}
 
     final initialActionStep = AgentActionStep(
-      title: 'Инспекция контекста $activeProject и подготовка ответа',
+      title: DesktopI18n.tr('Инспекция контекста $activeProject и подготовка ответа', 'Inspecting context of $activeProject and preparing response'),
       type: AgentActionType.analyzingCode,
       isRunning: true,
-      details: 'Чтение структуры рабочей области ${activeProjectPath.value ?? resolveInitialProjectPath()}',
+      details: DesktopI18n.tr('Чтение структуры рабочей области ${activeProjectPath.value ?? resolveInitialProjectPath()}', 'Reading workspace structure ${activeProjectPath.value ?? resolveInitialProjectPath()}'),
     );
 
     final botMessage = ChatMessage(
@@ -2883,13 +2895,25 @@ $goalsText
         botMessage.isThinkingFinished = true;
         botMessage.isThinkingExpanded = false;
         if (streamedResponse.statusCode == 401) {
-          botMessage.text = 'Ошибка авторизации (HTTP 401): Неверный API ключ для провайдера ($providerId).\nПроверьте настройки API ключа в диалоге Настроек.';
+          botMessage.text = DesktopI18n.tr(
+            'Ошибка авторизации (HTTP 401): Неверный API ключ для провайдера ($providerId).\nПроверьте настройки API ключа в диалоге Настроек.',
+            'Authorization Error (HTTP 401): Invalid API key for provider ($providerId).\nCheck API key settings in the Settings dialog.',
+          );
         } else if (streamedResponse.statusCode == 404) {
-          botMessage.text = 'Ошибка (HTTP 404): Модель "$model" или эндпоинт не найден на сервере провайдера ($providerId).\nBASE_URL: $endpoint\nОтвет: $errBody';
+          botMessage.text = DesktopI18n.tr(
+            'Ошибка (HTTP 404): Модель "$model" или эндпоинт не найден на сервере провайдера ($providerId).\nBASE_URL: $endpoint\nОтвет: $errBody',
+            'Error (HTTP 404): Model "$model" or endpoint not found on provider ($providerId).\nBASE_URL: $endpoint\nResponse: $errBody',
+          );
         } else if (streamedResponse.statusCode == 429) {
-          botMessage.text = 'Превышен лимит запросов (HTTP 429): Quota exceeded / Rate limit на стороне провайдера ($providerId).\n$errBody';
+          botMessage.text = DesktopI18n.tr(
+            'Превышен лимит запросов (HTTP 429): Quota exceeded / Rate limit на стороне провайдера ($providerId).\n$errBody',
+            'Rate Limit Exceeded (HTTP 429): Quota exceeded / Rate limit from provider ($providerId).\n$errBody',
+          );
         } else {
-          botMessage.text = 'Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody';
+          botMessage.text = DesktopI18n.tr(
+            'Ошибка провайдера ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody',
+            'Provider error ($providerId, HTTP ${streamedResponse.statusCode}):\n$errBody',
+          );
         }
         isRunning.value = false;
         thinkingTimer.cancel();
@@ -3007,10 +3031,10 @@ $goalsText
       }
       if (botMessage.text.contains('```')) {
         botMessage.steps.add(AgentActionStep(
-          title: 'Генерация кода и артефактов решения',
+          title: DesktopI18n.tr('Генерация кода и артефактов решения', 'Generating code & solution artifacts'),
           type: AgentActionType.editingFile,
           isRunning: false,
-          details: 'Сформированы исполняемые блоки кода и артефакты',
+          details: DesktopI18n.tr('Сформированы исполняемые блоки кода и артефакты', 'Formed executable code blocks & artifacts'),
         ));
         trajectorySteps.add(TrajectoryStep(
           id: 'step_${DateTime.now().millisecondsSinceEpoch}_tool',
@@ -3071,11 +3095,19 @@ $goalsText
       botMessage.isThinkingFinished = true;
       botMessage.isThinkingExpanded = false;
       if (e is TimeoutException || e.toString().contains('TimeoutException')) {
-        botMessage.text = 'Превышен таймаут ответа от модели ($providerId / $model, лимит 120 секунд).\n'
-            'Сервер провайдера перегружен или модель генерирует очень длинную цепочку рассуждений (CoT).\n'
-            'Попробуйте повторить запрос кнопкой "Повторить" ниже или переключитесь на другую модель.';
+        botMessage.text = DesktopI18n.tr(
+          'Превышен таймаут ответа от модели ($providerId / $model, лимит 120 секунд).\n'
+              'Сервер провайдера перегружен или модель генерирует очень длинную цепочку рассуждений (CoT).\n'
+              'Попробуйте повторить запрос кнопкой "Повторить" ниже или переключитесь на другую модель.',
+          'Model response timed out ($providerId / $model, 120s limit).\n'
+              'Provider server is overloaded or model is generating an extended chain of thought (CoT).\n'
+              'Please retry with the "Retry" button below or switch to another model.',
+        );
       } else {
-        botMessage.text = 'Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.';
+        botMessage.text = DesktopI18n.tr(
+          'Ошибка подключения к провайдеру ($providerId / $model):\n$e\n\nПроверьте настройки API ключа и сетевое подключение.',
+          'Connection error with provider ($providerId / $model):\n$e\n\nPlease check API key configuration and network connectivity.',
+        );
       }
       isRunning.value = false;
       _saveCurrentSessionState();

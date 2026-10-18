@@ -8,6 +8,10 @@ class ThinkingAccordion extends StatefulWidget {
   final bool isThinking;
   final int? elapsedSeconds;
   final bool initiallyExpanded;
+  final String? thinkingLabel;
+  final String? activeThinkingLabel;
+  final String? durationSuffix;
+  final String? placeholderText;
 
   const ThinkingAccordion({
     super.key,
@@ -15,6 +19,10 @@ class ThinkingAccordion extends StatefulWidget {
     this.isThinking = false,
     this.elapsedSeconds,
     this.initiallyExpanded = false,
+    this.thinkingLabel,
+    this.activeThinkingLabel,
+    this.durationSuffix,
+    this.placeholderText,
   });
 
   @override
@@ -67,9 +75,10 @@ class _ThinkingAccordionState extends State<ThinkingAccordion>
       return const SizedBox.shrink();
     }
 
+    final suffix = widget.durationSuffix ?? 'сек';
     final durationText = widget.elapsedSeconds != null
-        ? '${widget.elapsedSeconds} сек'
-        : (widget.isThinking ? 'идёт анализ...' : '');
+        ? '${widget.elapsedSeconds} $suffix'
+        : (widget.isThinking ? (widget.durationSuffix == 's' ? 'analyzing...' : 'идёт анализ...') : '');
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 6),
@@ -128,8 +137,8 @@ class _ThinkingAccordionState extends State<ThinkingAccordion>
                     ),
                   Text(
                     widget.isThinking
-                        ? 'DeepThink: размышляет'
-                        : 'Ход мыслей агента',
+                        ? (widget.activeThinkingLabel ?? 'DeepThink: размышляет')
+                        : (widget.thinkingLabel ?? 'Ход мыслей агента'),
                     style: const TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
@@ -182,7 +191,7 @@ class _ThinkingAccordionState extends State<ThinkingAccordion>
               ),
               child: SelectableText(
                 widget.thinkingContent.trim().isEmpty
-                    ? 'Формирование цепочки рассуждений...'
+                    ? (widget.placeholderText ?? 'Формирование цепочки рассуждений...')
                     : widget.thinkingContent,
                 style: const TextStyle(
                   fontSize: 11,

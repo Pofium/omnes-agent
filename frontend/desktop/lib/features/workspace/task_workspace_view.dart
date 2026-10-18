@@ -845,7 +845,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
             // Right side: 3. Trajectory Badge / Button (opens inspector trajectory tab in side window)
             Tooltip(
-              message: 'Открыть траекторию выполнения в боковом окне',
+              message: DesktopI18n.tr('Открыть траекторию выполнения в боковом окне', 'Open execution trajectory in side panel'),
               child: InkWell(
                 onTap: widget.onOpenTrajectory,
                 borderRadius: BorderRadius.circular(6),
@@ -869,7 +869,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       ),
                       const SizedBox(width: 5),
                       Text(
-                        'Траектория',
+                        DesktopI18n.tr('Траектория', 'Trajectory'),
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
@@ -2038,14 +2038,17 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 borderRadius: BorderRadius.circular(8),
                 border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5)),
               ),
-              child: const Row(
+              child: Row(
                 children: [
-                  Icon(Icons.file_download, size: 16, color: Color(0xFF00D2FF)),
-                  SizedBox(width: 8),
+                  const Icon(Icons.file_download, size: 16, color: Color(0xFF00D2FF)),
+                  const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Отпустите файлы или папки для добавления ссылки (@path)',
-                      style: TextStyle(
+                      DesktopI18n.tr(
+                        'Отпустите файлы или папки для добавления ссылки (@path)',
+                        'Drop files or folders to attach reference (@path)',
+                      ),
+                      style: const TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
                         color: Color(0xFF00D2FF),
@@ -2109,24 +2112,36 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           // 3. Multi-line Input field
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            child: TextField(
-              controller: widget.controller.inputController,
-              focusNode: widget.controller.inputFocusNode,
-              maxLines: isHero ? 4 : 3,
-              minLines: isHero ? 2 : 1,
-              style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, height: 1.4),
-              decoration: InputDecoration(
-                hintText: isHero
-                    ? DesktopI18n.heroInputHint
-                    : DesktopI18n.promptPlaceholder,
-                hintStyle: TextStyle(fontSize: 13, color: DesktopTheme.textMuted),
-                border: InputBorder.none,
-                enabledBorder: InputBorder.none,
-                focusedBorder: InputBorder.none,
-                isDense: true,
-                contentPadding: EdgeInsets.zero,
+            child: Focus(
+              onKeyEvent: (node, event) {
+                if (event is KeyDownEvent &&
+                    (event.logicalKey == LogicalKeyboardKey.enter ||
+                     event.logicalKey == LogicalKeyboardKey.numpadEnter) &&
+                    !HardwareKeyboard.instance.isShiftPressed) {
+                  widget.controller.sendMessage();
+                  return KeyEventResult.handled;
+                }
+                return KeyEventResult.ignored;
+              },
+              child: TextField(
+                controller: widget.controller.inputController,
+                focusNode: widget.controller.inputFocusNode,
+                maxLines: isHero ? 4 : 3,
+                minLines: isHero ? 2 : 1,
+                style: TextStyle(fontSize: 14, color: DesktopTheme.textPrimary, height: 1.4),
+                decoration: InputDecoration(
+                  hintText: isHero
+                      ? DesktopI18n.heroInputHint
+                      : DesktopI18n.promptPlaceholder,
+                  hintStyle: TextStyle(fontSize: 13, color: DesktopTheme.textMuted),
+                  border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                  isDense: true,
+                  contentPadding: EdgeInsets.zero,
+                ),
+                onSubmitted: (_) => widget.controller.sendMessage(),
               ),
-              onSubmitted: (_) => widget.controller.sendMessage(),
             ),
           ),
 
@@ -3244,7 +3259,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 ),
                 const Spacer(),
                 Tooltip(
-                  message: 'Откатить изменения файлов этого хода',
+                  message: DesktopI18n.tr('Откатить изменения файлов этого хода', 'Rollback changed files for this turn'),
                   child: InkWell(
                     onTap: () => _confirmRollbackToUserMessage(context, msg),
                     borderRadius: BorderRadius.circular(4),
@@ -3356,7 +3371,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
 
                         // Review button
                         Tooltip(
-                          message: 'Просмотреть diff в инспекторе',
+                          message: DesktopI18n.tr('Просмотреть diff в инспекторе', 'Review diff in inspector'),
                           child: InkWell(
                             onTap: () {
                               widget.controller.openProjectFile(relPath);
@@ -3399,7 +3414,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                                       children: [
                                         Icon(Icons.edit_note, size: 14, color: DesktopTheme.accentCyan),
                                         const SizedBox(width: 8),
-                                        Text('Открыть в ADE Editor', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+                                        Text(DesktopI18n.tr('Открыть в ADE Editor', 'Open in ADE Editor'), style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                                       ],
                                     ),
                                   ),
@@ -3410,7 +3425,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                                       children: [
                                         Icon(Icons.folder_open, size: 14, color: DesktopTheme.textSecondary),
                                         const SizedBox(width: 8),
-                                        Text('Показать в Проводнике', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+                                        Text(DesktopI18n.tr('Показать в Проводнике', 'Show in Explorer'), style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                                       ],
                                     ),
                                   ),
@@ -3421,7 +3436,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                                       children: [
                                         Icon(Icons.copy, size: 14, color: DesktopTheme.textSecondary),
                                         const SizedBox(width: 8),
-                                        Text('Скопировать путь', style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+                                        Text(DesktopI18n.tr('Скопировать путь', 'Copy path'), style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
                                       ],
                                     ),
                                   ),
@@ -3531,6 +3546,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         thinkingContent: msg.thinking!,
         isThinking: isStreamingThinking,
         elapsedSeconds: msg.thinkingSeconds,
+        thinkingLabel: DesktopI18n.tr('Ход мыслей агента', "Agent's train of thought"),
+        activeThinkingLabel: DesktopI18n.tr('DeepThink: размышляет', 'DeepThink: thinking'),
+        durationSuffix: DesktopI18n.tr('сек', 's'),
+        placeholderText: DesktopI18n.tr('Формирование цепочки рассуждений...', 'Formulating reasoning chain...'),
       ),
     );
   }
@@ -3542,7 +3561,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
     required String codeBody,
   }) {
     final linesCount = codeBody.split('\n').length;
-    final displayName = filePath ?? (lang == 'text' ? 'Текстовый файл' : 'Сниппет .$lang');
+    final displayName = filePath ?? (lang == 'text' ? DesktopI18n.tr('Текстовый файл', 'Text file') : DesktopI18n.tr('Сниппет .$lang', 'Snippet .$lang'));
 
     IconData fileIcon = Icons.insert_drive_file_outlined;
     Color iconColor = const Color(0xFF00D2FF);
@@ -4478,7 +4497,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               if (msg.checkpointHash != null || (msg.filesChangedCount != null && msg.filesChangedCount! > 0)) ...[
                 const SizedBox(width: 8),
                 Tooltip(
-                  message: 'Откатить проект к этой контрольной точке (Rewind)',
+                  message: DesktopI18n.tr('Откатить проект к этой контрольной точке (Rewind)', 'Revert project to this checkpoint (Rewind)'),
                   child: InkWell(
                     onTap: () => _confirmRevertToCheckpoint(context, msg),
                     borderRadius: BorderRadius.circular(4),
@@ -4489,14 +4508,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         borderRadius: BorderRadius.circular(4),
                         border: Border.all(color: const Color(0xFFF59E0B).withOpacity(0.3), width: 0.8),
                       ),
-                      child: const Row(
+                      child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(Icons.history, size: 12, color: Color(0xFFF59E0B)),
-                          SizedBox(width: 3),
+                          const Icon(Icons.history, size: 12, color: Color(0xFFF59E0B)),
+                          const SizedBox(width: 3),
                           Text(
-                            'Откатить',
-                            style: TextStyle(fontSize: 10, color: Color(0xFFF59E0B), fontWeight: FontWeight.bold),
+                            DesktopI18n.tr('Откатить', 'Revert'),
+                            style: const TextStyle(fontSize: 10, color: Color(0xFFF59E0B), fontWeight: FontWeight.bold),
                           ),
                         ],
                       ),
@@ -4564,21 +4583,24 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           borderRadius: BorderRadius.circular(12),
           side: BorderSide(color: DesktopTheme.borderSubtle),
         ),
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.history, size: 20, color: Color(0xFFF59E0B)),
-            SizedBox(width: 8),
-            Text('Откатить проект?', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+            const Icon(Icons.history, size: 20, color: Color(0xFFF59E0B)),
+            const SizedBox(width: 8),
+            Text(DesktopI18n.tr('Откатить проект?', 'Revert project?'), style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
           ],
         ),
-        content: const Text(
-          'Вы действительно хотите откатить файлы проекта к состоянию до выполнения этого шага? Текущие несохраненные изменения в рабочей директории будут сброшены.',
-          style: TextStyle(fontSize: 12),
+        content: Text(
+          DesktopI18n.tr(
+            'Вы действительно хотите откатить файлы проекта к состоянию до выполнения этого шага? Текущие несохраненные изменения в рабочей директории будут сброшены.',
+            'Are you sure you want to revert project files to the state prior to this step? Unsaved local changes will be reset.',
+          ),
+          style: const TextStyle(fontSize: 12),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
+            child: Text(DesktopI18n.tr('Отмена', 'Cancel'), style: TextStyle(color: DesktopTheme.textMuted)),
           ),
           ElevatedButton(
             onPressed: () {
@@ -4589,7 +4611,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               backgroundColor: const Color(0xFFF59E0B),
               foregroundColor: const Color(0xFF0F172A),
             ),
-            child: const Text('Откатить', style: TextStyle(fontWeight: FontWeight.bold)),
+            child: Text(DesktopI18n.tr('Откатить', 'Revert'), style: const TextStyle(fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -4606,21 +4628,23 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           borderRadius: BorderRadius.circular(12),
           side: BorderSide(color: DesktopTheme.borderSubtle),
         ),
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.history, size: 20, color: Color(0xFFF59E0B)),
-            SizedBox(width: 8),
-            Text('Откат к сообщению', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+            const Icon(Icons.history, size: 20, color: Color(0xFFF59E0B)),
+            const SizedBox(width: 8),
+            Text(DesktopI18n.tr('Откат к сообщению', 'Rollback to message'), style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
           ],
         ),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Вы собираетесь откатить диалог и файлы проекта до состояния этого сообщения.\n'
-              'Все последующие ответы агента и несохраненные правки в коде будут отменены.',
-              style: TextStyle(fontSize: 12, height: 1.4),
+            Text(
+              DesktopI18n.tr(
+                'Вы собираетесь откатить диалог и файлы проекта до состояния этого сообщения.\nВсе последующие ответы агента и несохраненные правки в коде будут отменены.',
+                'You are about to roll back the conversation and project files to this message.\nSubsequent agent responses and unsaved code edits will be discarded.',
+              ),
+              style: const TextStyle(fontSize: 12, height: 1.4),
             ),
             const SizedBox(height: 12),
             Container(
@@ -4643,7 +4667,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
+            child: Text(DesktopI18n.tr('Отмена', 'Cancel'), style: TextStyle(color: DesktopTheme.textMuted)),
           ),
           OutlinedButton(
             onPressed: () {
@@ -4654,7 +4678,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               foregroundColor: DesktopTheme.textPrimary,
               side: BorderSide(color: DesktopTheme.borderSubtle),
             ),
-            child: const Text('Откатить и оставить'),
+            child: Text(DesktopI18n.tr('Откатить и оставить', 'Rollback & keep')),
           ),
           ElevatedButton(
             onPressed: () {
@@ -4665,7 +4689,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               backgroundColor: const Color(0xFFF59E0B),
               foregroundColor: const Color(0xFF0F172A),
             ),
-            child: const Text('Откатить и редактировать', style: TextStyle(fontWeight: FontWeight.bold)),
+            child: Text(DesktopI18n.tr('Откатить и редактировать', 'Rollback & edit'), style: const TextStyle(fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -4675,7 +4699,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
   /// System file icon button for project rules (AGENTS.md)
   Widget _buildProjectRulesIconButton() {
     return Tooltip(
-      message: 'Правила агентов',
+      message: DesktopI18n.tr('Правила агентов (AGENTS.md)', 'Agent rules (AGENTS.md)'),
       child: InkWell(
         onTap: () => _showProjectRulesDialog(context),
         borderRadius: BorderRadius.circular(6),
@@ -4773,7 +4797,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             const Icon(Icons.rule_folder_outlined, size: 18, color: Color(0xFF00D2FF)),
             const SizedBox(width: 8),
             Text(
-              'Правила проекта (AGENTS.md)',
+              DesktopI18n.tr('Правила проекта (AGENTS.md)', 'Project rules (AGENTS.md)'),
               style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
             ),
           ],
@@ -4785,7 +4809,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Инструкции и правила кодирования, передаваемые агенту в системном контексте:',
+                DesktopI18n.tr(
+                  'Инструкции и правила кодирования, передаваемые агенту в системном контексте:',
+                  'System context instructions and coding rules passed to the agent:',
+                ),
                 style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted),
               ),
               const SizedBox(height: 10),
@@ -4816,7 +4843,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: Text('Отмена', style: TextStyle(color: DesktopTheme.textMuted)),
+            child: Text(DesktopI18n.tr('Отмена', 'Cancel'), style: TextStyle(color: DesktopTheme.textMuted)),
           ),
           ElevatedButton(
             onPressed: () {
@@ -4827,7 +4854,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               backgroundColor: const Color(0xFF00D2FF),
               foregroundColor: const Color(0xFF090D14),
             ),
-            child: const Text('Сохранить', style: TextStyle(fontWeight: FontWeight.bold)),
+            child: Text(DesktopI18n.tr('Сохранить', 'Save'), style: const TextStyle(fontWeight: FontWeight.bold)),
           ),
         ],
       ),
@@ -4925,8 +4952,8 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               estimatedHeight: 155,
               minWidth: 260,
               items: [
-                _buildPopupItem('attachment', Icons.attach_file, 'Прикрепить файл / изображение...'),
-                _buildPopupItem('paste_image', Icons.content_paste_go, 'Вставить скриншот из буфера (Ctrl+V)'),
+                _buildPopupItem('attachment', Icons.attach_file, DesktopI18n.tr('Прикрепить файл / изображение...', 'Attach file / image...')),
+                _buildPopupItem('paste_image', Icons.content_paste_go, DesktopI18n.tr('Вставить скриншот из буфера (Ctrl+V)', 'Paste screenshot from clipboard (Ctrl+V)')),
                 _buildPopupItem('mention', Icons.alternate_email, DesktopI18n.mentionFileItem),
                 _buildPopupItem('command', Icons.terminal, DesktopI18n.insertCommandItem),
               ],
@@ -4937,8 +4964,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               widget.controller.pasteScreenshotFromClipboard().then((hasImage) {
                 if (!hasImage) {
                   Get.snackbar(
-                    'Скриншот',
-                    'В буфере обмена нет изображения. Сделайте снимок (Win+Shift+S) и повторите.',
+                    DesktopI18n.tr('Скриншот', 'Screenshot'),
+                    DesktopI18n.tr(
+                      'В буфере обмена нет изображения. Сделайте снимок (Win+Shift+S) и повторите.',
+                      'No image in clipboard. Capture a screenshot (Win+Shift+S) and try again.',
+                    ),
                     snackPosition: SnackPosition.BOTTOM,
                     duration: const Duration(seconds: 2),
                   );
@@ -5055,11 +5085,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       final hasProviders = configuredProvs.isNotEmpty;
 
       final currentProv = configuredProvs.firstWhereOrNull((p) => p['id'] == activeProvId);
-      final displayName = currentProv?['name'] as String? ?? (hasProviders ? configuredProvs.first['name'] as String : 'Нет провайдеров');
+      final displayName = currentProv?['name'] as String? ?? (hasProviders ? configuredProvs.first['name'] as String : DesktopI18n.tr('Нет провайдеров', 'No providers'));
 
       return Builder(
         builder: (btnCtx) => Tooltip(
-          message: hasProviders ? 'Выбор LLM-провайдера' : 'Провайдеры не настроены (нажмите для настройки)',
+          message: hasProviders ? DesktopI18n.tr('Выбор LLM-провайдера', 'Select LLM provider') : DesktopI18n.tr('Провайдеры не настроены (нажмите для настройки)', 'Providers not configured (click to configure)'),
           child: InkWell(
             onTap: () async {
               final double estHeight = !hasProviders ? 80.0 : (40.0 + configuredProvs.length * 36.0 + 44.0);
@@ -5069,36 +5099,36 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 minWidth: 230,
                 items: !hasProviders
                     ? [
-                        const PopupMenuItem(
+                        PopupMenuItem(
                           enabled: false,
                           height: 28,
                           child: Text(
-                            'НЕТ ПОДКЛЮЧЕННЫХ ПРОВАЙДЕРОВ',
-                            style: TextStyle(fontSize: 10, color: Color(0xFFEF4444), fontWeight: FontWeight.bold),
+                            DesktopI18n.tr('НЕТ ПОДКЛЮЧЕННЫХ ПРОВАЙДЕРОВ', 'NO CONNECTED PROVIDERS'),
+                            style: const TextStyle(fontSize: 10, color: Color(0xFFEF4444), fontWeight: FontWeight.bold),
                           ),
                         ),
                         PopupMenuItem(
                           value: 'manage',
                           height: 40,
                           child: Row(
-                            children: const [
-                              Icon(Icons.add_circle_outline, size: 14, color: Color(0xFF00D2FF)),
-                              SizedBox(width: 8),
+                            children: [
+                              const Icon(Icons.add_circle_outline, size: 14, color: Color(0xFF00D2FF)),
+                              const SizedBox(width: 8),
                               Text(
-                                'Подключить провайдер (API Key)...',
-                                style: TextStyle(fontSize: 12, color: Colors.white),
+                                DesktopI18n.tr('Подключить провайдер (API Key)...', 'Connect provider (API Key)...'),
+                                style: const TextStyle(fontSize: 12, color: Colors.white),
                               ),
                             ],
                           ),
                         ),
                       ]
                     : [
-                        const PopupMenuItem(
+                        PopupMenuItem(
                           enabled: false,
                           height: 28,
                           child: Text(
-                            'АКТИВНЫЕ ПРОВАЙДЕРЫ',
-                            style: TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.bold),
+                            DesktopI18n.tr('АКТИВНЫЕ ПРОВАЙДЕРЫ', 'ACTIVE PROVIDERS'),
+                            style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.bold),
                           ),
                         ),
                         for (final p in configuredProvs)
@@ -5134,10 +5164,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                           value: 'manage',
                           height: 36,
                           child: Row(
-                            children: const [
-                              Icon(Icons.settings_outlined, size: 14, color: Color(0xFF94A3B8)),
-                              SizedBox(width: 8),
-                              Text('Управление провайдерами...', style: TextStyle(fontSize: 12, color: Color(0xFFCBD5E1))),
+                            children: [
+                              const Icon(Icons.settings_outlined, size: 14, color: Color(0xFF94A3B8)),
+                              const SizedBox(width: 8),
+                              Text(DesktopI18n.tr('Управление провайдерами...', 'Manage providers...'), style: const TextStyle(fontSize: 12, color: Color(0xFFCBD5E1))),
                             ],
                           ),
                         ),
@@ -5198,11 +5228,11 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
       final active = widget.controller.activeModel.value;
       final configured = widget.controller.configuredModels;
       final hasConfigured = configured.isNotEmpty;
-      final hasActiveModel = hasConfigured && active != 'Провайдер не настроен';
+      final hasActiveModel = hasConfigured && active != 'Провайдер не настроен' && active != 'Provider not configured';
 
       return Builder(
         builder: (btnCtx) => Tooltip(
-          message: hasConfigured ? DesktopI18n.modelTooltip : 'Нет доступных моделей',
+          message: hasConfigured ? DesktopI18n.modelTooltip : DesktopI18n.tr('Нет доступных моделей', 'No available models'),
           child: InkWell(
             onTap: () async {
               final double estHeight = !hasConfigured ? 80.0 : (36.0 + configured.length * 36.0 + 44.0);
@@ -5212,24 +5242,24 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 minWidth: 230,
                 items: !hasConfigured
                     ? [
-                        const PopupMenuItem(
+                        PopupMenuItem(
                           enabled: false,
                           height: 28,
                           child: Text(
-                            'НЕТ ДОСТУПНЫХ МОДЕЛЕЙ',
-                            style: TextStyle(fontSize: 10, color: Color(0xFFEF4444), fontWeight: FontWeight.bold),
+                            DesktopI18n.tr('НЕТ ДОСТУПНЫХ МОДЕЛЕЙ', 'NO AVAILABLE MODELS'),
+                            style: const TextStyle(fontSize: 10, color: Color(0xFFEF4444), fontWeight: FontWeight.bold),
                           ),
                         ),
                         PopupMenuItem(
                           value: 'manage',
                           height: 40,
                           child: Row(
-                            children: const [
-                              Icon(Icons.add_circle_outline, size: 14, color: Color(0xFF00D2FF)),
-                              SizedBox(width: 8),
+                            children: [
+                              const Icon(Icons.add_circle_outline, size: 14, color: Color(0xFF00D2FF)),
+                              const SizedBox(width: 8),
                               Text(
-                                'Подключить провайдер (API Key)...',
-                                style: TextStyle(fontSize: 12, color: Colors.white),
+                                DesktopI18n.tr('Подключить провайдер (API Key)...', 'Connect provider (API Key)...'),
+                                style: const TextStyle(fontSize: 12, color: Colors.white),
                               ),
                             ],
                           ),
@@ -5240,7 +5270,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                           enabled: false,
                           height: 28,
                           child: Text(
-                            'ДОСТУПНЫЕ МОДЕЛИ',
+                            DesktopI18n.tr('ДОСТУПНЫЕ МОДЕЛИ', 'AVAILABLE MODELS'),
                             style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), fontWeight: FontWeight.bold),
                           ),
                         ),
@@ -5251,10 +5281,10 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                           value: 'refresh',
                           height: 36,
                           child: Row(
-                            children: const [
-                              Icon(Icons.sync, size: 14, color: Color(0xFF00D2FF)),
-                              SizedBox(width: 8),
-                              Text('Загрузить модели с BASE_URL', style: TextStyle(fontSize: 12, color: Color(0xFF00D2FF))),
+                            children: [
+                              const Icon(Icons.sync, size: 14, color: Color(0xFF00D2FF)),
+                              const SizedBox(width: 8),
+                              Text(DesktopI18n.tr('Загрузить модели с BASE_URL', 'Fetch models from BASE_URL'), style: const TextStyle(fontSize: 12, color: Color(0xFF00D2FF))),
                             ],
                           ),
                         ),
@@ -5299,7 +5329,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                   ),
                   const SizedBox(width: 6),
                   Text(
-                    hasActiveModel ? active : 'Модель не выбрана',
+                    hasActiveModel ? active : DesktopI18n.tr('Модель не выбрана', 'No model selected'),
                     style: TextStyle(
                       fontSize: 12,
                       color: hasActiveModel ? Colors.white : const Color(0xFFFCA5A5),
@@ -5391,14 +5421,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                 color: const Color(0xFF00D2FF).withOpacity(0.18),
                 borderRadius: BorderRadius.circular(4),
               ),
-              child: const Row(
+              child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.schedule, size: 12, color: Color(0xFF00D2FF)),
-                  SizedBox(width: 4),
+                  const Icon(Icons.schedule, size: 12, color: Color(0xFF00D2FF)),
+                  const SizedBox(width: 4),
                   Text(
-                    'В очереди',
-                    style: TextStyle(
+                    DesktopI18n.tr('В очереди', 'Queued'),
+                    style: const TextStyle(
                       fontSize: 10,
                       fontWeight: FontWeight.bold,
                       fontFamily: 'Consolas',
@@ -5409,6 +5439,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               ),
             ),
             const SizedBox(width: 8),
+            Text(
+              DesktopI18n.tr('Отправится после завершения:', 'Sends after finish:'),
+              style: TextStyle(
+                fontSize: 11,
+                color: DesktopTheme.textMuted,
+              ),
+            ),
+            const SizedBox(width: 6),
             Expanded(
               child: Text(
                 displayPrompt,
@@ -5423,7 +5461,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             ),
             const SizedBox(width: 8),
             Tooltip(
-              message: 'Вернуть в поле ввода для правки',
+              message: DesktopI18n.tr('Вернуть в поле ввода для правки', 'Return to input field to edit'),
               child: InkWell(
                 onTap: widget.controller.editQueuedPrompt,
                 borderRadius: BorderRadius.circular(4),
@@ -5435,7 +5473,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                       Icon(Icons.edit_outlined, size: 12, color: DesktopTheme.textSecondary),
                       const SizedBox(width: 4),
                       Text(
-                        'Исправить',
+                        DesktopI18n.tr('Исправить', 'Edit'),
                         style: TextStyle(fontSize: 11, color: DesktopTheme.textSecondary),
                       ),
                     ],
@@ -5445,7 +5483,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             ),
             const SizedBox(width: 4),
             Tooltip(
-              message: 'Остановить текущий шаг и отправить сразу',
+              message: DesktopI18n.tr('Остановить текущий шаг и отправить сразу', 'Stop current run and send immediately'),
               child: InkWell(
                 onTap: widget.controller.forceSendQueuedPrompt,
                 borderRadius: BorderRadius.circular(4),
@@ -5456,14 +5494,14 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                     borderRadius: BorderRadius.circular(4),
                     border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4), width: 0.8),
                   ),
-                  child: const Row(
+                  child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.bolt, size: 12, color: Color(0xFF00D2FF)),
-                      SizedBox(width: 3),
+                      const Icon(Icons.bolt, size: 12, color: Color(0xFF00D2FF)),
+                      const SizedBox(width: 3),
                       Text(
-                        'Отправить сейчас',
-                        style: TextStyle(
+                        DesktopI18n.tr('Отправить сейчас', 'Send now'),
+                        style: const TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.bold,
                           color: Color(0xFF00D2FF),
@@ -5476,7 +5514,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
             ),
             const SizedBox(width: 4),
             Tooltip(
-              message: 'Отменить ожидающий промпт',
+              message: DesktopI18n.tr('Отменить ожидающий промпт', 'Cancel queued prompt'),
               child: InkWell(
                 onTap: widget.controller.cancelQueuedPrompt,
                 borderRadius: BorderRadius.circular(4),
