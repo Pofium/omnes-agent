@@ -868,7 +868,7 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                         color: Color(0xFF00E5FF),
                       ),
                       const SizedBox(width: 5),
-                      const Text(
+                      Text(
                         'Траектория',
                         style: TextStyle(
                           fontSize: 11,

@@ -3044,7 +3044,7 @@ $goalsText
       trajectorySteps.refresh();
       await _updateMessageFileChanges(
         botMessage,
-        initialFiles: initialSnapshotFiles,
+        initialFiles: initialSnapshotFiles.toList(),
         initialAdditions: initialAdditions,
         initialDeletions: initialDeletions,
         preExecutionHash: preExecutionHash,
