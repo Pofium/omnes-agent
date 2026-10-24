@@ -2041,6 +2041,69 @@ fn powershell_named_risk(base: &str) -> Option<CommandRiskLevel> {
     None
 }
 
+/// Return the index of the effective git subcommand in `args`, skipping
+/// git global options (including those that consume the following token as a
+/// value, such as `-C`, `--git-dir`, `--work-tree`, `--namespace`,
+/// `--exec-path`, `--super-prefix`, `--attr-source`, `-c`, and `--config-env`).
+fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        match arg {
+            "--" => return args.get(idx + 1).map(|_| idx + 1),
+            // Global options whose value is a separate following token. Git
+            // consumes that token as the option value, so the real subcommand is
+            // the token after it. Missing any of these lets a value that
+            // resembles a read verb hide the actual (possibly mutating)
+            // subcommand from the approval classifier: `git --attr-source log
+            // commit` runs `commit`, not `log`. `-c`/`--config-env` also take a
+            // separate value and are included so this resolver is correct on its
+            // own, independent of the allowlist gate that separately rejects
+            // them.
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+            | "--super-prefix" | "--attr-source" | "--config-env" => {
+                idx += 2;
+            }
+            "--bare"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-pager"
+            | "--paginate"
+            | "--version"
+            | "--help"
+            | "-h"
+            | "-p" => {
+                idx += 1;
+            }
+            _ if arg.starts_with("-c") && arg.len() > 2 => {
+                idx += 1;
+            }
+            _ if arg.starts_with("--git-dir=")
+                || arg.starts_with("--work-tree=")
+                || arg.starts_with("--namespace=")
+                || arg.starts_with("--exec-path=")
+                || arg.starts_with("--super-prefix=")
+                || arg.starts_with("--attr-source=")
+                || arg.starts_with("--config-env=") =>
+            {
+                idx += 1;
+            }
+            _ if arg.starts_with('-') => {
+                idx += 1;
+            }
+            _ => return Some(idx),
+        }
+    }
+
+    None
+}
+
 fn generic_segment_risk(
     base: &str,
     args: &[String],
@@ -2107,23 +2170,26 @@ fn generic_segment_risk(
 
     match base {
         "git" => Some(
-            if args.first().is_some_and(|verb| {
-                matches!(
-                    verb.as_str(),
-                    "commit"
-                        | "push"
-                        | "reset"
-                        | "clean"
-                        | "rebase"
-                        | "merge"
-                        | "cherry-pick"
-                        | "revert"
-                        | "branch"
-                        | "checkout"
-                        | "switch"
-                        | "tag"
-                )
-            }) {
+            if git_effective_subcommand_index(args)
+                .and_then(|idx| args.get(idx))
+                .is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "commit"
+                            | "push"
+                            | "reset"
+                            | "clean"
+                            | "rebase"
+                            | "merge"
+                            | "cherry-pick"
+                            | "revert"
+                            | "branch"
+                            | "checkout"
+                            | "switch"
+                            | "tag"
+                    )
+                })
+            {
                 CommandRiskLevel::Medium
             } else {
                 CommandRiskLevel::Low
@@ -8086,5 +8152,57 @@ mod tests {
         );
         assert_eq!(attached_short_option_value("-f"), None);
         assert_eq!(attached_short_option_value("--long"), None);
+    }
+
+    #[test]
+    fn git_value_taking_global_options_do_not_hide_a_mutating_subcommand() {
+        // Regression for the approval-classification bypass where a value-taking
+        // git global option hid the real subcommand from the risk classifier.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git -C /repo commit",
+            "git -C log commit",
+            "git -C/repo commit",
+            "git --git-dir /repo/.git commit",
+            "git --git-dir=/repo/.git push",
+            "git --work-tree /repo checkout main",
+            "git -c core.pager=cat commit",
+            "git --config-env core.pager=PAGER commit",
+            "git --attr-source log commit",
+            "git --attr-source HEAD commit",
+            "git --attr-source=HEAD commit",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Medium,
+                "value-taking global option must not hide the write subcommand: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_attr_source_read_stays_low() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git -C /repo status",
+            "git --git-dir /repo/.git log",
+            "git --attr-source HEAD status",
+            "git --attr-source=HEAD log",
+            "git --attr-source HEAD diff",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "ordinary read behind global options should stay low: {command}"
+            );
+        }
     }
 }
