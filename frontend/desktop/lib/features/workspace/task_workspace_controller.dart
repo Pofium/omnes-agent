@@ -189,7 +189,7 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
     scrollController.addListener(_onScrollChanged);
     final isSeeded = GetStorage().read<bool>('desktop_sessions_seeded') ?? false;
     if (!isSeeded) {
-      _initSampleSessions();
+      _initDefaultSession();
       GetStorage().write('desktop_sessions_seeded', true);
     }
     _loadLocalCustomSessions();
@@ -341,14 +341,16 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
     } catch (_) {}
   }
 
-  void _initSampleSessions() {
+  /// The default workspace session bound to the currently opened project.
+  /// Fabricated demo conversations are deliberately not seeded here — the
+  /// session list must only contain real (user- or backend-created) chats.
+  void _initDefaultSession() {
     final deleted = _getDeletedSessionIds();
     final initProj = resolveInitialProjectName();
     final initPath = resolveInitialProjectPath();
     final initBranch = readGitHeadBranchSync(initPath) ?? 'main';
     final hasGit = universal_io.Directory(p.join(initPath, '.git')).existsSync();
 
-    // 1. Primary workspace session for currently opened project
     if (!deleted.contains('session-init')) {
       sessions['session-init'] = TaskSession(
         id: 'session-init',
@@ -364,32 +366,6 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
         messages: [
           ChatMessage(
             text: 'Добро пожаловать в OmnesAgent. Рабочая область проекта "$initProj" ($initPath) готова к решению задач.',
-            chatMessageType: ChatMessageType.bot,
-          ),
-        ],
-      );
-    }
-
-    // 2. quick-draft (Default group "Разное", without repository)
-    if (!deleted.contains('quick-draft')) {
-      sessions['quick-draft'] = TaskSession(
-        id: 'quick-draft',
-        title: 'Заметки и идеи',
-        group: 'Разное',
-        project: null,
-        projectPath: null,
-        branch: null,
-        hasGitRepo: false,
-        additions: 0,
-        deletions: 0,
-        activeModel: 'GLM-5.3-Flash',
-        messages: [
-          ChatMessage(
-            text: 'Напомни ключевые концепции протокола Model Context Protocol (MCP).',
-            chatMessageType: ChatMessageType.user,
-          ),
-          ChatMessage(
-            text: 'Основные концепции MCP:\n\n1. **Tools**: функции с JSON-Schema, вызываемые моделью.\n2. **Resources**: URI-адресуемые данные (файлы, базы данных, логи).\n3. **Prompts**: шаблоны взаимодействия.\n4. **Sampling**: запрос агента к хост-модели для выполнения рассуждений.',
             chatMessageType: ChatMessageType.bot,
           ),
         ],

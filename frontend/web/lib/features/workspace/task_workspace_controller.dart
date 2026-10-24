@@ -62,7 +62,7 @@ class DesktopTaskWorkspaceController extends GetxController {
   final isRunning = false.obs;
 
   // Active Session info
-  final activeSessionId = 'omnes-core-arch'.obs;
+  final activeSessionId = 'session-init'.obs;
   final activeTaskTitle = 'Архитектура ядра OmnesAgent'.obs;
   final activeGroup = RxnString('Разное');
   final activeProject = RxnString('Omnes agent');
@@ -256,7 +256,7 @@ class DesktopTaskWorkspaceController extends GetxController {
     super.onInit();
     final isSeeded = GetStorage().read<bool>('desktop_sessions_seeded') ?? false;
     if (!isSeeded) {
-      _initSampleSessions();
+      _initDefaultSession();
       GetStorage().write('desktop_sessions_seeded', true);
     }
     _loadLocalCustomSessions();
@@ -364,84 +364,29 @@ class DesktopTaskWorkspaceController extends GetxController {
     } catch (_) {}
   }
 
-  void _initSampleSessions() {
-    // 1. omnes-core-arch (Real session from gateway)
+  /// The default workspace session shown on first launch. Fabricated demo
+  /// conversations are deliberately not seeded here — the session list must
+  /// only contain real (user- or backend-created) chats.
+  void _initDefaultSession() {
     final deleted = _getDeletedSessionIds();
-    if (!deleted.contains('omnes-core-arch')) {
-      sessions['omnes-core-arch'] = TaskSession(
-      id: 'omnes-core-arch',
-      title: 'Архитектура ядра OmnesAgent',
-      group: 'Работа',
-      project: 'Omnes agent',
-      projectPath: r'C:\Projects\Omnes-agent',
-      branch: 'feat/ade-split',
-      hasGitRepo: true,
-      additions: 100,
-      deletions: 23,
-      activeModel: 'GLM-5.3-Flash',
-      messages: [
-        ChatMessage(
-          text: 'Спланируй модульную архитектуру ядра OmnesAgent для распределенного исполнения задач.',
-          chatMessageType: ChatMessageType.user,
-        ),
-        ChatMessage(
-          text: 'Архитектурный план ядра OmnesAgent подготовлен:\n\n1. `omnesagent-gateway`: шлюз протоколов WebSocket, SSE и REST.\n2. `omnesagent-runtime`: исполнитель циклов планирования, ReAct-рассуждений и вызова инструментов.\n3. `ob2h_runtime`: долгосрочная память, графы сущностей и оценка Blast Radius.\n4. `omnesagent-tools`: встроенные песочницы для выполнения кода, git и файловых операций.',
-          chatMessageType: ChatMessageType.bot,
-          thinking: 'Thought: Архитектурный анализ кодовой базы завершен. Разделение модулей валидировано.',
-        ),
-      ],
-      );
-    }
-
-    // 2. deepseek-v3-eval (Real session from gateway)
-    if (!deleted.contains('deepseek-v3-eval')) {
-      sessions['deepseek-v3-eval'] = TaskSession(
-      id: 'deepseek-v3-eval',
-      title: 'Тестирование инференса DeepSeek',
-      group: 'Работа',
-      project: 'deepseek-harness-master',
-      projectPath: r'C:\Projects\Omnes-agent',
-      branch: 'desktop-brand-ru',
-      hasGitRepo: true,
-      additions: 45,
-      deletions: 12,
-      activeModel: 'deepseek-chat',
-      messages: [
-        ChatMessage(
-          text: 'Проведи оценку скорости ответа модели DeepSeek Chat через OpenAI-совместимый API.',
-          chatMessageType: ChatMessageType.user,
-        ),
-        ChatMessage(
-          text: 'Результаты замера производительности инференса DeepSeek:\n\n• Время до первого токена (TTFT): 342ms\n• Скорость генерации: 68.4 токенов/сек\n• Успешность запросов: 100% (20/20 проб)\n• Потребление контекста: 14.2k токенов\n\nМодель полностью готова для использования в агентах по умолчанию.',
-          chatMessageType: ChatMessageType.bot,
-        ),
-      ],
-      );
-    }
-
-    // 3. quick-draft (Default group "Разное", without repository)
-    if (!deleted.contains('quick-draft')) {
-      sessions['quick-draft'] = TaskSession(
-      id: 'quick-draft',
-      title: 'Заметки и идеи',
-      group: 'Разное',
-      project: null,
-      projectPath: null,
-      branch: null,
-      hasGitRepo: false,
-      additions: 0,
-      deletions: 0,
-      activeModel: 'GLM-5.3-Flash',
-      messages: [
-        ChatMessage(
-          text: 'Напомни ключевые концепции протокола Model Context Protocol (MCP).',
-          chatMessageType: ChatMessageType.user,
-        ),
-        ChatMessage(
-          text: 'Основные концепции MCP:\n\n1. **Tools**: функции с JSON-Schema, вызываемые моделью.\n2. **Resources**: URI-адресуемые данные (файлы, базы данных, логи).\n3. **Prompts**: шаблоны взаимодействия.\n4. **Sampling**: запрос агента к хост-модели для выполнения рассуждений.',
-          chatMessageType: ChatMessageType.bot,
-        ),
-      ],
+    if (!deleted.contains('session-init')) {
+      sessions['session-init'] = TaskSession(
+        id: 'session-init',
+        title: 'Рабочая область OmnesAgent',
+        group: 'Разное',
+        project: null,
+        projectPath: null,
+        branch: null,
+        hasGitRepo: false,
+        additions: 0,
+        deletions: 0,
+        activeModel: 'GLM-5.3-Flash',
+        messages: [
+          ChatMessage(
+            text: 'Добро пожаловать в OmnesAgent. Задайте вопрос или подключите проект, чтобы начать работу.',
+            chatMessageType: ChatMessageType.bot,
+          ),
+        ],
       );
     }
   }
