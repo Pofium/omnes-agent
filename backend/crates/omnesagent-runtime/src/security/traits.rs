@@ -8,6 +8,10 @@ use std::process::Command;
 pub trait Sandbox: Send + Sync {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()>;
 
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Wrap a runtime-built shell command with its pre-resolution identity.
     ///
     /// Host sandboxes retain the resolved program in `cmd`. A container

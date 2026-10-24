@@ -65,8 +65,32 @@ pub fn sandbox_posture(
     sandbox_posture_result(
         requested_backend,
         active_backend.name(),
-        active_backend.description(),
+        firejail_args_description(active_backend, &sandbox.firejail_args)
+            .unwrap_or_else(|| active_backend.description()),
     )
+}
+
+/// When Firejail is the active backend and its configured `firejail_args`
+/// would be rejected, the posture says so (and that commands are blocked)
+/// rather than describing Firejail as if those arguments applied.
+fn firejail_args_description(
+    active_backend: SelectedSandboxBackend,
+    firejail_args: &[String],
+) -> Option<String> {
+    if !matches!(active_backend, SelectedSandboxBackend::Firejail) {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        super::firejail::FirejailSandbox::validate_extra_args(firejail_args)
+            .err()
+            .map(|error| firejail_args_rejected_description(&error))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = firejail_args;
+        None
+    }
 }
 
 fn sandbox_posture_result(
@@ -351,9 +375,12 @@ pub fn create_sandbox(
     }
 
     match backend {
-        SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots)
-        }
+        SandboxBackend::Auto | SandboxBackend::None => detect_best_sandbox(
+            runtime_kind,
+            workspace_dir,
+            extra_roots,
+            &sandbox.firejail_args,
+        ),
         requested => {
             let selected =
                 configured_backend_selection(requested, runtime_kind, workspace_dir, extra_roots);
@@ -367,7 +394,12 @@ pub fn create_sandbox(
                 }
                 return Arc::new(super::traits::NoopSandbox);
             }
-            if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
+            if let Some(sandbox) = create_selected_sandbox(
+                selected,
+                workspace_dir,
+                extra_roots,
+                &sandbox.firejail_args,
+            ) {
                 return sandbox;
             }
             log_requested_backend_unavailable(selected_backend_label(requested));
@@ -380,13 +412,16 @@ fn detect_best_sandbox(
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
+    firejail_args: &[String],
 ) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir, extra_roots);
     if matches!(selected, SelectedSandboxBackend::DockerRuntime) {
         log_auto_backend_selection(selected, runtime_kind);
         return Arc::new(super::traits::NoopSandbox);
     }
-    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
+    if let Some(sandbox) =
+        create_selected_sandbox(selected, workspace_dir, extra_roots, firejail_args)
+    {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -395,10 +430,69 @@ fn detect_best_sandbox(
     Arc::new(super::traits::NoopSandbox)
 }
 
+#[cfg(target_os = "linux")]
+fn firejail_args_rejected_description(error: &std::io::Error) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-security-status-sandbox-description-firejail-args-rejected",
+        &[("reason", &error.to_string())],
+    )
+}
+
+/// Firejail was selected but its configured `firejail_args` were rejected.
+/// Running the command without them would present configured hardening as
+/// active when it is not, and running it unsandboxed would drop the sandbox
+/// altogether, so every command is refused with the reason instead.
+#[cfg(target_os = "linux")]
+struct RejectedFirejailArgsSandbox {
+    error: std::io::Error,
+    description: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Sandbox for RejectedFirejailArgsSandbox {
+    fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.check_initialization()
+    }
+
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            self.error.kind(),
+            self.error.to_string(),
+        ))
+    }
+
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &str {
+        "firejail"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_firejail_sandbox(firejail_args: &[String]) -> Option<Arc<dyn Sandbox>> {
+    match super::firejail::FirejailSandbox::with_args(firejail_args) {
+        Ok(sandbox) => Some(Arc::new(sandbox)),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            Some(Arc::new(RejectedFirejailArgsSandbox {
+                description: firejail_args_rejected_description(&error),
+                error,
+            }))
+        }
+        Err(_) => None,
+    }
+}
+
 fn create_selected_sandbox(
     selected: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
+    firejail_args: &[String],
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
@@ -429,12 +523,11 @@ fn create_selected_sandbox(
         SelectedSandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
             {
-                super::firejail::FirejailSandbox::new()
-                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                    .ok()
+                create_firejail_sandbox(firejail_args)
             }
             #[cfg(not(target_os = "linux"))]
             {
+                let _ = firejail_args;
                 None
             }
         }
@@ -634,10 +727,75 @@ pub fn linux_memcg_available() -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_firejail_with_rejected_args_blocks_commands_instead_of_dropping_them() {
+        let sandbox = create_selected_sandbox(
+            SelectedSandboxBackend::Firejail,
+            None,
+            &SandboxExtraRoots::default(),
+            &[
+                "--net=none".to_string(),
+                "--profile=/tmp/weaker.profile".to_string(),
+            ],
+        )
+        .expect("rejected firejail_args must not fall back to no sandbox");
+        assert_eq!(sandbox.name(), "firejail");
+        assert!(!sandbox.is_available());
+        let mut command = std::process::Command::new("/bin/echo");
+        let error = sandbox.wrap_command(&mut command).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("--profile"), "{error}");
+        assert_eq!(command.get_program(), "/bin/echo");
+        assert!(sandbox.check_initialization().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firejail_posture_reports_rejected_args() {
+        let rejected = firejail_args_description(
+            SelectedSandboxBackend::Firejail,
+            &["--ignore=noroot".to_string()],
+        )
+        .expect("rejected args are reported");
+        let reason = super::super::firejail::FirejailSandbox::validate_extra_args(&[
+            "--ignore=noroot".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            rejected,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-security-status-sandbox-description-firejail-args-rejected",
+                &[("reason", &reason)],
+            )
+        );
+        assert!(rejected.contains("--ignore"), "{rejected}");
+        assert_eq!(
+            firejail_args_description(
+                SelectedSandboxBackend::Firejail,
+                &["--net=none".to_string()]
+            ),
+            None
+        );
+        assert_eq!(
+            firejail_args_description(
+                SelectedSandboxBackend::Landlock,
+                &["--ignore=noroot".to_string()]
+            ),
+            None,
+            "firejail_args only matter when Firejail is the active backend"
+        );
+    }
+
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox =
-            detect_best_sandbox(RuntimeKind::Cloudflare, None, &SandboxExtraRoots::default());
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+            &[],
+        );
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -698,7 +856,12 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox(RuntimeKind::Native, None, &SandboxExtraRoots::default());
+        let sandbox = detect_best_sandbox(
+            RuntimeKind::Native,
+            None,
+            &SandboxExtraRoots::default(),
+            &[],
+        );
         assert_ne!(sandbox.name(), "docker");
     }
 
