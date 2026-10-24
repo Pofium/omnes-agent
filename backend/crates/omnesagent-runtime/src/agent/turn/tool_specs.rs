@@ -59,6 +59,13 @@ pub(crate) fn build_iteration_tool_specs(
             }
         }
     }
+    // Tool specs are assembled from unordered maps (the MCP registry keeps
+    // tools in a HashMap), so their order varies between processes. The tools
+    // block is the first section of every provider request, so any reshuffle
+    // changes the token prefix and invalidates prompt caching for the whole
+    // request (tools + system + messages) - cache reads become full cache
+    // writes. Sorting by name makes the prefix byte-stable across processes.
+    tool_specs.sort_by(|a, b| a.name.cmp(&b.name));
     let known_tool_names: HashSet<String> = tool_specs
         .iter()
         .map(|tool| tool.name.to_ascii_lowercase())
@@ -257,5 +264,23 @@ mod tests {
             !specs.use_native_tools,
             "active provider must decide whether this turn uses native tool transport"
         );
+    }
+
+    #[test]
+    fn build_iteration_tool_specs_sorts_tools_alphabetically() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tool_z = Box::new(CountingTool::new("zeta", Arc::clone(&invocations)));
+        let tool_a = Box::new(CountingTool::new("alpha", Arc::clone(&invocations)));
+        let tool_m = Box::new(CountingTool::new("mu", Arc::clone(&invocations)));
+        let specs = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &[tool_z, tool_a, tool_m],
+            &[],
+            None,
+        )
+        .expect("build specs");
+        let names: Vec<_> = specs.tool_specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mu", "zeta"]);
     }
 }
