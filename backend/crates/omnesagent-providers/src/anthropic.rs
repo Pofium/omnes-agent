@@ -35,10 +35,11 @@ const MAX_ENCODED_IMAGE_PAYLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// the model reads as fact.
 const TRUNCATED_DATA_NOTE: &str = "[truncated inline data removed]";
 /// Stand-in prose for a user message whose only content is an image, so the
-/// message never ends on an `image` block — `apply_cache_to_last_message` is a
-/// silent no-op on one, which would cost the request its cache breakpoint with
-/// nothing reporting it. Used by the user arm of
-/// [`AnthropicModelProvider::convert_messages`].
+/// message never ends on an `image` block. The turn then carries a block that
+/// `apply_cache_to_last_message` can mark, which keeps the rolling breakpoint
+/// on the latest message instead of rolling it back to an earlier one, and the
+/// model reads prose about the attachment rather than a bare image. Used by
+/// the user arm of [`AnthropicModelProvider::convert_messages`].
 const IMAGE_ONLY_TEXT_PLACEHOLDER: &str = "[image]";
 /// Stands in for a `tool_result` that never arrived, so an interrupted turn
 /// cannot wedge the session with a hard 400 on replay. See
@@ -678,22 +679,46 @@ impl AnthropicModelProvider {
         messages.iter().filter(|m| m.role != "system").count() > 1
     }
 
-    /// Apply cache control to the last message content block. The rolling
-    /// marker carries the configured cache entry lifetime.
+    /// Apply the rolling cache breakpoint: the last `text` or `tool_result`
+    /// block of the last message, rolling back when that message cannot host
+    /// it. The rolling marker carries the configured cache entry lifetime.
+    ///
+    /// A message whose trailing block is `tool_use`, `image` or `thinking`
+    /// takes the marker on its last `text`/`tool_result` block instead, and a
+    /// message with no such block at all (an image-only turn) rolls the marker
+    /// back to the nearest earlier message that has one, so a turn that cannot
+    /// carry the breakpoint does not leave the request with the system
+    /// breakpoint alone. `tool_use`, `image` and `thinking` blocks are never
+    /// marked. At most one block is marked per call, and none when no message
+    /// holds a `text` or `tool_result` block. This is the conversation
+    /// breakpoint only: the last tool definition, the system block and, under
+    /// OAuth, the identity prefix carry their own, so a request has at most
+    /// four, which is Anthropic's limit.
     fn apply_cache_to_last_message(messages: &mut [NativeMessage], cache_ttl: CacheTtl) {
-        if let Some(last_msg) = messages.last_mut()
-            && let Some(last_content) = last_msg.content.last_mut()
-        {
-            match last_content {
+        for message in messages.iter_mut().rev() {
+            if Self::apply_cache_to_message(message, cache_ttl) {
+                return;
+            }
+        }
+    }
+
+    /// Mark the last `text` or `tool_result` block of `message` and return
+    /// whether one was found. A trailing markable block is just the first hit
+    /// of the same backward scan that serves the fallback case.
+    fn apply_cache_to_message(message: &mut NativeMessage, cache_ttl: CacheTtl) -> bool {
+        for content in message.content.iter_mut().rev() {
+            match content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
                     *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                    return true;
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
                 | NativeContentOut::Thinking { .. } => {}
             }
         }
+        false
     }
 
     fn convert_tools(&self, tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -3184,10 +3209,11 @@ mod tests {
 
     /// Asserts that no converted message ends on an `image` block.
     ///
-    /// `apply_cache_to_last_message` writes nothing to an `image` block and says
-    /// nothing about it, so a message ending on one costs the request its
-    /// conversation cache breakpoint silently. `label` names the sub-case,
-    /// because the caller drives several histories through the same invariant.
+    /// The converter puts a turn's prose, or the `[image]` placeholder, after
+    /// its images so the turn holds a block `apply_cache_to_last_message` can
+    /// mark and the rolling breakpoint stays on the latest message instead of
+    /// rolling back to an earlier one. `label` names the sub-case, because the
+    /// caller drives several histories through the same invariant.
     fn assert_no_message_ends_on_an_image(label: &str, native_msgs: &[NativeMessage]) {
         let wire = serde_json::to_value(native_msgs).expect("serialize native messages");
         for message in wire.as_array().expect("messages array") {
@@ -4531,6 +4557,225 @@ data: {\"type\":\"message_stop\"}\n\n";
             }
             _ => panic!("Expected ToolUse variant"),
         }
+    }
+
+    /// A message ending in an image takes the rolling breakpoint on its text
+    /// block; the image block never carries one.
+    #[test]
+    fn apply_cache_to_last_message_text_then_image_marks_text() {
+        let mut messages = vec![NativeMessage {
+            role: "user".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "look at this".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][1].get("cache_control").is_none(),
+            "the trailing image must not gain a cache marker: {wire}"
+        );
+    }
+
+    /// An image-only last message cannot host the breakpoint, so it rolls back
+    /// to the nearest earlier message that can; the image-only message itself
+    /// stays unmarked.
+    #[test]
+    fn apply_cache_to_last_message_image_only_rolls_back() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Image {
+                    source: ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: CANONICAL_PNG_B64.to_string(),
+                    },
+                }],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[1].content[0] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(
+                    cache_control.is_some(),
+                    "the nearest earlier text block must carry the rolling breakpoint"
+                );
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[2]["content"][0].get("cache_control").is_none(),
+            "the image-only last message must stay unmarked: {wire}"
+        );
+    }
+
+    /// An assistant tool-call message holds thinking, then text, then tool_use.
+    /// The backward scan skips the tool_use and marks the text, leaving both
+    /// unmarkable blocks alone. A second shape puts the thinking block last, so
+    /// the scan has to step over it too; the converter never emits thinking
+    /// after text, so that half pins the helper's contract, not a wire shape.
+    ///
+    /// Neither shape reaches this helper from `convert_messages` at present:
+    /// `backfill_orphaned_tool_uses` appends a stub `tool_result` message after
+    /// a trailing tool_use before the breakpoint pass runs. The test pins what
+    /// the helper does on its own, without that upstream step.
+    #[test]
+    fn apply_cache_to_last_message_skips_thinking_and_tool_use_to_mark_text() {
+        let mut messages = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                NativeContentOut::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                NativeContentOut::Text {
+                    text: "checking the weather".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::ToolUse {
+                    id: "tool_123".to_string(),
+                    name: "get_weather".to_string(),
+                    input: serde_json::json!({}),
+                    cache_control: None,
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        match &messages[0].content[1] {
+            NativeContentOut::Text { cache_control, .. } => {
+                assert!(cache_control.is_some());
+            }
+            _ => panic!("Expected Text variant"),
+        }
+        let wire = serde_json::to_value(&messages).expect("serialize native messages");
+        assert!(
+            wire[0]["content"][0].get("cache_control").is_none()
+                && wire[0]["content"][2].get("cache_control").is_none(),
+            "thinking and tool_use blocks must stay unmarked: {wire}"
+        );
+
+        let mut trailing_thinking = vec![NativeMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                NativeContentOut::Text {
+                    text: "checking the weather".to_string(),
+                    cache_control: None,
+                },
+                NativeContentOut::Thinking {
+                    thinking: "let me check".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+            ],
+        }];
+
+        AnthropicModelProvider::apply_cache_to_last_message(
+            &mut trailing_thinking,
+            CacheTtl::default(),
+        );
+
+        let wire = serde_json::to_value(&trailing_thinking).expect("serialize native messages");
+        assert_eq!(
+            wire[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "the scan must step over a trailing thinking block to the text: {wire}"
+        );
+        assert!(
+            wire[0]["content"][1].get("cache_control").is_none(),
+            "a trailing thinking block must stay unmarked: {wire}"
+        );
+    }
+
+    /// Whatever the last message's shape, the rolling pass leaves at most one
+    /// breakpoint in the whole message list; here, with markable blocks in
+    /// every message, exactly one.
+    #[test]
+    fn apply_cache_to_last_message_places_exactly_one_breakpoint() {
+        let mut messages = vec![
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hi".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "assistant".to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: "hello".to_string(),
+                    cache_control: None,
+                }],
+            },
+            NativeMessage {
+                role: "user".to_string(),
+                content: vec![
+                    NativeContentOut::Text {
+                        text: "look at this".to_string(),
+                        cache_control: None,
+                    },
+                    NativeContentOut::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: "image/png".to_string(),
+                            data: CANONICAL_PNG_B64.to_string(),
+                        },
+                    },
+                ],
+            },
+        ];
+
+        AnthropicModelProvider::apply_cache_to_last_message(&mut messages, CacheTtl::default());
+
+        let breakpoints = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| match block {
+                NativeContentOut::Text { cache_control, .. }
+                | NativeContentOut::ToolResult { cache_control, .. }
+                | NativeContentOut::ToolUse { cache_control, .. } => cache_control.is_some(),
+                NativeContentOut::Image { .. } | NativeContentOut::Thinking { .. } => false,
+            })
+            .count();
+        assert_eq!(
+            breakpoints, 1,
+            "exactly one rolling breakpoint per request, got {breakpoints}"
+        );
     }
 
     #[test]
@@ -6011,6 +6256,57 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(
             tool_result["cache_control"]["type"], "ephemeral",
             "block-list content must not cost the request its cache breakpoint: {tool_result}"
+        );
+    }
+
+    /// A user turn that carries an attachment keeps its rolling breakpoint:
+    /// the marker lands on the turn's text block, the image block stays
+    /// unmarked, and the message list holds exactly one breakpoint.
+    #[test]
+    fn image_carrying_user_turn_keeps_rolling_breakpoint_on_text() {
+        let messages = vec![
+            ChatMessage::system("You look at pictures."),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"
+            )),
+        ];
+
+        let (_, mut native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        assert!(
+            AnthropicModelProvider::should_cache_conversation(&messages),
+            "this history must be long enough to be cached, or the test is vacuous"
+        );
+        AnthropicModelProvider::apply_cache_to_last_message(&mut native_msgs, CacheTtl::default());
+
+        let wire = serde_json::to_value(&native_msgs).expect("serialize native messages");
+        let last = wire
+            .as_array()
+            .and_then(|on_wire| on_wire.last())
+            .expect("a last message");
+        let blocks = last["content"].as_array().expect("content blocks");
+        let text = blocks
+            .iter()
+            .find(|block| block["type"] == "text")
+            .expect("a text block in the image turn");
+        assert_eq!(
+            text["cache_control"]["type"], "ephemeral",
+            "the image turn's text block must carry the rolling breakpoint: {last}"
+        );
+        let image = blocks
+            .iter()
+            .find(|block| block["type"] == "image")
+            .expect("an image block in the image turn");
+        assert!(
+            image.get("cache_control").is_none(),
+            "the image block must not carry a cache marker: {last}"
+        );
+        assert_eq!(
+            wire.to_string().matches("cache_control").count(),
+            1,
+            "exactly one rolling breakpoint in the message list: {wire}"
         );
     }
 
@@ -7605,14 +7901,15 @@ data: {\"type\":\"message_stop\"}\n\n";
     /// No converted message ends on an `image` block, whatever the user arm was
     /// given.
     ///
-    /// `apply_cache_to_last_message` is a silent no-op on an `image` block, so a
-    /// message ending on one costs the request its conversation cache breakpoint
-    /// with nothing reporting it. Four fallback tests used to assert this as a
-    /// trailing detail, but each built its image through a path that no longer
-    /// exists: the ambiguous carrier and the demoted duplicate both stopped
-    /// emitting top-level blocks. The user arm is now the only place an `image`
-    /// block reaches top-level content, so the invariant is stated once, here,
-    /// against it.
+    /// The user arm pushes a turn's images first and its prose, or the `[image]`
+    /// placeholder, last, so the turn holds a block `apply_cache_to_last_message`
+    /// can mark and the rolling breakpoint stays on the latest message rather
+    /// than rolling back to an earlier one. Four fallback tests used to assert
+    /// this as a trailing detail, but each built its image through a path that
+    /// no longer exists: the ambiguous carrier and the demoted duplicate both
+    /// stopped emitting top-level blocks. The user arm is now the only place an
+    /// `image` block reaches top-level content, so the invariant is stated once,
+    /// here, against it.
     ///
     /// The blank-prose case pins a dependency across the two modules. `[image]`
     /// stands in only when the text is exactly empty, and a real text block is
