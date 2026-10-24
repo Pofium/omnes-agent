@@ -47,6 +47,7 @@ pub(crate) fn collect_tool_results(
     model: &str,
     iteration: usize,
     turn_id: &str,
+    compression_policy: &omnesagent_compression::CompressionPolicy,
 ) -> Result<CollectedResults> {
     let mut tool_results = String::new();
     let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
@@ -127,10 +128,11 @@ pub(crate) fn collect_tool_results(
         let canonical_output =
             canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
 
-        // Native in-process token compression (SmartCrusher + Deduplication + Family Policy)
-        let family = omnesagent_compression::ModelFamily::detect_from_name(model);
-        let compression_policy = omnesagent_compression::CompressionPolicy::for_family(family);
-        let compressed = GLOBAL_COMPRESSOR.compress_tool_output(&canonical_output, &compression_policy);
+        // Native in-process token compression (SmartCrusher + Deduplication +
+        // family tuning), narrowed by the turn's classified intent — the
+        // policy is resolved once per turn in `run_tool_call_loop`.
+        let compressed =
+            GLOBAL_COMPRESSOR.compress_tool_output(&canonical_output, compression_policy);
 
         let mut result_output = truncate_tool_result(&compressed, max_tool_result_chars);
         // Append HMAC receipt to tool result when receipts are enabled
@@ -276,6 +278,7 @@ mod tests {
             "test-model",
             0,
             "turn-test",
+            &omnesagent_compression::CompressionPolicy::default(),
         )
     }
 
@@ -333,6 +336,7 @@ mod tests {
                 "test-model",
                 iteration,
                 "turn-test",
+                &omnesagent_compression::CompressionPolicy::default(),
             )?;
             check_identical_output_abort(
                 &collected.detection_relevant_output,

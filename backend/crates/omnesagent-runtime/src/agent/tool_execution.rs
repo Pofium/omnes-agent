@@ -2136,6 +2136,7 @@ mod tests {
             "test-model",
             0,
             "turn-test",
+            &omnesagent_compression::CompressionPolicy::default(),
         )
         .expect("collect_tool_results must succeed");
 

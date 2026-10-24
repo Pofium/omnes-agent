@@ -91,23 +91,7 @@ impl SessionExecutionProfile {
             ),
         };
 
-        let compression_policy = match intent {
-            AgentIntent::DirectChat => omnesagent_compression::CompressionPolicy::default(),
-            AgentIntent::CodeExploration => omnesagent_compression::CompressionPolicy {
-                enable_ast_code_collapse: true,
-                ..omnesagent_compression::CompressionPolicy::default()
-            },
-            AgentIntent::EngineeringTask => omnesagent_compression::CompressionPolicy {
-                enable_ast_code_collapse: true,
-                enable_dedup: true,
-                enable_smart_crusher: true,
-                ..omnesagent_compression::CompressionPolicy::default()
-            },
-            AgentIntent::SystemAdmin => omnesagent_compression::CompressionPolicy {
-                enable_smart_crusher: true,
-                ..omnesagent_compression::CompressionPolicy::default()
-            },
-        };
+        let compression_policy = compression_policy_for_intent(intent);
 
         Self {
             intent,
@@ -127,9 +111,14 @@ impl SessionExecutionProfile {
     }
 
     /// Adapts the session compression policy to a specific model family.
+    ///
+    /// The family policy keeps authority over family-specific knobs (schema
+    /// mode, dedup ref format, cache breakpoints); the intent policy only
+    /// narrows the feature toggles, so a capability the intent disables stays
+    /// disabled regardless of family defaults.
     #[must_use]
     pub fn with_model_family(mut self, family: omnesagent_compression::ModelFamily) -> Self {
-        self.compression_policy = omnesagent_compression::CompressionPolicy::for_family(family);
+        self.compression_policy = narrow_by_family(self.compression_policy, family);
         self
     }
 
@@ -139,4 +128,57 @@ impl SessionExecutionProfile {
         self.compression_policy = policy;
         self
     }
+}
+
+/// Intent-specific baseline compression policy, family-independent.
+#[must_use]
+pub fn compression_policy_for_intent(
+    intent: AgentIntent,
+) -> omnesagent_compression::CompressionPolicy {
+    match intent {
+        AgentIntent::DirectChat => omnesagent_compression::CompressionPolicy::default(),
+        AgentIntent::CodeExploration => omnesagent_compression::CompressionPolicy {
+            enable_ast_code_collapse: true,
+            ..omnesagent_compression::CompressionPolicy::default()
+        },
+        AgentIntent::EngineeringTask => omnesagent_compression::CompressionPolicy {
+            enable_ast_code_collapse: true,
+            enable_dedup: true,
+            enable_smart_crusher: true,
+            ..omnesagent_compression::CompressionPolicy::default()
+        },
+        AgentIntent::SystemAdmin => omnesagent_compression::CompressionPolicy {
+            enable_smart_crusher: true,
+            ..omnesagent_compression::CompressionPolicy::default()
+        },
+    }
+}
+
+/// Intersects intent feature toggles with the model-family tuning.
+#[must_use]
+pub fn narrow_by_family(
+    intent_policy: omnesagent_compression::CompressionPolicy,
+    family: omnesagent_compression::ModelFamily,
+) -> omnesagent_compression::CompressionPolicy {
+    let mut family_policy = omnesagent_compression::CompressionPolicy::for_family(family);
+    family_policy.enable_dedup &= intent_policy.enable_dedup;
+    family_policy.enable_smart_crusher &= intent_policy.enable_smart_crusher;
+    family_policy.enable_ast_code_collapse &= intent_policy.enable_ast_code_collapse;
+    family_policy
+}
+
+/// Resolves the effective tool-output compression policy for one turn:
+/// the intent classified from the triggering user message, narrowed by the
+/// serving model's family tuning. This is the seam the turn loop uses —
+/// the rest of [`SessionExecutionProfile`] is consumed as the Triage
+/// Router's remaining phases come online.
+#[must_use]
+pub fn resolve_compression_policy(
+    message: &str,
+    model: &str,
+) -> omnesagent_compression::CompressionPolicy {
+    let intent = super::heuristic::classify_message(message).intent;
+    let intent_policy = compression_policy_for_intent(intent);
+    let family = omnesagent_compression::ModelFamily::detect_from_name(model);
+    narrow_by_family(intent_policy, family)
 }

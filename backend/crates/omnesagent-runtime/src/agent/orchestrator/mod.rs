@@ -13,7 +13,10 @@ pub mod auto_continue;
 mod tests;
 
 pub use intent::{AgentIntent, ExecutionEngine};
-pub use profile::{SessionExecutionProfile, UiFlags};
+pub use profile::{
+    compression_policy_for_intent, narrow_by_family, resolve_compression_policy,
+    SessionExecutionProfile, UiFlags,
+};
 pub use tool_group::{
     filter_tools_for_intent, filter_tools_for_intent_with_query, is_mcp_or_external_tool,
     is_read_only_tool, prune_mcp_tools, ToolGroup,

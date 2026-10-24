@@ -476,6 +476,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
+    // Per-turn tool-output compression (Triage Router wiring): the intent
+    // classified from the triggering user message narrows the model-family
+    // policy, instead of every tool result being compressed by family
+    // defaults regardless of conversational context.
+    let triage_decision = crate::agent::orchestrator::classify_message(p1_text);
+    let compression_policy = crate::agent::orchestrator::narrow_by_family(
+        crate::agent::orchestrator::compression_policy_for_intent(triage_decision.intent),
+        omnesagent_compression::ModelFamily::detect_from_name(&model),
+    );
+
     if let Some(ref tx) = event_tx {
         let _ = tx
             .send(TurnEvent::TrajectoryStep {
@@ -487,7 +497,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 step_type: "s1_gate".to_string(),
                 payload_json: serde_json::json!({
                     "decision": "loop",
-                    "intent": "autonomous_coding",
+                    "intent": triage_decision.intent.as_str(),
                     "query_preview": if p1_text.len() > 100 { &p1_text[..100] } else { p1_text },
                 })
                 .to_string(),
@@ -1497,6 +1507,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             model,
             iteration,
             turn_id,
+            &compression_policy,
         )?;
 
         if !cancelled_mid_batch {
