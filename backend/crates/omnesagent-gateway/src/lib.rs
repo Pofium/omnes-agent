@@ -2718,8 +2718,9 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             omnesagent_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                omnesagent_runtime::agent::process_message(
+                omnesagent_runtime::agent::process_message_with_live_config(
                     config,
+                    std::sync::Arc::clone(&state.config),
                     &agent_alias,
                     message,
                     session_id,
