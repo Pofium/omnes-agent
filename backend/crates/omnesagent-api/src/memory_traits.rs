@@ -769,6 +769,8 @@ mod tests {
             tenant_id: None,
             agent_alias: None,
             agent_id: None,
+            trust: None,
+            last_feedback_at: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -786,6 +788,8 @@ mod tests {
         assert!(parsed.kind.is_none());
         assert!(!parsed.pinned);
         assert!(parsed.tenant_id.is_none());
+        assert!(parsed.trust.is_none());
+        assert!(parsed.last_feedback_at.is_none());
     }
 
     #[test]
@@ -805,6 +809,10 @@ mod tests {
         assert!(parsed.kind.is_none());
         assert!(!parsed.pinned);
         assert!(parsed.tenant_id.is_none());
+        // `trust` falls back to the neutral default via `default_trust`;
+        // `last_feedback_at` has no default value and stays unset.
+        assert_eq!(parsed.trust, Some(0.5));
+        assert!(parsed.last_feedback_at.is_none());
     }
 
     #[test]
@@ -825,6 +833,8 @@ mod tests {
             tenant_id: Some("tenant-1".into()),
             agent_alias: Some("agent-a".into()),
             agent_id: Some("agent-uuid".into()),
+            trust: Some(0.85),
+            last_feedback_at: Some("2026-10-23T00:00:00Z".into()),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -836,6 +846,8 @@ mod tests {
         );
         assert!(parsed.pinned);
         assert_eq!(parsed.tenant_id.as_deref(), Some("tenant-1"));
+        assert_eq!(parsed.trust, Some(0.85));
+        assert_eq!(parsed.last_feedback_at.as_deref(), Some("2026-10-23T00:00:00Z"));
     }
 
     struct LegacyOptionsMemory;
