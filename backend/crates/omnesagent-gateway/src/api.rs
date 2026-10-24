@@ -2162,22 +2162,39 @@ pub async fn handle_api_s1_status(
         return e.into_response();
     }
 
-    let s1_cfg = omnesagent_s1::config::SystemOneConfig::default();
-    let ready = s1_cfg
+    // The S1 layer is env-configured (OMNESAGENT_S1_* / OMNES_S1_*), not part
+    // of config.toml — every runtime consumer (classifier, context analyzer,
+    // channel orchestrator, memory inject) reads `from_env()`. Reporting
+    // `default()` here described an S1 that no running subsystem uses, and the
+    // model name was hardcoded rather than derived from the configured weights.
+    let s1_cfg = omnesagent_s1::config::SystemOneConfig::from_env();
+    let model_name = s1_cfg.model_path.as_ref().map(|p| {
+        p.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    });
+    let weights_present = s1_cfg
         .model_path
         .as_deref()
-        .map(|p| p.exists())
-        .unwrap_or(false)
-        || std::env::var("OMNESAGENT_S1_PATH")
-            .map(|p| std::path::Path::new(&p).exists())
-            .unwrap_or(false);
+        .is_some_and(|p| p.exists());
+    let provider_on = s1_cfg.provider != omnesagent_s1::config::ProviderKind::Off;
 
     Json(serde_json::json!({
         "provider": format!("{:?}", s1_cfg.provider),
-        "model": "convaiinnovations/laya",
-        "ready": ready,
+        "model": model_name,
+        "model_path": s1_cfg.model_path.as_ref().map(|p| p.display().to_string()),
+        "weights_present": weights_present,
+        "ready": provider_on && weights_present,
         "max_tokens": s1_cfg.max_tokens,
         "device": format!("{:?}", s1_cfg.device),
+        "quantization": format!("{:?}", s1_cfg.quantization),
+        "features": {
+            "channel_intent": s1_cfg.channel_intent_enabled,
+            "compaction": s1_cfg.compaction_enabled,
+            "memory_rerank": s1_cfg.memory_rerank_enabled,
+            "tool_gate": s1_cfg.tool_gate_enabled,
+            "router": s1_cfg.router_enabled,
+        },
     }))
     .into_response()
 }
