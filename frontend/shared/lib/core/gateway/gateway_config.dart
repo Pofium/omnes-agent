@@ -6,7 +6,6 @@ import 'package:universal_io/io.dart' as universal_io;
 class GatewayConfig {
   static const String defaultHttpUrl = "http://127.0.0.1:42617";
   static const String defaultAgentAlias = "chief";
-  static const String defaultToken = "omnes-token-secret-12345";
 
   static const String _urlKey = "gateway_url";
   static const String _agentKey = "gateway_agent_alias";
@@ -117,8 +116,12 @@ class GatewayConfig {
     return getAgentAlias();
   }
 
-  /// Retrieves Bearer token for gateway auth.
-  /// Retrieves Bearer token for gateway auth with dynamic discovery.
+  /// Retrieves Bearer token for gateway auth. Resolution order: explicit
+  /// override (tests), stored token, `OMNES_GATEWAY_TOKEN`, `.omnes/gateway.json`
+  /// (written by the gateway at startup). Returns an empty string when nothing
+  /// is discovered — callers omit the Authorization header; a pairing-enabled
+  /// gateway then answers 401 with its "pair first" hint instead of trusting
+  /// a published default secret.
   static Future<String> getToken() async {
     if (_overrideToken != null) return _overrideToken!;
     try {
@@ -140,7 +143,7 @@ class GatewayConfig {
         }
       } catch (_) {}
     }
-    return defaultToken;
+    return '';
   }
 
   /// Stores Bearer token.

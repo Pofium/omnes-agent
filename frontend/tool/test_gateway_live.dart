@@ -6,28 +6,47 @@ import 'dart:io';
 void main() async {
   print('--- Testing OmnesAgent Live Gateway (127.0.0.1:42617) ---');
 
-  // 1. Test HTTP GET /health
+  // Bearer token is never hardcoded: read it from the environment or from
+  // the gateway's own discovery descriptor (.omnes/gateway.json).
+  final token = Platform.environment['OMNES_GATEWAY_TOKEN'] ??
+      () {
+        final f = File('.omnes/gateway.json');
+        if (f.existsSync()) {
+          final parsed = jsonDecode(f.readAsStringSync());
+          if (parsed is Map && parsed['token'] is String) return parsed['token'] as String;
+        }
+        return '';
+      }();
+  if (token.isEmpty) {
+    print('! No gateway token found: set OMNES_GATEWAY_TOKEN or start the '
+        'gateway so it writes .omnes/gateway.json');
+    exitCode = 1;
+    return;
+  }
+  print('1. Token discovered (${token.length} chars).');
+
+  // 2. Test HTTP GET /health
   final client = HttpClient();
   final healthReq = await client.getUrl(Uri.parse('http://127.0.0.1:42617/health'));
   final healthRes = await healthReq.close();
   final healthBody = await utf8.decodeStream(healthRes);
-  print('1. Health check: status=${healthRes.statusCode}, body=$healthBody');
+  print('2. Health check: status=${healthRes.statusCode}, body=$healthBody');
   if (healthRes.statusCode != 200) {
     exitCode = 1;
     return;
   }
 
-  // 2. Test HTTP GET /api/status with Bearer token
+  // 3. Test HTTP GET /api/status with Bearer token
   final statusReq = await client.getUrl(Uri.parse('http://127.0.0.1:42617/api/status'));
-  statusReq.headers.add('Authorization', 'Bearer omnes-token-secret-12345');
+  statusReq.headers.add('Authorization', 'Bearer $token');
   final statusRes = await statusReq.close();
   final statusBody = await utf8.decodeStream(statusRes);
-  print('2. Status check: status=${statusRes.statusCode}, version in body=${statusBody.contains("0.8.4")}');
+  print('3. Status check: status=${statusRes.statusCode}, version in body=${statusBody.contains("0.8.4")}');
 
-  // 3. Test WebSocket /ws/chat
-  final wsUrl = 'ws://127.0.0.1:42617/ws/chat?agent=chief&session_id=live_test_1&token=omnes-token-secret-12345';
-  print('3. Connecting WebSocket to $wsUrl ...');
-  final ws = await WebSocket.connect(wsUrl, protocols: ['omnesagent.v1', 'bearer.omnes-token-secret-12345']);
+  // 4. Test WebSocket /ws/chat
+  final wsUrl = 'ws://127.0.0.1:42617/ws/chat?agent=chief&session_id=live_test_1&token=$token';
+  print('4. Connecting WebSocket to $wsUrl ...');
+  final ws = await WebSocket.connect(wsUrl, protocols: ['omnesagent.v1', 'bearer.$token']);
   print('   WebSocket connected! readyState=${ws.readyState}');
 
   final completer = Completer<void>();
@@ -65,7 +84,7 @@ void main() async {
   });
 
   // Send prompt
-  print('4. Sending message: "Привет! Ответь коротко: Ты Omnes?"');
+  print('5. Sending message: "Привет! Ответь коротко: Ты Omnes?"');
   ws.add(jsonEncode({
     'type': 'message',
     'content': 'Привет! Ответь коротко: Ты Omnes?',

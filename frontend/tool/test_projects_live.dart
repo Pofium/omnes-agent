@@ -4,7 +4,7 @@ import 'dart:convert';
 import 'dart:io';
 
 const String baseUrl = 'http://127.0.0.1:42617';
-const String token = 'omnes-token-secret-12345';
+final String token = Platform.environment['OMNES_GATEWAY_TOKEN'] ?? '';
 const String agent = 'chief';
 
 final client = HttpClient();
