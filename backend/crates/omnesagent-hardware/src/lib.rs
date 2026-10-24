@@ -35,7 +35,7 @@ pub mod pico_flash;
 pub mod pico_code;
 
 /// Datasheet management — search, download, and manage device datasheets.
-#[cfg(feature = "hardware")]
+#[cfg(any(test, feature = "hardware"))]
 pub mod datasheet;
 
 /// Interactive hardware onboarding wizard UI.
