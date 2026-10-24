@@ -116,6 +116,9 @@ fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut Has
         if let Some(cached) = rates.cached_input_per_mtok {
             slot.insert(format!("{model_id}.cached_input"), cached);
         }
+        if let Some(write) = rates.cache_write_per_mtok {
+            slot.insert(format!("{model_id}.cache_write"), write);
+        }
     }
 }
 
@@ -189,25 +192,29 @@ tokio::task_local! {
 }
 
 fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
-    let try_lookup = |key: &str| -> Option<ModelRates> {
+    let try_lookup = |key: &str| -> ModelRates {
         let input = pricing.get(&format!("{key}.input")).copied();
         let output = pricing.get(&format!("{key}.output")).copied();
         let cached = pricing.get(&format!("{key}.cached_input")).copied();
+        let write = pricing.get(&format!("{key}.cache_write")).copied();
         let flat = pricing.get(key).copied();
-        if input.is_none() && output.is_none() && cached.is_none() && flat.is_none() {
-            None
-        } else {
-            Some(ModelRates {
-                input_per_mtok: input.or(flat),
-                output_per_mtok: output.or(flat),
-                cached_input_per_mtok: cached,
-            })
+        ModelRates {
+            input_per_mtok: input.or(flat),
+            output_per_mtok: output.or(flat),
+            cached_input_per_mtok: cached,
+            cache_write_per_mtok: write,
         }
     };
 
+    // Merge candidates from most-specific to least-specific. A model-key
+    // entry may contain only the write rate while the suffix entry carries
+    // the other dimensions; stopping at the first non-empty entry would lose
+    // those fallback rates.
     omnesagent_providers::pricing::model_id_candidates(model)
-        .find_map(try_lookup)
-        .unwrap_or_default()
+        .map(try_lookup)
+        .fold(ModelRates::default(), |resolved, candidate| {
+            resolved.or(candidate)
+        })
 }
 
 fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates> {
@@ -309,6 +316,22 @@ fn record_tool_loop_cost_usage_inner(
     usage: &omnesagent_providers::traits::TokenUsage,
     updates_context_window_fill: bool,
 ) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_inner_with_live(
+        model_provider_name,
+        model,
+        usage,
+        updates_context_window_fill,
+        None,
+    )
+}
+
+fn record_tool_loop_cost_usage_inner_with_live(
+    model_provider_name: &str,
+    model: &str,
+    usage: &omnesagent_providers::traits::TokenUsage,
+    updates_context_window_fill: bool,
+    live_override: Option<ModelRates>,
+) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
@@ -329,9 +352,11 @@ fn record_tool_loop_cost_usage_inner(
     // Live-price FALLBACK fills only the dimensions config left unset; never
     // fetches on this path (reads a cached snapshot, empty unless a provider
     // opted into `live_pricing`).
-    let live = (!config_rates.is_complete())
-        .then(|| live_pricing_for(model_provider_name, model))
-        .flatten();
+    let live = live_override.or_else(|| {
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
+            .then(|| live_pricing_for(model_provider_name, model))
+            .flatten()
+    });
     // `mut` so the global-catalog fallback below can still fill rates config and
     // the live snapshot both left unset.
     let (mut input_rate, mut output_rate, mut cached_rate) =
@@ -354,13 +379,21 @@ fn record_tool_loop_cost_usage_inner(
         false
     };
 
-    let cost_usage = CostTokenUsage::new_with_cache(
+    let cache_creation_input_tokens = usage.cache_creation_input_tokens.unwrap_or(0);
+    let write_rate = config_rates
+        .cache_write_per_mtok
+        .or_else(|| live.and_then(|l| l.cache_write_per_mtok))
+        .unwrap_or(0.0);
+
+    let cost_usage = CostTokenUsage::new_with_cache_write(
         model,
         input_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens,
         output_tokens,
         input_rate,
         cached_rate,
+        write_rate,
         output_rate,
     );
 
@@ -613,6 +646,7 @@ mod tests {
                     input_tokens: Some(1_000_000),
                     output_tokens: Some(0),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -631,6 +665,7 @@ mod tests {
             input_per_mtok: Some(99.0),
             output_per_mtok: Some(15.0),
             cached_input_per_mtok: Some(1.5),
+            ..ModelRates::default()
         });
         assert_eq!(merge_config_and_live_rates(config, live), (5.0, 15.0, 1.5));
     }
@@ -650,11 +685,13 @@ mod tests {
                     input_per_mtok: Some(0.0),
                     output_per_mtok: Some(0.0),
                     cached_input_per_mtok: None,
+                    ..ModelRates::default()
                 },
                 Some(ModelRates {
                     input_per_mtok: Some(3.0),
                     output_per_mtok: Some(9.0),
                     cached_input_per_mtok: Some(0.3),
+                    ..ModelRates::default()
                 })
             ),
             (0.0, 0.0, 0.3)
@@ -840,6 +877,18 @@ mod tests {
         map
     }
 
+    fn pricing_with_cache_write(
+        model: &str,
+        input: f64,
+        cached_input: f64,
+        cache_write: f64,
+        output: f64,
+    ) -> HashMap<String, f64> {
+        let mut map = pricing_with_cache(model, input, cached_input, output);
+        map.insert(format!("{model}.cache_write"), cache_write);
+        map
+    }
+
     #[test]
     fn build_model_provider_pricing_prefers_rate_sheet_over_legacy_alias_pricing() {
         let mut config = Config::default();
@@ -859,6 +908,7 @@ mod tests {
                 input_per_mtok: Some(0.14),
                 output_per_mtok: Some(0.28),
                 cached_input_per_mtok: Some(0.0028),
+                cache_write_per_mtok: None,
             },
         );
 
@@ -943,6 +993,7 @@ mod tests {
                 input_per_mtok: Some(0.14),
                 output_per_mtok: Some(0.28),
                 cached_input_per_mtok: Some(0.0028),
+                cache_write_per_mtok: None,
             },
         );
 
@@ -1021,6 +1072,7 @@ mod tests {
             input_tokens: Some(5_000),
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
+            cache_creation_input_tokens: None,
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1068,6 +1120,7 @@ mod tests {
             input_tokens: Some(5_000),
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
+            cache_creation_input_tokens: Some(1_000),
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1099,11 +1152,13 @@ mod tests {
             input_tokens: Some(80),
             output_tokens: Some(5),
             cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
         };
         let accepted = omnesagent_providers::traits::TokenUsage {
             input_tokens: Some(80),
             output_tokens: Some(7),
             cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(TOOL_LOOP_TURN_USAGE.scope(
