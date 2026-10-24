@@ -169,6 +169,7 @@ use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use omnesagent_config::schema::{AliasedAgentConfig, Config};
 use omnesagent_memory::Memory;
@@ -582,6 +583,16 @@ impl AllToolsResult {
 }
 
 /// Create full tool registry including memory tools and optional Composio
+fn runtime_for_all_tools(
+    root_config: &omnesagent_config::schema::Config,
+    tui_env: Option<&HashMap<String, String>>,
+) -> anyhow::Result<Arc<dyn RuntimeAdapter>> {
+    let tui_path = tui_env.and_then(|env| env.get("PATH")).map(OsStr::new);
+    Ok(Arc::from(
+        omnesagent_config::platform::create_runtime_with_path(&root_config.runtime, tui_path)?,
+    ))
+}
+
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -606,12 +617,14 @@ pub fn all_tools(
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
 ) -> AllToolsResult {
+    let runtime = runtime_for_all_tools(root_config, tui_env.as_ref())
+        .unwrap_or_else(|_| Arc::new(NativeRuntime::new()));
     all_tools_with_runtime(
         config,
         security,
         risk_profile,
         agent_alias,
-        Arc::new(NativeRuntime::new()),
+        runtime,
         memory,
         composio_key,
         composio_entity_id,
@@ -2727,6 +2740,53 @@ permissions = ["http_client"]
             tools.iter().all(|tool| tool.name() != "metadata-probe"),
             "a component whose required metadata probe fails must not receive manifest fallback metadata"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shell = tmp.path().join("all-tools-configured-shell");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut root_config = Config::default();
+        root_config.runtime.shell = Some("all-tools-configured-shell".to_string());
+        let path = std::env::join_paths([
+            OsString::new(),
+            OsString::from("relative-decoy"),
+            shell.parent().unwrap().as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let tui_env = HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+        let runtime = runtime_for_all_tools(&root_config, Some(&tui_env)).unwrap();
+        let command = runtime
+            .build_shell_command("echo all-tools", tmp.path())
+            .unwrap();
+
+        assert_eq!(
+            command.as_std().get_program(),
+            shell.canonicalize().unwrap().as_os_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_rejects_empty_or_relative_only_tui_path() {
+        use std::ffi::OsString;
+
+        for path in [OsString::new(), OsString::from("relative-only")] {
+            let mut root_config = Config::default();
+            root_config.runtime.shell = Some("all-tools-missing-shell".to_string());
+            let tui_env =
+                HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+            assert!(runtime_for_all_tools(&root_config, Some(&tui_env)).is_err());
+        }
     }
 
     /// `web_search_tool` must be registered behind `RateLimitedTool` like
