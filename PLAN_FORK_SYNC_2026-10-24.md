@@ -57,11 +57,11 @@
 - `ec102ec88` (#10716) — биллинг cache writes (обязательная пара к passthrough).
 - `a55179236` (#10890) — per-image стоимость в estimate_history_tokens; `55b078b9f` (#10555) — cap image-promotion (path-listing'и). Бьют в известную проблему structured_history_cap.
 
-### 4.2 Parser и tool-вызовы (реальные сломанные вызовы в проде)
-- `3500014d9`+`83a06780a` (#11188,#11025) — **`browser_open`/`web_search` конвертируются в `curl`** у GLM-стиль моделей + алиасы не нормализуются в xml/minimax-форматах. Наш parser ≈ v0.8.5 — порт чистый.
-- `44655c34c`+`2d85371f3` (#11479,#10914) — recover structured native tool arguments (стрингифицированные object/array аргументы). Цепочка из 2 коммитов.
-- `e8627d2e8` (#11201) — сериализация file_edit+file_write в одном batch (гонка read-modify-write теряет правки).
-- `2d85371f3` (base) — preserve string arguments при fallback parsing.
+### 4.2 Parser и tool-вызовы [ВЫПОЛНЕНО]
+- `3500014d9`+`83a06780a` (#11188,#11025) — **`browser_open`/`web_search` конвертируются в `curl`** у GLM-стиль моделей + алиасы не нормализуются в xml/minimax-форматах [ВЫПОЛНЕНО: `b618a37b2`, `f779df4bf`].
+- `44655c34c`+`2d85371f3` (#11479,#10914) — recover structured native tool arguments (стрингифицированные object/array аргументы) [ВЫПОЛНЕНО: `8bf5c1b38`, `f1359b99b`].
+- `e8627d2e8` (#11201) — сериализация file_edit+file_write в одном batch (гонка read-modify-write теряет правки) [ВЫПОЛНЕНО: `4b569cf33`].
+- `2d85371f3` (base) — preserve string arguments при fallback parsing [ВЫПОЛНЕНО: `f1359b99b`].
 
 ### 4.3 Стримы и надёжность провайдеров
 - `f72e4d656` (#10442) — **OpenRouter стрим умирает по request timeout** (наш http_client() вешает timeout на весь запрос — баг жив).
