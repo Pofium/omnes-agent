@@ -139,6 +139,8 @@ fn from_wit_entry(e: WitMemoryEntry) -> MemoryEntry {
         tenant_id: None,
         agent_alias: e.agent_alias,
         agent_id: e.agent_id,
+        trust: Some(0.5),
+        last_feedback_at: None,
     }
 }
 

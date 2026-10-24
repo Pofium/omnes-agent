@@ -115,7 +115,7 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 /// unavailable, not "deny-all".
 ///
 /// The reason this is fail-closed rather than governed: enabling `wasi:http`
-/// here would attach `wasmtime_wasi_http::p2::default_hooks()` — UNRESTRICTED
+/// here would attach `wasmtime_wasi_http::default_hooks()` — UNRESTRICTED
 /// egress with no destination allowlist, no metadata/loopback denial, no DNS
 /// pinning, and no connection budget. That is a fresh instance of the egress
 /// SSRF hole (issue 9395), which making channel construction a production
