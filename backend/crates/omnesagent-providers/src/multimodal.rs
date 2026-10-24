@@ -11,7 +11,7 @@ use omnesagent_api::media::{
 use omnesagent_api::model_provider::ChatMessage;
 use omnesagent_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
-const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
+pub const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -348,9 +348,9 @@ fn is_windows_unc_path(candidate: &str) -> bool {
     !server.is_empty() && !share.is_empty()
 }
 
-fn collapse_wrapped_marker(raw: &str) -> String {
+fn collapse_wrapped_marker(raw: &str) -> Cow<'_, str> {
     if !raw.contains('\n') && !raw.contains('\r') {
-        return raw.trim().to_string();
+        return Cow::Borrowed(raw.trim());
     }
     let mut out = String::with_capacity(raw.len());
     let mut skip_ws = false;
@@ -367,7 +367,7 @@ fn collapse_wrapped_marker(raw: &str) -> String {
         }
         out.push(ch);
     }
-    out.trim().to_string()
+    Cow::Owned(out.trim().to_string())
 }
 
 /// True when `content` holds an image marker, terminated or not.
@@ -381,20 +381,21 @@ pub(crate) fn carries_image_marker(content: &str) -> bool {
     content.contains(IMAGE_MARKER_PREFIX)
 }
 
-pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
-    let mut refs = Vec::new();
-    let mut cleaned = String::with_capacity(content.len());
+/// Walk `content` once, reporting every span that survives as text through
+/// `on_text` and every loadable, collapsed image reference through `on_ref`.
+/// Both [`parse_image_markers`] and [`image_marker_summary`] are built on
+/// this scanner so the marker grammar has one definition.
+fn scan_image_markers(content: &str, mut on_text: impl FnMut(&str), mut on_ref: impl FnMut(&str)) {
     let mut cursor = 0usize;
 
     while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
         let start = cursor + rel_start;
-        cleaned.push_str(&content[cursor..start]);
+        on_text(&content[cursor..start]);
 
         let marker_start = start + IMAGE_MARKER_PREFIX.len();
         let Some(rel_end) = content[marker_start..].find(']') else {
-            cleaned.push_str(&content[start..]);
-            cursor = content.len();
-            break;
+            on_text(&content[start..]);
+            return;
         };
 
         let end = marker_start + rel_end;
@@ -404,19 +405,47 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
             // Preserve the original marker text (placeholders like
             // `[IMAGE:...]` or `[IMAGE:<path>]` should survive as prose
             // rather than triggering a loader error).
-            cleaned.push_str(&content[start..=end]);
+            on_text(&content[start..=end]);
         } else {
-            refs.push(candidate);
+            on_ref(candidate.as_ref());
         }
 
         cursor = end + 1;
     }
 
     if cursor < content.len() {
-        cleaned.push_str(&content[cursor..]);
+        on_text(&content[cursor..]);
     }
+}
 
+pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+    let mut cleaned = String::with_capacity(content.len());
+    let mut refs = Vec::new();
+    scan_image_markers(
+        content,
+        |text| cleaned.push_str(text),
+        |reference| refs.push(reference.to_string()),
+    );
     (cleaned.trim().to_string(), refs)
+}
+
+/// Byte count of the non-marker text and the number of loadable references,
+/// computed by the same scanner as `parse_image_markers` without building
+/// the cleaned string or copying references.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageMarkerSummary {
+    pub text_bytes: usize,
+    pub image_refs: usize,
+}
+
+pub fn image_marker_summary(content: &str) -> ImageMarkerSummary {
+    let mut summary = ImageMarkerSummary::default();
+    scan_image_markers(
+        content,
+        |text| summary.text_bytes += text.len(),
+        |_| summary.image_refs += 1,
+    );
+    summary
 }
 
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
@@ -645,6 +674,40 @@ fn should_normalize_message_images(
     }
 
     message.role == "user"
+}
+
+/// How multimodal preparation will treat the `[IMAGE:...]` markers in a
+/// message at its position in the history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageMarkerDisposition {
+    /// Loadable markers become provider image blocks: user messages and the
+    /// latest run of tool-result carriers.
+    Normalized,
+    /// Markers are stripped before dispatch: tool-result carriers outside the
+    /// latest run.
+    Stripped,
+    /// Content is dispatched verbatim as text: system and assistant messages.
+    Literal,
+}
+
+/// One disposition per message, computed with the same predicates preparation
+/// uses (`is_tool_result_carrier`, `latest_tool_result_indices`,
+/// `should_normalize_message_images`).
+pub fn image_marker_dispositions(messages: &[ChatMessage]) -> Vec<ImageMarkerDisposition> {
+    let latest_indices = latest_tool_result_indices(messages);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if should_normalize_message_images(index, message, &latest_indices) {
+                ImageMarkerDisposition::Normalized
+            } else if is_tool_result_carrier(message) {
+                ImageMarkerDisposition::Stripped
+            } else {
+                ImageMarkerDisposition::Literal
+            }
+        })
+        .collect()
 }
 
 fn stripped_image_marker_text(content: &str) -> String {
@@ -1541,6 +1604,66 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_marker_dispositions_match_preparation() {
+        let native = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("yo"),
+            ChatMessage::tool("early result"),
+            ChatMessage::user("turn two"),
+            ChatMessage::assistant("calling"),
+            ChatMessage::tool("latest result"),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&native),
+            vec![
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Stripped,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Literal,
+                ImageMarkerDisposition::Normalized,
+            ]
+        );
+
+        let prompt_mode = vec![
+            ChatMessage::user("[Tool results]\nearly carrier"),
+            ChatMessage::user("turn"),
+            ChatMessage::user("[Tool results]\nlatest carrier"),
+        ];
+        assert_eq!(
+            image_marker_dispositions(&prompt_mode),
+            vec![
+                ImageMarkerDisposition::Stripped,
+                ImageMarkerDisposition::Normalized,
+                ImageMarkerDisposition::Normalized,
+            ]
+        );
+    }
+
+    #[test]
+    fn image_marker_summary_matches_parse_image_markers() {
+        let placeholder = "[IMAGE:...]";
+        let content = format!(
+            "  see [IMAGE:/tmp/a.png] plus {placeholder} and [IMAGE:/tmp/wrapped-\nlong.png] ok  "
+        );
+        let (cleaned, refs) = parse_image_markers(&content);
+        let summary = image_marker_summary(&content);
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0], "/tmp/a.png");
+        assert_eq!(refs[1], "/tmp/wrapped-long.png");
+        assert_eq!(summary.image_refs, refs.len());
+
+        // Every byte the scanner keeps as text, placeholder included, without
+        // the trim parse applies to its cleaned string.
+        let expected_text = format!("  see  plus {placeholder} and  ok  ");
+        assert_eq!(summary.text_bytes, expected_text.len());
+        assert_eq!(summary.text_bytes, cleaned.len() + 4);
+    }
 
     #[test]
     fn image_failure_reporting_tracks_reference_and_kind_until_success() {
