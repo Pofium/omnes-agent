@@ -637,6 +637,11 @@ pub struct ModelProviderRuntimeOptions {
     /// message) into request bodies and capture gateway-reported cache
     /// usage. Propagated from `ModelProviderConfig::cache_passthrough`.
     pub cache_passthrough: bool,
+    /// Prompt-cache entry lifetime for providers that place Anthropic
+    /// cache markers (native Anthropic; compatible ones behind
+    /// `cache_passthrough`). `None` keeps the 5-minute default.
+    /// Propagated from `ModelProviderConfig::cache_ttl`.
+    pub cache_ttl: Option<omnesagent_config::schema::CacheTtl>,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -683,6 +688,7 @@ impl Default for ModelProviderRuntimeOptions {
             provider_extra: None,
             replay_assistant_reasoning: None,
             cache_passthrough: false,
+            cache_ttl: None,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -748,6 +754,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
         cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
+        cache_ttl: entry.and_then(|e| e.cache_ttl),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
@@ -824,6 +831,12 @@ pub fn options_for_provider_ref(
             // fallback family must use its own default rather than inherit
             // the previous provider alias's policy.
             options.tool_result_image_policy = Default::default();
+            // Cache settings are provider-entry opt-ins: `cache_ttl` is a
+            // paid lifetime choice and `cache_passthrough` gates marker
+            // injection, so a bare family ref must not inherit another
+            // alias's cache opt-ins (there is no entry to turn them off on).
+            options.cache_ttl = None;
+            options.cache_passthrough = false;
             options
         }
     }
@@ -2237,6 +2250,48 @@ mod tests {
         let defaults =
             model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
         assert!(!defaults.cache_passthrough);
+    }
+
+    #[test]
+    fn cache_ttl_config_field_maps_into_runtime_options() {
+        use omnesagent_config::schema::{CacheTtl, Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_ttl: Some(CacheTtl::OneHour),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.cache_ttl, Some(CacheTtl::OneHour));
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert_eq!(defaults.cache_ttl, None);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_does_not_inherit_cache_settings() {
+        use omnesagent_config::schema::{
+            AnthropicModelProviderConfig, CacheTtl, Config, ModelProviderConfig,
+        };
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "primary".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    cache_ttl: Some(CacheTtl::OneHour),
+                    cache_passthrough: true,
+                    ..Default::default()
+                },
+            },
+        );
+        let fallback = ModelProviderRuntimeOptions::default();
+        let opts = options_for_provider_ref(&config, "anthropic.primary", &fallback);
+        assert_eq!(opts.cache_ttl, Some(CacheTtl::OneHour));
+        assert!(opts.cache_passthrough);
+        let bare = options_for_provider_ref(&config, "anthropic", &opts);
+        assert_eq!(bare.cache_ttl, None);
+        assert!(!bare.cache_passthrough);
     }
 
     use super::test_util::{EnvGuard, env_lock};
