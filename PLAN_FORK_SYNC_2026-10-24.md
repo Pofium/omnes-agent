@@ -80,7 +80,7 @@
 - `87e3c2235` (#11650) — **Telegram 429**: ждать `retry_after`, не долбить в flood.
 - `28a34bfc7` (#11669) — Lark flat post-контент молча дропался.
 - `2881a7189` (#11258) — transcription `initial_prompt` игнорировался (смежно с нашим transcription.rs:886).
-- `927ae8df0` (#11144) + `de0444dcb` (#11143) — memory: FP credential-regex; Qdrant time-bounds pushdown.
+- `927ae8df0` (#11144) — memory: FP credential-regex (threat.rs); `de0444dcb` (#11143) **SKIPPED** (встроенный легаси бэкенд Qdrant удалён в пользу ob2h).
 - `ecac0dbce`+`3def06fb7` (#10958,#10239) — interruption scope коллизии (`/stop` может cancel'ить чужой turn).
 - `130781675`+`caf806ae3` (#10833,#10266) — `is_direct_message` для Signal и WhatsApp Web (DM молча дропались).
 - `e6fe7a8c9` (#10692) — per-agent transcription binding.

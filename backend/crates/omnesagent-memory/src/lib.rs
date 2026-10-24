@@ -33,7 +33,6 @@ pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod prefetch;
-pub mod qdrant;
 pub mod redact;
 pub mod rerank;
 pub mod response_cache;
@@ -63,7 +62,6 @@ pub use policy::PolicyEnforcer;
 #[cfg(feature = "memory-postgres")]
 #[allow(unused_imports)]
 pub use postgres::PostgresMemory;
-pub use qdrant::QdrantMemory;
 pub use rerank::{RerankConfig, RerankStrategy};
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
@@ -683,40 +681,8 @@ pub fn create_memory_with_storage_and_routes(
     };
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
-        let qdrant_cfg = match active_storage {
-            ActiveStorage::Qdrant(q) => q,
-            _ => anyhow::bail!(
-                "memory backend 'qdrant' requires a `[storage.qdrant.<alias>]` entry \
-                 referenced by `memory.backend = \"qdrant.<alias>\"`"
-            ),
-        };
-        let url = qdrant_cfg
-            .url
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .context("Qdrant memory backend requires `url` in [storage.qdrant.<alias>]")?;
-        let collection = qdrant_cfg.collection.clone();
-        let qdrant_api_key = qdrant_cfg.api_key.clone().filter(|s| !s.trim().is_empty());
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.model_provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
-        ::omnesagent_log::record!(
-            INFO,
-            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
-            &format!(
-                "📦 Qdrant memory backend configured (url: {}, collection: {})",
-                url, collection
-            )
-        );
-        return wrap_scanned_and_audit(
-            QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder),
-            &config.policy,
-            workspace_dir,
-            config.audit_enabled,
+        anyhow::bail!(
+            "The legacy Qdrant memory backend was removed in OmnesAgent.              Persistent memory, semantic indexing, and knowledge graph are provided via ob2h."
         );
     }
 
@@ -2124,7 +2090,7 @@ store_timeout_ms = 40000
     /// `[storage.qdrant.<alias>]` entry with a URL resolves (construction is
     /// lazy; no server contact happens here).
     #[test]
-    fn storage_aware_factory_still_builds_qdrant_with_storage_config() {
+    fn storage_aware_factory_rejects_removed_qdrant() {
         use omnesagent_config::schema::QdrantStorageConfig;
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
@@ -2135,16 +2101,17 @@ store_timeout_ms = 40000
             url: Some("http://localhost:6333".into()),
             ..QdrantStorageConfig::default()
         };
-        let mem = create_memory_with_storage_and_routes(
+        match create_memory_with_storage_and_routes(
             &cfg,
             &[],
             ActiveStorage::Qdrant(&storage),
             tmp.path(),
             None,
             None,
-        )
-        .expect("qdrant with resolved storage config must still construct");
-        assert_eq!(mem.name(), "qdrant");
+        ) {
+            Err(err) => assert!(err.to_string().contains("Qdrant memory backend was removed in OmnesAgent")),
+            Ok(_) => panic!("expected Qdrant construction to fail"),
+        }
     }
 
     #[test]

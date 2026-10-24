@@ -58,7 +58,7 @@ const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 
 const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "qdrant",
-    label: "Qdrant — vector database for semantic search via [memory.qdrant]",
+    label: "Qdrant — legacy backend removed in favor of ob2h",
     auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,
