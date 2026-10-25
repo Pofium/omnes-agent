@@ -7864,6 +7864,54 @@ async fn process_channel_message_body(
                             .await
                         {
                             Ok(()) => true,
+                            Err(e)
+                                if e
+                                    .downcast_ref::<omnesagent_api::channel::FinalizePartialDelivery>(
+                                    )
+                                    .is_some() =>
+                            {
+                                // The channel already posted part of the chunked
+                                // final answer and could not finish. Resending the
+                                // full answer here would duplicate the delivered
+                                // prefix, so accept degraded delivery instead of
+                                // restarting from chunk zero.
+                                let delivered = e
+                                    .downcast_ref::<omnesagent_api::channel::FinalizePartialDelivery>()
+                                    .map(|p| p.delivered)
+                                    .unwrap_or(0);
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Note
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"delivered_chunks": delivered})),
+                                    "Final answer partially delivered; not resending to avoid duplicating the accepted prefix"
+                                );
+                                true
+                            }
+                            Err(e)
+                                if e
+                                    .downcast_ref::<omnesagent_api::channel::FinalizeUndelivered>()
+                                    .is_some() =>
+                            {
+                                // Nothing was delivered and the channel asked us
+                                // not to send again yet (e.g. a flood limit).
+                                // Resending would only extend the penalty, and
+                                // the reply must not be reported as sent.
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Fail
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Final answer not delivered; not resending"
+                                );
+                                false
+                            }
                             Err(e) => {
                                 ::omnesagent_log::record!(
                                     WARN,
