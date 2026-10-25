@@ -1190,9 +1190,83 @@ pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
 
     let manifest = SopManifest::from_sop(sop);
     let toml_content = toml::to_string_pretty(&manifest)?;
-    std::fs::write(sop_dir.join("SOP.toml"), toml_content)?;
-    std::fs::write(sop_dir.join("SOP.md"), render_steps(&sop.steps))?;
+    write_file_atomic(&sop_dir.join("SOP.toml"), &toml_content)?;
+    write_file_atomic(&sop_dir.join("SOP.md"), &render_steps(&sop.steps))?;
 
+    Ok(())
+}
+
+/// Replace a file's contents atomically: stage a sibling temp file, flush it
+/// to disk, then rename it over the target. Readers see either the old
+/// contents or the new ones, never a half-written file, and a reader holding
+/// the target open does not stop the replace on any platform.
+fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_file_atomic_detailed(path, contents).map_err(AtomicWriteError::into_inner)
+}
+
+#[derive(Debug)]
+enum AtomicWriteError {
+    NotPublished(anyhow::Error),
+    PublishedNotFlushed(anyhow::Error),
+}
+
+impl AtomicWriteError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::NotPublished(e) | Self::PublishedNotFlushed(e) => e,
+        }
+    }
+}
+
+fn write_file_atomic_detailed(path: &Path, contents: &str) -> Result<(), AtomicWriteError> {
+    use std::io::Write as _;
+
+    let Some(dir) = path.parent() else {
+        return Err(AtomicWriteError::NotPublished(anyhow::Error::msg(format!(
+            "cannot write '{}': no parent directory",
+            path.display()
+        ))));
+    };
+
+    let stage = || -> Result<tempfile::NamedTempFile> {
+        let mut tmp = tempfile::Builder::new().make_in(dir, create_staging_file)?;
+        tmp.write_all(contents.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        if let Ok(existing) = std::fs::metadata(path) {
+            tmp.as_file().set_permissions(existing.permissions())?;
+        }
+        Ok(tmp)
+    };
+    let mut staged = stage()
+        .map_err(AtomicWriteError::NotPublished)?
+        .into_temp_path();
+    std::fs::rename(&staged, path)
+        .map_err(|e| AtomicWriteError::NotPublished(anyhow::Error::new(e)))?;
+    staged.disable_cleanup(true);
+    sync_dir(dir).map_err(AtomicWriteError::PublishedNotFlushed)
+}
+
+fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    use anyhow::Context as _;
+
+    std::fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("synchronizing directory {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1579,6 +1653,29 @@ mod tests {
         let parsed = parse_steps(&rendered);
 
         assert_eq!(parsed, vec![step, terminal]);
+    }
+
+    fn named_sop(name: &str, title: &str) -> Sop {
+        let mut sop = authoring_sop(vec![titled_step(1, title)]);
+        sop.name = name.into();
+        sop
+    }
+
+    #[test]
+    fn a_save_replaces_files_a_reader_holds_open() {
+        let root = tempfile::tempdir().unwrap();
+        save_sop(root.path(), &named_sop("held", "Old step")).unwrap();
+        let sop_dir = root.path().join("held");
+        let _held_manifest = std::fs::File::open(sop_dir.join("SOP.toml")).unwrap();
+        let mut held_steps = std::fs::File::open(sop_dir.join("SOP.md")).unwrap();
+
+        save_sop(root.path(), &named_sop("held", "New step"))
+            .expect("an open reader must not stop the save");
+
+        let old_steps = std::io::read_to_string(&mut held_steps).unwrap();
+        assert!(old_steps.contains("Old step"), "{old_steps}");
+        let loaded = load_sop_by_name(root.path(), "held", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.steps[0].title, "New step");
     }
 
     #[test]
