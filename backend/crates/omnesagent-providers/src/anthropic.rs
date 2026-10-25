@@ -2443,14 +2443,19 @@ impl AnthropicModelProvider {
                     return;
                 }
                 "error" => {
-                    let msg = event
-                        .get("error")
+                    let error = event.get("error");
+                    let msg = error
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown streaming error");
-                    let _ = tx
-                        .send(Err(StreamError::ModelProvider(msg.to_string())))
-                        .await;
+                    // Carry the machine-readable type (`overloaded_error`,
+                    // `rate_limit_error`, ...) so downstream retry
+                    // classification can match on it.
+                    let msg = match error.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
+                        Some(error_type) => format!("{error_type}: {msg}"),
+                        None => msg.to_string(),
+                    };
+                    let _ = tx.send(Err(StreamError::ModelProvider(msg))).await;
                     return;
                 }
                 _ => {}
@@ -8702,6 +8707,64 @@ data: {\"type\":\"message_stop\"}\n\n";
                 .expect("second payload must be a JSON object");
         assert_eq!(second["thinking"], "");
         assert_eq!(second["signature"], "sigB");
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_carries_error_type() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "overloaded_error: Overloaded",
+                    "the machine-readable type must prefix the message so retry classification can match it"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_error_frame_without_type_keeps_message() {
+        use std::io::Cursor;
+
+        let bytes: &[u8] = b"event: error\n\
+data: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+
+        let mut last_err = None;
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            if let Err(err) = ev {
+                last_err = Some(err);
+            }
+        }
+        match last_err.expect("error frame must emit a StreamError") {
+            StreamError::ModelProvider(msg) => {
+                assert_eq!(
+                    msg, "Overloaded",
+                    "message must be unchanged when the type is absent"
+                );
+            }
+            other => panic!("expected ModelProvider error, got {other:?}"),
+        }
     }
 
     #[test]
