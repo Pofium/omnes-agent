@@ -32,10 +32,13 @@ pub struct SteeringPosture {
 /// between takes effect.
 pub type SteeringAdmit = Box<dyn Fn() -> SteeringAdmission + Send + Sync>;
 
+use omnesagent_api::ingress::IngressContext;
+
 /// One mid-turn steering message.
 pub struct SteeringInput {
     text: String,
     admit: Option<SteeringAdmit>,
+    ingress: Option<IngressContext>,
 }
 
 impl SteeringInput {
@@ -46,6 +49,7 @@ impl SteeringInput {
         Self {
             text: text.into(),
             admit: None,
+            ingress: None,
         }
     }
 
@@ -54,7 +58,20 @@ impl SteeringInput {
         Self {
             text: text.into(),
             admit: Some(admit),
+            ingress: None,
         }
+    }
+
+    /// Attach producer-stamped ingress facts independently of live
+    /// authorization. Absent facts never inherit the enclosing turn.
+    #[must_use]
+    pub fn with_ingress(mut self, ingress: IngressContext) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+
+    pub fn ingress(&self) -> Option<&IngressContext> {
+        self.ingress.as_ref()
     }
 
     pub fn text(&self) -> &str {

@@ -80,7 +80,7 @@ use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
 };
-use crate::security::ingress::{IngressPolicy, ingress_policy};
+use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -382,7 +382,28 @@ impl<'a> TurnState<'a> {
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+/// The Agent wrapper admits steering before history insertion. Admit only
+/// the original user message, or skip admission on subsequent rounds.
+pub(crate) enum InitialIngressSubject<'a> {
+    Original(&'a str),
+    AlreadyAdmitted,
+}
+
+pub(crate) async fn run_tool_call_loop_with_initial_ingress(
+    p: ToolLoop<'_>,
+    subject: InitialIngressSubject<'_>,
+) -> Result<String> {
+    run_tool_call_loop_impl(p, Some(subject)).await
+}
+
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    run_tool_call_loop_impl(p, None).await
+}
+
+async fn run_tool_call_loop_impl<'a>(
+    mut p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -451,13 +472,20 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
-    let p1_text = turn_state
-        .history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
-    match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
+    let p1_text = match &initial_ingress {
+        Some(InitialIngressSubject::Original(text)) => Some(*text),
+        Some(InitialIngressSubject::AlreadyAdmitted) => None,
+        None => Some(
+            turn_state
+                .history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map_or("", |m| m.content.as_str()),
+        ),
+    };
+    if let Some(p1_text) = p1_text {
+        match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
         // DEFAULT — the only arm reachable under the default policy. Proceed
         // into the loop exactly as today.
         IngressDecision::Loop => {}
@@ -476,13 +504,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 &[("reason", reason.as_str())],
             ));
         }
+        }
     }
 
     // Per-turn tool-output compression (Triage Router wiring): the intent
     // classified from the triggering user message narrows the model-family
     // policy, instead of every tool result being compressed by family
     // defaults regardless of conversational context.
-    let triage_decision = crate::agent::orchestrator::classify_message(p1_text);
+    let triage_text = p1_text.unwrap_or("");
+    let triage_decision = crate::agent::orchestrator::classify_message(triage_text);
     let compression_policy = crate::agent::orchestrator::narrow_by_family(
         crate::agent::orchestrator::compression_policy_for_intent(triage_decision.intent),
         omnesagent_compression::ModelFamily::detect_from_name(&model),
@@ -500,10 +530,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 payload_json: serde_json::json!({
                     "decision": "loop",
                     "intent": triage_decision.intent.as_str(),
-                    "query_preview": if p1_text.len() > 100 { &p1_text[..100] } else { p1_text },
+                    "query_preview": if triage_text.len() > 100 { &triage_text[..100] } else { triage_text },
                 })
                 .to_string(),
-                tokens_used: (p1_text.len() + 3) / 4,
+                tokens_used: (triage_text.len() + 3) / 4,
                 duration_us: 15_000,
                 created_at: chrono::Utc::now().to_rfc3339(),
             })
@@ -684,8 +714,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 SteeringAdmission::Admitted(posture) if posture == SteeringPosture::default() => {}
                 _ => continue,
             }
-            let steering_message = steering_input.into_text();
-            match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
+            match steering_policy(
+                steering_input.text(),
+                steering_input.ingress(),
+                &ingress_policy_cfg,
+            ) {
                 // DEFAULT — append the injection to history exactly as today.
                 IngressDecision::Loop => {}
                 // Phase 3: frame as untrusted data; proceed as Loop until
@@ -701,7 +734,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // (do not append it) when it is.
                 IngressDecision::Drop { .. } => continue,
             }
-            let msg = ChatMessage::user(steering_message);
+            let msg = ChatMessage::user(steering_input.into_text());
             turn_state.push_dual(msg);
         }
 

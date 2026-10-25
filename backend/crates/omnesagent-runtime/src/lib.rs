@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(
     clippy::to_string_in_format_args,
     clippy::useless_format,

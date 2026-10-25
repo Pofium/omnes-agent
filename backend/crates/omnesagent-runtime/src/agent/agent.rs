@@ -7,6 +7,8 @@ use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
+use crate::security::ingress::{IngressPolicy, steering_policy};
+use omnesagent_api::ingress::IngressDecision;
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
@@ -1134,6 +1136,13 @@ impl Agent {
                 return prepared;
             }
             for input in batch {
+                match steering_policy(input.text(), input.ingress(), &IngressPolicy::default()) {
+                    IngressDecision::Drop { .. } => continue,
+                    IngressDecision::Loop | IngressDecision::Annotate { .. } => {}
+                    IngressDecision::Gate { .. } => {
+                        // SOP diversion is not wired yet; preserve Loop behavior.
+                    }
+                }
                 if !self.admit_steering_input(&input, turn_id) {
                     continue;
                 }
@@ -3119,11 +3128,17 @@ impl Agent {
                 }
             };
             round_added.extend(steering_messages);
+            let initial_ingress_subject = if round == 0 {
+                crate::agent::turn::InitialIngressSubject::Original(user_message)
+            } else {
+                crate::agent::turn::InitialIngressSubject::AlreadyAdmitted
+            };
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                    crate::agent::turn::run_tool_call_loop_with_initial_ingress(
+                        crate::agent::loop_::ToolLoop {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -3211,9 +3226,11 @@ impl Agent {
                                 }
                             })
                         }),
-                    }),
+                    },
+                    initial_ingress_subject,
                 ),
-            );
+            ),
+        );
             // Scope the provider-fallback task-local around the round so the
             // resilient wrapper's requested-vs-served record is visible here,
             // then read it immediately. Box before adding the prompt scope so
@@ -10394,6 +10411,253 @@ mod tests {
         }
         assert_steering_closed(&steering_tx, "its future being dropped");
         drop(steering_rx);
+    }
+
+    fn steering_context(
+        message_id: &str,
+        sender: &str,
+        transport: omnesagent_api::ingress::Transport,
+    ) -> omnesagent_api::ingress::IngressContext {
+        omnesagent_api::ingress::IngressContext {
+            message_id: Some(message_id.to_string()),
+            source_class: omnesagent_api::ingress::SourceClass::External,
+            sender: Some(sender.to_string()),
+            transport,
+            trust: omnesagent_api::ingress::TrustClass::Untrusted,
+            origin: omnesagent_api::ingress::TurnOrigin::Interactive,
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_admission_keeps_per_injection_context() {
+        let observations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer = Arc::new(CapturingObserver::default());
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer.clone())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let first_context =
+            steering_context("rpc-1", "actor-a", omnesagent_api::ingress::Transport::Rpc);
+        let second_context = steering_context(
+            "gateway-2",
+            "actor-b",
+            omnesagent_api::ingress::Transport::Gateway,
+        );
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::new("accepted-a").with_ingress(first_context.clone()),
+            )
+            .await
+            .expect("first steering message should enqueue");
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::with_admission(
+                    "drop-me",
+                    Box::new(|| {
+                        crate::agent::SteeringAdmission::Admitted(crate::agent::SteeringPosture {
+                            tool_ceiling: Some(Vec::new()),
+                            disable_principal_unaware_nested_tools: false,
+                        })
+                    }),
+                )
+                .with_ingress(second_context.clone()),
+            )
+            .await
+            .expect("second steering message should enqueue");
+        steering_tx
+            .send(crate::agent::SteeringInput::new("legacy".to_string()))
+            .await
+            .expect("legacy steering message should enqueue");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let outcome = crate::security::ingress::with_test_policy_probe(
+            observations.clone(),
+            Some("drop-me".to_string()),
+            agent.turn_streamed_with_steering_state(
+                "original",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn should succeed");
+
+        assert_eq!(
+            agent.tool_names(),
+            ["echo"],
+            "provenance-dropped steering must not narrow the session's tools"
+        );
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["accepted-a", "drop-me", "legacy", "original"],
+            "the wrapper must admit each injection, then the loop must admit only the original user"
+        );
+        assert_eq!(observations[0].ingress, Some(first_context));
+        assert_eq!(observations[1].ingress, Some(second_context));
+        assert!(observations[2].ingress.is_none());
+        assert_eq!(
+            observations[3].ingress,
+            Some(omnesagent_api::ingress::IngressContext::agent_direct())
+        );
+
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("original"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("accepted-a"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-me")),
+            "a dropped injection must not reach transcript history"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_drop_only_after_round_does_not_replay_model() {
+        let observations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        agent.config.resolved.max_tool_iterations = 2;
+
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let probe_observations = observations.clone();
+        let handle = omnesagent_spawn::spawn!(async move {
+            crate::security::ingress::with_test_policy_probe(
+                probe_observations,
+                Some("drop-late".to_string()),
+                agent.turn_streamed_with_steering_state(
+                    "original",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send(crate::agent::SteeringInput::new("drop-late".to_string()))
+                        .await
+                        .expect("late steering message should enqueue");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "draft");
+        assert_eq!(
+            seen_messages.lock().len(),
+            1,
+            "a late injection dropped at the wrapper must not trigger another model request"
+        );
+
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["original", "drop-late"]
+        );
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-late")),
+            "a late dropped injection must not reach transcript history"
+        );
     }
 
     #[tokio::test]

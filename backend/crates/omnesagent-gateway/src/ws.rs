@@ -29,6 +29,18 @@ use omnesagent_runtime::sop::approval::{
 /// channel-side default on `TelegramConfig::approval_timeout_secs`.
 const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
+fn gateway_steering_input(content: String) -> omnesagent_runtime::agent::SteeringInput {
+    omnesagent_runtime::agent::SteeringInput::new(content).with_ingress(omnesagent_api::ingress::IngressContext {
+        message_id: None,
+        source_class: omnesagent_api::ingress::SourceClass::External,
+        sender: None,
+        transport: omnesagent_api::ingress::Transport::Gateway,
+        trust: omnesagent_api::ingress::TrustClass::Untrusted,
+        origin: omnesagent_api::ingress::TurnOrigin::Interactive,
+    })
+}
+
+
 /// Single ingress identity for gateway WebSocket turns.
 ///
 /// This name is used in three places that MUST agree:
@@ -1208,7 +1220,7 @@ async fn process_chat_message(
                                 let _ = sender.send(Message::Text(err.to_string().into())).await;
                                 continue;
                             }
-                            match steering_tx.try_send(content.into()) {
+                            match steering_tx.try_send(gateway_steering_input(content)) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     let err = serde_json::json!({
