@@ -63,12 +63,11 @@
 - `e8627d2e8` (#11201) — сериализация file_edit+file_write в одном batch (гонка read-modify-write теряет правки) [ВЫПОЛНЕНО: `4b569cf33`].
 - `2d85371f3` (base) — preserve string arguments при fallback parsing [ВЫПОЛНЕНО: `f1359b99b`].
 
-### 4.3 Стримы и надёжность провайдеров
-- `f72e4d656` (#10442) — **OpenRouter стрим умирает по request timeout** (наш http_client() вешает timeout на весь запрос — баг жив).
-- `9d3fd8db0`+`2d4bed5b7` (#10803,#11170) — retry-ядро reliable.rs: retry budget single-candidate recovery, overload-классификация, retry до send.
-- `2eb7df78b` (#10886) — timeout_secs → streaming idle floor 300s.
-- `9862c149a`+`e66c219e6` (#10397,#10566) — **MCP token blowup** (CallToolResult дублировал payload) + materialization картинок.
-
+### 4.3 Стримы и надёжность провайдеров [ВЫПОЛНЕНО]
+- `f72e4d656` (#10442) — **OpenRouter стрим умирает по request timeout** [ВЫПОЛНЕНО: `136906d35`].
+- `9d3fd8db0`+`2d4bed5b7` (#10803,#11170) — retry-ядро reliable.rs: retry budget single-candidate recovery, overload-классификация, retry до send [ВЫПОЛНЕНО: `20e330911`, `d737e042d`].
+- `2eb7df78b` (#10886) — timeout_secs → streaming idle floor 300s [ВЫПОЛНЕНО: `8181da07e`].
+- `9862c149a`+`e66c219e6` (#10397,#10566) — **MCP token blowup** (CallToolResult дублировал payload) + materialization картинок [ВЫПОЛНЕНО: `fe93ab07c`, `624ba61b5`].
 ### 4.4 Steering и turn-цикл (адаптировать вокруг нашего Triage Router)
 - `3b8ed46fc` (#11617) — **close steering channel при выходе** (поздние сообщения теряются — воспроизводимая потеря).
 - `4f41bfa61`+`9ce12530b`+`2125a1301` (#11725,#11181,#11132) — доставка steering на следующем шаге цикла (yield-after-tool-round). Не тащить upstream-механику целиком — встроить идею в наш цикл.
