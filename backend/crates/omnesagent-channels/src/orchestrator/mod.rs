@@ -794,21 +794,32 @@ fn followup_thread_id(msg: &omnesagent_api::channel::ChannelMessage) -> Option<S
     }
 }
 
+/// Encodes the conversation scope tuple canonically using length-prefixed
+/// components to prevent boundary collisions between adjacent components
+/// (e.g., `#room_` + `alice` vs `#room` + `_alice`). Both `Sender` and
+/// `ReplyTarget` variants use the same injective representation.
 fn interruption_scope_key(msg: &omnesagent_api::channel::ChannelMessage) -> String {
-    match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
-        (omnesagent_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
-            sanitize_session_key(&format!("{}_{}", channel_scope(msg), scope))
-        }
-        (omnesagent_api::channel::ChannelConversationScope::ReplyTarget, None) => {
-            sanitize_session_key(&format!("{}_{}", channel_scope(msg), msg.reply_target))
-        }
-        (omnesagent_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, msg.sender, scope
+    let tag = match msg.conversation_scope {
+        omnesagent_api::channel::ChannelConversationScope::Sender => "sender",
+        omnesagent_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
+    };
+    let ch = channel_scope(msg);
+    let target = &msg.reply_target;
+    let sender = &msg.sender;
+    match msg.interruption_scope_id.as_deref() {
+        Some(scope) => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}:{}:{scope}",
+            ch.len(),
+            target.len(),
+            sender.len(),
+            scope.len()
         ),
-        (omnesagent_api::channel::ChannelConversationScope::Sender, None) => {
-            format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
-        }
+        None => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}",
+            ch.len(),
+            target.len(),
+            sender.len()
+        ),
     }
 }
 
@@ -26728,7 +26739,10 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_history_key(&msg),
             "wecom_ws_work_group--room-1"
         );
-        assert_eq!(interruption_scope_key(&msg), "wecom_ws_work_group--room-1");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "reply_target:13:wecom_ws.work:13:group--room-1:14:omnesagent_user:13:group--room-1"
+        );
     }
 
     #[test]
@@ -34232,15 +34246,19 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:6:matrix:4:room:5:alice"
+        );
 
+        // Empty alias is treated like no alias by channel_scope.
         let empty_alias_msg = omnesagent_api::channel::ChannelMessage {
             channel_alias: Some(String::new()),
             ..msg
         };
         assert_eq!(
             interruption_scope_key(&empty_alias_msg),
-            "matrix_room_alice"
+            "sender:6:matrix:4:room:5:alice"
         );
     }
 
@@ -34261,7 +34279,10 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:6:matrix:4:room:5:alice:8:$thread1"
+        );
     }
 
     #[test]
@@ -34282,7 +34303,246 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:5:slack:4:C123:5:alice"
+        );
+    }
+
+    #[test]
+    fn interruption_scope_key_keeps_listeners_apart_when_underscores_collide() {
+        // Without length-prefixed canonical encoding, `slack.work` + `room_x` and `slack.work_room` + `x`
+        // could collide across component boundaries.
+        let scoped = |alias: &str, reply_target: &str| omnesagent_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: reply_target.into(),
+            content: "hi".into(),
+            channel: "slack".into(),
+            channel_alias: Some(alias.into()),
+            timestamp: 0,
+            thread_ts: Some("1234567890.000100".into()),
+            interruption_scope_id: Some("1234567890.000100".into()),
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+
+        let short_alias = interruption_scope_key(&scoped("work", "room_x"));
+        let long_alias = interruption_scope_key(&scoped("work_room", "x"));
+
+        assert_eq!(
+            short_alias,
+            "sender:10:slack.work:6:room_x:5:alice:17:1234567890.000100"
+        );
+        assert_eq!(
+            long_alias,
+            "sender:15:slack.work_room:1:x:5:alice:17:1234567890.000100"
+        );
+        assert_ne!(short_alias, long_alias);
+    }
+
+    #[test]
+    fn interruption_scope_key_prevents_component_boundary_collision() {
+        let irc_msg =
+            |target: &str, sender: &str, scope: omnesagent_api::channel::ChannelConversationScope| {
+                omnesagent_api::channel::ChannelMessage {
+                    id: "1".into(),
+                    sender: sender.into(),
+                    reply_target: target.into(),
+                    content: "hi".into(),
+                    channel: "irc".into(),
+                    channel_alias: Some("default".into()),
+                    timestamp: 0,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    conversation_scope: scope,
+                    attachments: vec![],
+                    subject: None,
+                    ..Default::default()
+                }
+            };
+
+        // Sender scope variants
+        let sender_room_underscore = irc_msg(
+            "#room_",
+            "alice",
+            omnesagent_api::channel::ChannelConversationScope::Sender,
+        );
+        let sender_user_underscore = irc_msg(
+            "#room",
+            "_alice",
+            omnesagent_api::channel::ChannelConversationScope::Sender,
+        );
+        assert_eq!(
+            interruption_scope_key(&sender_room_underscore),
+            "sender:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&sender_user_underscore),
+            "sender:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&sender_user_underscore)
+        );
+
+        // ReplyTarget scope variants
+        let reply_room_underscore = irc_msg(
+            "#room_",
+            "alice",
+            omnesagent_api::channel::ChannelConversationScope::ReplyTarget,
+        );
+        let reply_user_underscore = irc_msg(
+            "#room",
+            "_alice",
+            omnesagent_api::channel::ChannelConversationScope::ReplyTarget,
+        );
+        assert_eq!(
+            interruption_scope_key(&reply_room_underscore),
+            "reply_target:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&reply_user_underscore),
+            "reply_target:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&reply_room_underscore),
+            interruption_scope_key(&reply_user_underscore)
+        );
+
+        // Cross-scope: Sender vs ReplyTarget with identical components must never collide
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&reply_room_underscore)
+        );
+
+        // Leading and trailing underscores across all boundaries:
+        // 1. Channel scope boundary
+        let ch_underscore = omnesagent_api::channel::ChannelMessage {
+            channel: "irc_default".into(),
+            channel_alias: None,
+            reply_target: "room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        let target_underscore = omnesagent_api::channel::ChannelMessage {
+            channel: "irc".into(),
+            channel_alias: None,
+            reply_target: "_default_room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            interruption_scope_key(&ch_underscore),
+            interruption_scope_key(&target_underscore)
+        );
+
+        // 2. Sender vs scope_id boundary
+        let mut sender_underscore_trailing = sender_room_underscore.clone();
+        sender_underscore_trailing.sender = "alice_".into();
+        sender_underscore_trailing.interruption_scope_id = Some("thread".into());
+
+        let mut scope_underscore_leading = sender_room_underscore.clone();
+        scope_underscore_leading.sender = "alice".into();
+        scope_underscore_leading.interruption_scope_id = Some("_thread".into());
+
+        assert_ne!(
+            interruption_scope_key(&sender_underscore_trailing),
+            interruption_scope_key(&scope_underscore_leading)
+        );
+
+        // 3. None scope_id vs empty string scope_id vs non-empty scope_id
+        let mut msg_none = sender_room_underscore.clone();
+        msg_none.interruption_scope_id = None;
+
+        let mut msg_empty = sender_room_underscore.clone();
+        msg_empty.interruption_scope_id = Some("".into());
+
+        let mut msg_some = sender_room_underscore.clone();
+        msg_some.interruption_scope_id = Some("t".into());
+
+        assert_ne!(
+            interruption_scope_key(&msg_none),
+            interruption_scope_key(&msg_empty)
+        );
+        assert_ne!(
+            interruption_scope_key(&msg_none),
+            interruption_scope_key(&msg_some)
+        );
+        assert_ne!(
+            interruption_scope_key(&msg_empty),
+            interruption_scope_key(&msg_some)
+        );
+    }
+
+    /// Sibling scopes with boundary underscores (e.g. `(telegram.default, room_, alice)`
+    /// vs `(telegram.default, room, _alice)`) must not cancel each other's turn when /stop is sent.
+    #[tokio::test]
+    async fn message_dispatch_boundary_colliding_scopes_do_not_cancel_each_other() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            omnesagent_config::schema::Config::default(),
+            omnesagent_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<omnesagent_api::channel::ChannelMessage>(8);
+        let send_task = omnesagent_spawn::spawn!(async move {
+            // Scope A: (telegram.default, room_, alice) starts an in-flight turn
+            tx.send(omnesagent_api::channel::ChannelMessage {
+                id: "m1".into(),
+                sender: "alice".into(),
+                reply_target: "room_".into(),
+                content: "please think slowly".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+            // Scope B: (telegram.default, room, _alice) sends /stop while Scope A is in flight.
+            // Delimiter-escaped keys collapsed both to `telegram.default_room___alice`.
+            // Canonical length-prefixed keys keep them distinct so Scope A continues.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(omnesagent_api::channel::ChannelMessage {
+                id: "s1".into(),
+                sender: "_alice".into(),
+                reply_target: "room".into(),
+                content: "/stop".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let stop_no_task =
+            omnesagent_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("please think slowly")),
+            "Scope A turn must complete despite Scope B /stop: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.ends_with(&stop_no_task)),
+            "Scope B /stop must resolve to no task of its own: {sent:?}"
+        );
     }
 
     #[tokio::test]
