@@ -4058,10 +4058,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(StreamError::Http(super::stream_idle_error_message(
-                                &e,
-                                idle_timeout,
-                            ))))
+                            .send(Err(if e.is_connect() {
+                                StreamError::ConnectFailed(super::stream_idle_error_message(
+                                    &e,
+                                    idle_timeout,
+                                ))
+                            } else {
+                                StreamError::Http(super::stream_idle_error_message(
+                                    &e,
+                                    idle_timeout,
+                                ))
+                            }))
                             .await;
                         return;
                     }
@@ -4238,10 +4245,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::stream_idle_error_message(
-                            &e,
-                            idle_timeout,
-                        ))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))
+                        } else {
+                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                        }))
                         .await;
                     return;
                 }
@@ -4360,10 +4371,14 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::stream_idle_error_message(
-                            &e,
-                            idle_timeout,
-                        ))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))
+                        } else {
+                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                        }))
                         .await;
                     return;
                 }
@@ -11163,6 +11178,109 @@ mod tests {
             vec!["user", "assistant"]
         );
         assert_eq!(stripped[1].content, "Here are the results");
+    }
+
+    /// A streaming request to a closed local port fails at connect on the
+    /// first hop: the adapter must tag the transport failure as
+    /// `ConnectFailed` so Reliable can retry the entry.
+    #[tokio::test]
+    async fn connect_failed_tagged_on_connect_failure_to_closed_port() {
+        use futures_util::StreamExt as _;
+
+        // Take a port and drop the listener: nothing is listening there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions::new(true),
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port stream must fail immediately");
+        match first.expect("closed-port stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => {
+                panic!("connect failure must be tagged ConnectFailed, got {other:?}")
+            }
+            Ok(_) => panic!("a closed port cannot produce stream events"),
+        }
+    }
+
+    /// An accepted HTTP 200 stream whose SSE body carries an error frame is
+    /// a body-level failure: the send succeeded, so nothing in it may be
+    /// tagged `ConnectFailed`, whatever the frame text says. (The
+    /// chat-completions parser currently swallows such a frame without
+    /// surfacing an error; the pin is that it can never become a
+    /// connect-failed transport verdict either way.)
+    #[tokio::test]
+    async fn connect_failed_not_tagged_on_accepted_stream_body_error() {
+        use axum::response::IntoResponse;
+        use axum::{Router, http::header, routing::post};
+        use futures_util::StreamExt as _;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"error\":{\"message\":\"failed to resolve backend\"}}\n\n",
+                )
+                    .into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions::new(true),
+        );
+        let mut items = Vec::new();
+        while let Some(item) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("accepted stream must not hang")
+        {
+            items.push(item);
+        }
+        server.abort();
+        assert!(
+            !items.is_empty(),
+            "an accepted stream must yield at least its final event"
+        );
+        for item in items {
+            if let Err(err) = item {
+                assert!(
+                    !matches!(err, StreamError::ConnectFailed(_)),
+                    "an accepted stream's body error must not be tagged ConnectFailed: {err:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

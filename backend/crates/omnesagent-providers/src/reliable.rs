@@ -5,7 +5,7 @@ use super::dispatch::{
     stream_with_exact_dispatch_route, with_exact_dispatch_route,
 };
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult,
     TokenUsage,
 };
 use async_trait::async_trait;
@@ -73,6 +73,14 @@ pub(crate) struct ReliableCallAccounting {
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
     stream_recovery_failure: Option<ProviderErrorDiagnostic>,
+    /// True iff the recorded stream failure carries a transport-reported
+    /// connect failure: some error in the chain downcasts to
+    /// `StreamError::ConnectFailed`, which only a send site emits. This
+    /// grant matches the non-streaming retry loop, which already retries
+    /// connect failures on the same entry; the redirect limit on that
+    /// variant applies equally to both paths. Provider error text never
+    /// sets this.
+    stream_recovery_connect_failed: bool,
 }
 
 impl ReliableCallAccounting {
@@ -185,9 +193,25 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
 
 /// Preserve the classified stream failure while runtime attempts eligible
 /// non-streaming recovery candidates.
+///
+/// The diagnostic is presentation-only. The recovery exception is decided
+/// from the error chain itself: it is granted only when some cause
+/// downcasts to `StreamError::ConnectFailed`, which a streaming adapter
+/// emits at the send site on a transport-reported connect failure. The
+/// exception matches the non-streaming retry loop, which already retries
+/// connect failures on the same entry; the redirect limit on that variant
+/// applies equally to both paths. Provider error text never grants it.
 pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
+    let stream_recovery_connect_failed = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<StreamError>(),
+            Some(StreamError::ConnectFailed(_))
+        )
+    });
     let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
-        accounting.lock().stream_recovery_failure = Some(provider_error_diagnostic(error));
+        let mut accounting = accounting.lock();
+        accounting.stream_recovery_connect_failed = stream_recovery_connect_failed;
+        accounting.stream_recovery_failure = Some(provider_error_diagnostic(error));
     });
 }
 
@@ -1943,13 +1967,24 @@ impl ReliableModelProvider {
     }
 
     /// Admit an entry with its configured retry budget, except for the exact
-    /// stream-failed entry, which is skipped to avoid replaying it — with two
-    /// exceptions: the semantic-empty entry (when the budget permits it,
-    /// granted as a single attempt), and the single-candidate case (no other
-    /// candidate exists, so a non-stream retry of the same entry is recovery,
-    /// not replay, and it carries the full configured budget). When both
-    /// apply to the same entry, semantic-empty wins and its grant stays a
-    /// single attempt — never two.
+    /// stream-failed entry, which is skipped to avoid replaying it — with
+    /// three exceptions, each granting non-stream attempt(s) of the same
+    /// entry before the next candidate is tried:
+    ///
+    /// 1. The semantic-empty entry, when the configured budget permits it:
+    ///    granted as a single attempt.
+    /// 2. The connect-failed entry: when the transport reports a connect
+    ///    failure at the stream send site (`StreamError::ConnectFailed`),
+    ///    nothing was delivered, so the entry is retried with its
+    ///    configured budget even when another candidate exists.
+    /// 3. The single-candidate case: no other candidate exists, so a
+    ///    non-stream retry of the same entry is recovery, not replay, and
+    ///    it carries the full configured budget.
+    ///
+    /// When more than one exception applies to the same entry,
+    /// semantic-empty wins (it came from a completed response, so it
+    /// cannot be a connect failure) and its grant stays a single attempt,
+    /// never two.
     fn effective_retry_limit(
         &self,
         model_slot: usize,
@@ -1963,9 +1998,18 @@ impl ReliableModelProvider {
                 let exact_failed_entry = accounting.stream_resume_after.is_some_and(|failed| {
                     model_slot == failed.model_slot && entry_index == failed.entry_index
                 });
+                // Connect-failed is a transport fact, not an error-text
+                // reading: the flag is set only when the recorded failure
+                // carries `StreamError::ConnectFailed`, which adapters emit
+                // at the send site on a transport-reported connect failure.
+                // A provider's own error text (an SSE error frame on an
+                // accepted 200 response, an API error body) never grants
+                // this; unknown provenance keeps the skip.
+                let connect_failed = accounting.stream_recovery_connect_failed;
                 let decision = Self::stream_recovery_decision(
                     max_retries,
                     exact_failed_entry,
+                    connect_failed,
                     accounting.stream_recovery_semantic_empty_permission,
                     has_other_candidate,
                 );
@@ -1974,10 +2018,13 @@ impl ReliableModelProvider {
                         if exact_failed_entry {
                             // Consume one-shot recovery grants so each fires at
                             // most once. Clearing the resume marker merges the
-                            // single-candidate grant into the semantic-empty
-                            // attempt when both apply.
+                            // single-candidate and connect-failed grants into
+                            // the semantic-empty attempt when more than one
+                            // applies, and keeps the connect-failed grant
+                            // from firing twice in one call. The next
+                            // candidate keeps its own ordinary budget.
                             accounting.stream_recovery_semantic_empty_permission = false;
-                            if !has_other_candidate {
+                            if !has_other_candidate || connect_failed {
                                 accounting.stream_resume_after = None;
                             }
                         }
@@ -1996,16 +2043,29 @@ impl ReliableModelProvider {
     fn stream_recovery_decision(
         max_retries: u32,
         exact_failed_entry: bool,
+        connect_failed: bool,
         semantic_empty_permission: bool,
         has_other_candidate: bool,
     ) -> RetryDecision {
         if !exact_failed_entry {
             return RetryDecision::Admit(max_retries);
         }
-        // Semantic-empty wins when both exceptions apply (see
-        // `effective_retry_limit` for the merged single-attempt consumption).
+        // Semantic-empty wins when more than one exception applies (a
+        // semantic-empty failure came from a completed response, so it can
+        // never be a connect failure; it stays first so the order reads
+        // right). See `effective_retry_limit` for the merged single-attempt
+        // consumption.
         if max_retries > 0 && semantic_empty_permission {
             return RetryDecision::Admit(0);
+        }
+        // Connect failure on the stream send: the exception matches the
+        // non-streaming retry loop, which already retries connect failures
+        // on the same entry; the redirect limit on the variant applies
+        // equally to both paths. The grant carries the configured budget
+        // even when another candidate exists (a zero budget still means
+        // exactly one attempt).
+        if connect_failed {
+            return RetryDecision::Admit(max_retries);
         }
         // Single-candidate stream failure: no alternative entry exists, so a
         // non-stream retry of the same entry is recovery, not replay, and it
@@ -9643,6 +9703,126 @@ mod tests {
         mode: StreamingRecordMode,
     }
 
+    /// The stream errors the connect-failed recovery tests drive, each
+    /// matching the exact shape its adapter emits.
+    #[derive(Clone, Copy)]
+    enum ConfiguredStreamError {
+        /// A transport connect failure at the send site, tagged by the
+        /// adapter as `StreamError::ConnectFailed` (the observed
+        /// connect-timeout chain).
+        ConnectFailed,
+        /// B1's counterexample: an accepted HTTP 200 stream whose SSE error
+        /// frame says `failed to resolve backend`, forwarded as a plain
+        /// provider-side error.
+        AcceptedResolveBackend,
+        /// The observed connect-timeout text carried without the transport's
+        /// typed verdict.
+        UntaggedConnectTimeoutText,
+    }
+
+    impl ConfiguredStreamError {
+        fn emit(self) -> crate::traits::StreamError {
+            match self {
+                Self::ConnectFailed => crate::traits::StreamError::ConnectFailed(
+                    "error sending request for url (https://gateway.example.test/v1/messages):                      client error (Connect): operation timed out"
+                        .to_string(),
+                ),
+                Self::AcceptedResolveBackend => crate::traits::StreamError::ModelProvider(
+                    "api_error: failed to resolve backend".to_string(),
+                ),
+                Self::UntaggedConnectTimeoutText => crate::traits::StreamError::Http(
+                    "error sending request for url (https://gateway.example.test/v1/messages):                      client error (Connect): operation timed out"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+
+    /// Wrap a stream error the way the runtime's stream consumer hands it to
+    /// `record_stream_recovery_failure`: an outer message with the stream
+    /// error reachable as a chain cause.
+    fn runtime_stream_error_wrap(stream_error: crate::traits::StreamError) -> anyhow::Error {
+        anyhow::Error::new(stream_error).context("model_provider stream error")
+    }
+
+    /// Stream emits the configured error as its first item; non-streaming
+    /// chat counts calls, failing with an overload for the first
+    /// `chat_overload_failures` calls and then succeeding.
+    struct ConfiguredStreamErrorChatMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        stream_error_kind: ConfiguredStreamError,
+        chat_overload_failures: usize,
+    }
+
+    impl ::omnesagent_api::attribution::Attributable for ConfiguredStreamErrorChatMock {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Provider(
+                ::omnesagent_api::attribution::ProviderKind::Model(
+                    ::omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ConfiguredStreamErrorChatMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ConfiguredStreamErrorChatMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(self.stream_error_kind.emit())]).boxed()
+        }
+    }
+
     struct StreamErrorNoChatReplayMock {
         stream_calls: Arc<AtomicUsize>,
         chat_calls: Arc<AtomicUsize>,
@@ -10655,32 +10835,364 @@ mod tests {
         );
     }
 
+    /// A stream failure carrying the transport's own connect-failed verdict
+    /// must hand the exact failed entry its non-streaming recovery attempt
+    /// before any other candidate is tried. The recorded error is the
+    /// stream error the mock actually emitted, wrapped the way the runtime
+    /// wraps it.
+    #[tokio::test]
+    async fn connect_failed_stream_recovery_retries_the_failed_entry_before_other_candidates() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::ConnectFailed,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        // The transport reported the connect failure, so the primary gets
+        // the non-streaming attempt and the backup is never called.
+        assert_eq!(response.unwrap().text.as_deref(), Some("must not replay"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The connect-failed grant carries the configured retry budget: the
+    /// failed entry sees exactly `max_retries + 1` non-streaming attempts
+    /// before the backup is reached, and the backup keeps its own ordinary
+    /// budget.
+    #[tokio::test(start_paused = true)]
+    async fn connect_failed_stream_recovery_exhausts_the_failed_entry_budget_before_the_backup() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::ConnectFailed,
+                        chat_overload_failures: usize::MAX,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            2_000,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// An accepted stream cannot buy the connect-failed grant: an SSE error
+    /// on a 200 response (B1's counterexample, `api_error: failed to
+    /// resolve backend`) is a provider-side error type, so the failed entry
+    /// keeps the multi-candidate skip and the backup serves instead.
+    #[tokio::test]
+    async fn stream_recovery_skips_accepted_stream_error_frame_text() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::AcceptedResolveBackend,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        // The frame's `resolve` wording still classifies as a DNS
+        // diagnostic for presentation, but the recorded type is a
+        // provider-side stream error, so the primary is never retried.
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Connect-timeout text alone no longer grants the exception: the
+    /// observed connect-timeout message, recorded without the transport's
+    /// typed connect-failed verdict, keeps the multi-candidate skip.
+    #[tokio::test]
+    async fn stream_recovery_skips_connect_timeout_text_without_typed_verdict() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::UntaggedConnectTimeoutText,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
-    fn stream_recovery_decision_matrix() {
+    fn single_candidate_recovery_decision_boundaries() {
+        // Non-failed entries always admit the configured budget.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, true, true),
+            ReliableModelProvider::stream_recovery_decision(0, false, false, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, false, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        // Semantic-empty wins with budget; without budget it stays skipped
+        // when another candidate exists.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, true, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true, true),
             RetryDecision::Skip
         );
+        // Single-candidate stream failure: recovery is not replay, so the
+        // failed entry carries the configured budget (admitting one attempt
+        // when that budget is zero). Merges with semantic-empty into the
+        // same single attempt when both grants apply at a zero budget.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, false),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, true, false),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true, false),
             RetryDecision::Admit(0)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, false, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false),
             RetryDecision::Admit(2)
         );
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(2, true, true, false),
+            ReliableModelProvider::stream_recovery_decision(2, true, false, true, false),
             RetryDecision::Admit(0)
         );
         // Multi-candidate without permission: skip the failed entry.
         assert_eq!(
-            ReliableModelProvider::stream_recovery_decision(0, true, false, true),
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, true),
             RetryDecision::Skip
+        );
+    }
+
+    #[test]
+    fn connect_failed_stream_recovery_decision_boundaries() {
+        // A connect failure admits the configured budget even when another
+        // candidate exists, exactly as the single-candidate case does (a
+        // zero budget still means exactly one attempt).
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, true),
+            RetryDecision::Admit(2)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false),
+            RetryDecision::Admit(2)
+        );
+        // A failure that reached the upstream keeps the multi-candidate
+        // skip when no other exception applies.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, true),
+            RetryDecision::Skip
+        );
+        // Semantic-empty still wins over the connect-failed grant and
+        // keeps its single attempt (a semantic-empty failure came from a
+        // completed response, so it can never be a connect failure).
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, true, true),
+            RetryDecision::Admit(0)
         );
     }
 

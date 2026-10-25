@@ -426,6 +426,18 @@ pub enum StreamError {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// The connection for the failing request hop could not be opened
+    /// (connect, TLS handshake or DNS), as reported by the transport at
+    /// the send site. For a request that followed no redirect, nothing
+    /// was delivered. A redirect-following client may already have
+    /// delivered an earlier hop; callers that must not re-send delivered
+    /// work cannot rely on this variant alone.
+    ///
+    /// The display text matches [`StreamError::Http`] so logs, diagnostics
+    /// and user-facing messages are unchanged.
+    #[error("HTTP error: {0}")]
+    ConnectFailed(String),
+
     #[error("JSON parse error: {0}")]
     Json(serde_json::Error),
 
