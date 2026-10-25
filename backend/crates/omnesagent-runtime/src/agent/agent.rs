@@ -453,6 +453,19 @@ pub struct StreamedTurnError {
     pub new_messages: Vec<ConversationMessage>,
 }
 
+/// Closes a lent steering receiver when dropped, so every exit from a
+/// steered turn (including the turn future being dropped) refuses later
+/// senders instead of accepting messages nobody will read.
+struct CloseSteeringOnExit<'a>(Option<&'a mut tokio::sync::mpsc::Receiver<String>>);
+
+impl Drop for CloseSteeringOnExit<'_> {
+    fn drop(&mut self) {
+        if let Some(rx) = self.0.as_deref_mut() {
+            rx.close();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<omnesagent_config::schema::Config>>,
@@ -2743,7 +2756,35 @@ impl Agent {
             .map_err(|err| err.error)
     }
 
+    /// Run one streamed turn that can take steering messages mid-turn.
+    ///
+    /// The steering receiver is closed on every exit: success, error,
+    /// cancellation, a response-cache hit, and the returned future being
+    /// dropped. The caller usually lends the receiver (&mut) and keeps it
+    /// alive after the turn, so without the close a late 	ry_send would
+    /// get Ok and the message would never be read. Closed, the sender sees
+    /// Closed and can send the text as an ordinary prompt instead.
     pub async fn turn_streamed_with_steering_state(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        let mut steering = CloseSteeringOnExit(steering_rx);
+        self.turn_streamed_with_steering_body(
+            user_message,
+            event_tx,
+            cancel_token,
+            steering.0.as_deref_mut(),
+        )
+        .await
+    }
+
+    /// Body of [Self::turn_streamed_with_steering_state]. The successful
+    /// finish closes the receiver itself before its last drain; every other
+    /// exit relies on the wrapper's guard.
+    async fn turn_streamed_with_steering_body(
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
@@ -3149,6 +3190,16 @@ impl Agent {
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
 
+                    // About to finish. Close first, then drain once
+                    // more: a sender whose message landed after the
+                    // drain above got Ok from 	ry_send, and
+                    // without this the turn would end and drop it.
+                    // Anything that slipped in before the close still
+                    // gets its round; a later sender sees Closed and
+                    // can fall back to an ordinary prompt.
+                    if let Some(rx) = steering_rx.as_deref_mut() {
+                        rx.close();
+                    }
                     let has_more_steering =
                         steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
                     if has_more_steering {
@@ -9814,10 +9865,14 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        // The receiver comes back out of the task alive, as it does for the
+        // gateway (which lends `&mut`): only an explicit close, not a drop,
+        // can make the late send below fail.
         let handle = omnesagent_spawn::spawn!(async move {
-            agent
+            let result = agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
-                .await
+                .await;
+            (result, steering_rx)
         });
 
         loop {
@@ -9833,11 +9888,18 @@ mod tests {
             }
         }
 
-        let outcome = handle
-            .await
-            .expect("turn task should finish")
-            .expect("steered turn should succeed");
+        let (outcome, _live_steering_rx) = handle.await.expect("turn task should finish");
+        let outcome = outcome.expect("steered turn should succeed");
         assert_eq!(outcome.response, "draftfinal");
+        // The turn has ended: a late steer must be refused visibly rather
+        // than accepted into a receiver nobody will drain again.
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a finished turn must close its steering channel"
+        );
 
         let new_chat_messages: Vec<_> = outcome
             .new_messages
@@ -9943,9 +10005,10 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
         let handle = omnesagent_spawn::spawn!(async move {
-            agent
+            let result = agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
-                .await
+                .await;
+            (result, steering_rx)
         });
 
         loop {
@@ -9961,10 +10024,15 @@ mod tests {
             }
         }
 
-        let err = handle
-            .await
-            .expect("turn task should finish")
-            .expect_err("second provider call should fail");
+        let (outcome, _live_steering_rx) = handle.await.expect("turn task should finish");
+        let err = outcome.expect_err("second provider call should fail");
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a turn that ends on a provider error must close its steering channel"
+        );
         assert_eq!(err.committed_response, "draft");
         assert!(
             err.new_messages.iter().any(|msg| {
@@ -9978,6 +10046,240 @@ mod tests {
             }),
             "accepted steering user message should still be returned after continuation failure"
         );
+    }
+
+    fn assert_steering_closed(
+        steering_tx: &tokio::sync::mpsc::Sender<String>,
+        exit: &str,
+    ) {
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a turn that ends by {exit} must close its steering channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_when_cancelled() {
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let calls = AtomicUsize::new(0);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(StreamingSteeringModelProvider {
+                seen_messages: Arc::new(Mutex::new(Vec::new())),
+                call_count: calls,
+                fail_on_call: None,
+                fail_chat_on_call: None,
+                fail_after_delta_on_call: None,
+                delay_chat_on_call: None,
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<String>(4);
+        let err = agent
+            .turn_streamed_with_steering_state(
+                "first",
+                event_tx,
+                Some(cancel),
+                Some(&mut steering_rx),
+            )
+            .await
+            .expect_err("a cancelled turn must return an error");
+        assert!(
+            err.error
+                .downcast_ref::<crate::agent::loop_::ToolLoopCancelled>()
+                .is_some(),
+            "the turn must end on the cancellation path, got: {}",
+            err.error
+        );
+        // `steering_rx` is still alive here; only an explicit close fails the send.
+        assert_steering_closed(&steering_tx, "cancellation");
+        drop(steering_rx);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_on_response_cache_hit() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            omnesagent_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let mut first = context_recovery_cache_agent(
+            tmp.path(),
+            cache.clone(),
+            first_calls.clone(),
+            "cached answer",
+            false,
+        );
+        let mut second = context_recovery_cache_agent(
+            tmp.path(),
+            cache,
+            second_calls.clone(),
+            "fresh answer",
+            false,
+        );
+
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (warm_tx, mut warm_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let warmed = first
+            .turn_streamed_with_steering_state("same request", event_tx_a, None, Some(&mut warm_rx))
+            .await
+            .expect("first turn should reach the provider and fill the cache");
+        assert_eq!(warmed.response, "cached answer");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        drop(warm_tx);
+
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<String>(4);
+        let hit = second
+            .turn_streamed_with_steering_state(
+                "same request",
+                event_tx_b,
+                None,
+                Some(&mut steering_rx),
+            )
+            .await
+            .expect("cache hit should succeed");
+        assert_eq!(
+            hit.response, "cached answer",
+            "the second turn must be served from the response cache"
+        );
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "a cache hit must not reach the provider"
+        );
+        assert_steering_closed(&steering_tx, "a response-cache hit");
+        drop(steering_rx);
+    }
+
+    struct GatedFinalCompletionProvider {
+        calls: Arc<AtomicUsize>,
+        started: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedFinalCompletionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("root-final".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<omnesagent_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started
+                .send(())
+                .await
+                .expect("final-completion test should still be observing the provider");
+            self.release.notified().await;
+            Ok(omnesagent_providers::ChatResponse {
+                text: Some("root-final".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::omnesagent_api::attribution::Attributable for GatedFinalCompletionProvider {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Provider(
+                ::omnesagent_api::attribution::ProviderKind::Model(
+                    ::omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GatedFinalCompletionProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_when_turn_future_is_dropped() {
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(GatedFinalCompletionProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                started: started_tx,
+                release: Arc::new(tokio::sync::Notify::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<String>(4);
+        {
+            let mut turn = Box::pin(agent.turn_streamed_with_steering_state(
+                "first",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ));
+            tokio::select! {
+                _ = &mut turn => panic!("the gated provider must hold the turn open"),
+                started = started_rx.recv() => {
+                    started.expect("provider should signal that the turn is in flight");
+                }
+            }
+            steering_tx
+                .try_send("while the turn runs".into())
+                .expect("a turn in flight must accept steering");
+            // Dropping `turn` here abandons it mid-provider-call, as a caller
+            // racing the turn against a disconnect would.
+        }
+        assert_steering_closed(&steering_tx, "its future being dropped");
+        drop(steering_rx);
     }
 
     #[tokio::test]
