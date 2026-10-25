@@ -96,16 +96,29 @@
 
 **DoD этапа 2:** все перечисленные PR закоммичены с тестами апстрима (адаптированными), parser-матрица (browser_open/xml/minimax/structured args) зелёная, prompt-cache A/B: повторный вызов той же сессии показывает cache-hit токены.
 
-## 5. Этап 3 — PORT-ADAPT средние (выравнивание с нашими особенностями)
+## 5. Этап 3 — PORT-ADAPT средние (выравнивание с нашими особенностями) — начат 25.10.2026
 
+### 5.1 Config-батч [5/7 ВЫПОЛНЕНО]
+- `ba23a8a2e` (#10612) детерминизм итерации провайдеров [ВЫПОЛНЕНО: `34bfdd6f2`]
+- `6ddfc6cbe` (#10686) openai-chat→openai миграция [ВЫПОЛНЕНО: `29253e39f`]
+- `09556e0ab` (#10589) max_image_size_mb default 20 [ВЫПОЛНЕНО: `5b04b89dc`; docs-часть пропущена — нет mdbook]
+- `1e1e092e4` (#11616) статические пути секций в macros [ВЫПОЛНЕНО: `4621ba990`]
+- `afc47d333` (#11370) lock data dir + resume splits [ВЫПОЛНЕНО: `46826fdba`; env-имена в тестах адаптированы OMNESAGENT_*]
+- `c813acfee` (#11191) nevis cleanup — **SKIP**: зависит от серии #8289 (у нас `deserialize_inert_nevis` из OIDC-серии отсутствует, Nevis — живая интеграция; retire удалил бы рабочий конфиг). Вернуть в Этап 4 вместе с решением по #8289.
+- `e16fd898b` (#11260) context budget unclamp — **SKIP (N/A)**: баг живёт в машинерии #9535 (`ResolvedContextLimits::legacy_fallback`), которая у нас не портирована; наш `effective_context_budget()` явный бюджет не зажимает.
+
+### 5.2 Skills/HTTP [3/3 ВЫПОЛНЕНО]
+- `7b84f9c80` (#11512) единый deadline на skill-HTTP (DNS вне reqwest timeout) [ВЫПОЛНЕНО: `4f02fb7eb`; 24 теста, ключ локали en/cli.ftl добавлен вручную, docs пропущены]
+- `96da19523` (#11804) GIT_TERMINAL_PROMPT=0 в open-skills sync [ВЫПОЛНЕНО: `ec4e6d873`]
+- `88be24ac4` (#11599) native_tools для всех compat-семейств [ВЫПОЛНЕНО: `6dc0973f2`; 17 тестов]
+
+### 5.3 Остальное (НЕ начато)
 - **Multimodal-кластер**: `d6899dfa1` (#10903 — tool-result картинки доезжают до модели), `8730e7b24` (#10088), `360bcaaf0` (#9819 pixel-валидация), `c1da9332c` (#11582 batch-evict), `4b87318df` (#11200 verbatim user text), `f42b095d9`, `fc4b4c0ea`, `9d268ffb2` — стыковать с нашим image_cache/relocate-фичей.
 - **Cost-цепочка**: `36a6f119c` (#11350 — наш `GLOBAL_COST_TRACKER: OnceLock` — тот же баг), `f1527d7e1`, `91958a0b7`, `9abe969b6`, `7007365f4` (#11692 — surface warn_at_percent).
-- **Config-батч (schema 1:1 → PORT-CLEAN внутри)**: `ba23a8a2e` (#10612 детерминизм итерации), `6ddfc6cbe` (#10686 openai-chat→openai), `1e1e092e4` (#11616 статические пути в macros), `c813acfee` (#11191 nevis cleanup), `afc47d333` (#11370), `09556e0ab` (#10589), `e16fd898b` (#11260 context budget), `0695c9f8f` если не сделан в этапе 2.
 - **Memory-кластер**: `6108618d1`+`3ed28c40b` (sqlite_permissions модуль), `6c23e02b6` (#10567 дата recall — слить с нашими trust/last_feedback_at), `18bc1fccc` (#10252 category-scoped grants), `72324ab20` (#11458).
-- **Skills/HTTP**: `7b84f9c80` (#11512 единый deadline — DNS вне reqwest timeout у нас в skill_http.rs:134), `96da19523` (#11804 GIT_TERMINAL_PROMPT=0), `88be24ac4` (#11599 native_tools).
 - **RPC-мелочи**: `61b0ec88b` (#11330 session/configure гонка), `083d05ff2` (#11452), `25d543835` (#11151 agent-param в memory/*), `59f21a316` (#11291), `5a2a6250a` (#10775).
-- **Провайдеры-мелочи**: `5ea5333c5`+`bab3fb4a7` (grok: резолв бинаря до spawn из workspace — наш TODO-зон; frame limits), `4244a30d2`+`4123877c9` (opencode session header), `88be24ac4`, `a647de344`, `3b61e23b5`, `5ee21b7d6`, `e941e0ca6` (#10519 llm_task alias-aware), `e8d2e5fc8` (#11350 model_switch note).
-- **Gateway/daemon-мелочи**: `996c9fa24` (#11083 webhook SOP drive), `49fa46bb1` (#10538 — обрыв WS не убивает ход; session_queue.rs чист), `fa31aee26` (#10637 WS-память на чужом провайдере), `fee19d41` (#11518 EOF ≠ решение оператора), `21fbd9538` (#10093 subprocess изоляция), `24938afc6`+`6c0b1f9ee` (tailscale supervise/report — чисто), `77ae057e0` (#10455), `23950c9a1` (#11901 graceful shutdown — крупный, можно отдельным PR).
+- **Провайдеры-мелочи**: `5ea5333c5`+`bab3fb4a7` (grok: резолв бинаря до spawn из workspace — наш TODO-зон; frame limits), `4244a30d2`+`4123877c9` (opencode session header), `3b61e23b5`, `5ee21b7d6`, `e941e0ca6` (#10519 llm_task alias-aware), `e8d2e5fc8` (#11350 model_switch note), `a647de344` (#10552).
+- **Gateway/daemon-мелочи**: `996c9fa24` (#11083 webhook SOP drive), `49fa46bb1` (#10538 — обрыв WS не убивает ход; session_queue.rs чист), `fa31aee26` (#10637 WS-память на чужом провайдере), `feea19d41` (#11518 EOF ≠ решение оператора), `21fbd9538` (#10093 subprocess изоляция), `24938afc6`+`6c0b1f9ee` (tailscale supervise/report — чисто), `77ae057e0` (#10455), `23950c9a1` (#11901 graceful shutdown — крупный, можно отдельным PR).
 
 ## 6. Этап 4 — Архитектурные решения (требуют решения владельца, НЕ чери-пикать бездумно)
 
@@ -197,10 +210,10 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 
 | Этап | Позиций | Оценка | Ответвления/риски |
 |---|---|---|---|
-| 0 подготовка | — | 0.5 дня | — |
-| 1 security | 13 | 3–4 дня | 1.12 крупный (~2k строк); deps — только lock |
+| 0 подготовка | — | 0.5 дня | ВЫПОЛНЕНО |
+| 1 security | 13 | 3–4 дня | ВЫПОЛНЕНО 100% (см. §3) |
 | 2 прод-баги | 42 | 8–10 дней | ВЫПОЛНЕНО: все 6 секций 4.1–4.6 завершены |
-| 3 ADAPT средние | ~40 | 10–12 дней | multimodal/cost/memory стыковка с нашими расширениями |
+| 3 ADAPT средние | ~40 | 10–12 дней | 8/48 портов готово (config 5 + skills 3); 2 SKIP обоснованы; дальше по §5.3 |
 | 4 архитектурные | 9 решений | по решению | серии #8289, live-revisions — недели |
 | 5 собственные фиксы | ~8 | 2–3 дня | whatsapp cleanup, RAM-буфер аудио, god-file split |
 | 6 frontend адаптация | ~16 | 4–5 дней | Flutter gateway models, SOP Studio, Steering UX, Token Budget |
