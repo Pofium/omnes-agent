@@ -28,6 +28,7 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
+    SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture,
     is_semantic_empty_terminal_completion,
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
