@@ -20,8 +20,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use omnesagent_config::schema::{CacheTtl, ToolResultImagePolicy};
 
-/// Maximum silence between body reads for OpenAI-compatible SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
 /// Appended to a tool result whose image payloads were moved out of the
@@ -927,8 +926,11 @@ impl OpenAiCompatibleModelProvider {
 
     /// HTTP client for streaming SSE connections — no overall timeout (reqwest's
     /// total timeout kills long-running streams mid-response), but a `read_timeout`
-    /// idle bound (`STREAM_IDLE_TIMEOUT`) so a silent connection fails fast instead
-    /// of hanging forever. Streaming paths must use this client instead of http_client().
+    /// idle bound so a silent connection fails fast instead of hanging forever.
+    /// The bound is derived as `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: the 300 s
+    /// floor applies when `timeout_secs` is unset or lower, and a higher
+    /// `timeout_secs` raises the bound to match. Streaming paths must use this
+    /// client instead of http_client().
     fn streaming_http_client(&self) -> Client {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
@@ -966,7 +968,7 @@ impl OpenAiCompatibleModelProvider {
 
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(STREAM_IDLE_TIMEOUT)
+                .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration())
                 .default_headers(headers);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = omnesagent_config::schema::apply_runtime_proxy_to_builder(
@@ -989,7 +991,7 @@ impl OpenAiCompatibleModelProvider {
 
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
         let builder =
             omnesagent_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {
@@ -2103,9 +2105,13 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
 }
 
 /// Convert SSE byte stream to text chunks.
+/// Convert an SSE byte stream into structured chunks. `idle_timeout` is the
+/// streaming client's read-idle bound; it names the bound that fired in
+/// body-read timeout errors, including whether `timeout_secs` can raise it.
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -2184,7 +2190,10 @@ fn sse_bytes_to_chunks(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -2206,13 +2215,19 @@ pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-    sse_bytes_to_events_for_contract(response, count_tokens, false)
+    sse_bytes_to_events_for_contract(
+        response,
+        count_tokens,
+        false,
+        super::StreamIdleBound::Fixed(super::STREAM_IDLE_TIMEOUT),
+    )
 }
 
 fn sse_bytes_to_events_for_contract(
     response: reqwest::Response,
     count_tokens: bool,
     targets_mistral_tool_call_contract: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -2363,7 +2378,10 @@ fn sse_bytes_to_events_for_contract(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -4017,6 +4035,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -4039,7 +4058,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                            .send(Err(StreamError::Http(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))))
                             .await;
                         return;
                     }
@@ -4086,6 +4108,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 response,
                 count_tokens,
                 targets_mistral_tool_call_contract,
+                idle_timeout,
             );
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
@@ -4189,6 +4212,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -4214,7 +4238,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -4232,7 +4259,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -4313,6 +4340,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -4332,7 +4360,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -4348,7 +4379,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break;
@@ -6622,7 +6653,11 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
         )
         .await;
-        let mut stream = sse_bytes_to_chunks(response, false);
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+        );
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -10643,6 +10678,170 @@ mod tests {
     fn default_timeout_is_120s() {
         let p = make_model_provider("test", "https://example.com", None);
         assert_eq!(p.timeout_secs, 120);
+    }
+
+    #[test]
+    fn stream_idle_timeout_keeps_300s_floor_when_timeout_secs_is_lower() {
+        assert_eq!(
+            crate::stream_idle_timeout(120),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(300),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_raises_bound_when_timeout_secs_exceeds_floor() {
+        assert_eq!(
+            crate::stream_idle_timeout(301),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(301))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(3600),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_names_bound_on_read_timeout() {
+        // Accept the connection, then never write a byte: the read-idle bound
+        // fires while the streaming client waits for response headers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            err.is_timeout(),
+            "client must experience the silence as a timeout: {err}"
+        );
+        assert!(!err.is_connect(), "the connection itself succeeded: {err}");
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            message.contains("raise timeout_secs above 300s"),
+            "idle message must name the knob that raises the bound: {message}"
+        );
+        assert!(
+            message.contains(&crate::format_error_chain(&err)),
+            "the underlying reqwest error must stay in the chain: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_leaves_connect_errors_unchanged() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/stream")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_connect(),
+            "a refused local port is a connect error: {err}"
+        );
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert_eq!(
+            message,
+            crate::format_error_chain(&err),
+            "connect errors must keep the plain error chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_chunk_stream_names_idle_bound_when_body_goes_silent() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // A 1 s read-idle bound gives the header exchange and first chunk a
+        // comfortable window on a slow runner; the silent body still trips it
+        // in about a second, keeping the whole test under ~2 s.
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(std::time::Duration::from_secs(300)),
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("first chunk must arrive before the stall")
+            .expect("chunk stream must yield a chunk")
+            .expect("first chunk must be valid");
+        assert_eq!(first.delta, "hi");
+        let item = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("stall must hit the read-idle bound")
+            .expect("stalled chunk stream must yield an item");
+        server.abort();
+        let message = match item {
+            Err(StreamError::Http(message)) => message,
+            Err(other) => panic!("expected an HTTP stream error, got {other:?}"),
+            Ok(_) => panic!("expected an error after the stalled body"),
+        };
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            !message.contains("timeout_secs"),
+            "a fixed idle bound has no knob advice: {message}"
+        );
     }
 
     #[test]
