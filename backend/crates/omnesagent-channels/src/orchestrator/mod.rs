@@ -453,34 +453,92 @@ impl InterruptOnNewMessageConfig {
     }
 }
 
+/// Snapshot whether any alias enables `interrupt_on_new_message` for each
+/// channel type. This preserves the legacy fallback for inbound messages that
+/// do not carry an alias; aliased messages resolve their own live config.
 fn interrupt_on_new_message_config(
     channels: &omnesagent_config::schema::ChannelsConfig,
 ) -> InterruptOnNewMessageConfig {
     InterruptOnNewMessageConfig {
         telegram: channels
             .telegram
-            .get("default")
-            .is_some_and(|tg| tg.interrupt_on_new_message),
+            .values()
+            .any(|tg| tg.interrupt_on_new_message),
         slack: channels
             .slack
-            .get("default")
-            .is_some_and(|sl| sl.interrupt_on_new_message),
+            .values()
+            .any(|sl| sl.interrupt_on_new_message),
         discord: channels
             .discord
-            .get("default")
-            .is_some_and(|dc| dc.interrupt_on_new_message),
+            .values()
+            .any(|dc| dc.interrupt_on_new_message),
         mattermost: channels
             .mattermost
-            .get("default")
-            .is_some_and(|mm| mm.interrupt_on_new_message),
+            .values()
+            .any(|mm| mm.interrupt_on_new_message),
         matrix: channels
             .matrix
-            .get("default")
-            .is_some_and(|mx| mx.interrupt_on_new_message),
+            .values()
+            .any(|mx| mx.interrupt_on_new_message),
         whatsapp: channels
             .whatsapp
-            .get("default")
-            .is_some_and(|wa| wa.interrupt_on_new_message),
+            .values()
+            .any(|wa| wa.interrupt_on_new_message),
+    }
+}
+
+fn interrupt_on_new_message_enabled(
+    ctx: &ChannelRuntimeContext,
+    msg: &omnesagent_api::channel::ChannelMessage,
+) -> bool {
+    let Some(alias) = msg
+        .channel_alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+    else {
+        return ctx
+            .interrupt_on_new_message
+            .enabled_for_channel(msg.channel.as_str());
+    };
+
+    match msg.channel.as_str() {
+        "telegram" => ctx
+            .prompt_config
+            .channels
+            .telegram
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "slack" => ctx
+            .prompt_config
+            .channels
+            .slack
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "discord" => ctx
+            .prompt_config
+            .channels
+            .discord
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "mattermost" => ctx
+            .prompt_config
+            .channels
+            .mattermost
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "matrix" => ctx
+            .prompt_config
+            .channels
+            .matrix
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "whatsapp" => ctx
+            .prompt_config
+            .channels
+            .whatsapp
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        _ => false,
     }
 }
 
@@ -642,7 +700,11 @@ fn conversation_memory_key(msg: &omnesagent_api::channel::ChannelMessage) -> Str
 /// omnesagent alias when present, so two bots on the same platform (e.g.
 /// `discord.clamps` + `discord.glados`) never share a keyspace.
 fn channel_scope(msg: &omnesagent_api::channel::ChannelMessage) -> String {
-    match &msg.channel_alias {
+    match msg
+        .channel_alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+    {
         Some(alias) => format!("{}.{}", msg.channel, alias),
         None => msg.channel.clone(),
     }
@@ -8205,9 +8267,7 @@ async fn dispatch_worker(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
-    let interrupt_enabled = ctx
-        .interrupt_on_new_message
-        .enabled_for_channel(msg.channel.as_str());
+    let interrupt_enabled = interrupt_on_new_message_enabled(&ctx, &msg);
     let sender_scope_key = interruption_scope_key(&msg);
     let cancellation_token = CancellationToken::new();
     let completion = Arc::new(InFlightTaskCompletion::new());
@@ -34101,6 +34161,45 @@ This is an example JSON object for profile settings."#;
         assert!(!cfg.enabled_for_channel("telegram"));
     }
 
+    /// Regression: the alias map is keyed by the operator-chosen section name,
+    /// so `[channels.whatsapp.home]` must opt in exactly like a `default` one.
+    /// This previously resolved to `false` because the lookup hardcoded the
+    /// literal key `"default"`.
+    #[test]
+    fn interrupt_on_new_message_config_reads_non_default_whatsapp_alias() {
+        let mut channels = omnesagent_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            omnesagent_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/omnesagent-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(cfg.enabled_for_channel("whatsapp"));
+    }
+
+    /// A configured alias that leaves the flag off must not opt the channel in.
+    #[test]
+    fn interrupt_on_new_message_config_ignores_non_default_alias_with_flag_off() {
+        let mut channels = omnesagent_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            omnesagent_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/omnesagent-whatsapp-session.db".into()),
+                interrupt_on_new_message: false,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(!cfg.enabled_for_channel("whatsapp"));
+    }
+
     #[test]
     fn interrupt_on_new_message_disabled_for_discord_by_default() {
         let cfg = InterruptOnNewMessageConfig {
@@ -34134,6 +34233,15 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+
+        let empty_alias_msg = omnesagent_api::channel::ChannelMessage {
+            channel_alias: Some(String::new()),
+            ..msg
+        };
+        assert_eq!(
+            interruption_scope_key(&empty_alias_msg),
+            "matrix_room_alice"
+        );
     }
 
     #[test]
