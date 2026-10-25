@@ -47,15 +47,15 @@
 
 **DoD этапа 1:** все RUSTSEC-позиции в Cargo.lock обновлены (`cargo audit` чист или решения зафиксированы), git-классификатор протестирован на bypass-матрице, `/health` не содержит `last_error`, DLL-паттерны закрыты.
 
-## 4. Этап 2 — Прод-баги ядра (P1)
+## 4. Этап 2 — Прод-баги ядра (P1) — Завершено 100%
 
 ### 4.1 Промпт-кэш и токены [ВЫПОЛНЕНО]
-- `6ab38e3a6` (#10959) — **sort tool specs**: 8 строк, стабилизирует префикс кэша. *Лучший ROI всего синка.*
-- `7808fcd68` (#10862) — дата вне cached system prompt (иначе кэш умирает ежедневно).
-- `bd5494b67` (#11801) — wall-clock дата из channel/agent::run промптов.
-- `c10496d63`+`9b9a267ef`+`97ea54ab1` (#10623,#10724,#10895) — **cache passthrough** для всех OpenAI-compatible (breakpoints system+rolling, cache_ttl, фикс rolling breakpoint на image/tool_use-хвостах). Решает нашу известную проблему «кэш только в OpenRouter». Решить: апстримовская раскладка становится канонической, наша openrouter-фича — fallback.
-- `ec102ec88` (#10716) — биллинг cache writes (обязательная пара к passthrough).
-- `a55179236` (#10890) — per-image стоимость в estimate_history_tokens; `55b078b9f` (#10555) — cap image-promotion (path-listing'и). Бьют в известную проблему structured_history_cap.
+- `6ab38e3a6` (#10959) — **sort tool specs**: 8 строк, стабилизирует префикс кэша. [ВЫПОЛНЕНО: `00d78a696`]
+- `7808fcd68` (#10862) — дата вне cached system prompt (иначе кэш умирает ежедневно). [ВЫПОЛНЕНО: `156942ad3`]
+- `bd5494b67` (#11801) — wall-clock дата из channel/agent::run промптов. [ВЫПОЛНЕНО: `eeaaeb76b`]
+- `c10496d63`+`9b9a267ef`+`97ea54ab1` (#10623,#10724,#10895) — **cache passthrough** для всех OpenAI-compatible. [ВЫПОЛНЕНО: `3ce65fc18`, `20ba59a22`, `f3a61f584`]
+- `ec102ec88` (#10716) — биллинг cache writes (обязательная пара к passthrough). [ВЫПОЛНЕНО: `6a1c5d3d4`]
+- `a55179236` (#10890) — per-image стоимость в estimate_history_tokens; `55b078b9f` (#10555) — cap image-promotion. [ВЫПОЛНЕНО: `98ace5c44`]
 
 ### 4.2 Parser и tool-вызовы [ВЫПОЛНЕНО]
 - `3500014d9`+`83a06780a` (#11188,#11025) — **`browser_open`/`web_search` конвертируются в `curl`** у GLM-стиль моделей + алиасы не нормализуются в xml/minimax-форматах [ВЫПОЛНЕНО: `b618a37b2`, `f779df4bf`].
@@ -68,30 +68,31 @@
 - `9d3fd8db0`+`2d4bed5b7` (#10803,#11170) — retry-ядро reliable.rs: retry budget single-candidate recovery, overload-классификация, retry до send [ВЫПОЛНЕНО: `20e330911`, `d737e042d`].
 - `2eb7df78b` (#10886) — timeout_secs → streaming idle floor 300s [ВЫПОЛНЕНО: `8181da07e`].
 - `9862c149a`+`e66c219e6` (#10397,#10566) — **MCP token blowup** (CallToolResult дублировал payload) + materialization картинок [ВЫПОЛНЕНО: `fe93ab07c`, `624ba61b5`].
-### 4.4 Steering и turn-цикл (адаптировать вокруг нашего Triage Router)
-- `3b8ed46fc` (#11617) — **close steering channel при выходе** (поздние сообщения теряются — воспроизводимая потеря).
-- `4f41bfa61`+`9ce12530b`+`2125a1301` (#11725,#11181,#11132) — доставка steering на следующем шаге цикла (yield-after-tool-round). Не тащить upstream-механику целиком — встроить идею в наш цикл.
-- `64b703012` (#10696) — low-water trim target (основа для dc372cc7a #11067, 06ce69fa4 #9368).
-- `c25324e96` (#10935) — stream-guard не глотает прозу с цитатой tool-result (перенести паттерн в наш переписанный guard).
 
-### 4.5 Каналы и память
-- `0695c9f8f` (#9753) — **absent vs empty `allowed_tools`** (deny-all семантика): точный баг в нашем policy.rs:3616.
-- `87e3c2235` (#11650) — **Telegram 429**: ждать `retry_after`, не долбить в flood.
-- `28a34bfc7` (#11669) — Lark flat post-контент молча дропался.
-- `2881a7189` (#11258) — transcription `initial_prompt` игнорировался (смежно с нашим transcription.rs:886).
-- `927ae8df0` (#11144) — memory: FP credential-regex (threat.rs); `de0444dcb` (#11143) **SKIPPED** (встроенный легаси бэкенд Qdrant удалён в пользу ob2h).
-- `ecac0dbce`+`3def06fb7` (#10958,#10239) — interruption scope коллизии (`/stop` может cancel'ить чужой turn).
-- `130781675`+`caf806ae3` (#10833,#10266) — `is_direct_message` для Signal и WhatsApp Web (DM молча дропались).
-- `e6fe7a8c9` (#10692) — per-agent transcription binding.
+### 4.4 Steering и turn-цикл [ВЫПОЛНЕНО]
+- `3b8ed46fc` (#11617) — **close steering channel при выходе** [ВЫПОЛНЕНО: `1ee579f4e`].
+- `4f41bfa61`+`9ce12530b`+`2125a1301` (#11725,#11181,#11132) — доставка steering на следующем шаге цикла [ВЫПОЛНЕНО: `9f8af9a2b`].
+- `64b703012` (#10696) — low-water trim target [ВЫПОЛНЕНО: `318b76eb1`].
+- `c25324e96` (#10935) — stream-guard не глотает прозу с цитатой tool-result [ВЫПОЛНЕНО: `5ba5d6542`].
 
-### 4.6 Windows-пакет (мы целевая платформа)
-- `31a7137fb` (#10954) — PowerShell UTF-8 output (у нас кракозябры).
-- `c4c2d667a` (#11400) — doctor: замена models_cache.json при открытом reader (file-lock).
-- `9c2bfaf50` (#11398) — замена JSONL session-файла, удерживаемого reader.
-- `a7dad4ae5` (#10928) — exited Windows task owners.
-- `a516d3315`+`3bf862b1f` (#11362,#11363) — SOP: замена файла при открытом reader; directory-триггеры и Windows-пути.
-- `a2bfa0c76` (#10735) — heap-pin больших dispatch-веток (stack overflow на Windows 1 MiB).
-- `ae9b84be0` (#11285) — tokio `time` feature в omnesagent-api (латентный сбой сборки).
+### 4.5 Каналы и память [ВЫПОЛНЕНО]
+- `0695c9f8f` (#9753) — **absent vs empty `allowed_tools`** (deny-all семантика) [ВЫПОЛНЕНО: `6eebc35dc`].
+- `87e3c2235` (#11650) — **Telegram 429**: ждать `retry_after`, не долбить в flood [ВЫПОЛНЕНО: `20026f6b4`].
+- `28a34bfc7` (#11669) — Lark flat post-контент молча дропался [ВЫПОЛНЕНО: `8f373cb27`].
+- `2881a7189` (#11258) — transcription `initial_prompt` игнорировался [ВЫПОЛНЕНО: `6ce697b6c`].
+- `927ae8df0` (#11144) — memory: FP credential-regex (threat.rs) [ВЫПОЛНЕНО: `26e7d3618`]; `de0444dcb` (#11143) **SKIPPED** (встроенный легаси бэкенд Qdrant удалён в пользу ob2h).
+- `ecac0dbce`+`3def06fb7` (#10958,#10239) — interruption scope коллизии [ВЫПОЛНЕНО: `e8784cabd`, `1f2a5d072`].
+- `130781675`+`caf806ae3` (#10833,#10266) — `is_direct_message` для Signal и WhatsApp Web [ВЫПОЛНЕНО: `22c73a559`, `ffd20d7de`].
+- `e6fe7a8c9` (#10692) — per-agent transcription binding [ALREADY: `7053551ee`].
+
+### 4.6 Windows-пакет (мы целевая платформа) [ВЫПОЛНЕНО]
+- `31a7137fb` (#10954) — PowerShell UTF-8 output [ВЫПОЛНЕНО: `18483a8d1`].
+- `c4c2d667a` (#11400) — doctor: замена models_cache.json при открытом reader [ВЫПОЛНЕНО: `420786e33`].
+- `9c2bfaf50` (#11398) — замена JSONL session-файла, удерживаемого reader [ВЫПОЛНЕНО: `703933983`].
+- `a7dad4ae5` (#10928) — exited Windows task owners [ВЫПОЛНЕНО: `986b40c47`].
+- `a516d3315`+`3bf862b1f` (#11362,#11363) — SOP: замена файла при открытом reader; directory-триггеры и Windows-пути [ВЫПОЛНЕНО: `7fd049c04`, `6c9a44964`].
+- `a2bfa0c76` (#10735) — heap-pin больших dispatch-веток (stack overflow на Windows 1 MiB) [ВЫПОЛНЕНО: `b230e7cfa`].
+- `ae9b84be0` (#11285) — tokio `time` feature в omnesagent-api [ВЫПОЛНЕНО: `2ecbab44a`].
 
 **DoD этапа 2:** все перечисленные PR закоммичены с тестами апстрима (адаптированными), parser-матрица (browser_open/xml/minimax/structured args) зелёная, prompt-cache A/B: повторный вызов той же сессии показывает cache-hit токены.
 
