@@ -425,6 +425,7 @@ impl ModelRoutingConfigTool {
                     "max_delegation_depth": runtime.map(|r| r.max_delegation_depth),
                     "agentic": runtime.map(|r| r.agentic),
                     "allowed_tools": risk.map(|r| &r.allowed_tools),
+                    "deny_all_tools": risk.map(|r| r.deny_all_tools),
                     "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
                     "delegate_same_risk_profile": agent.delegate_same_risk_profile,
                     "delegates": agent.delegates,
@@ -881,11 +882,22 @@ impl ModelRoutingConfigTool {
         let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
 
-        let allowed_tools_update = if let Some(raw) = args.get("allowed_tools") {
-            Some(Self::parse_string_list(raw, "allowed_tools")?)
-        } else {
-            None
+        let allowed_tools_update = match args.get("allowed_tools") {
+            None => MaybeSet::Unset,
+            Some(raw) if raw.is_null() => MaybeSet::Null,
+            Some(raw) => MaybeSet::Set(Self::parse_string_list(raw, "allowed_tools")?),
         };
+
+        let deny_all_tools_update = Self::parse_optional_bool(args, "deny_all_tools")?;
+        if deny_all_tools_update == Some(true) {
+            if let MaybeSet::Set(tools) = &allowed_tools_update {
+                if !tools.is_empty() {
+                    anyhow::bail!(
+                        "'deny_all_tools' cannot be combined with a non-empty 'allowed_tools' list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
+                    );
+                }
+            }
+        }
 
         let delegate_same_risk_profile_update =
             Self::parse_optional_bool(args, "delegate_same_risk_profile")?;
@@ -942,8 +954,25 @@ impl ModelRoutingConfigTool {
         // synthesize risk_profiles[name] from allowed_tools (authorization).
         {
             let risk = cfg.risk_profiles.entry(name.clone()).or_default();
-            if let Some(tools) = allowed_tools_update {
-                risk.allowed_tools = tools;
+            match &allowed_tools_update {
+                // `null` and `[]` are both the legacy unrestricted state; a
+                // non-empty list is the explicit allowlist and clears the
+                // deny-all flag (the combination is rejected above).
+                MaybeSet::Set(tools) => {
+                    risk.allowed_tools = tools.clone();
+                    risk.deny_all_tools = false;
+                }
+                MaybeSet::Null => {
+                    risk.allowed_tools = Vec::new();
+                    risk.deny_all_tools = false;
+                }
+                MaybeSet::Unset => {}
+            }
+            if let Some(deny_all) = deny_all_tools_update {
+                risk.deny_all_tools = deny_all;
+                if deny_all {
+                    risk.allowed_tools = Vec::new();
+                }
             }
         }
 
@@ -1383,6 +1412,158 @@ mod tests {
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(output["agents"]["coder"].is_null());
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_allowed_tools_null_restores_unrestricted_and_empty_is_unrestricted() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let set = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(set.success, "{:?}", set.error);
+
+        let cfg = omnesagent_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.risk_profiles.get("coder").unwrap().allowed_tools,
+            vec!["shell".to_string()]
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+
+        let clear = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": null
+            }))
+            .await
+            .unwrap();
+        assert!(clear.success, "{:?}", clear.error);
+
+        let cfg = omnesagent_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.risk_profiles
+                .get("coder")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "null must restore unrestricted"
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+
+        let legacy_empty = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": []
+            }))
+            .await
+            .unwrap();
+        assert!(legacy_empty.success, "{:?}", legacy_empty.error);
+
+        let cfg = omnesagent_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.risk_profiles
+                .get("coder")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "[] is the legacy unrestricted state, not deny-all"
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_deny_all_tools_flag_and_contradiction_check() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let deny = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "deny_all_tools": true
+            }))
+            .await
+            .unwrap();
+        assert!(deny.success, "{:?}", deny.error);
+
+        let cfg = omnesagent_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let risk = cfg.risk_profiles.get("coder").unwrap();
+        assert!(risk.deny_all_tools, "deny_all_tools must be stored");
+        assert!(
+            risk.allowed_tools.is_empty(),
+            "deny_all_tools must not leave a stray allowlist behind"
+        );
+
+        // Re-allowing via a nonempty list clears the flag.
+        let allow = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(allow.success, "{:?}", allow.error);
+
+        let cfg = omnesagent_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let risk = cfg.risk_profiles.get("coder").unwrap();
+        assert!(!risk.deny_all_tools);
+        assert_eq!(risk.allowed_tools, vec!["shell".to_string()]);
+
+        // The contradictory combination fails loudly instead of one side
+        // silently winning.
+        let contradiction = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "deny_all_tools": true,
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(!contradiction.success, "must be rejected");
+        let err = contradiction.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("deny_all_tools"),
+            "error must name deny_all_tools, got: {err:?}"
+        );
     }
 
     #[tokio::test]

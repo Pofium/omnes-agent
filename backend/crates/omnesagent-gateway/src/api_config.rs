@@ -4376,4 +4376,45 @@ mod tests {
             "Bearer test-api-key-123"
         );
     }
+    #[tokio::test]
+    async fn patch_allow_from_deny_all_persists_and_reloads_tool_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.risk_profiles.insert(
+            "default".to_string(),
+            omnesagent_config::schema::RiskProfileConfig {
+                deny_all_tools: true,
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, _json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/allowed_tools",
+                        "value": ["shell"]
+                    },
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/deny_all_tools",
+                        "value": false
+                    }
+                ])),
+            )
+            .await,
+        );
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let reloaded = state.config.load();
+        let profile = reloaded.risk_profiles.get("default").unwrap();
+        assert!(!profile.deny_all_tools);
+        assert_eq!(profile.allowed_tools, vec!["shell".to_string()]);
+    }
+
 }

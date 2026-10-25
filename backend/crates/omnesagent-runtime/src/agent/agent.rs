@@ -11712,6 +11712,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn register_skill_tools_deny_all_allowlist_denies_skill_tools() {
+        // Deny-all (the runtime `Some(vec![])` produced by
+        // `deny_all_tools = true`) applies to skill-defined tools as well as
+        // built-ins and MCP. A nonempty allowlist still leaves skill tools
+        // visible (see register_skill_tools_allowlist_does_not_hide_skills).
+        let security = Arc::new(crate::security::SecurityPolicy {
+            allowed_tools: Some(vec![]),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let skills = vec![
+            make_skill("deploy", &["run"]),
+            crate::skills::Skill {
+                name: "weather".to_string(),
+                description: "weather skill".to_string(),
+                description_localizations: Default::default(),
+                version: "0.1.0".to_string(),
+                author: None,
+                tags: vec![],
+                tools: vec![crate::skills::SkillTool {
+                    name: "get_weather".to_string(),
+                    description: "http weather".to_string(),
+                    kind: "http".to_string(),
+                    command: String::new(),
+                    args: std::collections::HashMap::new(),
+                    target: Some("https://example.invalid/weather".to_string()),
+                    locked_args: std::collections::HashMap::new(),
+                    timeout_secs: None,
+                }],
+                prompts: vec![],
+                slash_options: Vec::new(),
+                always: false,
+                location: None,
+            },
+        ];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"deploy__run"),
+            "deny-all must hide shell skill tools, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("weather")),
+            "deny-all must hide HTTP skill tools, got {names:?}"
+        );
+    }
+
     fn observer_event_turn_id(event: &ObserverEvent) -> Option<&str> {
         match event {
             ObserverEvent::AgentStart { turn_id, .. }
@@ -13325,4 +13375,6 @@ mod approval_route_tests {
             "no originator to inherit; gate applies the non-interactive auto-deny"
         );
     }
+
+
 }
