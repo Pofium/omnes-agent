@@ -102,7 +102,10 @@ pub(crate) async fn gate_tool_approval(
             };
             (decision, decided_by, unanswerable)
         } else {
-            (mgr.prompt_cli(&request), None, false)
+            match mgr.prompt_cli(&request) {
+                Ok(decision) => (decision, None, false),
+                Err(_) => (ApprovalResponse::No, None, true),
+            }
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
@@ -162,10 +165,17 @@ pub(crate) async fn gate_tool_approval(
                         // to lobby for its own privilege expansion.
                         "denied_by_runtime": unanswerable,
                         "operator_hint": if unanswerable {
-                            Some("No operator could be asked. Check that an approval-capable \
-                                  channel is connected and that the agent's approval route names \
-                                  a registered, reachable approver. If this tool should run \
-                                  unattended, review the agent's risk profile deliberately.")
+                            if mgr.is_non_interactive() {
+                                Some("No operator could be asked. Check that an approval-capable \
+                                      channel is connected and that the agent's approval route names \
+                                      a registered, reachable approver. If this tool should run \
+                                      unattended, review the agent's risk profile deliberately.")
+                            } else {
+                                Some("CLI approval input was unavailable. Run with a controlling \
+                                      terminal or readable stdin so an operator can answer. If this \
+                                      tool should run unattended, review the agent's risk profile \
+                                      deliberately.")
+                            }
                         } else {
                             None
                         },
