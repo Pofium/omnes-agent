@@ -5,6 +5,7 @@
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
+use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -348,8 +349,28 @@ struct ModelEntry {
     /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
     /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
     /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
-    #[serde(default)]
+    /// Vendors also use `pricing` for other shapes (xAI image models send an
+    /// array of per-tier objects); those read as unknown pricing rather than
+    /// failing the whole listing.
+    #[serde(default, deserialize_with = "deserialize_lenient_pricing")]
     pricing: Option<omnesagent_api::model_provider::ModelPricing>,
+}
+
+/// Accept only the per-token object shape for `pricing`; any other shape (an
+/// array, a scalar, an object with non-string rates) is `None`. Arrays must be
+/// rejected explicitly: serde would otherwise read them positionally into the
+/// struct.
+fn deserialize_lenient_pricing<'de, D>(
+    deserializer: D,
+) -> Result<Option<omnesagent_api::model_provider::ModelPricing>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(object @ serde_json::Value::Object(_)) => serde_json::from_value(object).ok(),
+        _ => None,
+    })
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -361,6 +382,11 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+pub(crate) fn parse_model_ids_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let body: ModelsResponse = serde_json::from_slice(bytes)?;
+    Ok(normalize_model_ids(body))
 }
 
 /// Extract model IDs with pricing from a ModelsResponse.
@@ -869,8 +895,12 @@ impl OpenAiCompatibleModelProvider {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
+        // An OpenCode client needs its own redirect policy, which the shared
+        // cached client below does not carry.
+        let endpoint = self.chat_completions_url();
+        let targets_opencode = crate::opencode_session::is_opencode_target(&endpoint);
 
-        if has_user_agent || has_extra_headers || has_tls_cert {
+        if has_user_agent || has_extra_headers || has_tls_cert || targets_opencode {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -904,6 +934,7 @@ impl OpenAiCompatibleModelProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = omnesagent_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -939,6 +970,7 @@ impl OpenAiCompatibleModelProvider {
     /// `timeout_secs` raises the bound to match. Streaming paths must use this
     /// client instead of http_client().
     fn streaming_http_client(&self) -> Client {
+        let endpoint = self.chat_completions_url();
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
@@ -977,6 +1009,7 @@ impl OpenAiCompatibleModelProvider {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration())
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = omnesagent_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -999,6 +1032,7 @@ impl OpenAiCompatibleModelProvider {
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
+        let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
         let builder =
             omnesagent_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {
@@ -2449,6 +2483,40 @@ impl OpenAiCompatibleModelProvider {
         apply_auth_to_request(req, &self.auth_header, credential)
     }
 
+    /// OpenCode affinity header value for the calling conversation, or `None`
+    /// when this provider does not target OpenCode.
+    ///
+    /// Classifies `chat_completions_url()`, the URL every header-carrying
+    /// request is sent to, rather than `base_url`: an `api_path` is appended to
+    /// the base, so the base alone need not name the destination host.
+    ///
+    /// Returns `None` when the operator has already pinned a valid header value
+    /// through `extra_headers`: those are baked into the client's default
+    /// headers, so adding a second value here would put the header on the wire
+    /// twice. A pinned value the client builder skips as invalid does not count.
+    fn opencode_session_value(&self) -> Option<String> {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
+            return None;
+        }
+        crate::opencode_session::session_token(&self.chat_completions_url())
+    }
+
+    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// caller's task.
+    ///
+    /// Streaming paths must not use this: they build inside
+    /// `omnesagent_spawn::spawn!`, where the conversation task-local is no longer
+    /// readable. Those resolve `opencode_session_value` before the spawn.
+    fn apply_opencode_session_header(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.opencode_session_value() {
+            Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
+            None => req,
+        }
+    }
+
     fn convert_tool_specs(
         &self,
         tools: Option<&[omnesagent_api::tool::ToolSpec]>,
@@ -3503,10 +3571,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
 
         let response = match self
-            .apply_auth_header(
+            .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
-            )
+            ))
             .send()
             .await
         {
@@ -3600,10 +3668,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(
+            .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
-            )
+            ))
             .send()
             .await
         {
@@ -3681,10 +3749,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = loop {
             let response = match self
-                .apply_auth_header(
+                .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                )
+                ))
                 .send()
                 .await
             {
@@ -3821,10 +3889,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = loop {
             let response = match self
-                .apply_auth_header(
+                .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                )
+                ))
                 .send()
                 .await
             {
@@ -3930,6 +3998,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
 
         let provider = self.clone();
+        // Resolved here, not in the spawned task: `spawn!` propagates the
+        // tracing span but not task-locals, so the conversation scope is
+        // unreadable past this point.
+        let opencode_session = self.opencode_session_value();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<omnesagent_api::tool::ToolSpec>> =
             request.tools.map(<[omnesagent_api::tool::ToolSpec]>::to_vec);
@@ -4060,6 +4132,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 req_builder =
                     apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
                 req_builder = req_builder.header("Accept", "text/event-stream");
+                if let Some(session) = opencode_session.as_deref() {
+                    req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
+                }
 
                 let response = match req_builder.send().await {
                     Ok(r) => r,
@@ -4147,6 +4222,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let provider = self.clone();
+        // Resolved here, not in the spawned task: `spawn!` propagates the
+        // tracing span but not task-locals, so the conversation scope is
+        // unreadable past this point.
+        let opencode_session = self.opencode_session_value();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
         let model = model.to_string();
@@ -4246,6 +4325,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
 
             // Send request
             let response = match req_builder.send().await {
@@ -4301,6 +4383,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let provider = self.clone();
+        // Resolved here, not in the spawned task: `spawn!` propagates the
+        // tracing span but not task-locals, so the conversation scope is
+        // unreadable past this point.
+        let opencode_session = self.opencode_session_value();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
         let count_tokens = options.count_tokens;
@@ -4373,6 +4459,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let mut req_builder = client.post(&url).json(&request);
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
 
             let response = match req_builder.send().await {
                 Ok(r) => r,
@@ -7172,6 +7261,161 @@ mod tests {
         assert!(zhipu_jwt_bearer("").is_err());
         assert!(zhipu_jwt_bearer(".secret").is_err());
         assert!(zhipu_jwt_bearer("id.").is_err());
+    }
+
+    fn opencode_provider(base_url: &str) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url(base_url)
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .build()
+    }
+
+    /// Request as the chat paths build it, addressed to the real endpoint,
+    /// without sending anything.
+    fn built_opencode_request(provider: &OpenAiCompatibleModelProvider) -> reqwest::Request {
+        provider
+            .apply_opencode_session_header(
+                reqwest::Client::new().post(provider.chat_completions_url()),
+            )
+            .build()
+            .expect("request must build")
+    }
+
+    /// Header value as it would go on the wire, without sending anything.
+    fn built_session_header(provider: &OpenAiCompatibleModelProvider) -> Option<String> {
+        built_opencode_request(provider)
+            .headers()
+            .get(OPENCODE_SESSION_HEADER)
+            .map(|value| value.to_str().expect("header must be ASCII").to_string())
+    }
+
+    #[test]
+    fn opencode_session_header_follows_the_built_request_destination() {
+        // Header selection must agree with the parser that addresses the
+        // request, not with a textual reading of the configured URI.
+        for (base_url, api_path, expected_host) in [
+            // `\` ends the authority; `@opencode.ai/v1` is only path.
+            (
+                "https://relay.example\\@opencode.ai/v1",
+                None,
+                "relay.example",
+            ),
+            // A percent-encoded host decodes to the relay.
+            ("https://%6fpencode.ai/v1", None, "opencode.ai"),
+            // `api_path` is appended to the base, so the base alone need not
+            // name the destination; only the finished endpoint does.
+            (
+                "https:",
+                Some("//opencode.ai/zen/v1/chat/completions"),
+                "opencode.ai",
+            ),
+            (
+                "https:",
+                Some("//relay.example/v1/chat/completions"),
+                "relay.example",
+            ),
+        ] {
+            let provider = OpenAiCompatibleModelProvider::builder("opencode")
+                .display_name("OpenCode Zen")
+                .base_url(base_url)
+                .api_path(api_path.map(str::to_string))
+                .credential(Some("test-key"))
+                .auth_style(AuthStyle::Bearer)
+                .build();
+            let request = built_opencode_request(&provider);
+            let host = request.url().host_str().expect("request must have a host");
+            assert_eq!(host, expected_host, "{base_url} + {api_path:?}");
+            assert_eq!(
+                request.headers().contains_key(OPENCODE_SESSION_HEADER),
+                host == "opencode.ai",
+                "{base_url} + {api_path:?}: header selection must match the request host {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_requests_carry_the_session_header() {
+        for base_url in [
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen/go/v1",
+        ] {
+            let header = built_session_header(&opencode_provider(base_url))
+                .unwrap_or_else(|| panic!("{base_url} must carry the affinity header"));
+            assert_eq!(header.len(), 32, "expected a 128-bit hex token");
+            assert!(header.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn non_opencode_requests_do_not_carry_the_session_header() {
+        assert!(
+            built_session_header(&opencode_provider("https://api.openai.com/v1")).is_none(),
+            "the header must not leak to unrelated providers"
+        );
+    }
+
+    #[test]
+    fn operator_pinned_session_header_is_not_overridden() {
+        // `extra_headers` become client default headers, so emitting our own
+        // value too would put the header on the wire twice.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "X-Opencode-Session".to_string(),
+            "pinned-by-operator".to_string(),
+        );
+        let provider = OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url("https://opencode.ai/zen/v1")
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        assert!(
+            provider.opencode_session_value().is_none(),
+            "an operator-pinned header must win over the derived value"
+        );
+    }
+
+    #[test]
+    fn malformed_pinned_session_header_falls_back_to_the_derived_token() {
+        // The client builder skips a header value it cannot encode, so treating
+        // it as a pin would leave the request with no affinity header at all.
+        let headers = std::collections::HashMap::from([(
+            "x-opencode-session".to_string(),
+            "bad\nvalue".to_string(),
+        )]);
+        let provider = OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url("https://opencode.ai/zen/v1")
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        assert!(
+            built_session_header(&provider).is_some(),
+            "an invalid pinned value must not suppress the derived token"
+        );
+    }
+
+    #[test]
+    fn opencode_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest strips only credential headers on a cross-host redirect, so
+        // every client an OpenCode provider builds must stop there instead.
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+
+        let opencode = opencode_provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_http_client()));
+
+        let other = opencode_provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_http_client()));
     }
 
     #[test]
@@ -11606,6 +11850,67 @@ mod tests {
         assert!(models[0].pricing.is_none());
         assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
         assert!(models[1].pricing.is_none());
+    }
+
+    /// xAI's `/v1/models` mixes chat models (flat integer price fields, no
+    /// `pricing`) with image models whose `pricing` is an array of per-tier
+    /// objects. One unrecognized `pricing` shape must not fail the listing.
+    const XAI_MODELS_WITH_TIERED_IMAGE_PRICING: &str = r#"{
+        "data": [
+            {"id": "grok-4.6", "aliases": [], "context_length": 256000,
+             "created": 1768003200, "object": "model", "owned_by": "xai",
+             "prompt_text_token_price": 20000, "completion_text_token_price": 80000,
+             "capabilities": {"reasoning_effort": ["low", "high"]}},
+            {"id": "grok-imagine-image", "aliases": [], "created": 1769472000,
+             "object": "model", "owned_by": "xai", "image_price": 200000000,
+             "pricing": [
+                 {"quality": "medium", "resolution": "1k", "image_price": 200000000},
+                 {"quality": "high", "resolution": "2k", "image_price": 400000000}
+             ]}
+        ],
+        "object": "list"
+    }"#;
+
+    #[test]
+    fn model_ids_parse_despite_tiered_array_pricing() {
+        let ids = parse_model_ids_from_bytes(XAI_MODELS_WITH_TIERED_IMAGE_PRICING.as_bytes())
+            .expect("array-shaped pricing must not fail the model list");
+        assert_eq!(ids, vec!["grok-4.6", "grok-imagine-image"]);
+    }
+
+    #[test]
+    fn models_with_pricing_drop_unrecognized_pricing_shape() {
+        let body: ModelsResponse =
+            serde_json::from_str(XAI_MODELS_WITH_TIERED_IMAGE_PRICING).unwrap();
+        let models = normalize_models_with_pricing(body);
+        assert_eq!(models.len(), 2);
+        assert!(
+            models.iter().all(|m| m.pricing.is_none()),
+            "a pricing shape we cannot read is unknown pricing, not a parse failure"
+        );
+    }
+
+    #[test]
+    fn models_with_pricing_keep_object_pricing() {
+        // OpenRouter/Kilo object shape must still parse; a malformed object
+        // (non-string rate) degrades that entry to unknown pricing only.
+        let body: ModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "a", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+                {"id": "b", "pricing": {"prompt": {"tier": 1}}},
+                {"id": "c", "pricing": null}
+            ]}"#,
+        )
+        .unwrap();
+        let models = normalize_models_with_pricing(body);
+        let a = models[0]
+            .pricing
+            .as_ref()
+            .expect("object pricing preserved");
+        assert_eq!(a.prompt.as_deref(), Some("0.000003"));
+        assert_eq!(a.completion.as_deref(), Some("0.000015"));
+        assert!(models[1].pricing.is_none());
+        assert!(models[2].pricing.is_none());
     }
 
     #[test]
