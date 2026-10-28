@@ -2834,7 +2834,9 @@ pub struct GrokCliModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
+    /// Absolute path or bare executable name for the `grok` CLI (default: `grok`).
+    /// Bare names resolve only from absolute PATH directories; empty and relative
+    /// PATH entries are ignored before the subprocess working directory is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
     /// Required absolute working directory for the `grok` subprocess and ACP
