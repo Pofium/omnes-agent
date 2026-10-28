@@ -36,6 +36,10 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
+    /// Operator `[multimodal]` policy for this provider's own image-marker
+    /// expansion pass. Resolved once at construction from
+    /// `ModelProviderRuntimeOptions`.
+    multimodal: omnesagent_config::schema::MultimodalConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,6 +143,7 @@ impl OpenAiCodexModelProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
+            multimodal: options.multimodal.clone(),
         })
     }
 
@@ -1501,8 +1506,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         messages.push(ChatMessage::user(message));
 
         // Normalize images: convert file paths to data URIs
-        let config = omnesagent_config::schema::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
@@ -1517,8 +1522,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         // Normalize image markers: convert file paths to data URIs
-        let config = omnesagent_config::schema::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
@@ -1532,9 +1537,9 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let config = omnesagent_config::schema::MultimodalConfig::default();
         let prepared =
-            crate::multimodal::prepare_messages_for_provider(request.messages, &config).await?;
+            crate::multimodal::prepare_messages_for_provider(request.messages, &self.multimodal)
+                .await?;
         let (instructions, input) = build_responses_input(&prepared.messages);
         let response = self
             .send_responses_request(input, instructions, convert_tools(request.tools), model)
@@ -1575,17 +1580,20 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::omnesagent_spawn::spawn!(async move {
-            let config = omnesagent_config::schema::MultimodalConfig::default();
-            let prepared =
-                match crate::multimodal::prepare_messages_for_provider(&messages, &config).await {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        let _ = tx
-                            .send(Err(StreamError::ModelProvider(err.to_string())))
-                            .await;
-                        return;
-                    }
-                };
+            let prepared = match crate::multimodal::prepare_messages_for_provider(
+                &messages,
+                &provider.multimodal,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             let creds = match provider.resolve_credentials().await {
                 Ok(c) => c,
@@ -1759,6 +1767,26 @@ mod tests {
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
 
         (provider, captured, server_handle, temp_dir, proxy_guard)
+    }
+
+    #[test]
+    fn provider_construction_carries_operator_multimodal_policy() {
+        let multimodal = omnesagent_config::schema::MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 2,
+            ..Default::default()
+        };
+
+        let options = ModelProviderRuntimeOptions {
+            multimodal,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+
+        // Every `prepare_messages_for_provider` call in this adapter uses this
+        // field; defaults would drop the operator's image limits.
+        assert_eq!(provider.multimodal.max_images, 1);
+        assert_eq!(provider.multimodal.max_image_size_mb, 2);
     }
 
     #[tokio::test]
