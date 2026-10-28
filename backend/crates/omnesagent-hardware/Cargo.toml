@@ -10,6 +10,7 @@ publish = false
 omnesagent-log.workspace = true
 omnesagent-api.workspace = true
 omnesagent-config.workspace = true
+omnesagent-spawn.workspace = true
 omnesagent-tools.workspace = true
 
 anyhow = "1.0"
@@ -54,7 +55,6 @@ dev-sim = []
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws", "macros"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util", "signal"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
-omnesagent-spawn.workspace = true
 
 [[example]]
 name = "esp32_sim"

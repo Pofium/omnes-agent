@@ -7171,6 +7171,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "hyper",
+ "libc",
  "nix 0.30.1",
  "omnesagent-api",
  "omnesagent-config",
@@ -7193,6 +7194,7 @@ dependencies = [
  "tokio-util",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
