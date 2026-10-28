@@ -112,13 +112,36 @@
 - `96da19523` (#11804) GIT_TERMINAL_PROMPT=0 в open-skills sync [ВЫПОЛНЕНО: `ec4e6d873`]
 - `88be24ac4` (#11599) native_tools для всех compat-семейств [ВЫПОЛНЕНО: `6dc0973f2`; 17 тестов]
 
-### 5.3 Остальное (НЕ начато)
-- **Multimodal-кластер**: `d6899dfa1` (#10903 — tool-result картинки доезжают до модели), `8730e7b24` (#10088), `360bcaaf0` (#9819 pixel-валидация), `c1da9332c` (#11582 batch-evict), `4b87318df` (#11200 verbatim user text), `f42b095d9`, `fc4b4c0ea`, `9d268ffb2` — стыковать с нашим image_cache/relocate-фичей.
-- **Cost-цепочка**: `36a6f119c` (#11350 — наш `GLOBAL_COST_TRACKER: OnceLock` — тот же баг), `f1527d7e1`, `91958a0b7`, `9abe969b6`, `7007365f4` (#11692 — surface warn_at_percent).
-- **Memory-кластер**: `6108618d1`+`3ed28c40b` (sqlite_permissions модуль), `6c23e02b6` (#10567 дата recall — слить с нашими trust/last_feedback_at), `18bc1fccc` (#10252 category-scoped grants), `72324ab20` (#11458).
-- **RPC-мелочи**: `61b0ec88b` (#11330 session/configure гонка), `083d05ff2` (#11452), `25d543835` (#11151 agent-param в memory/*), `59f21a316` (#11291), `5a2a6250a` (#10775).
-- **Провайдеры-мелочи**: `5ea5333c5`+`bab3fb4a7` (grok: резолв бинаря до spawn из workspace — наш TODO-зон; frame limits), `4244a30d2`+`4123877c9` (opencode session header), `3b61e23b5`, `5ee21b7d6`, `e941e0ca6` (#10519 llm_task alias-aware), `e8d2e5fc8` (#11350 model_switch note), `a647de344` (#10552).
-- **Gateway/daemon-мелочи**: `996c9fa24` (#11083 webhook SOP drive), `49fa46bb1` (#10538 — обрыв WS не убивает ход; session_queue.rs чист), `fa31aee26` (#10637 WS-память на чужом провайдере), `feea19d41` (#11518 EOF ≠ решение оператора), `21fbd9538` (#10093 subprocess изоляция), `24938afc6`+`6c0b1f9ee` (tailscale supervise/report — чисто), `77ae057e0` (#10455), `23950c9a1` (#11901 graceful shutdown — крупный, можно отдельным PR).
+### 5.3 Остальное (статус на 25.10.2026, вторая волна)
+
+**Провайдеры — ЗАКРЫТО (8 позиций):**
+- `5ea5333c5` (#10829) grok resolve до spawn [ВЫПОЛНЕНО: `8f60da5cd`; libc/windows-sys в Cargo.toml вручную]
+- `bab3fb4a7` (#10830) grok ACP frame limits [ВЫПОЛНЕНО: `80c9dba72`]
+- `4244a30d2`+`4123877c9` (#10604/#10853) opencode session header + redirects [ВЫПОЛНЕНО: `dcea5ea68`; openai.rs вручную]
+- `3b61e23b5` (#11627) non-object pricing [ВЫПОЛНЕНО: `b7861fd17`; + хелпер parse_model_ids_from_bytes из мастера]
+- `5ee21b7d6` (#11659) snake_case overflow [ВЫПОЛНЕНО: `7a0c0c20c`]
+- `e8d2e5fc8` (#11350-note) model_switch note [ВЫПОЛНЕНО: `ab40a1f66`]
+- `a647de344` (#10552) multimodal config threading [ВЫПОЛНЕНО: `dbd4f5320`]
+- `e941e0ca6` (#10519) llm_task alias-aware — **ОТЛОЖЕН** (ADAPT ~534 строки: наш llm_task реорганизован в omnesagent-tools, связанная смена сигнатуры LlmTaskTool::new через 2 крейта)
+
+**Gateway/daemon — частично:**
+- `77ae057e0` (#10455) config write invariants [ВЫПОЛНЕНО: `3d7c5233f`]
+- `21fbd9538` (#10093) subprocess изоляция манифеста [ВЫПОЛНЕНО: `9fa482e89`]
+- `feea19d41` (#11518) EOF ≠ решение оператора [ВЫПОЛНЕНО: `bc350a430`; prompt_cli → io::Result, unix-child тест пропущен]
+- `996c9fa24` (#11083) webhook SOP drive — **SKIP**: зависит от `2f5e85041` (#9841 headless SOP — Этап 4); коммит был применён и убран ребейзом (не компилился)
+- `24938afc6`+`6c0b1f9ee` (#11726/#11531) tailscale — **SKIP**: зависят от промежуточного рефакторинга tunnel/mod.rs v0.8.6 (TunnelProcess/kill_shared удалены у апстрима)
+- `49fa46bb1` (#10538), `fa31aee26` (#10637), `23950c9a1` (#11901) — не начаты
+
+**RPC-кластер — ручные follow-up'ы (dispatch.rs разошёлся, механический патчинг дал смешение хунков — откат, делать по одному через Edit):**
+- `5a2a6250a` (#10775 mode swap: session.rs publish_prepared + dispatch.rs), `61b0ec88b` (#11330 configure fence), `083d05ff2` (#11452), `25d543835` (#11151 memory agent-param)
+- `59f21a316` (#11291) — **SKIP**: зависит от `f0ae8c8bd` (#11171 bounded local transport)
+
+**Cost — частично:**
+- `36a6f119c` (#11350) trackers по ledger path [ВЫПОЛНЕНО: `648185b15`; баг был жив: единственный OnceLock крал трекер чужого ledger; +новый тест]
+- `f1527d7e1` (#11557), `91958a0b7` (#10718), `9abe969b6` (#9939), `7007365f4` (#11692) — не начаты (ручные: tracker.rs/cost.rs/apps-часть разошлись; #7007365f4 apps/omnescode-часть N/A — наш клиент свой)
+
+**Memory-кластер** — не начат: `6108618d1`+`3ed28c40b` (sqlite_permissions), `6c23e02b6` (#10567), `18bc1fccc` (#10252), `72324ab20` (#11458).
+**Multimodal-кластер** — не начат: `d6899dfa1` (#10903), `8730e7b24` (#10088), `360bcaaf0` (#9819), `c1da9332c` (#11582), `4b87318df` (#11200), `f42b095d9`, `fc4b4c0ea`, `9d268ffb2`.
 
 ## 6. Этап 4 — Архитектурные решения (требуют решения владельца, НЕ чери-пикать бездумно)
 
@@ -213,7 +236,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 | 0 подготовка | — | 0.5 дня | ВЫПОЛНЕНО |
 | 1 security | 13 | 3–4 дня | ВЫПОЛНЕНО 100% (см. §3) |
 | 2 прод-баги | 42 | 8–10 дней | ВЫПОЛНЕНО: все 6 секций 4.1–4.6 завершены |
-| 3 ADAPT средние | ~40 | 10–12 дней | 8/48 портов готово (config 5 + skills 3); 2 SKIP обоснованы; дальше по §5.3 |
+| 3 ADAPT средние | ~40 | 10–12 дней | Готово 17 позиций: config 5, skills 3, провайдеры 8, cost 1; SKIP 6 обоснованы (зависимости от #8289/#9535/#11171/#9841/tunnel-рефакторинга); RPC 4 — ручные follow-up'ы; memory/multimodal не начаты |
 | 4 архитектурные | 9 решений | по решению | серии #8289, live-revisions — недели |
 | 5 собственные фиксы | ~8 | 2–3 дня | whatsapp cleanup, RAM-буфер аудио, god-file split |
 | 6 frontend адаптация | ~16 | 4–5 дней | Flutter gateway models, SOP Studio, Steering UX, Token Budget |
