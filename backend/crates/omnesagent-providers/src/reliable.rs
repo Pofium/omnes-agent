@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex as ParkingMutex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -2252,6 +2252,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -2259,6 +2260,9 @@ impl ModelProvider for ReliableModelProvider {
         // retryable error, sleep with exponential backoff and retry.
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -2450,6 +2454,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -2535,11 +2542,15 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -2745,6 +2756,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -2925,11 +2939,15 @@ impl ModelProvider for ReliableModelProvider {
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
 
         let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let Some(retry_limit) =
                     self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
                 else {
@@ -3150,6 +3168,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3234,11 +3255,15 @@ impl ModelProvider for ReliableModelProvider {
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
 
         let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let Some(retry_limit) =
                     self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
                 else {
@@ -3463,6 +3488,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
