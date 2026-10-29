@@ -140,8 +140,22 @@
 - `36a6f119c` (#11350) trackers по ledger path [ВЫПОЛНЕНО: `648185b15`; баг был жив: единственный OnceLock крал трекер чужого ledger; +новый тест]
 - `f1527d7e1` (#11557), `91958a0b7` (#10718), `9abe969b6` (#9939), `7007365f4` (#11692) — не начаты (ручные: tracker.rs/cost.rs/apps-часть разошлись; #7007365f4 apps/omnescode-часть N/A — наш клиент свой)
 
-**Memory-кластер** — не начат: `6108618d1`+`3ed28c40b` (sqlite_permissions), `6c23e02b6` (#10567), `18bc1fccc` (#10252), `72324ab20` (#11458).
-**Multimodal-кластер** — не начат: `d6899dfa1` (#10903), `8730e7b24` (#10088), `360bcaaf0` (#9819), `c1da9332c` (#11582), `4b87318df` (#11200), `f42b095d9`, `fc4b4c0ea`, `9d268ffb2`.
+**Memory-кластер — ЗАКРЫТО (4/5):**
+- `3ed28c40b` (#10091) + `6108618d1` (#10835) + `72324ab20` (#11458) — цепочка sqlite_permissions [ВЫПОЛНЕНО одной комиссией: `8cc7ed8dc`; модуль создан апстримом 13.09 (после нашей базы), 512 тестов крейта зелёные]
+- `6c23e02b6` (#10567) дата recall [ВЫПОЛНЕНО: `a21c3963e`; 29 тестов memory_inject]
+- `18bc1fccc` (#10252) category-scoped grants — **ОТЛОЖЕН** (17 файлов/1606 строк, наш qdrant.rs переписан под ob2h — требуется ручная реконструкция поверх agent_scoped.rs с учётом trust/kag-полей)
+
+**Multimodal-кластер — РУЧНАЯ ИНТЕГРАЦИЯ (механический порт невозможен):** `8730e7b24` (#10088), `d6899dfa1` (#10903), `360bcaaf0` (#9819), `f42b095d9` (#10953), `fc4b4c0ea` (#10838), `9d268ffb2` (#11637), `c1da9332c` (#11582), `4b87318df` (#11200). Причины: multimodal.rs несёт нашу relocate-фичу, часть логики #10088-эры уже присутствует в базе в изменённом виде (patch детектит reversed), cluster переплетён с нашим image_cache. Требует пофайлового разбора с тестами.
+
+## 5.4 РЕГРЕССИЯ ЭТАПА 2 (найдена финальным прогоном, требует фикса)
+
+`20e330911` (#10803, retry budget single-candidate recovery) **ломает 2 теста** в `provider_call.rs::streaming_fallback_tests`: `stream_failure_without_fallback_keeps_typed_terminal_cause` и `compatible_stream_failures_recover_to_typed_terminal_kinds_without_replay` — stream-кандидат, который обязан упасть, возвращает Ok. Бисекция по worktree-коммитам: `8181da07e` (до #10803) — 8/8 зелёные; `20e330911` — 2 падают. У апстрима тесты те же и зелёные с #10803 → гипотеза: наш порт (1183 строки в reliable.rs) воткнул retry-budget в ветку упавшего stream-кандидата вместо fallback-recovery (пустой стрим → non-stream повтор), из-за чего fail-once мок проходит со второй попытки. Фикс: сверить ветку retry в `ReliableDispatch` с апстримным diff #10803.
+
+Финальный прогон (25.10): runtime lib 4279 passed / 10 failed (7 — известные flaky denial/stream, 2 — регрессия #10803, 1 — `agent_turn_with_zero_budget_preserves_full_tool_result` из flaky-семейства); config 1502/1 (pre-existing powershell); providers **1633/0**; memory 512/0.
+
+## 5.5 cargo audit после Этапа 1 (25.10)
+
+Было 18 находок → безопасные точечные апгрейды (rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots/root-certs 1.0.10, pulldown-cmark 0.13.5, negentropy 0.5.2) → **осталось 10**: zip (1.1.4/8.6.0 → ≥9.0.0, мажор — апстрим #11790), matrix-sdk-crypto 0.18 → 0.19 (#11065, мажор), webpki-roots 0.26.11 (старая мажорная ветка reqwest), ruzstd 0.8.3 (транзитивно, semver-барьер), + предупреждения (yanked/unsound: bitmaps, paste, spin, anymap2, nostr-relay-pool… — транзитивные через matrix-sdk/nostr). Решение по мажорным и по ignore-файлу (в т.ч. RUSTSEC-2026-0292 imbl-sized-chunks, который апстрим осознанно игнорирует) — за владельцем.
 
 ## 6. Этап 4 — Архитектурные решения (требуют решения владельца, НЕ чери-пикать бездумно)
 
