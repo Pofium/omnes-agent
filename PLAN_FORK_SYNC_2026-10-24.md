@@ -147,11 +147,13 @@
 
 **Multimodal-кластер — РУЧНАЯ ИНТЕГРАЦИЯ (механический порт невозможен):** `8730e7b24` (#10088), `d6899dfa1` (#10903), `360bcaaf0` (#9819), `f42b095d9` (#10953), `fc4b4c0ea` (#10838), `9d268ffb2` (#11637), `c1da9332c` (#11582), `4b87318df` (#11200). Причины: multimodal.rs несёт нашу relocate-фичу, часть логики #10088-эры уже присутствует в базе в изменённом виде (patch детектит reversed), cluster переплетён с нашим image_cache. Требует пофайлового разбора с тестами.
 
-## 5.4 РЕГРЕССИЯ ЭТАПА 2 (найдена финальным прогоном, требует фикса)
+## 5.4 РЕГРЕССИЯ ЭТАПА 2 — ИСПРАВЛЕНА (25.10, `cd35a83a9`)
 
-`20e330911` (#10803, retry budget single-candidate recovery) **ломает 2 теста** в `provider_call.rs::streaming_fallback_tests`: `stream_failure_without_fallback_keeps_typed_terminal_cause` и `compatible_stream_failures_recover_to_typed_terminal_kinds_without_replay` — stream-кандидат, который обязан упасть, возвращает Ok. Бисекция по worktree-коммитам: `8181da07e` (до #10803) — 8/8 зелёные; `20e330911` — 2 падают. У апстрима тесты те же и зелёные с #10803 → гипотеза: наш порт (1183 строки в reliable.rs) воткнул retry-budget в ветку упавшего stream-кандидата вместо fallback-recovery (пустой стрим → non-stream повтор), из-за чего fail-once мок проходит со второй попытки. Фикс: сверить ветку retry в `ReliableDispatch` с апстримным diff #10803.
+`20e330911` (#10803) ломал 2 теста `streaming_fallback_tests`. Две причины, обе устранены:
+1. **Порт был неполный**: механизм `terminal_provider_keys` (типизированный терминальный маркер блокирует повторный допуск провайдера) отсутствовал — добавлен во все 4 dispatch-цикла (объявление, проверка при допуске, вставка в non-retryable ветке), как в апстриме (master :2535/:2745 и аналоги).
+2. **Устаревшие тесты**: апстрим сменил семантику в #8966 (18.09, ДО слияния #10803) — single-candidate stream failure восстанавливается одним non-stream вызовом (recovery, не replay); compatible-флоу делает 2 запроса с терминальной классификацией. Наши тесты обновлены по мастер-образцам: `stream_failure_without_fallback_recovers_via_non_streaming` (переименован), compatible-тест ждёт `request_count == 2`.
 
-Финальный прогон (25.10): runtime lib 4279 passed / 10 failed (7 — известные flaky denial/stream, 2 — регрессия #10803, 1 — `agent_turn_with_zero_budget_preserves_full_tool_result` из flaky-семейства); config 1502/1 (pre-existing powershell); providers **1633/0**; memory 512/0.
+Итог: streaming_fallback 8/8 зелёные; полный прогон runtime lib — только 8 известных pre-existing flaky (проходят поодиночке).
 
 ## 5.5 cargo audit после Этапа 1 (25.10)
 
