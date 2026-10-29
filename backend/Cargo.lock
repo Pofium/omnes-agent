@@ -7101,6 +7101,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "filetime",
+ "libc",
  "omnesagent-api",
  "omnesagent-config",
  "omnesagent-kag",
