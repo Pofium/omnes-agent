@@ -6636,6 +6636,7 @@ dependencies = [
  "omnesagent-api",
  "omnesagent-channels",
  "omnesagent-config",
+ "omnesagent-editor",
  "omnesagent-eval",
  "omnesagent-gateway",
  "omnesagent-hardware",

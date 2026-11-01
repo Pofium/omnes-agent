@@ -425,6 +425,9 @@ panic = "abort"
 # registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
 # binary build, so the assemble()-only seal holds in production.
 omnesagent-runtime = { workspace = true, features = ["test-util"] }
+# test-only: gateway component tests construct `AppState` and must stamp the
+# editor registry field the production struct requires.
+omnesagent-editor = { workspace = true }
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"

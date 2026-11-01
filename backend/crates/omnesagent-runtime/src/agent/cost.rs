@@ -454,6 +454,30 @@ fn record_tool_loop_cost_usage_inner_with_live(
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
 }
 
+/// A model with token usage whose ledger records explicitly report that one
+/// or more token-bearing pricing dimensions were unavailable.
+pub struct UnpricedModel {
+    pub model: String,
+    pub unpriced_tokens: u64,
+}
+
+/// Return per-model unpriced token subsets from the ledger-derived summary,
+/// sorted by model id for stable output (upstream #9939).
+pub fn unpriced_models_in_summary(
+    by_model: &HashMap<String, omnesagent_config::cost::ModelStats>,
+) -> Vec<UnpricedModel> {
+    let mut out: Vec<UnpricedModel> = by_model
+        .values()
+        .filter(|m| m.unpriced_tokens > 0)
+        .map(|m| UnpricedModel {
+            model: m.model.clone(),
+            unpriced_tokens: m.unpriced_tokens,
+        })
+        .collect();
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    out
+}
+
 /// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,
 /// `false` thereafter. Split out from `warn_once_missing_pricing` so the
 /// dedup contract can be unit-tested with a caller-owned set instead of the
@@ -743,6 +767,68 @@ mod tests {
             missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
             "different model under same model_provider is a distinct pair"
         );
+    }
+
+    fn model_stats(
+        model: &str,
+        total_tokens: u64,
+        cost_usd: f64,
+        unpriced_tokens: u64,
+    ) -> omnesagent_config::cost::ModelStats {
+        omnesagent_config::cost::ModelStats {
+            model: model.to_string(),
+            cost_usd,
+            input_tokens: total_tokens,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens,
+            unpriced_tokens,
+            request_count: 1,
+        }
+    }
+
+    #[test]
+    fn unpriced_models_use_recorded_provenance_not_aggregate_cost() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "claude-haiku-4-5-20251001".to_string(),
+            model_stats("claude-haiku-4-5-20251001", 9420, 0.0, 9420),
+        );
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        by_model.insert("mixed".to_string(), model_stats("mixed", 3000, 0.05, 700));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        assert_eq!(unpriced.len(), 2);
+        assert_eq!(unpriced[0].model, "claude-haiku-4-5-20251001");
+        assert_eq!(unpriced[0].unpriced_tokens, 9420);
+        assert_eq!(unpriced[1].model, "mixed");
+        assert_eq!(unpriced[1].unpriced_tokens, 700);
+    }
+
+    /// Output is sorted by model id for stable, deterministic status output.
+    #[test]
+    fn unpriced_models_are_sorted_by_id() {
+        let mut by_model = HashMap::new();
+        by_model.insert("zeta".to_string(), model_stats("zeta", 10, 0.0, 10));
+        by_model.insert("alpha".to_string(), model_stats("alpha", 20, 0.0, 20));
+        by_model.insert("mike".to_string(), model_stats("mike", 30, 0.0, 30));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        let ids: Vec<&str> = unpriced.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mike", "zeta"]);
+    }
+
+    #[test]
+    fn genuinely_free_model_does_not_warn() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        assert!(unpriced_models_in_summary(&by_model).is_empty());
     }
 
     #[test]

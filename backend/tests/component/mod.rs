@@ -7,6 +7,7 @@ mod config_dir_locale_regression;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
+mod cost_status_cli;
 #[cfg(feature = "agent-runtime")]
 mod cron_delivery_cli;
 mod cron_help_examples;
