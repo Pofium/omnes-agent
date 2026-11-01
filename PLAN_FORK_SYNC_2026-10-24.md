@@ -124,21 +124,27 @@
 - `a647de344` (#10552) multimodal config threading [ВЫПОЛНЕНО: `dbd4f5320`]
 - `e941e0ca6` (#10519) llm_task alias-aware — **ОТЛОЖЕН** (ADAPT ~534 строки: наш llm_task реорганизован в omnesagent-tools, связанная смена сигнатуры LlmTaskTool::new через 2 крейта)
 
-**Gateway/daemon — частично:**
+**Gateway/daemon — частично (волна 4, 30.10–01.11):**
 - `77ae057e0` (#10455) config write invariants [ВЫПОЛНЕНО: `3d7c5233f`]
 - `21fbd9538` (#10093) subprocess изоляция манифеста [ВЫПОЛНЕНО: `9fa482e89`]
 - `feea19d41` (#11518) EOF ≠ решение оператора [ВЫПОЛНЕНО: `bc350a430`; prompt_cli → io::Result, unix-child тест пропущен]
 - `996c9fa24` (#11083) webhook SOP drive — **SKIP**: зависит от `2f5e85041` (#9841 headless SOP — Этап 4); коммит был применён и убран ребейзом (не компилился)
 - `24938afc6`+`6c0b1f9ee` (#11726/#11531) tailscale — **SKIP**: зависят от промежуточного рефакторинга tunnel/mod.rs v0.8.6 (TunnelProcess/kill_shared удалены у апстрима)
-- `49fa46bb1` (#10538), `fa31aee26` (#10637), `23950c9a1` (#11901) — не начаты
+- `49fa46bb1` (#10538), `fa31aee26` (#10637), `23950c9a1` (#11901) — **НЕ НАЧАТЫ, крупные**: #10538 переписывает ws.rs (+1148 строк, detach-survival архитектуры у нас нет — our ws.rs живёт по-другому), #11901 +1699 строк lib.rs (drain/admission), #10637 зависит от #10538. Отложить до архитектурного решения (см. §6) или отдельной многодневной работой.
 
-**RPC-кластер — ручные follow-up'ы (dispatch.rs разошёлся, механический патчинг дал смешение хунков — откат, делать по одному через Edit):**
-- `5a2a6250a` (#10775 mode swap: session.rs publish_prepared + dispatch.rs), `61b0ec88b` (#11330 configure fence), `083d05ff2` (#11452), `25d543835` (#11151 memory agent-param)
+**RPC-кластер — ЗАКРЫТ (волна 4, ручная работа через Edit, как предписано):**
+- `5a2a6250a` (#10775) preserve live sessions при отказе mode-replacement [ВЫПОЛНЕНО: `dd431ac7a`; ADAPT: наш session/new не имел resume_existing/insert_if_absent — введены publish_prepared+insert_if_absent в session.rs (полный апстрим-тест capacity+fenced), захват generation под permit, staging кандидата + единая точка rollback; 4 апстрим-теста портированы (recovery-ассерпт адаптирован: у нас same-ID re-create = replacement, gen+1); rpc:: 337/337 зелёные]
+- `25d543835` (#11151) memory agent-param — **N/A**: чинится через `memory_plane`/`list_for_principal`/`selector_agent` (principal-изоляция RFC #7141/#8289), которого у нас нет (серия отложена, §6.1); наш `agent`-параметр в memory-методах отсутствует как класс
+- `61b0ec88b` (#11330) configure fence — **ALREADY**: наш `handle_session_configure` захватывает generation как ПЕРВЫЙ шаг и ре-верифицирует под локом (gap «ownership-check→capture» отсутствует, т.к. authz-предвар нет); апстримов fencing на `authorized.live_generation` непортируем до #8289
+- `083d05ff2` (#11452) register live channels — **N/A**: баг живёт в `populate_local_session_channels`/`local_session_channel_factory`/`TrustedLocal` (zerocode-TUI фича) — эти символы отсутствуют в форке; наш `register_channel` уже делает fan-out по всем хендлам
 - `59f21a316` (#11291) — **SKIP**: зависит от `f0ae8c8bd` (#11171 bounded local transport)
 
-**Cost — частично:**
+**Cost — ЗАКРЫТ (волна 4):**
 - `36a6f119c` (#11350) trackers по ledger path [ВЫПОЛНЕНО: `648185b15`; баг был жив: единственный OnceLock крал трекер чужого ledger; +новый тест]
-- `f1527d7e1` (#11557), `91958a0b7` (#10718), `9abe969b6` (#9939), `7007365f4` (#11692) — не начаты (ручные: tracker.rs/cost.rs/apps-часть разошлись; #7007365f4 apps/omnescode-часть N/A — наш клиент свой)
+- `f1527d7e1` (#11557) rejected ledger records [ВЫПОЛНЕНО: `82c0eba97`; ADAPT хитов: ручной перенос в our tracker (строки разошлись); for_each_record → Result<usize>, поле+wire rejected_records, 3 апстрим-теста; config 52 зелёных]
+- `91958a0b7` (#10718) conversation attribution [ВЫПОЛНЕНО: `223b76268`; CostRecord.conversation_id (additive JSONL), record_usage_attributed, TOOL_LOOP_SESSION_KEY в tool-loop; тест атрибуции двух чатов на одном демоне зелёный]
+- `9abe969b6` (#9939) pricing-unavailable [ALREADY B1: `f4381e74f` — config/tracker/schema-часть; ДОЗАКРЫТО волной 4: runtime `unpriced_models_in_summary`+`UnpricedModel`, CLI-витрина в `status` (+ftl ключ), 3 юнит-теста + component `cost_status_cli.rs` (7 e2e-тестов); попутно починен **предсуществующий** дрейф component-таргета: `config_patch_cli` AppState.editor, `support/helpers` MemoryEntry.trust/last_feedback_at, +omnesagent-editor в dev-deps]
+- `7007365f4` (#11692) warn_at_percent [ВЫПОЛНЕНО волной 4; apps/zerocode-часть N/A — наш клиент свой: TurnEvent::BudgetWarning+BudgetWarningPeriod (api), announce_budget_warning (try_send, one-per-turn latch) до enforce_tool_loop_budget, SessionUpdateEvent::BudgetWarning + dispatch-маппинг, ACP-мост: custom `_omnesagent/budget_warning`; 3 provider_call теста + dispatch тест зелёные; frontend-отображение — Этап 6 §8.1]
 
 **Memory-кластер — ЗАКРЫТО (4/5):**
 - `3ed28c40b` (#10091) + `6108618d1` (#10835) + `72324ab20` (#11458) — цепочка sqlite_permissions [ВЫПОЛНЕНО одной комиссией: `8cc7ed8dc`; модуль создан апстримом 13.09 (после нашей базы), 512 тестов крейта зелёные]
@@ -158,6 +164,16 @@
 ## 5.5 cargo audit после Этапа 1 (25.10)
 
 Было 18 находок → безопасные точечные апгрейды (rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots/root-certs 1.0.10, pulldown-cmark 0.13.5, negentropy 0.5.2) → **осталось 10**: zip (1.1.4/8.6.0 → ≥9.0.0, мажор — апстрим #11790), matrix-sdk-crypto 0.18 → 0.19 (#11065, мажор), webpki-roots 0.26.11 (старая мажорная ветка reqwest), ruzstd 0.8.3 (транзитивно, semver-барьер), + предупреждения (yanked/unsound: bitmaps, paste, spin, anymap2, nostr-relay-pool… — транзитивные через matrix-sdk/nostr). Решение по мажорным и по ignore-файлу (в т.ч. RUSTSEC-2026-0292 imbl-sized-chunks, который апстрим осознанно игнорирует) — за владельцем.
+
+## 5.6 Волна 4 (30.10–01.11) — итоги
+
+Закрыты RPC-кластер и Cost-кластер (см. §5.3). Ключевое:
+- **#10775 (`dd431ac7a`)** — самый рискованный порт волны: session/new перестроен на candidate-staging + `publish_prepared` (generation-фенс, capacity-нейтральная замена). До порта баг был жив в нашей форме: `insert` молча заменял живую инкарнацию, а rollback ошибочной подготовки удалял новую, не восстанавливая старую. Тесты: `rpc::` 337/337 + 4 портированных апстрим-теста + session-store capacity/fence тест.
+- **#9939** — B1-порт (#9939 config/tracker) был неполным без runtime/CLI-витрины; дозакрыто [ВЫПОЛНЕНО: `7605cfd91`; helper, `status`, ftl, unit+component 7/7 e2e; попутно component-таргет не компилировался ДО нас (struct-дрейф AppState/MemoryEntry) — починен тем же коммитом].
+- **#11692** [ВЫПОЛНЕНО: `1d39f10c4`] — витрина warn_at_percent: TurnEvent::BudgetWarning → session/update `budget_warning`, gateway-WS кадр (Flutter), ACP custom-метод; однократно за turn, try_send. Frontend-рендер — Этап 6 §8.1.
+- Регрессий не обнаружено: config cost 52/52, runtime agent::cost 20/20, provider_call budget_warning 3/3, dispatch notification тесты зелёные.
+
+Остаток этапа 3 на будущее: мультимодальный кластер (§5.3, ручной), gateway-тройка (перенесена в §6), отложенные #10519/#10252.
 
 ## 6. Этап 4 — Архитектурные решения (требуют решения владельца, НЕ чери-пикать бездумно)
 
@@ -252,8 +268,8 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 | 0 подготовка | — | 0.5 дня | ВЫПОЛНЕНО |
 | 1 security | 13 | 3–4 дня | ВЫПОЛНЕНО 100% (см. §3) |
 | 2 прод-баги | 42 | 8–10 дней | ВЫПОЛНЕНО: все 6 секций 4.1–4.6 завершены |
-| 3 ADAPT средние | ~40 | 10–12 дней | Готово 17 позиций: config 5, skills 3, провайдеры 8, cost 1; SKIP 6 обоснованы (зависимости от #8289/#9535/#11171/#9841/tunnel-рефакторинга); RPC 4 — ручные follow-up'ы; memory/multimodal не начаты |
-| 4 архитектурные | 9 решений | по решению | серии #8289, live-revisions — недели |
+| 3 ADAPT средние | ~40 | 10–12 дней | **Волна 4 (30.10–01.11): этапы 3.1–3.5 закрыты.** Готово 25 портированных позиций: config 5, skills 3, провайдеры 8, cost 5 (#11350/#11557/#10718/#11692 + #9939 B1-закрытие), gateway 3, RPC 1 (#10775), memory 4 (волна 3); вердикты закрытия: #11330 ALREADY, #11452/#11151 N/A (все трое — предок #8289 отложен); SKIP 7 обоснованы (10519, 10252, 11083, 11291, tailscale×2, e16fd898b). Остаток этапа 3: 3 крупных gateway (#10538/#10637/#11901 — перенесены в §6-класс решений) + multimodal-кластер (ручной, 8 позиций) + 2 отложенных (10519/10252) |
+| 4 архитектурные | 9 решений | по решению | серии #8289, live-revisions — недели; +gateway-тройка #10538/#10637/#11901 (архитектура ws/drain у нас другая) |
 | 5 собственные фиксы | ~8 | 2–3 дня | whatsapp cleanup, RAM-буфер аудио, god-file split |
 | 6 frontend адаптация | ~16 | 4–5 дней | Flutter gateway models, SOP Studio, Steering UX, Token Budget |
 
