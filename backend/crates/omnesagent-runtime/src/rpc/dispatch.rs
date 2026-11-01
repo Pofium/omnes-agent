@@ -1509,6 +1509,27 @@ impl RpcDispatcher {
             }
         }
 
+        // Fork-gap guard: a caller-supplied `cwd` becomes this session's
+        // SecurityPolicy workspace root (`Agent::from_config_...` overwrites
+        // `policy.workspace_dir` with the session cwd), so an unconfined value
+        // would let any RPC caller re-root the agent's sandbox outside its
+        // configured scope. Confine it to the agent's workspace allowlist — the
+        // per-agent workspace plus its risk-profile `allowed_roots` and
+        // cross-agent grants — and fail closed. Only the caller-supplied value
+        // is checked: a resumed session's persisted cwd was validated when that
+        // session was first created.
+        if let Some(requested) = req.cwd.as_deref() {
+            let policy =
+                omnesagent_config::policy::SecurityPolicy::for_agent(&config, &req.agent_alias)
+                    .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
+            if !policy.is_resolved_path_allowed(std::path::Path::new(requested)) {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("cwd is outside the agent workspace allowlist: {requested}"),
+                ));
+            }
+        }
+
         // The session cwd: caller-supplied wins, then a resumed ACP session's
         // persisted cwd, then the agent's workspace dir.
         let cwd = req
@@ -8555,7 +8576,16 @@ mod tests {
         );
 
         let mut risk_profiles = HashMap::new();
-        risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
+        // `session/new` confines a caller-supplied cwd to the agent's allowlist;
+        // the temp install root is this test's sandbox, so grant it as an
+        // allowed root.
+        risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                allowed_roots: vec![tmp.path().to_string_lossy().into_owned()],
+                ..RiskProfileConfig::default()
+            },
+        );
 
         omnesagent_config::schema::Config {
             data_dir: workspace_dir,
@@ -10205,6 +10235,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_new_rejects_cwd_outside_agent_allowlist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // A directory outside every allowlisted root (and outside the per-agent
+        // workspace) must be refused: a caller-supplied cwd becomes the session's
+        // SecurityPolicy workspace root, so accepting it would re-root the
+        // agent's sandbox on demand.
+        let outside = tempfile::TempDir::new().unwrap();
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "cwd": outside.path().to_string_lossy(),
+            }))
+            .await
+            .expect_err("cwd outside the allowlist must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("allowlist"),
+            "rejection must name the allowlist: {}",
+            err.message
+        );
+
+        // The same agent still accepts a cwd inside its allowlisted temp root.
+        let allowed = tmp.path().join("project-dir");
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "cwd": allowed.to_string_lossy(),
+            }))
+            .await
+            .expect("allowlisted cwd must be accepted");
+        assert_eq!(
+            created["workspace_dir"],
+            allowed.to_string_lossy().to_string()
+        );
+    }
+
+    #[tokio::test]
     async fn reaped_acp_session_rehydrates_without_memory_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -11333,9 +11407,16 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        config
-            .risk_profiles
-            .insert("test-profile".into(), RiskProfileConfig::default());
+        // `session/new` confines a caller-supplied cwd to the agent's allowlist;
+        // the temp install root is this test's sandbox, so grant it as an
+        // allowed root.
+        config.risk_profiles.insert(
+            "test-profile".into(),
+            RiskProfileConfig {
+                allowed_roots: vec![tmp.path().to_string_lossy().into_owned()],
+                ..RiskProfileConfig::default()
+            },
+        );
         config
             .runtime_profiles
             .insert("default".into(), Default::default());
