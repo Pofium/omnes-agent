@@ -2527,6 +2527,22 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            // Closed ACP union again: underscore-prefixed custom method,
+            // safe to ignore by strict ACP clients.
+            method: "_omnesagent/budget_warning",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "currentUsd": current_usd,
+                "limitUsd": limit_usd,
+                "period": period,
+            }),
+        },
         // ACP has no `session/update` shape for usage; the cost tracker records
         // it out-of-band. Keep this helper total even if a caller omits its
         // fast-path filter.

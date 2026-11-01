@@ -1335,6 +1335,16 @@ async fn process_chat_message(
                             kept_turns,
                             reason,
                         } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
+                        TurnEvent::BudgetWarning {
+                            current_usd,
+                            limit_usd,
+                            period,
+                        } => serde_json::json!({
+                            "type": "budget_warning",
+                            "current_usd": current_usd,
+                            "limit_usd": limit_usd,
+                            "period": period,
+                        }),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
