@@ -4329,7 +4329,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let child_started_at = child_started_at.expect("child process should be visible");
-        let child_identity = format!("zc-process-v1:{child_pid}:{child_started_at}:test-owner");
+        let child_identity = format!("oc-process-v1:{child_pid}:{child_started_at}:test-owner");
 
         let temp = TempDir::new().unwrap();
         let data_dir = temp.path().join("data");
@@ -7320,8 +7320,8 @@ mod tests {
             receipts.as_slice()
         );
         assert!(
-            receipts[0].starts_with("echo_tool: zc-receipt-"),
-            "sub-tool receipt must be tagged with the tool name and a zc-receipt- HMAC token, got: {}",
+            receipts[0].starts_with("echo_tool: oc-receipt-"),
+            "sub-tool receipt must be tagged with the tool name and a oc-receipt- HMAC token, got: {}",
             receipts[0]
         );
     }

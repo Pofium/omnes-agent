@@ -339,11 +339,11 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
 /// the drop count on its own schedule.
 #[tokio::test]
 async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
-    const ATTRIB_MARKER: &str = "zc-log-attribution-marker";
+    const ATTRIB_MARKER: &str = "oc-log-attribution-marker";
     const ATTRIB_ALIAS: &str = "e2e-plugin-agent";
-    const STALL_MARKER: &str = "zc-blocked-log-writer-marker";
-    const FLOOD_MARKER: &str = "zc-log-flood-marker";
-    const OVERSIZED_MARKER: &str = "zc-log-oversized-marker";
+    const STALL_MARKER: &str = "oc-blocked-log-writer-marker";
+    const FLOOD_MARKER: &str = "oc-log-flood-marker";
+    const OVERSIZED_MARKER: &str = "oc-log-oversized-marker";
 
     /// Test-local attributable whose role maps to the `agent_alias`
     /// attribution field, mirroring how a host agent scope labels events.

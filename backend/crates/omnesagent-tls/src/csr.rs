@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn software_signer_emits_csr_and_software_key() {
         let csr = SoftwareP256Signer
-            .generate_csr("zerocode")
+            .generate_csr("omnescode")
             .expect("software signer generates a CSR");
         assert!(csr.csr_pem.contains("BEGIN CERTIFICATE REQUEST"));
         match csr.key {

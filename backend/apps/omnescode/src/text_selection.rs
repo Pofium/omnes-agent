@@ -1,4 +1,4 @@
-//! Rendered-text selection primitives shared by interactive ZeroCode panes.
+//! Rendered-text selection primitives shared by interactive OmnesCode panes.
 
 use ratatui::{
     Frame,

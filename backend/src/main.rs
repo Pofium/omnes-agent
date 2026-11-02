@@ -1132,15 +1132,15 @@ Examples:
     #[command(long_about = "\
 Fetch translated Fluent (.ftl) catalogues for a locale from the upstream \
 repository and install them under `<config-dir>/data/ftl/<locale>/`, where the \
-runtime and zerocode loaders read them.
+runtime and omnescode loaders read them.
 
 Pass a single locale. By default every catalogue is fetched; restrict with \
---catalog (comma-separated): cli, tools, zerocode.
+--catalog (comma-separated): cli, tools, omnescode.
 
 Examples:
   omnesagent locales fetch ja
   omnesagent locales fetch fr --catalog cli,tools
-  omnesagent locales fetch zh-CN --catalog zerocode")]
+  omnesagent locales fetch zh-CN --catalog omnescode")]
     Locales {
         #[command(subcommand)]
         locales_command: LocalesCommands,
@@ -1201,7 +1201,7 @@ enum LocalesCommands {
     Fetch {
         /// Locale code to fetch (e.g. `ja`, `fr`, `zh-CN`).
         locale: String,
-        /// Comma-separated catalogues to fetch: cli, tools, zerocode.
+        /// Comma-separated catalogues to fetch: cli, tools, omnescode.
         /// Omit to fetch all of them.
         #[arg(long)]
         catalog: Option<String>,
@@ -2479,8 +2479,8 @@ async fn run_quickstart_cli(
                     &[("alias", &applied.alias)]
                 )
             );
-            if which_zerocode_on_path() {
-                println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
+            if which_omnescode_on_path() {
+                println!("  omnescode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
         }
@@ -2792,9 +2792,9 @@ fn pick_preset(
 }
 
 #[cfg(feature = "agent-runtime")]
-fn which_zerocode_on_path() -> bool {
+fn which_omnescode_on_path() -> bool {
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("zerocode").is_file()))
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("omnescode").is_file()))
         .unwrap_or(false)
 }
 
@@ -3050,11 +3050,11 @@ enum SecurityCommands {
     ///
     /// Reads the per-daemon CA at `<data_dir>/tls/ca.{crt,key}` (auto-generated on
     /// first run when `[wss]` is enabled) and writes a `clientAuth` certificate +
-    /// key that zerocode (or any client) can present to the mutually-authenticated
+    /// key that omnescode (or any client) can present to the mutually-authenticated
     /// WSS plane.
     IssueClientCert {
         /// Subject/device identity stamped into the certificate (CN).
-        #[arg(long, default_value = "zerocode")]
+        #[arg(long, default_value = "omnescode")]
         name: String,
 
         /// Directory to write the certificate / key. Defaults to `<data_dir>/tls`.
@@ -3095,7 +3095,7 @@ enum SecurityCommands {
 
     /// Ask the running daemon to mint another enrollment pairing code.
     ///
-    /// This adds another browser/zerocode device without restarting the daemon.
+    /// This adds another browser/omnescode device without restarting the daemon.
     /// It is a local operator command: the request is exchanged through the
     /// daemon's data dir, not through the public enrollment route.
     EnrollPaircode {
@@ -3374,7 +3374,7 @@ fn issue_wss_client_cert(
     })?;
 
     // When issuing into a separate out-dir, also lay it out as a drop-in client
-    // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
+    // `tls/` directory (ca.crt + client.crt + client.key). omnescode looks for
     // exactly these names under its <config-dir>/tls, so a client that copies this
     // directory needs no --tls-* flags at all.
     if has_out_dir {
@@ -3473,15 +3473,15 @@ fn issue_wss_client_cert(
         }
         println!("{}", t("cli-mtls-relay-connect-header", "relay connect"));
         if has_out_dir {
-            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            // i18n-exempt: literal omnescode command line; the flags are not translatable
             println!(
-                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
+                "  omnescode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
                 relay.url, relay_node, relay_flags
             );
         } else {
-            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            // i18n-exempt: literal omnescode command line; the flags are not translatable
             println!(
-                "  zerocode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+                "  omnescode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
                 relay.url,
                 relay_node,
                 relay_flags,
@@ -3494,9 +3494,9 @@ fn issue_wss_client_cert(
         println!("{}", t("cli-mtls-relay-ca-note-2", "daemon CA note"));
     } else {
         println!("{}", t("cli-mtls-direct-connect-header", "direct connect"));
-        // i18n-exempt: literal zerocode command line; the flags are not translatable
+        // i18n-exempt: literal omnescode command line; the flags are not translatable
         println!(
-            "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+            "  omnescode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
             ca_cert.display(),
             cert_path.display(),
             key_path.display()

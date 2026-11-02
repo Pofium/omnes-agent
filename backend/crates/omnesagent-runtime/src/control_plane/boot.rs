@@ -97,7 +97,7 @@ fn process_identity() -> &'static str {
         let started_at = current_process_started_at()
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".into());
-        format!("zc-process-v1:{pid}:{started_at}:{}", uuid::Uuid::new_v4())
+        format!("oc-process-v1:{pid}:{started_at}:{}", uuid::Uuid::new_v4())
     })
 }
 
@@ -261,7 +261,7 @@ mod tests {
         let first = ControlPlaneHandle::open(first.path()).unwrap();
         let second = ControlPlaneHandle::open(second.path()).unwrap();
         assert_eq!(first.boot_id, second.boot_id);
-        assert!(first.boot_id.starts_with("zc-process-v1:"));
+        assert!(first.boot_id.starts_with("oc-process-v1:"));
     }
 
     #[test]
@@ -329,7 +329,7 @@ mod tests {
                 agent: "main".into(),
                 status: TaskStatus::Running,
                 owner_pid: child_pid,
-                owner_boot_id: format!("zc-process-v1:{child_pid}:{started_at}:test-owner"),
+                owner_boot_id: format!("oc-process-v1:{child_pid}:{started_at}:test-owner"),
                 heartbeat_at: None,
                 depth: 0,
                 parent_id: None,

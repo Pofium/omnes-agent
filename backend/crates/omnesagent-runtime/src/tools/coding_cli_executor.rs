@@ -211,7 +211,7 @@ mod tests {
                 .args([
                     "-c",
                     "printf '%s:%s:%s' \"$ZC_RUNTIME_SENTINEL\" \"$ZC_SANDBOX_SENTINEL\" \"$1\"",
-                    "zc-runtime",
+                    "oc-runtime",
                 ])
                 .env("ZC_RUNTIME_SENTINEL", "runtime")
                 .current_dir(workspace_dir);

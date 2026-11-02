@@ -1,4 +1,4 @@
-//! Keymap abstraction for zerocode.
+//! Keymap abstraction for omnescode.
 //!
 //! Each leaf action enum carries its own default bindings inline.
 //! Consumers call `ChatTabAction::from_chord(&key)` directly — no
@@ -116,7 +116,7 @@ fn show_chord_in_help(_action_key: &str, _chord: &Chord) -> bool {
         && _chord.modifiers == KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)
     {
         // Some macOS terminals collapse Ctrl+Shift+C to Ctrl+C, which
-        // reaches ZeroCode as Quit instead of the advertised Logs action.
+        // reaches OmnesCode as Quit instead of the advertised Logs action.
         return false;
     }
     true

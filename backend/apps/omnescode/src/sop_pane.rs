@@ -569,7 +569,7 @@ impl SopPane {
     /// Whether the pane currently owns a text prompt.
     ///
     /// The read-only surface keeps Watch available, so its run-id prompt must
-    /// suppress global text chords just like the other zerocode inputs. Keep
+    /// suppress global text chords just like the other omnescode inputs. Keep
     /// this derived from the prompt buffers rather than introducing parallel
     /// focus state.
     pub(crate) fn wants_text_input(&self) -> bool {
@@ -1717,7 +1717,7 @@ impl SopPane {
             errors.push(list.clone());
         }
         if self.runs_poll_stale {
-            errors.push(crate::i18n::t("zc-sop-runs-stale"));
+            errors.push(crate::i18n::t("oc-sop-runs-stale"));
         }
         (!errors.is_empty()).then(|| errors.join("\n"))
     }
@@ -1786,7 +1786,7 @@ impl SopPane {
             } else if self.read_only {
                 // Authoring keys are inert in the read-only status view;
                 // don't advertise them.
-                crate::i18n::t("zc-sop-empty-read-only")
+                crate::i18n::t("oc-sop-empty-read-only")
             } else {
                 "(no nodes; press n to author, e to edit)".to_string()
             };
@@ -2288,7 +2288,7 @@ const ROW_GAP: u16 = 2;
 
 /// Project a persisted web-canvas pixel coordinate onto a terminal slot cell.
 /// `origin` and `web_pitch` come from the shared [`LayoutGeometry`] registry
-/// carried on the graph, so zerocode never hardcodes the web's pixel geometry.
+/// carried on the graph, so omnescode never hardcodes the web's pixel geometry.
 fn cell_from_web(coord: f64, origin: f64, web_pitch: f64, cell_pitch: u16) -> u16 {
     if web_pitch <= 0.0 {
         return 0;
@@ -2640,13 +2640,13 @@ mod tests {
 
     #[test]
     fn read_only_empty_state_comes_from_fluent_catalogue() {
-        assert_eq!(crate::i18n::t("zc-sop-empty-read-only"), "(no nodes)");
+        assert_eq!(crate::i18n::t("oc-sop-empty-read-only"), "(no nodes)");
     }
 
     #[test]
     fn honored_toml_coords_land_on_matching_slot() {
         // A node dragged to web grid slot (col 2, row 1) persists TOML
-        // x = 24 + 2*340 = 704, y = 24 + 1*130 = 154. zerocode must place it
+        // x = 24 + 2*340 = 704, y = 24 + 1*130 = 154. omnescode must place it
         // on the same slot: col_cells = 2*(CARD_W+COL_GAP), row_cells =
         // 1*(CARD_H+ROW_GAP), from an origin-cornered inner rect.
         let layout = GraphLayout {
@@ -2730,7 +2730,7 @@ mod tests {
             trigger_source_walk(&registry),
             vec!["webhook", "future_source", "channel"],
             "picker must render the backend walk verbatim, including a source \
-             present only in `sources`, so zerocode cannot drift"
+             present only in `sources`, so omnescode cannot drift"
         );
     }
 
@@ -3135,7 +3135,7 @@ mod status_agg_tests {
         );
         assert!(pane.runs_poll_stale);
         assert_eq!(pane.error.as_deref(), Some("save failed"));
-        let stale_message = crate::i18n::t("zc-sop-runs-stale");
+        let stale_message = crate::i18n::t("oc-sop-runs-stale");
         let first_visible_error = pane.visible_error().unwrap();
         assert!(first_visible_error.contains("save failed"));
         assert!(first_visible_error.contains(&stale_message));

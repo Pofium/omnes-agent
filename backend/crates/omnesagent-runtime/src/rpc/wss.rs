@@ -860,7 +860,7 @@ fn rpc_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig 
     ///   admitted as a single frame - which tungstenite's 16 MiB DEFAULT frame
     ///   cap would wrongly reject. It must not be shrunk below the request
     ///   contract.
-    /// - It mirrors the client's RPC-plane config (zerocode `rpc_ws_config`),
+    /// - It mirrors the client's RPC-plane config (omnescode `rpc_ws_config`),
     ///   so the two ends cannot drift into one side rejecting what the other
     ///   will send.
     /// - It is a PER-MESSAGE bound, not a host budget. Aggregate parser
@@ -1020,7 +1020,7 @@ pub async fn run_wss_listener(
                                 &format!(
                                     "WSS TLS handshake failed from {remote_addr}: {e}. The WSS plane \
                                      requires a client certificate; an un-migrated client must enroll \
-                                     first (zerocode --enroll), and a revoked cert is refused."
+                                     first (omnescode --enroll), and a revoked cert is refused."
                                 )
                             );
                             return None;

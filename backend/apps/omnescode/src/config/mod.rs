@@ -1,6 +1,6 @@
-//! Local zerocode client configuration: theme and keybindings.
-//! Always read from the local `<config_dir>/zerocode-config.toml`, independent
-//! of the connection target. Layering: defaults -> file -> `ZEROCODE_*` env.
+//! Local omnescode client configuration: theme and keybindings.
+//! Always read from the local `<config_dir>/omnescode-config.toml`, independent
+//! of the connection target. Layering: defaults -> file -> `OMNESCODE_*` env.
 #![allow(dead_code)]
 
 pub mod keybindings;
@@ -11,11 +11,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::keymap::{ChatTabAction, Chord, GlobalAction, overrides::OverrideTable};
+use crate::keymap::{overrides::OverrideTable, ChatTabAction, Chord, GlobalAction};
 use crate::theme::{self, Theme};
 
-const FILE_NAME: &str = "zerocode-config.toml";
-const ENV_PREFIX: &str = "ZEROCODE_";
+const FILE_NAME: &str = "omnescode-config.toml";
+/// Pre-rebrand file name. Read (and edited) in place when it is the only file
+/// present, so an install created before the rename keeps its settings.
+const LEGACY_FILE_NAME: &str = "zerocode-config.toml";
+const ENV_PREFIX: &str = "OMNESCODE_";
 const ENV_SEP: &str = "__";
 
 /// One or more chords bound to an action. Accepts a bare string (one
@@ -320,7 +323,7 @@ impl TodoTrackerSection {
     /// before persistence so a success message always describes the values
     /// the next session will consume, and [`resolve_todo_tracker_checked`]
     /// calls it on the effective (post-env-override) section so hand-edited
-    /// files and `ZEROCODE_todotracker__*` overrides fail visibly instead of
+    /// files and `OMNESCODE_todotracker__*` overrides fail visibly instead of
     /// being normalized.
     pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
         if self.width == 0 || self.max_height == 0 {
@@ -337,7 +340,7 @@ impl TodoTrackerSection {
     /// the panel if some future caller bypasses validation — it is **not** the
     /// authority on validity. An explicit zero from the file or the
     /// environment must fail visibly rather than be silently normalized to
-    /// `1`, which is enforced by [`ZerocodeConfig::validate_todo_tracker`];
+    /// `1`, which is enforced by [`OmnescodeConfig::validate_todo_tracker`];
     /// every session boundary runs it via [`resolve_todo_tracker_checked`].
     pub(crate) fn resolve(&self) -> TodoTrackerSettings {
         TodoTrackerSettings {
@@ -367,7 +370,7 @@ pub(crate) enum TodoLocation {
 }
 
 /// Runtime `[todotracker]` settings, resolved from the config section by
-/// [`ZerocodeConfig::resolve_todo_tracker`]. Values are validated at that
+/// [`OmnescodeConfig::resolve_todo_tracker`]. Values are validated at that
 /// boundary, so downstream consumers can trust them as-is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TodoTrackerSettings {
@@ -422,7 +425,7 @@ fn default_todotracker_max_height() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ZerocodeConfig {
+pub(crate) struct OmnescodeConfig {
     #[serde(default = "default_locale")]
     pub locale: Option<String>,
     #[serde(default)]
@@ -437,7 +440,7 @@ pub(crate) struct ZerocodeConfig {
     pub todotracker: TodoTrackerSection,
 }
 
-impl Default for ZerocodeConfig {
+impl Default for OmnescodeConfig {
     fn default() -> Self {
         Self {
             locale: default_locale(),
@@ -457,7 +460,7 @@ fn default_theme() -> String {
     theme::DEFAULT_THEME_NAME.to_string()
 }
 
-impl ZerocodeConfig {
+impl OmnescodeConfig {
     pub fn resolve_theme(&self) -> Result<Theme> {
         let name = self.theme.name.trim();
         if name.is_empty() {
@@ -530,7 +533,7 @@ impl ZerocodeConfig {
     }
 
     /// Validate the effective `[todotracker]` section, whatever its origin
-    /// (file, defaults, or `ZEROCODE_todotracker__*` override).
+    /// (file, defaults, or `OMNESCODE_todotracker__*` override).
     pub(crate) fn validate_todo_tracker(
         &self,
     ) -> std::result::Result<(), UiSectionValidationError> {
@@ -538,18 +541,30 @@ impl ZerocodeConfig {
     }
 }
 
+/// The effective config file: the current `omnescode-config.toml` when it
+/// exists, otherwise a leftover pre-rebrand `zerocode-config.toml` (read and
+/// edited in place so an existing install keeps its settings), otherwise the
+/// current name for a fresh file.
 pub(crate) fn config_path(config_dir: &Path) -> PathBuf {
-    config_dir.join(FILE_NAME)
+    let primary = config_dir.join(FILE_NAME);
+    if primary.exists() {
+        return primary;
+    }
+    let legacy = config_dir.join(LEGACY_FILE_NAME);
+    if legacy.exists() {
+        return legacy;
+    }
+    primary
 }
 
-/// The effective config: on-disk values with `ZEROCODE_*` env overrides
+/// The effective config: on-disk values with `OMNESCODE_*` env overrides
 /// applied on top. This is what runtime consumers (sessions, rendering) read.
 ///
 /// Env overrides are process-transient and must never be written back to disk,
 /// so anything that *edits and saves* config must use [`load_persisted`]
 /// instead — otherwise saving one field would bake an env-injected value for
-/// an unrelated field into `zerocode-config.toml`.
-pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
+/// an unrelated field into `omnescode-config.toml`.
+pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<OmnescodeConfig> {
     let mut config = load_persisted(config_dir)?;
     apply_env_overrides(&mut config)?;
     Ok(config)
@@ -565,7 +580,7 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// tracker on restart/switch. This variant re-parses that one section strictly
 /// so the caller can preserve the current settings on failure; a *valid* or
 /// *absent* section resolves exactly as `ensure_and_load` would, with
-/// `ZEROCODE_todotracker__*` overrides applied.
+/// `OMNESCODE_todotracker__*` overrides applied.
 ///
 /// The effective section is validated **after** env overrides are applied, so
 /// an explicit zero `width`/`max_height` fails visibly whether it came from
@@ -621,21 +636,21 @@ pub(crate) fn load_persisted_todotracker_strict(
 
 /// The on-disk config exactly as persisted, with **no** env overrides applied.
 /// This is the correct base for read-modify-write edits (the Config pane), so
-/// a transient `ZEROCODE_*` value can never leak into the saved file.
-pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
+/// a transient `OMNESCODE_*` value can never leak into the saved file.
+pub(crate) fn load_persisted(config_dir: &Path) -> Result<OmnescodeConfig> {
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
 
     let path = config_path(config_dir);
     if !path.exists() {
-        let default = ZerocodeConfig::default();
+        let default = OmnescodeConfig::default();
         let body = toml::to_string_pretty(&default).context("serializing default config")?;
         std::fs::write(&path, body)
             .with_context(|| format!("writing default {}", path.display()))?;
     }
 
     let mut doc = load_document(&path)?;
-    let mut config = ZerocodeConfig::default();
+    let mut config = OmnescodeConfig::default();
     let mut migrated_keybindings = false;
     if let Some(v) = doc.get("locale").and_then(|v| v.as_str()) {
         let trimmed = v.trim();
@@ -647,7 +662,7 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
         match v.clone().try_into::<ThemeSection>() {
             Ok(section) => config.theme = section,
             Err(e) => eprintln!(
-                "zerocode: ignoring [theme] in {} ({e}); using default",
+                "omnescode: ignoring [theme] in {} ({e}); using default",
                 path.display()
             ),
         }
@@ -656,7 +671,7 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
         match v.clone().try_into::<ConnectionSection>() {
             Ok(section) => config.connection = section,
             Err(e) => eprintln!(
-                "zerocode: ignoring [connection] in {} ({e}); using default",
+                "omnescode: ignoring [connection] in {} ({e}); using default",
                 path.display()
             ),
         }
@@ -724,7 +739,7 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                 config.keybindings = rows;
             }
             Err(e) => eprintln!(
-                "zerocode: ignoring [keybindings] in {} ({e}); using defaults",
+                "omnescode: ignoring [keybindings] in {} ({e}); using defaults",
                 path.display()
             ),
         }
@@ -733,7 +748,7 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
         match v.clone().try_into::<TodoTrackerSection>() {
             Ok(section) => config.todotracker = section,
             Err(e) => eprintln!(
-                "zerocode: ignoring [todotracker] in {} ({e}); using default",
+                "omnescode: ignoring [todotracker] in {} ({e}); using default",
                 path.display()
             ),
         }
@@ -1060,14 +1075,14 @@ fn flatten_table(table: &OverrideTable) -> HashMap<String, ChordSpec> {
     out
 }
 
-/// Apply every `ZEROCODE_<dotted__path>=value` env var. Hard-errors on any var
+/// Apply every `OMNESCODE_<dotted__path>=value` env var. Hard-errors on any var
 /// that does not resolve to a known config path.
 ///
-/// Canonical spelling: the `ZEROCODE_` prefix followed by the lowercase dotted
-/// config path with `.` written as `__` — e.g. `ZEROCODE_todotracker__enabled=false`
+/// Canonical spelling: the `OMNESCODE_` prefix followed by the lowercase dotted
+/// config path with `.` written as `__` — e.g. `OMNESCODE_todotracker__enabled=false`
 /// sets `todotracker.enabled`. This mirrors the daemon's `OMNESAGENT_<path>` form.
 /// Overrides are process-transient and are never written back to disk.
-fn apply_env_overrides(config: &mut ZerocodeConfig) -> Result<()> {
+fn apply_env_overrides(config: &mut OmnescodeConfig) -> Result<()> {
     let mut entries: Vec<(String, String, String)> = std::env::vars()
         .filter_map(|(k, v)| {
             let tail = k.strip_prefix(ENV_PREFIX)?;
@@ -1119,7 +1134,7 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     }
 
     // Parse the string into the correct TOML type by inspecting the existing
-    // field value. This lets env overrides like `ZEROCODE_todotracker__enabled=false`
+    // field value. This lets env overrides like `OMNESCODE_todotracker__enabled=false`
     // set a boolean without the caller knowing the field type.
     let existing = table[*leaf].clone();
     let new_value = match existing {
@@ -1167,14 +1182,14 @@ mod tests {
 
     #[test]
     fn default_theme_is_registered() {
-        let c = ZerocodeConfig::default();
+        let c = OmnescodeConfig::default();
         assert_eq!(c.theme.name, theme::DEFAULT_THEME_NAME);
         assert!(c.resolve_theme().is_ok());
     }
 
     #[test]
     fn default_config_emits_locale() {
-        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        let body = toml::to_string_pretty(&OmnescodeConfig::default()).unwrap();
         assert!(
             body.contains("locale = \"en\""),
             "default config must surface the locale prop on disk; got:\n{body}"
@@ -1183,12 +1198,12 @@ mod tests {
 
     #[test]
     fn resolve_locale_trims_and_blanks_fall_back() {
-        let c = ZerocodeConfig {
+        let c = OmnescodeConfig {
             locale: Some("  fr  ".to_string()),
             ..Default::default()
         };
         assert_eq!(c.resolve_locale().as_deref(), Some("fr"));
-        let blank = ZerocodeConfig {
+        let blank = OmnescodeConfig {
             locale: Some("   ".to_string()),
             ..Default::default()
         };
@@ -1197,7 +1212,7 @@ mod tests {
 
     #[test]
     fn set_prop_locale_roundtrip() {
-        let mut c = ZerocodeConfig::default();
+        let mut c = OmnescodeConfig::default();
         set_prop(&mut c, "locale", "ja").unwrap();
         assert_eq!(c.locale.as_deref(), Some("ja"));
     }
@@ -1218,21 +1233,21 @@ mod tests {
 
     #[test]
     fn set_prop_roundtrip() {
-        let mut c = ZerocodeConfig::default();
+        let mut c = OmnescodeConfig::default();
         set_prop(&mut c, "theme.name", "nord").unwrap();
         assert_eq!(c.theme.name, "nord");
     }
 
     #[test]
     fn set_prop_unknown_path_errors() {
-        let mut c = ZerocodeConfig::default();
+        let mut c = OmnescodeConfig::default();
         let err = set_prop(&mut c, "no_such_field", "x").unwrap_err();
         assert!(err.to_string().contains("did not resolve"));
     }
 
     #[test]
     fn resolve_unknown_theme_falls_back_to_terminal() {
-        let c = ZerocodeConfig {
+        let c = OmnescodeConfig {
             theme: ThemeSection {
                 name: "bogus".to_string(),
                 ..Default::default()
@@ -1250,7 +1265,7 @@ mod tests {
     fn agent_override_resolves_known_theme() {
         let body =
             "[theme]\nname = \"nord_dark\"\n\n[theme.agent_override.coder]\nname = \"dracula\"\n";
-        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        let c: OmnescodeConfig = toml::from_str(body).unwrap();
         let t = c
             .resolve_agent_theme("coder")
             .unwrap()
@@ -1260,14 +1275,14 @@ mod tests {
 
     #[test]
     fn agent_override_absent_alias_is_none() {
-        let c: ZerocodeConfig = toml::from_str("[theme]\nname = \"nord_dark\"\n").unwrap();
+        let c: OmnescodeConfig = toml::from_str("[theme]\nname = \"nord_dark\"\n").unwrap();
         assert!(c.resolve_agent_theme("nobody").unwrap().is_none());
     }
 
     #[test]
     fn agent_override_unknown_theme_falls_back_to_terminal() {
         let body = "[theme.agent_override.coder]\nname = \"no_such_theme\"\n";
-        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        let c: OmnescodeConfig = toml::from_str(body).unwrap();
         let t = c
             .resolve_agent_theme("coder")
             .expect("unknown override falls back, never errors")
@@ -1279,14 +1294,14 @@ mod tests {
     #[test]
     fn agent_override_blank_name_is_none() {
         let body = "[theme.agent_override.coder]\nname = \"  \"\n";
-        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        let c: OmnescodeConfig = toml::from_str(body).unwrap();
         assert!(c.resolve_agent_theme("coder").unwrap().is_none());
     }
 
     #[test]
     fn agent_override_aliases_lists_configured() {
         let body = "[theme.agent_override.a]\nname = \"dracula\"\n[theme.agent_override.b]\nname = \"nord_dark\"\n";
-        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        let c: OmnescodeConfig = toml::from_str(body).unwrap();
         let mut aliases: Vec<&str> = c.agent_override_aliases().collect();
         aliases.sort_unstable();
         assert_eq!(aliases, vec!["a", "b"]);
@@ -1294,7 +1309,7 @@ mod tests {
 
     #[test]
     fn default_config_emits_no_agent_override() {
-        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        let body = toml::to_string_pretty(&OmnescodeConfig::default()).unwrap();
         assert!(
             !body.contains("agent_override"),
             "default config must not scaffold agent_override; got:\n{body}"
@@ -1371,7 +1386,7 @@ mod tests {
     #[test]
     fn resolve_empty_theme_recovers_to_default() {
         for blank in ["", "   "] {
-            let c = ZerocodeConfig {
+            let c = OmnescodeConfig {
                 theme: ThemeSection {
                     name: blank.to_string(),
                     ..Default::default()
@@ -1420,12 +1435,10 @@ mod tests {
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
         assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
-        assert!(
-            doc["keybindings"]
-                .as_table()
-                .unwrap()
-                .contains_key("dashboard.up")
-        );
+        assert!(doc["keybindings"]
+            .as_table()
+            .unwrap()
+            .contains_key("dashboard.up"));
     }
 
     #[test]
@@ -1765,12 +1778,12 @@ mod tests {
 
     #[test]
     fn connection_section_round_trips() {
-        let mut c = ZerocodeConfig::default();
+        let mut c = OmnescodeConfig::default();
         c.connection.wss.uri = Some("wss://host:9781".to_string());
         c.connection.wss.tls.skip_verify = true;
         c.connection.wss.tls.skip_verify_routes = vec!["wss://host:9781".to_string()];
         let body = toml::to_string_pretty(&c).unwrap();
-        let back: ZerocodeConfig = toml::from_str(&body).unwrap();
+        let back: OmnescodeConfig = toml::from_str(&body).unwrap();
         assert_eq!(back.connection.wss.uri.as_deref(), Some("wss://host:9781"));
         assert!(back.connection.wss.tls.skip_verify);
         assert_eq!(
@@ -1781,18 +1794,18 @@ mod tests {
 
     #[test]
     fn empty_connection_defaults_are_clean() {
-        let c = ZerocodeConfig::default();
+        let c = OmnescodeConfig::default();
         assert!(c.connection.wss.uri.is_none());
         assert!(!c.connection.wss.tls.skip_verify);
         assert!(c.connection.wss.tls.skip_verify_routes.is_empty());
-        let parsed: ZerocodeConfig = toml::from_str("locale = \"en\"\n").unwrap();
+        let parsed: OmnescodeConfig = toml::from_str("locale = \"en\"\n").unwrap();
         assert!(parsed.connection.wss.uri.is_none());
         assert!(parsed.connection.wss.tls.skip_verify_routes.is_empty());
     }
 
     #[test]
     fn default_config_writes_no_connection_scaffolding() {
-        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        let body = toml::to_string_pretty(&OmnescodeConfig::default()).unwrap();
         assert!(
             !body.contains("connection"),
             "default config must not emit any [connection] scaffolding; got:\n{body}"
@@ -1963,7 +1976,7 @@ mod tests {
             "[theme]\nname = \"dracula\"\n\n[todotracker]\nwidth = \"not_a_number\"\n",
         );
         // Asserts on-disk parsing/fallback, so read the persisted view: the
-        // effective view would also layer in any ambient `ZEROCODE_*` override.
+        // effective view would also layer in any ambient `OMNESCODE_*` override.
         let cfg = load_persisted(dir.path()).unwrap();
         assert_eq!(cfg.theme.name, "dracula");
         assert_eq!(cfg.todotracker.width, default_todotracker_width());
@@ -2018,21 +2031,21 @@ mod tests {
 
     #[test]
     fn set_prop_todotracker_enabled() {
-        let mut c = ZerocodeConfig::default();
+        let mut c = OmnescodeConfig::default();
         set_prop(&mut c, "todotracker.enabled", "false").unwrap();
         assert!(!c.todotracker.enabled);
     }
 
     #[test]
     fn set_prop_todotracker_width() {
-        let mut c = ZerocodeConfig::default();
+        let mut c = OmnescodeConfig::default();
         set_prop(&mut c, "todotracker.width", "50").unwrap();
         assert_eq!(c.todotracker.width, 50);
     }
 
     #[test]
     fn set_prop_todotracker_location() {
-        let mut c = ZerocodeConfig::default();
+        let mut c = OmnescodeConfig::default();
         set_prop(&mut c, "todotracker.location", "left").unwrap();
         assert_eq!(c.todotracker.location, TodoTrackerLocation::Left);
     }
@@ -2092,11 +2105,11 @@ mod tests {
             "[todotracker]\nwidth = 32\nmax_height = 5\n",
         )
         .unwrap();
-        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+        let _v = EnvVarGuard::set("OMNESCODE_todotracker__width", "0");
 
         assert!(
             resolve_todo_tracker_checked(dir.path()).is_err(),
-            "ZEROCODE_todotracker__width=0 must fail visibly, not normalize to 1"
+            "OMNESCODE_todotracker__width=0 must fail visibly, not normalize to 1"
         );
     }
 
@@ -2104,11 +2117,11 @@ mod tests {
     fn resolve_todo_tracker_checked_rejects_zero_max_height_from_env() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        let _v = EnvVarGuard::set("ZEROCODE_todotracker__max_height", "0");
+        let _v = EnvVarGuard::set("OMNESCODE_todotracker__max_height", "0");
 
         assert!(
             resolve_todo_tracker_checked(dir.path()).is_err(),
-            "ZEROCODE_todotracker__max_height=0 must fail visibly, not normalize to 1"
+            "OMNESCODE_todotracker__max_height=0 must fail visibly, not normalize to 1"
         );
     }
 
@@ -2130,7 +2143,7 @@ mod tests {
 
     // ── Single source of truth ──────────────────────────────────────────────
     //
-    // `zerocode-config.toml` is the live source of truth for the tracker's
+    // `omnescode-config.toml` is the live source of truth for the tracker's
     // display settings: a value persisted by the Config pane must be visible
     // to the next session that resolves the file, never shadowed by a copy
     // cached at first-session start. Sessions resolve the file at each session
@@ -2163,23 +2176,23 @@ mod tests {
     }
     // ── Environment override contract ───────────────────────────────────────
     //
-    // Canonical spelling is `ZEROCODE_<lowercase dotted path with __>`, e.g.
-    // `ZEROCODE_todotracker__enabled`. These exercise real environment
+    // Canonical spelling is `OMNESCODE_<lowercase dotted path with __>`, e.g.
+    // `OMNESCODE_todotracker__enabled`. These exercise real environment
     // variables through `ensure_and_load` rather than calling `set_prop`
     // directly, so the public spelling stays covered.
 
-    use crate::test_support::{EnvVarGuard, env_test_lock};
+    use crate::test_support::{env_test_lock, EnvVarGuard};
 
     #[test]
     fn canonical_env_spelling_overrides_tracker_field() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        let _v = EnvVarGuard::set("ZEROCODE_todotracker__enabled", "false");
+        let _v = EnvVarGuard::set("OMNESCODE_todotracker__enabled", "false");
 
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert!(
             !cfg.todotracker.enabled,
-            "ZEROCODE_todotracker__enabled must reach the parser and win over the file"
+            "OMNESCODE_todotracker__enabled must reach the parser and win over the file"
         );
     }
 
@@ -2187,7 +2200,7 @@ mod tests {
     fn canonical_env_spelling_overrides_tracker_width() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "41");
+        let _v = EnvVarGuard::set("OMNESCODE_todotracker__width", "41");
 
         let cfg = ensure_and_load(dir.path()).unwrap();
         assert_eq!(cfg.resolve_todo_tracker().width, 41);
@@ -2197,7 +2210,7 @@ mod tests {
     fn unknown_env_path_is_rejected() {
         let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
-        let _v = EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        let _v = EnvVarGuard::set("OMNESCODE_todotracker__nope", "1");
 
         let err = ensure_and_load(dir.path()).expect_err("unknown path must hard-error");
         assert!(format!("{err:#}").contains("did not resolve to a config field"));
@@ -2216,7 +2229,7 @@ mod tests {
         };
         persist_todotracker(dir.path(), &on_disk).unwrap();
 
-        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+        let _v = EnvVarGuard::set("OMNESCODE_todotracker__width", "77");
 
         // Effective view honors the override...
         assert_eq!(ensure_and_load(dir.path()).unwrap().todotracker.width, 77);
@@ -2237,7 +2250,7 @@ mod tests {
         };
         persist_todotracker(dir.path(), &on_disk).unwrap();
 
-        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+        let _v = EnvVarGuard::set("OMNESCODE_todotracker__width", "77");
 
         // Edit an unrelated field starting from the persisted section.
         let mut candidate = load_persisted(dir.path()).unwrap().todotracker;

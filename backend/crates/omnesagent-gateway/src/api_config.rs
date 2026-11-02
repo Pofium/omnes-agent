@@ -3284,7 +3284,7 @@ mod tests {
 
     #[test]
     fn delete_cascade_resolves_custom_workspace_before_removing_entry() {
-        let custom = std::path::PathBuf::from("/var/lib/zc-test/custom-victim-ws");
+        let custom = std::path::PathBuf::from("/var/lib/oc-test/custom-victim-ws");
         let mut cfg = omnesagent_config::schema::Config::default();
         cfg.agents.insert(
             "victim".to_string(),

@@ -2291,7 +2291,7 @@ impl RpcDispatcher {
         );
 
         // Capture live attribution fields and max_context_tokens for the turn span.
-        // Zerocode's context meter field is named `max_context_tokens` and must
+        // Omnescode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
         // max_context_tokens`), not the provider model-window helper (which
         // falls back to 32_000 when `context_window` is unset).
@@ -5381,7 +5381,7 @@ fn truncate_memory_previews(
     entries
 }
 
-/// Resolve the max-token ceiling shown on Zerocode's context usage meter.
+/// Resolve the max-token ceiling shown on Omnescode's context usage meter.
 ///
 /// The wire field is named `max_context_tokens` and must track the operator's
 /// runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`),
@@ -5593,7 +5593,7 @@ mod tests {
     fn agent_alias_from_model_provider_prop_matches_only_the_bound_provider_field() {
         // The config pane and other `config/set agents.<alias>.model_provider`
         // callers write this path; it must map back to the alias so the live
-        // session refresh fires. The zerocode picker takes the `session/configure`
+        // session refresh fires. The omnescode picker takes the `session/configure`
         // path instead and is not a caller here.
         assert_eq!(
             agent_alias_from_model_provider_prop("agents.fred.model_provider"),
@@ -5679,7 +5679,7 @@ mod tests {
     #[test]
     fn session_initializes_mcp_for_chat_but_not_acp() {
         use crate::rpc::types::ChatMode;
-        // Chat sessions must initialize MCP so the Zerocode TUI sees the same
+        // Chat sessions must initialize MCP so the Omnescode TUI sees the same
         // MCP tools (and the deferred-loading `tool_search`) the gateway
         // already exposes for the agent
         assert!(
@@ -6300,7 +6300,7 @@ mod tests {
     }
 
     // The `sops/trigger-sources` RPC response must carry the full
-    // ordered `SopTriggerSource` walk so authoring surfaces (web + zerocode)
+    // ordered `SopTriggerSource` walk so authoring surfaces (web + omnescode)
     // render the picker from the backend list instead of reconstructing it.
     // Any new trigger source variant appears here automatically; a surface that
     // reconstructs its own list would drift while this guard would not, so the
@@ -8168,7 +8168,7 @@ mod tests {
         assert_eq!(v["params"]["max_context_tokens"], 32_000);
     }
 
-    /// Regression: Zerocode's context meter must read the runtime-profile
+    /// Regression: Omnescode's context meter must read the runtime-profile
     /// `max_context_tokens` budget, not the provider model-window helper.
     /// The model-window path falls back to 32_000 when `context_window` is
     /// unset, which made the meter ignore a profile set to e.g. 128_000.
@@ -9241,7 +9241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zerocode_code_surface_injects_context_without_changing_authority() {
+    async fn omnescode_code_surface_injects_context_without_changing_authority() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -9260,14 +9260,14 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
-                "session_id": "zerocode-acp",
+                "interaction_surface": "omnescode_code",
+                "session_id": "omnescode-acp",
             }))
             .await
-            .expect("ZeroCode ACP session should succeed");
+            .expect("OmnesCode ACP session should succeed");
 
         let generic = sessions.get_agent("generic-acp").await.unwrap();
-        let surfaced = sessions.get_agent("zerocode-acp").await.unwrap();
+        let surfaced = sessions.get_agent("omnescode-acp").await.unwrap();
         let mut generic_tools = generic
             .lock()
             .await
@@ -9290,18 +9290,18 @@ mod tests {
 
         let prompt = surfaced_guard.system_prompt_for_test().unwrap();
         assert!(prompt.contains("## Interaction Context"));
-        assert!(prompt.contains("Surface: ZeroCode Code (ACP)"));
+        assert!(prompt.contains("Surface: OmnesCode Code (ACP)"));
         assert!(prompt.contains("this description grants no capabilities"));
         drop(surfaced_guard);
 
         assert_eq!(
             acp_store
-                .load_session("zerocode-acp")
+                .load_session("omnescode-acp")
                 .unwrap()
                 .unwrap()
                 .interaction_surface
                 .as_deref(),
-            Some("zerocode_code")
+            Some("omnescode_code")
         );
     }
 
@@ -9317,7 +9317,7 @@ mod tests {
             json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "chat",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "wrong-mode",
             }),
             json!({
@@ -9340,7 +9340,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "interaction_context": {
                     "prompt": "CLIENT_AUTHORED_PROMPT_MUST_NOT_APPEAR",
                     "tools": "grant_everything"
@@ -9367,7 +9367,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "surface-resume",
             }))
             .await
@@ -9389,7 +9389,7 @@ mod tests {
                 .await
                 .system_prompt_for_test()
                 .unwrap()
-                .contains("Surface: ZeroCode Code (ACP)")
+                .contains("Surface: OmnesCode Code (ACP)")
         );
         assert!(sessions.remove("surface-resume").await);
 
@@ -9405,7 +9405,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "surface-mismatch",
             }))
             .await
@@ -9430,7 +9430,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "legacy-surface",
             }))
             .await
@@ -9442,7 +9442,7 @@ mod tests {
                 .unwrap()
                 .interaction_surface
                 .as_deref(),
-            Some("zerocode_code")
+            Some("omnescode_code")
         );
     }
 
@@ -12876,8 +12876,8 @@ mod tests {
     #[tokio::test]
     async fn process_line_drops_malformed_response_frames_without_reply() {
         let invalid_responses = [
-            r#"{"id":"zc-out-0","result":true}"#,
-            r#"{"jsonrpc":"1.0","id":"zc-out-0","result":true}"#,
+            r#"{"id":"oc-out-0","result":true}"#,
+            r#"{"jsonrpc":"1.0","id":"oc-out-0","result":true}"#,
             r#"{"jsonrpc":"2.0","result":true}"#,
             r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,
             r#"{"jsonrpc":"2.0","id":null,"result":true,"error":{"code":-1,"message":"bad"}}"#,
@@ -13000,8 +13000,8 @@ mod tests {
     #[test]
     fn response_id_key_accepts_string_and_numeric_ids() {
         assert_eq!(
-            response_id_key(&json!("zc-out-1")).as_deref(),
-            Some("zc-out-1")
+            response_id_key(&json!("oc-out-1")).as_deref(),
+            Some("oc-out-1")
         );
         assert_eq!(response_id_key(&json!(42)).as_deref(), Some("42"));
         assert_eq!(response_id_key(&Value::Null), None);

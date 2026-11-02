@@ -103,8 +103,8 @@ impl PaneKind {
     /// Stable Fluent key for this pane's display name.
     pub(crate) fn fluent_key(self) -> &'static str {
         match self {
-            PaneKind::Chat => "zc-chat-pane-chat",
-            PaneKind::Acp => "zc-chat-pane-acp",
+            PaneKind::Chat => "oc-chat-pane-chat",
+            PaneKind::Acp => "oc-chat-pane-acp",
         }
     }
 }
@@ -446,7 +446,7 @@ impl Chat {
             Err(e) => {
                 if !is_cancelled(cancellation) {
                     self.phase = ChatPhase::Error(crate::i18n::t_args(
-                        "zc-chat-error-fetch-agents",
+                        "oc-chat-error-fetch-agents",
                         &[("error", &e.to_string())],
                     ));
                 }
@@ -459,7 +459,7 @@ impl Chat {
         }
 
         if agents.is_empty() {
-            self.phase = ChatPhase::Error(crate::i18n::t("zc-chat-no-agents"));
+            self.phase = ChatPhase::Error(crate::i18n::t("oc-chat-no-agents"));
             return Ok(ChatInitOutcome::NoEnabledAgents);
         }
 
@@ -742,12 +742,12 @@ impl Chat {
         }
     }
 
-    /// Resolve the local `[todotracker]` settings from `zerocode-config.toml`.
+    /// Resolve the local `[todotracker]` settings from `omnescode-config.toml`.
     /// Called at every session boundary (new / restart / switch) so the file
     /// stays the single source of truth and a Config-pane save takes effect on
     /// the next transition.
     ///
-    /// On a load failure (e.g. an invalid `ZEROCODE_todotracker__*` override or
+    /// On a load failure (e.g. an invalid `OMNESCODE_todotracker__*` override or
     /// a malformed section) the `fallback` is returned rather than hard
     /// defaults, so a transient error does not silently reset a user's tracker
     /// layout/visibility to the built-ins. The failure is logged so it can be
@@ -759,7 +759,7 @@ impl Chat {
             Ok(settings) => settings,
             Err(error) => {
                 eprintln!(
-                    "zerocode: resolving [todotracker] failed ({error:#}); keeping current settings"
+                    "omnescode: resolving [todotracker] failed ({error:#}); keeping current settings"
                 );
                 fallback
             }
@@ -781,8 +781,8 @@ impl Chat {
         if is_cancelled(cancellation) {
             return;
         }
-        // TodoWrite display is a ZeroCode UI concern owned by
-        // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
+        // TodoWrite display is a OmnesCode UI concern owned by
+        // `omnescode-config.toml` — the daemon holds no TodoWrite display schema
         // — so read it from the local config file (honoring `--config-dir` /
         // `OMNESAGENT_CONFIG_DIR`), not over RPC. A fresh pane has no prior
         // tracker, so a load failure falls back to the built-in defaults.
@@ -852,7 +852,7 @@ impl Chat {
                 }
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
                 // `todo_settings` is resolved fresh at this boundary from
-                // `zerocode-config.toml` (the canonical owner); the removed
+                // `omnescode-config.toml` (the canonical owner); the removed
                 // `self.todo_settings` cache was the stale cross-session copy.
                 let mut state = ChatState::with_shared_commands(
                     session.session_id,
@@ -891,7 +891,7 @@ impl Chat {
                         Err(e) => {
                             let _ = self.rpc.session_close(&sid).await;
                             self.phase = ChatPhase::Error(crate::i18n::t_args(
-                                "zc-chat-session-switch-error",
+                                "oc-chat-session-switch-error",
                                 &[("error", &e.to_string())],
                             ));
                             return;
@@ -911,7 +911,7 @@ impl Chat {
             }
             Err(e) => {
                 self.phase = ChatPhase::Error(crate::i18n::t_args(
-                    "zc-chat-error-create-session",
+                    "oc-chat-error-create-session",
                     &[("error", &e.to_string())],
                 ));
             }
@@ -992,11 +992,11 @@ impl Chat {
                 state.reset_for_session(s.session_id, None, Self::resolve_todo_settings(current));
                 state.cwd = s.workspace_dir;
                 Self::refresh_model_identity(rpc, state).await;
-                state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
+                state.set_info_notice(crate::i18n::t("oc-chat-session-restarted"));
             }
             Err(e) => {
                 state.set_info_notice(crate::i18n::t_args(
-                    "zc-chat-session-restart-error",
+                    "oc-chat-session-restart-error",
                     &[("error", &e.to_string())],
                 ));
             }
@@ -1046,7 +1046,7 @@ impl Chat {
             state.settle_turn_from_prompt_response();
             if let Some(error) = completion.error {
                 state.set_info_notice(crate::i18n::t_args(
-                    "zc-queue-dispatch-failed",
+                    "oc-queue-dispatch-failed",
                     &[("error", &error)],
                 ));
             }
@@ -1066,7 +1066,7 @@ impl Chat {
                         state
                             .entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-chat-elicitation-dropped",
+                                "oc-chat-elicitation-dropped",
                             ))));
                         state.mark_dirty_append();
                     }
@@ -1237,7 +1237,7 @@ impl Chat {
             state
                 .entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                    "zc-cancel-timed-out",
+                    "oc-cancel-timed-out",
                 ))));
             state.mark_dirty_append();
             state.commit_turn(String::new(), false);
@@ -1320,7 +1320,7 @@ impl Chat {
                         return;
                     };
                     crate::mouse::copy_osc52(&text);
-                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                    state.set_info_notice(crate::i18n::t("oc-chat-copied-clipboard"));
                 }
                 ChatContextMenuAction::Edit => {
                     let ChatPhase::Active(ref mut state) = self.phase else {
@@ -1332,7 +1332,7 @@ impl Chat {
                         state
                             .entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-queue-edit-busy",
+                                "oc-queue-edit-busy",
                             ))));
                         state.mark_dirty_append();
                     } else if let Some((text, attachments)) = state.take_queued_for_edit(id) {
@@ -1381,7 +1381,7 @@ impl Chat {
                             .entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(
                                 crate::i18n::t_args(
-                                    "zc-queue-dispatch-failed",
+                                    "oc-queue-dispatch-failed",
                                     // The anyhow context includes the local
                                     // attachment path. Keep it out of the
                                     // transcript; the cleanup notice already
@@ -1545,7 +1545,7 @@ impl Chat {
                     area,
                     sessions,
                     list_state,
-                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    crate::i18n::t("oc-chat-session-list-resume-title"),
                 );
             }
             ChatPhase::PickCwd { explorer, .. } => {
@@ -1901,7 +1901,7 @@ impl Chat {
                         // input bar, so no info-bar notice is needed here.
                         state.clear_info_notice();
                     } else {
-                        state.set_info_notice(crate::i18n::t("zc-queue-resumed"));
+                        state.set_info_notice(crate::i18n::t("oc-queue-resumed"));
                         self.pump_queue();
                     }
                     return false;
@@ -2029,9 +2029,9 @@ impl Chat {
                     state.show_thoughts = !state.show_thoughts;
                     state.mark_dirty_full();
                     let status = if state.show_thoughts {
-                        crate::i18n::t("zc-chat-thinking-visible")
+                        crate::i18n::t("oc-chat-thinking-visible")
                     } else {
-                        crate::i18n::t("zc-chat-thinking-hidden")
+                        crate::i18n::t("oc-chat-thinking-hidden")
                     };
                     state
                         .entries
@@ -2416,7 +2416,7 @@ impl Chat {
             Err(e) => {
                 state.session_overlay = SessionOverlay::None;
                 state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                    "zc-chat-session-switch-error",
+                    "oc-chat-session-switch-error",
                     &[("error", &e.to_string())],
                 )));
                 state.mark_dirty_full();
@@ -2430,7 +2430,7 @@ impl Chat {
                 let _ = rpc.session_close(&new_sid).await;
                 state.session_overlay = SessionOverlay::None;
                 state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                    "zc-chat-session-switch-error",
+                    "oc-chat-session-switch-error",
                     &[("error", &e.to_string())],
                 )));
                 state.mark_dirty_full();
@@ -2461,7 +2461,7 @@ impl Chat {
         state: &mut ChatState,
         overrides: crate::client::SessionOverrides,
     ) {
-        let waiting = crate::widgets::InfoMessage::info(crate::i18n::t("zc-model-switch-applying"));
+        let waiting = crate::widgets::InfoMessage::info(crate::i18n::t("oc-model-switch-applying"));
         state.info_message = Some(waiting);
         state.mark_dirty_full();
 
@@ -2471,11 +2471,11 @@ impl Chat {
                 let model_provider = result.overrides.model_provider.unwrap_or_default();
                 let summary = if !model_provider.is_empty() {
                     crate::i18n::t_args(
-                        "zc-model-switch-provider-ok",
+                        "oc-model-switch-provider-ok",
                         &[("provider", &model_provider), ("model", &model)],
                     )
                 } else {
-                    crate::i18n::t_args("zc-model-switch-model-ok", &[("model", &model)])
+                    crate::i18n::t_args("oc-model-switch-model-ok", &[("model", &model)])
                 };
                 state.info_message = Some(crate::widgets::InfoMessage::note(summary));
                 let provider_ref = (!model_provider.is_empty()).then_some(model_provider.as_str());
@@ -2495,7 +2495,7 @@ impl Chat {
             }
             Err(e) => {
                 state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                    "zc-model-switch-failed",
+                    "oc-model-switch-failed",
                     &[("error", &e.to_string())],
                 )));
             }
@@ -2558,7 +2558,7 @@ impl Chat {
         };
         let Some(model_provider_ref) = active_provider else {
             state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
-                "zc-model-catalog-no-provider",
+                "oc-model-catalog-no-provider",
             )));
             state.mark_dirty_full();
             return;
@@ -2592,7 +2592,7 @@ impl Chat {
         // model_fetch_tx and is drained in refresh_if_inactive.
         state.model_picker = ModelPickerOverlay::Loading;
         state.info_message = Some(crate::widgets::InfoMessage::info(crate::i18n::t(
-            "zc-model-catalog-loading",
+            "oc-model-catalog-loading",
         )));
         state.mark_dirty_full();
 
@@ -2636,7 +2636,7 @@ impl Chat {
         if res.models.is_empty() {
             state.model_picker = ModelPickerOverlay::None;
             state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
-                "zc-model-catalog-empty",
+                "oc-model-catalog-empty",
             )));
             state.mark_dirty_full();
             return;
@@ -2660,7 +2660,7 @@ impl Chat {
                 let providers = snap.model_providers;
                 if providers.is_empty() {
                     state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
-                        "zc-model-catalog-no-provider",
+                        "oc-model-catalog-no-provider",
                     )));
                     state.mark_dirty_full();
                     return;
@@ -2677,7 +2677,7 @@ impl Chat {
             }
             Err(e) => {
                 state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                    "zc-model-provider-catalog-failed",
+                    "oc-model-provider-catalog-failed",
                     &[("error", &e.to_string())],
                 )));
                 state.mark_dirty_full();
@@ -2697,7 +2697,7 @@ impl Chat {
                 if let ChatPhase::Active(state) = &mut self.phase {
                     state.info_message =
                         Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
-                            "zc-chat-error-fetch-agents",
+                            "oc-chat-error-fetch-agents",
                             &[("error", &e.to_string())],
                         )));
                     state.mark_dirty_full();
@@ -3346,7 +3346,7 @@ impl crate::widgets::HelpContext for Chat {
                     ChatTabAction as C, GlobalAction, ModalAction, action_key_labels,
                 };
                 if *loading {
-                    HelpNode::entries(vec![E::key("", crate::i18n::t("zc-chat-loading-agents"))])
+                    HelpNode::entries(vec![E::key("", crate::i18n::t("oc-chat-loading-agents"))])
                 } else {
                     let nav = action_key_labels(C::BrowseUp)
                         .into_iter()
@@ -3354,14 +3354,14 @@ impl crate::widgets::HelpContext for Chat {
                         .chain(action_key_labels(C::BrowseUpVim))
                         .chain(action_key_labels(C::BrowseDownVim));
                     HelpNode::entries(vec![
-                        E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                        E::new(nav, crate::i18n::t("oc-chat-help-navigate")),
                         E::new(
                             action_key_labels(ModalAction::Confirm),
-                            crate::i18n::t("zc-chat-help-select-agent"),
+                            crate::i18n::t("oc-chat-help-select-agent"),
                         ),
                         E::new(
                             action_key_labels(GlobalAction::Quit),
-                            crate::i18n::t("zc-chat-help-quit"),
+                            crate::i18n::t("oc-chat-help-quit"),
                         ),
                     ])
                 }
@@ -3373,16 +3373,16 @@ impl crate::widgets::HelpContext for Chat {
                     .into_iter()
                     .chain(action_key_labels(M::Down));
                 HelpNode::entries(vec![
-                    E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                    E::new(nav, crate::i18n::t("oc-chat-help-navigate")),
                     E::new(
                         action_key_labels(M::Confirm),
-                        crate::i18n::t("zc-chat-help-switch-session"),
+                        crate::i18n::t("oc-chat-help-switch-session"),
                     ),
                     E::new(
                         action_key_labels(M::Cancel)
                             .into_iter()
                             .chain(action_key_labels(C::NewSession)),
-                        crate::i18n::t("zc-chat-help-new-session"),
+                        crate::i18n::t("oc-chat-help-new-session"),
                     ),
                 ])
             }
@@ -3391,7 +3391,7 @@ impl crate::widgets::HelpContext for Chat {
                 let keys = action_key_labels(C::ErrorDismiss)
                     .into_iter()
                     .chain(action_key_labels(GlobalAction::Quit));
-                HelpNode::entries(vec![E::new(keys, crate::i18n::t("zc-chat-help-quit"))])
+                HelpNode::entries(vec![E::new(keys, crate::i18n::t("oc-chat-help-quit"))])
             }
             ChatPhase::Active(state) => {
                 match &state.session_overlay {
@@ -3401,14 +3401,14 @@ impl crate::widgets::HelpContext for Chat {
                             .into_iter()
                             .chain(action_key_labels(M::Down));
                         return HelpNode::entries(vec![
-                            E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
+                            E::new(nav, crate::i18n::t("oc-chat-help-navigate")),
                             E::new(
                                 action_key_labels(M::Confirm),
-                                crate::i18n::t("zc-chat-help-switch-session"),
+                                crate::i18n::t("oc-chat-help-switch-session"),
                             ),
                             E::new(
                                 action_key_labels(M::Cancel),
-                                crate::i18n::t("zc-chat-help-close"),
+                                crate::i18n::t("oc-chat-help-close"),
                             ),
                         ]);
                     }
@@ -3427,21 +3427,21 @@ impl crate::widgets::HelpContext for Chat {
                         action_key_labels(M::Up)
                             .into_iter()
                             .chain(action_key_labels(M::Down)),
-                        crate::i18n::t("zc-chat-help-move-up"),
+                        crate::i18n::t("oc-chat-help-move-up"),
                     )];
                     if multi {
                         entries.push(E::new(
                             action_key_labels(M::Toggle),
-                            crate::i18n::t("zc-elicit-help-toggle"),
+                            crate::i18n::t("oc-elicit-help-toggle"),
                         ));
                     }
                     entries.push(E::new(
                         action_key_labels(M::Confirm),
-                        crate::i18n::t("zc-elicit-help-confirm"),
+                        crate::i18n::t("oc-elicit-help-confirm"),
                     ));
                     entries.push(E::new(
                         action_key_labels(M::Cancel),
-                        crate::i18n::t("zc-elicit-help-cancel"),
+                        crate::i18n::t("oc-elicit-help-cancel"),
                     ));
                     return HelpNode::entries(entries);
                 }
@@ -3450,19 +3450,19 @@ impl crate::widgets::HelpContext for Chat {
                     return HelpNode::entries(vec![
                         E::new(
                             action_key_labels(C::ApprovalApprove),
-                            crate::i18n::t("zc-chat-help-approve"),
+                            crate::i18n::t("oc-chat-help-approve"),
                         ),
                         E::new(
                             action_key_labels(C::ApprovalApproveAll),
-                            crate::i18n::t("zc-chat-help-always-approve"),
+                            crate::i18n::t("oc-chat-help-always-approve"),
                         ),
                         E::new(
                             action_key_labels(C::CancelTurn),
-                            crate::i18n::t("zc-chat-help-deny"),
+                            crate::i18n::t("oc-chat-help-deny"),
                         ),
                         E::new(
                             action_key_labels(C::CancelTurn),
-                            crate::i18n::t("zc-chat-help-cancel-turn"),
+                            crate::i18n::t("oc-chat-help-cancel-turn"),
                         ),
                     ]);
                 }
@@ -3475,27 +3475,27 @@ impl crate::widgets::HelpContext for Chat {
                             action_key_labels(C::BrowseUp)
                                 .into_iter()
                                 .chain(action_key_labels(C::BrowseUpVim)),
-                            crate::i18n::t("zc-chat-help-move-up"),
+                            crate::i18n::t("oc-chat-help-move-up"),
                         ),
                         E::new(
                             action_key_labels(C::BrowseDown)
                                 .into_iter()
                                 .chain(action_key_labels(C::BrowseDownVim)),
-                            crate::i18n::t("zc-chat-help-move-down"),
+                            crate::i18n::t("oc-chat-help-move-down"),
                         ),
                         E::new(
                             action_key_labels(C::BrowseSelectExtend)
                                 .into_iter()
                                 .chain(action_key_labels(C::BrowseSelectExtendDown)),
-                            crate::i18n::t("zc-chat-help-extend-selection"),
+                            crate::i18n::t("oc-chat-help-extend-selection"),
                         ),
                         E::new(
                             action_key_labels(C::CopySelection)
                                 .into_iter()
                                 .chain(action_key_labels(C::CopyAllVisible)),
-                            crate::i18n::t("zc-chat-help-yank-selection"),
+                            crate::i18n::t("oc-chat-help-yank-selection"),
                         ),
-                        E::new(return_keys, crate::i18n::t("zc-chat-help-return-to-input")),
+                        E::new(return_keys, crate::i18n::t("oc-chat-help-return-to-input")),
                     ]);
                 }
                 if state.turn_in_flight {
@@ -3503,14 +3503,14 @@ impl crate::widgets::HelpContext for Chat {
                     let mut cancel_keys = action_key_labels(C::CancelTurn);
                     cancel_keys.extend(action_key_labels(C::BrowseExitSelection));
                     let mut entries = vec![
-                        E::new(cancel_keys, crate::i18n::t("zc-chat-help-cancel-turn")),
+                        E::new(cancel_keys, crate::i18n::t("oc-chat-help-cancel-turn")),
                         E::new(
                             action_key_labels(crate::keymap::InputBarAction::Submit),
-                            crate::i18n::t("zc-queue-help-enqueue"),
+                            crate::i18n::t("oc-queue-help-enqueue"),
                         ),
                         E::new(
                             action_key_labels(crate::keymap::InputBarAction::Inject),
-                            crate::i18n::t("zc-queue-help-inject"),
+                            crate::i18n::t("oc-queue-help-inject"),
                         ),
                     ];
                     // Queue-management keys are only live while the sidebar is
@@ -3533,26 +3533,26 @@ impl crate::widgets::HelpContext for Chat {
                             .resolved()
                             .iter()
                             .map(|c| c.display().to_string()),
-                        crate::i18n::t("zc-chat-help-browse-mode"),
+                        crate::i18n::t("oc-chat-help-browse-mode"),
                     ),
                     E::key(
                         "Shift+↑/↓",
-                        crate::i18n::t("zc-chat-help-scroll-conversation"),
+                        crate::i18n::t("oc-chat-help-scroll-conversation"),
                     ),
-                    E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
+                    E::key("t", crate::i18n::t("oc-chat-help-toggle-thoughts")),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::NewSession),
-                        crate::i18n::t("zc-chat-help-new-session"),
+                        crate::i18n::t("oc-chat-help-new-session"),
                     ),
                     E::key(
                         chord_label(ChatTabAction::SwitchSession),
-                        crate::i18n::t("zc-chat-help-switch-session"),
+                        crate::i18n::t("oc-chat-help-switch-session"),
                     ),
                     E::spacer(),
                     E::key(
                         chord_label(ChatTabAction::PauseResumeQueue),
-                        crate::i18n::t("zc-queue-help-resume"),
+                        crate::i18n::t("oc-queue-help-resume"),
                     ),
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
@@ -3605,7 +3605,7 @@ fn draw_agent_picker(
     frame.render_widget(block, area);
 
     if loading {
-        let p = Paragraph::new(crate::i18n::t("zc-chat-loading-agents-msg"))
+        let p = Paragraph::new(crate::i18n::t("oc-chat-loading-agents-msg"))
             .alignment(Alignment::Center)
             .style(theme::dim_style());
         let vert = Layout::default()
@@ -3631,12 +3631,12 @@ fn draw_agent_picker(
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
-            format!("{} ", crate::i18n::t("zc-chat-picker-header")),
+            format!("{} ", crate::i18n::t("oc-chat-picker-header")),
             theme::body_style(),
         ),
         Span::styled(
             crate::i18n::t_args(
-                "zc-chat-picker-header-hint",
+                "oc-chat-picker-header-hint",
                 &[("keys", &picker_nav_keys())],
             ),
             theme::dim_style(),
@@ -3759,7 +3759,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
 
     let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
         Some(crate::i18n::t_args(
-            "zc-queue-paused-ghost",
+            "oc-queue-paused-ghost",
             &[("key", &resume_queue_chord_label())],
         ))
     } else {
@@ -3840,7 +3840,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
                 area,
                 sessions,
                 list_state,
-                crate::i18n::t("zc-chat-session-list-switch-title"),
+                crate::i18n::t("oc-chat-session-list-switch-title"),
             );
         }
         SessionOverlay::None => {}
@@ -3852,13 +3852,13 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
             // The "Loading models…" status shows in the info bar; the overlay
             // exists only to block input until the catalog arrives. A modal box
             // with no rows would render nothing, so draw a titled placeholder.
-            let title = crate::i18n::t("zc-model-catalog-loading");
+            let title = crate::i18n::t("oc-model-catalog-loading");
             let placeholder = [String::new()];
             crate::widgets::PickerModal::new(&title, &placeholder, usize::MAX).render(f, area);
         }
         ModelPickerOverlay::Model(picker) => {
             crate::widgets::PickerModal::new(
-                &crate::i18n::t("zc-model-picker-title"),
+                &crate::i18n::t("oc-model-picker-title"),
                 &picker.items,
                 picker.cursor,
             )
@@ -3866,7 +3866,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
         }
         ModelPickerOverlay::ConfiguredProviderStage(picker) => {
             crate::widgets::PickerModal::new(
-                &crate::i18n::t("zc-model-provider-picker-title"),
+                &crate::i18n::t("oc-model-provider-picker-title"),
                 &picker.items,
                 picker.cursor,
             )
@@ -3881,18 +3881,18 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
 fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> Option<Rect> {
     match model_picker {
         ModelPickerOverlay::Loading => {
-            let title = crate::i18n::t("zc-model-catalog-loading");
+            let title = crate::i18n::t("oc-model-catalog-loading");
             let placeholder = [String::new()];
             crate::widgets::PickerModal::area_for(&title, &placeholder, area)
         }
         ModelPickerOverlay::Model(picker) => crate::widgets::PickerModal::area_for(
-            &crate::i18n::t("zc-model-picker-title"),
+            &crate::i18n::t("oc-model-picker-title"),
             &picker.items,
             area,
         ),
         ModelPickerOverlay::ConfiguredProviderStage(picker) => {
             crate::widgets::PickerModal::area_for(
-                &crate::i18n::t("zc-model-provider-picker-title"),
+                &crate::i18n::t("oc-model-provider-picker-title"),
                 &picker.items,
                 area,
             )
@@ -3919,28 +3919,28 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
     vec![
         E::key(
             chord_label_pair(A::QueueNavUp, A::QueueNavDown),
-            crate::i18n::t("zc-queue-help-nav"),
+            crate::i18n::t("oc-queue-help-nav"),
         ),
         E::key(
             chord_label(A::QueueSendNow),
-            crate::i18n::t("zc-queue-help-inject"),
+            crate::i18n::t("oc-queue-help-inject"),
         ),
         E::key(
             chord_label(A::QueueCopy),
-            crate::i18n::t("zc-chat-context-menu-copy"),
+            crate::i18n::t("oc-chat-context-menu-copy"),
         ),
         E::key(
             chord_label(A::QueueDelete),
-            crate::i18n::t("zc-queue-help-delete"),
+            crate::i18n::t("oc-queue-help-delete"),
         ),
-        E::key("/clear-queue", crate::i18n::t("zc-queue-help-clear")),
+        E::key("/clear-queue", crate::i18n::t("oc-queue-help-clear")),
         E::key(
             chord_label(A::QueueEdit),
-            crate::i18n::t("zc-queue-help-edit"),
+            crate::i18n::t("oc-queue-help-edit"),
         ),
         E::key(
             chord_label_pair(A::QueueWiden, A::QueueNarrow),
-            crate::i18n::t("zc-queue-help-resize"),
+            crate::i18n::t("oc-queue-help-resize"),
         ),
     ]
 }
@@ -3975,7 +3975,7 @@ fn chord_label_pair(
 
 fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let title = crate::i18n::t_args(
-        "zc-queue-title",
+        "oc-queue-title",
         &[("count", &state.queue_len().to_string())],
     );
     let block = Block::default()
@@ -4000,7 +4000,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
 
     if state.message_queue.is_empty() {
         rows.push(Line::from(Span::styled(
-            crate::i18n::t("zc-queue-empty-list"),
+            crate::i18n::t("oc-queue-empty-list"),
             theme::dim_style(),
         )));
         row_owner.push(None);
@@ -4015,7 +4015,7 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
             };
             let preview = first_line_preview(&msg.text, inner.width.saturating_sub(4) as usize);
             let tag = if msg.status == QueueItemStatus::Injected {
-                format!(" {}", crate::i18n::t("zc-queue-item-injected"))
+                format!(" {}", crate::i18n::t("oc-queue-item-injected"))
             } else {
                 String::new()
             };
@@ -4223,7 +4223,7 @@ fn render_entry_into(
     match entry {
         ChatEntry::UserMessage { text, attachments } => {
             let label_span = Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-you")),
+                format!("{} ", crate::i18n::t("oc-chat-label-you")),
                 theme::user_label_style().add_modifier(sel_mod),
             );
             let body_style = theme::body_style().add_modifier(sel_mod);
@@ -4256,7 +4256,7 @@ fn render_entry_into(
         }
         ChatEntry::AgentMessage(text) => {
             lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+                format!("{} ", crate::i18n::t("oc-chat-label-agent")),
                 theme::agent_label_style().add_modifier(sel_mod),
             )]));
             let md_lines = markdown_to_lines(text.as_ref(), width);
@@ -4326,24 +4326,24 @@ fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
 }
 
 fn message_copy_label() -> String {
-    crate::i18n::t("zc-chat-copy-message")
+    crate::i18n::t("oc-chat-copy-message")
 }
 
 fn message_copied_label() -> String {
-    crate::i18n::t("zc-chat-copy-message-copied")
+    crate::i18n::t("oc-chat-copy-message-copied")
 }
 
 #[cfg(test)]
 fn context_menu_copy_label() -> String {
-    crate::i18n::t("zc-chat-context-menu-copy")
+    crate::i18n::t("oc-chat-context-menu-copy")
 }
 
 fn context_menu_action_label(action: ChatContextMenuAction) -> String {
     let key = match action {
-        ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
-        ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
-        ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
-        ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
+        ChatContextMenuAction::SendNow => "oc-chat-context-menu-send-now",
+        ChatContextMenuAction::Copy => "oc-chat-context-menu-copy",
+        ChatContextMenuAction::Edit => "oc-chat-context-menu-edit",
+        ChatContextMenuAction::Delete => "oc-chat-context-menu-delete",
     };
     crate::i18n::t(key)
 }
@@ -4558,7 +4558,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
         if has_stream_text {
             lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+                format!("{} ", crate::i18n::t("oc-chat-label-agent")),
                 theme::agent_label_style(),
             )]));
             lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
@@ -4851,10 +4851,10 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
     f.render_widget(Clear, overlay_area);
 
     let is_edit_tool = matches!(pa.tool_name.as_str(), "file_edit" | "file_write");
-    let allow = crate::i18n::t("zc-chat-approval-action-allow");
-    let always = crate::i18n::t("zc-chat-approval-action-always");
-    let reject = crate::i18n::t("zc-chat-approval-action-reject");
-    let edit = crate::i18n::t("zc-chat-approval-action-edit");
+    let allow = crate::i18n::t("oc-chat-approval-action-allow");
+    let always = crate::i18n::t("oc-chat-approval-action-always");
+    let reject = crate::i18n::t("oc-chat-approval-action-reject");
+    let edit = crate::i18n::t("oc-chat-approval-action-edit");
     let keys = if is_edit_tool {
         format!("Enter={allow}  a={always}  Ctrl+D={reject}  e={edit}")
     } else {
@@ -4871,7 +4871,7 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
 
     let secs = pa.timeout_secs.to_string();
     let title = crate::i18n::t_args(
-        "zc-chat-approval-title",
+        "oc-chat-approval-title",
         &[("tool", &pa.tool_name), ("secs", &secs)],
     );
     let text = if summary.is_empty() {
@@ -6287,7 +6287,7 @@ impl ChatState {
         crate::mouse::copy_osc52(text);
         self.clear_mouse_highlight();
         self.clear_browse_selection();
-        self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+        self.set_info_notice(crate::i18n::t("oc-chat-copied-clipboard"));
         true
     }
 
@@ -7225,7 +7225,7 @@ impl ChatState {
                 let dropped = dropped_messages.to_string();
                 let kept = kept_turns.to_string();
                 let notice = crate::i18n::t_args(
-                    "zc-chat-history-trimmed",
+                    "oc-chat-history-trimmed",
                     &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
                 );
                 self.entries
@@ -7276,7 +7276,7 @@ impl ChatState {
             // turn finished rather than silently vanishing.
             self.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                    "zc-turn-no-output",
+                    "oc-turn-no-output",
                 ))));
             self.mark_dirty_append();
         }
@@ -7373,14 +7373,14 @@ impl ChatState {
         if text.trim().is_empty() && attachments.is_empty() {
             let cleanup_report = cleanup_attachment_temps(&attachments);
             self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t("zc-queue-empty"));
+            return Err(crate::i18n::t("oc-queue-empty"));
         }
         let pending = self.message_queue.len();
         if pending >= Self::QUEUE_CAP {
             let cleanup_report = cleanup_attachment_temps(&attachments);
             self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
-                "zc-queue-full",
+                "oc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
             ));
         }
@@ -7402,13 +7402,13 @@ impl ChatState {
         if text.trim().is_empty() && attachments.is_empty() {
             let cleanup_report = cleanup_attachment_temps(&attachments);
             self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t("zc-queue-empty"));
+            return Err(crate::i18n::t("oc-queue-empty"));
         }
         if self.message_queue.len() >= Self::QUEUE_CAP {
             let cleanup_report = cleanup_attachment_temps(&attachments);
             self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
-                "zc-queue-full",
+                "oc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
             ));
         }
@@ -7726,22 +7726,22 @@ impl ChatState {
         match index {
             None => {
                 if count == 0 {
-                    return crate::i18n::t("zc-queue-clear-empty");
+                    return crate::i18n::t("oc-queue-clear-empty");
                 }
                 let cleanup_report = self.clear_queue();
                 self.mark_dirty_full();
                 append_cleanup_notice(
-                    crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())]),
+                    crate::i18n::t_args("oc-queue-cleared-all", &[("count", &count.to_string())]),
                     cleanup_report.notice(),
                 )
             }
             Some(n) => {
                 if count == 0 {
-                    return crate::i18n::t("zc-queue-clear-empty");
+                    return crate::i18n::t("oc-queue-clear-empty");
                 }
                 if n == 0 || n > count {
                     return crate::i18n::t_args(
-                        "zc-queue-clear-invalid",
+                        "oc-queue-clear-invalid",
                         &[("index", &n.to_string()), ("count", &count.to_string())],
                     );
                 }
@@ -7756,7 +7756,7 @@ impl ChatState {
                 }
                 self.mark_dirty_full();
                 append_cleanup_notice(
-                    crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())]),
+                    crate::i18n::t_args("oc-queue-cleared-one", &[("index", &n.to_string())]),
                     cleanup_report.notice(),
                 )
             }
@@ -7968,10 +7968,10 @@ fn clipboard_text(entry: &ChatEntry) -> String {
 fn labelled_clipboard_text(entry: &ChatEntry) -> String {
     match entry {
         ChatEntry::UserMessage { .. } => {
-            crate::i18n::t_args("zc-chat-clipboard-you", &[("text", &clipboard_text(entry))])
+            crate::i18n::t_args("oc-chat-clipboard-you", &[("text", &clipboard_text(entry))])
         }
         ChatEntry::AgentMessage(_) => crate::i18n::t_args(
-            "zc-chat-clipboard-agent",
+            "oc-chat-clipboard-agent",
             &[("text", &clipboard_text(entry))],
         ),
         _ => clipboard_text(entry),
@@ -9688,11 +9688,11 @@ mod tests {
 
     // ── Session-transition settings reload ──────────────────────────────────
     //
-    // `zerocode-config.toml` is the single source of truth for TodoWrite
+    // `omnescode-config.toml` is the single source of truth for TodoWrite
     // display. A fresh session obviously reloads it, but restart and
     // saved-session switch reuse the existing `ChatState`, so they must
     // re-resolve the file too — otherwise a Config-pane edit silently fails to
-    // apply until zerocode is restarted. These drive the real transition
+    // apply until omnescode is restarted. These drive the real transition
     // helpers (`restart_session_for_state` / `switch_to_session_entry`), not a
     // direct `reset_for_session` call.
 
@@ -9781,7 +9781,7 @@ mod tests {
         assert_eq!(
             state.todo_tracker.width(),
             44,
-            "restart must re-resolve zerocode-config.toml, not reuse the old layout"
+            "restart must re-resolve omnescode-config.toml, not reuse the old layout"
         );
         assert!(
             state.todo_tracker.is_visible(),
@@ -9847,7 +9847,7 @@ mod tests {
         assert_eq!(
             state.todo_tracker.width(),
             44,
-            "session switch must re-resolve zerocode-config.toml"
+            "session switch must re-resolve omnescode-config.toml"
         );
         assert!(
             state.todo_tracker.is_visible(),
@@ -9856,7 +9856,7 @@ mod tests {
     }
 
     // A transition-time config load failure (here: an unknown, hard-erroring
-    // `ZEROCODE_todotracker__*` override) must NOT silently reset the tracker
+    // `OMNESCODE_todotracker__*` override) must NOT silently reset the tracker
     // to built-in defaults. `resolve_todo_settings` returns the supplied
     // fallback so a restart/switch keeps the user's current layout.
     #[tokio::test]
@@ -9880,7 +9880,7 @@ mod tests {
         );
 
         // An unknown override makes `ensure_and_load` hard-error.
-        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        let _v = crate::test_support::EnvVarGuard::set("OMNESCODE_todotracker__nope", "1");
         assert!(
             crate::config::ensure_and_load(dir.path()).is_err(),
             "precondition: the bogus override should make resolution fail"
@@ -9965,7 +9965,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _guard = ConfigDirGuard::set(dir.path());
 
-        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+        let _v = crate::test_support::EnvVarGuard::set("OMNESCODE_todotracker__width", "0");
 
         let current = crate::todo_tracker::TodoTrackerSettings {
             enabled: true,
@@ -9978,7 +9978,7 @@ mod tests {
         let resolved = Chat::resolve_todo_settings(current);
         assert_eq!(
             resolved, current,
-            "ZEROCODE_todotracker__width=0 must keep current settings, not normalize to 1"
+            "OMNESCODE_todotracker__width=0 must keep current settings, not normalize to 1"
         );
         assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
     }
@@ -10169,7 +10169,7 @@ mod tests {
         // fix: a multi-agent reconnect reattaches instead of minting fresh.
         //
         // No config/list fetch precedes it: TodoWrite tracker settings are
-        // ZeroCode-local (`zerocode-config.toml`), resolved without a daemon
+        // OmnesCode-local (`omnescode-config.toml`), resolved without a daemon
         // round-trip, so session start goes straight to `session/new`.
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -11324,7 +11324,7 @@ mod tests {
         };
         assert_eq!(
             state.info_message.as_ref().map(|m| m.text.as_str()),
-            Some(crate::i18n::t("zc-chat-copied-clipboard").as_str()),
+            Some(crate::i18n::t("oc-chat-copied-clipboard").as_str()),
             "explicit message copy action should copy"
         );
         assert_eq!(
@@ -11610,7 +11610,7 @@ mod tests {
         assert_eq!(state.mouse_down_entry, None);
         assert_eq!(
             state.info_message.as_ref().map(|m| m.text.as_str()),
-            Some(crate::i18n::t("zc-chat-copied-clipboard").as_str())
+            Some(crate::i18n::t("oc-chat-copied-clipboard").as_str())
         );
         assert!(matches!(
             state.copy_feedback,
@@ -11982,7 +11982,7 @@ mod tests {
             chat.drain_entry_retry_results();
             if matches!(
                 &chat.phase,
-                ChatPhase::Error(message) if message == &crate::i18n::t("zc-chat-no-agents")
+                ChatPhase::Error(message) if message == &crate::i18n::t("oc-chat-no-agents")
             ) {
                 return;
             }
@@ -12384,7 +12384,7 @@ mod tests {
         assert_ne!(
             expected_bg,
             ratatui::style::Color::Reset,
-            "default ZeroCode theme should provide a concrete modal background"
+            "default OmnesCode theme should provide a concrete modal background"
         );
 
         let mut s = state();
@@ -12409,7 +12409,7 @@ mod tests {
         assert_eq!(
             cell.style().bg,
             Some(expected_bg),
-            "approval overlay interior must use the active ZeroCode theme background"
+            "approval overlay interior must use the active OmnesCode theme background"
         );
     }
 
@@ -12422,7 +12422,7 @@ mod tests {
         assert_ne!(
             expected_bg,
             ratatui::style::Color::Reset,
-            "default ZeroCode theme should provide a concrete sidebar background"
+            "default OmnesCode theme should provide a concrete sidebar background"
         );
 
         let mut s = state();
@@ -12445,14 +12445,14 @@ mod tests {
         assert_eq!(
             cell.style().bg,
             Some(expected_bg),
-            "queue sidebar interior must use the active ZeroCode theme background"
+            "queue sidebar interior must use the active OmnesCode theme background"
         );
 
         let unselected_text_cell = &terminal.backend().buffer()[(6, 2)];
         assert_eq!(
             unselected_text_cell.style().fg,
             Some(theme::active().body),
-            "unselected queue text must use the active ZeroCode body foreground"
+            "unselected queue text must use the active OmnesCode body foreground"
         );
         assert_eq!(
             unselected_text_cell.style().bg,
@@ -12470,7 +12470,7 @@ mod tests {
         assert_ne!(
             expected_bg,
             ratatui::style::Color::Reset,
-            "default ZeroCode theme should provide a concrete modal background"
+            "default OmnesCode theme should provide a concrete modal background"
         );
 
         let sessions = vec![SessionEntry {
@@ -12496,7 +12496,7 @@ mod tests {
                     area,
                     &sessions,
                     &mut list_state,
-                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                    crate::i18n::t("oc-chat-session-list-switch-title"),
                 );
             })
             .expect("draw session list overlay");
@@ -12505,7 +12505,7 @@ mod tests {
         assert_eq!(
             cell.style().bg,
             Some(expected_bg),
-            "session list overlay interior must use the active ZeroCode theme background"
+            "session list overlay interior must use the active OmnesCode theme background"
         );
 
         let selected_text_cell =
@@ -12556,7 +12556,7 @@ mod tests {
                     area,
                     &sessions,
                     &mut list_state,
-                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                    crate::i18n::t("oc-chat-session-list-switch-title"),
                 );
             })
             .expect("draw session list overlay");

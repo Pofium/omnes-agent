@@ -25,7 +25,7 @@ pub enum Transport {
     Gateway,
     /// Agent Client Protocol (local IDE bridge).
     Acp,
-    /// RPC socket turn (zerocode path).
+    /// RPC socket turn (omnescode path).
     Rpc,
     /// An internally driven turn with no external transport.
     Internal,

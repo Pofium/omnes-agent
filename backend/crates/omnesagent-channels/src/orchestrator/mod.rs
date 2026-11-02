@@ -21188,8 +21188,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "receipts block must be prefixed with the documented `---\\nTool receipts:` separator, got {receipts_message}"
         );
         assert!(
-            receipts_message.contains("zc-receipt-"),
-            "receipts block must carry at least one zc-receipt-* HMAC token (proves the generator actually ran), got {receipts_message}"
+            receipts_message.contains("oc-receipt-"),
+            "receipts block must carry at least one oc-receipt-* HMAC token (proves the generator actually ran), got {receipts_message}"
         );
         assert!(
             receipts_message.contains("mock_price"),
@@ -21449,8 +21449,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "agent must still respond when receipts are disabled"
         );
         assert!(
-            !sent_messages.iter().any(|m| m.contains("zc-receipt-")),
-            "no zc-receipt- token must appear in any sent message when receipts are disabled, got {:?}",
+            !sent_messages.iter().any(|m| m.contains("oc-receipt-")),
+            "no oc-receipt- token must appear in any sent message when receipts are disabled, got {:?}",
             sent_messages.as_slice()
         );
         assert!(

@@ -77,13 +77,13 @@ const TABS: [Tab; 7] = [
 impl Tab {
     fn fluent_key(self) -> &'static str {
         match self {
-            Self::Overview => "zc-dashboard-tab-overview",
-            Self::Sessions => "zc-dashboard-tab-sessions",
-            Self::Agents => "zc-dashboard-tab-agents",
-            Self::Memories => "zc-dashboard-tab-memories",
-            Self::Health => "zc-dashboard-tab-health",
-            Self::Cost => "zc-dashboard-tab-cost",
-            Self::Cron => "zc-dashboard-tab-cron",
+            Self::Overview => "oc-dashboard-tab-overview",
+            Self::Sessions => "oc-dashboard-tab-sessions",
+            Self::Agents => "oc-dashboard-tab-agents",
+            Self::Memories => "oc-dashboard-tab-memories",
+            Self::Health => "oc-dashboard-tab-health",
+            Self::Cost => "oc-dashboard-tab-cost",
+            Self::Cron => "oc-dashboard-tab-cron",
         }
     }
 }
@@ -294,7 +294,7 @@ impl Dashboard {
                         let msg = e.to_string();
                         if msg.contains("not available") {
                             self.cost_error =
-                                Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                                Some(crate::i18n::t("oc-dashboard-cost-not-available"));
                         } else {
                             self.cost_error = Some(msg);
                         }
@@ -345,7 +345,7 @@ impl Dashboard {
                         let msg = e.to_string();
                         if msg.contains("not available") {
                             self.memory_error =
-                                Some(crate::i18n::t("zc-dashboard-memory-not-configured"));
+                                Some(crate::i18n::t("oc-dashboard-memory-not-configured"));
                         } else {
                             self.memory_error = Some(msg);
                         }
@@ -363,7 +363,7 @@ impl Dashboard {
                         let msg = e.to_string();
                         if msg.contains("not available") {
                             self.cost_error =
-                                Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                                Some(crate::i18n::t("oc-dashboard-cost-not-available"));
                         } else {
                             self.cost_error = Some(msg);
                         }
@@ -385,7 +385,7 @@ impl Dashboard {
                     }
                     Err(_e) => {
                         self.cost_org = None;
-                        self.cost_org_error = Some(crate::i18n::t("zc-dashboard-cost-org-error"));
+                        self.cost_org_error = Some(crate::i18n::t("oc-dashboard-cost-org-error"));
                     }
                 }
             }
@@ -502,14 +502,14 @@ impl Dashboard {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
                 apply = if self.agent_rename.is_some() {
-                    crate::i18n::t("zc-dashboard-agent-rename-action-apply")
+                    crate::i18n::t("oc-dashboard-agent-rename-action-apply")
                 } else {
-                    crate::i18n::t("zc-dashboard-search-action-apply")
+                    crate::i18n::t("oc-dashboard-search-action-apply")
                 },
                 cancel = if self.agent_rename.is_some() {
-                    crate::i18n::t("zc-dashboard-agent-rename-action-cancel")
+                    crate::i18n::t("oc-dashboard-agent-rename-action-cancel")
                 } else {
-                    crate::i18n::t("zc-dashboard-search-action-cancel")
+                    crate::i18n::t("oc-dashboard-search-action-cancel")
                 },
             )
         } else if self.tab == Tab::Agents {
@@ -518,7 +518,7 @@ impl Dashboard {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "e".to_string());
-            format!("{key}:{}", crate::i18n::t("zc-dashboard-agent-rename-hint"))
+            format!("{key}:{}", crate::i18n::t("oc-dashboard-agent-rename-hint"))
         } else {
             String::new()
         };
@@ -526,7 +526,7 @@ impl Dashboard {
         let line = if let Some(rename) = &self.agent_rename {
             let mut spans = vec![
                 Span::styled(
-                    crate::i18n::t("zc-dashboard-agent-rename-prefix"),
+                    crate::i18n::t("oc-dashboard-agent-rename-prefix"),
                     theme::accent_style(),
                 ),
                 Span::styled(" ", theme::dim_style()),
@@ -557,7 +557,7 @@ impl Dashboard {
             let mut spans = Vec::new();
             if !self.search_query.is_empty() {
                 spans.push(Span::styled(
-                    crate::i18n::t("zc-dashboard-search-prefix"),
+                    crate::i18n::t("oc-dashboard-search-prefix"),
                     theme::dim_style(),
                 ));
                 spans.push(Span::styled(&self.search_query, theme::accent_style()));
@@ -625,7 +625,7 @@ impl Dashboard {
         } else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-dashboard-loading"),
+                    crate::i18n::t("oc-dashboard-loading"),
                     theme::dim_style(),
                 )),
                 inner,
@@ -687,7 +687,7 @@ impl Dashboard {
         if self.tuis.is_empty() {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-dashboard-no-tuis"),
+                    crate::i18n::t("oc-dashboard-no-tuis"),
                     theme::dim_style(),
                 )),
                 inner,
@@ -799,7 +799,7 @@ impl Dashboard {
         let Some(idx) = self.selected_session_index() else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-dashboard-no-session"),
+                    crate::i18n::t("oc-dashboard-no-session"),
                     theme::dim_style(),
                 )),
                 inner,
@@ -810,29 +810,29 @@ impl Dashboard {
         let s = &self.sessions[idx];
         let mut lines = vec![
             detail_line("ID", &s.session_id),
-            detail_line(&crate::i18n::t("zc-dashboard-detail-key"), &s.session_key),
+            detail_line(&crate::i18n::t("oc-dashboard-detail-key"), &s.session_key),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-agent"),
+                &crate::i18n::t("oc-dashboard-detail-agent"),
                 s.agent_alias.as_deref().unwrap_or("\u{2014}"),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-channel"),
+                &crate::i18n::t("oc-dashboard-detail-channel"),
                 s.channel_id.as_deref().unwrap_or("\u{2014}"),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-name"),
+                &crate::i18n::t("oc-dashboard-detail-name"),
                 s.name.as_deref().unwrap_or("\u{2014}"),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-messages"),
+                &crate::i18n::t("oc-dashboard-detail-messages"),
                 &s.message_count.to_string(),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-created"),
+                &crate::i18n::t("oc-dashboard-detail-created"),
                 &s.created_at,
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-activity"),
+                &crate::i18n::t("oc-dashboard-detail-activity"),
                 &s.last_activity,
             ),
         ];
@@ -842,7 +842,7 @@ impl Dashboard {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 crate::i18n::t_args(
-                    "zc-dashboard-message-history",
+                    "oc-dashboard-message-history",
                     &[("count", &self.session_messages.len().to_string())],
                 ),
                 theme::heading_style(),
@@ -877,7 +877,7 @@ impl Dashboard {
         } else {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-loading-messages"),
+                crate::i18n::t("oc-dashboard-loading-messages"),
                 theme::dim_style(),
             )));
         }
@@ -941,9 +941,9 @@ impl Dashboard {
                     Span::styled(format!("{:<20}", a.alias), theme::body_style()),
                     Span::styled(
                         if a.enabled {
-                            crate::i18n::t("zc-dashboard-enabled")
+                            crate::i18n::t("oc-dashboard-enabled")
                         } else {
-                            crate::i18n::t("zc-dashboard-disabled")
+                            crate::i18n::t("oc-dashboard-disabled")
                         },
                         status_style,
                     ),
@@ -985,7 +985,7 @@ impl Dashboard {
         let Some(idx) = self.selected_agent_index() else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-dashboard-no-agent"),
+                    crate::i18n::t("oc-dashboard-no-agent"),
                     theme::dim_style(),
                 )),
                 inner,
@@ -999,20 +999,20 @@ impl Dashboard {
         }
         let mut lines = vec![
             detail_action_line(
-                &crate::i18n::t("zc-dashboard-detail-alias"),
+                &crate::i18n::t("oc-dashboard-detail-alias"),
                 &a.alias,
-                &crate::i18n::t("zc-dashboard-agent-rename-hint"),
+                &crate::i18n::t("oc-dashboard-agent-rename-hint"),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-enabled"),
+                &crate::i18n::t("oc-dashboard-detail-enabled"),
                 &if a.enabled {
-                    crate::i18n::t("zc-dashboard-yes")
+                    crate::i18n::t("oc-dashboard-yes")
                 } else {
-                    crate::i18n::t("zc-dashboard-no")
+                    crate::i18n::t("oc-dashboard-no")
                 },
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-sessions"),
+                &crate::i18n::t("oc-dashboard-detail-sessions"),
                 &format!(
                     "{} live, {} persisted",
                     a.live_sessions, a.persisted_sessions
@@ -1021,14 +1021,14 @@ impl Dashboard {
         ];
         if a.persisted_sessions > 0 {
             lines.push(detail_line(
-                &crate::i18n::t("zc-dashboard-detail-persisted-sessions"),
+                &crate::i18n::t("oc-dashboard-detail-persisted-sessions"),
                 &a.persisted_sessions.to_string(),
             ));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            crate::i18n::t("zc-dashboard-section-channels"),
+            crate::i18n::t("oc-dashboard-section-channels"),
             theme::heading_style(),
         )));
         if a.channels.is_empty() {
@@ -1159,7 +1159,7 @@ impl Dashboard {
             (None, None) => {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
-                        crate::i18n::t("zc-dashboard-no-entry"),
+                        crate::i18n::t("oc-dashboard-no-entry"),
                         theme::dim_style(),
                     )),
                     inner,
@@ -1168,36 +1168,36 @@ impl Dashboard {
             }
         };
         let mut lines = vec![
-            detail_line(&crate::i18n::t("zc-dashboard-detail-key"), &m.key),
-            detail_line(&crate::i18n::t("zc-dashboard-detail-category"), &m.category),
+            detail_line(&crate::i18n::t("oc-dashboard-detail-key"), &m.key),
+            detail_line(&crate::i18n::t("oc-dashboard-detail-category"), &m.category),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-namespace"),
+                &crate::i18n::t("oc-dashboard-detail-namespace"),
                 &m.namespace,
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-timestamp"),
+                &crate::i18n::t("oc-dashboard-detail-timestamp"),
                 &m.timestamp,
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-agent"),
+                &crate::i18n::t("oc-dashboard-detail-agent"),
                 m.agent_alias.as_deref().unwrap_or("\u{2014}"),
             ),
         ];
         if let Some(score) = m.score {
             lines.push(detail_line(
-                &crate::i18n::t("zc-dashboard-detail-score"),
+                &crate::i18n::t("oc-dashboard-detail-score"),
                 &format!("{score:.3}"),
             ));
         }
         if let Some(imp) = m.importance {
             lines.push(detail_line(
-                &crate::i18n::t("zc-dashboard-detail-importance"),
+                &crate::i18n::t("oc-dashboard-detail-importance"),
                 &format!("{imp:.2}"),
             ));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            crate::i18n::t("zc-dashboard-section-content"),
+            crate::i18n::t("oc-dashboard-section-content"),
             theme::heading_style(),
         )));
         for l in m.content.lines() {
@@ -1251,7 +1251,7 @@ impl Dashboard {
         let Some(h) = health else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-dashboard-loading"),
+                    crate::i18n::t("oc-dashboard-loading"),
                     theme::dim_style(),
                 )),
                 inner,
@@ -1267,7 +1267,7 @@ impl Dashboard {
             if let Some(process) = obj.get("process") {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-dashboard-section-process"),
+                    crate::i18n::t("oc-dashboard-section-process"),
                     theme::heading_style(),
                 )));
                 if let Some(rss) = process.get("rss_bytes").and_then(|v| v.as_u64())
@@ -1296,7 +1296,7 @@ impl Dashboard {
                         .unwrap_or(0);
                     let val = if ncpu > 0 {
                         crate::i18n::t_args(
-                            "zc-dashboard-cpu-with-cores",
+                            "oc-dashboard-cpu-with-cores",
                             &[("cpu", &format!("{cpu:.1}%")), ("cores", &ncpu.to_string())],
                         )
                     } else {
@@ -1313,7 +1313,7 @@ impl Dashboard {
             if let Some(components) = obj.get("components").and_then(|v| v.as_object()) {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-dashboard-section-components"),
+                    crate::i18n::t("oc-dashboard-section-components"),
                     theme::heading_style(),
                 )));
                 for (name, val) in components {
@@ -1355,7 +1355,7 @@ impl Dashboard {
             if !extras.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-dashboard-section-details"),
+                    crate::i18n::t("oc-dashboard-section-details"),
                     theme::heading_style(),
                 )));
                 for key in extras {
@@ -1420,7 +1420,7 @@ impl Dashboard {
         let Some(ref c) = self.cost else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-dashboard-loading"),
+                    crate::i18n::t("oc-dashboard-loading"),
                     theme::dim_style(),
                 )),
                 inner,
@@ -1430,27 +1430,27 @@ impl Dashboard {
 
         let mut lines = vec![
             Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-summary"),
+                crate::i18n::t("oc-dashboard-section-summary"),
                 theme::heading_style(),
             )),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-session"),
+                &crate::i18n::t("oc-dashboard-detail-session"),
                 &format!("${:.6}", c.session_cost_usd),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-daily"),
+                &crate::i18n::t("oc-dashboard-detail-daily"),
                 &format!("${:.6}", c.daily_cost_usd),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-monthly"),
+                &crate::i18n::t("oc-dashboard-detail-monthly"),
                 &format!("${:.6}", c.monthly_cost_usd),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-tokens"),
+                &crate::i18n::t("oc-dashboard-detail-tokens"),
                 &format_tokens(c.total_tokens),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-requests"),
+                &crate::i18n::t("oc-dashboard-detail-requests"),
                 &c.request_count.to_string(),
             ),
         ];
@@ -1461,17 +1461,17 @@ impl Dashboard {
         if !self.cost_periods.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-by-period"),
+                crate::i18n::t("oc-dashboard-section-by-period"),
                 theme::heading_style(),
             )));
             lines.push(Line::from(Span::styled(
                 format!(
                     "  {:<10} {:>12} {:>12} {:>12} {:>7}",
-                    crate::i18n::t("zc-dashboard-col-period"),
-                    crate::i18n::t("zc-dashboard-col-cost"),
-                    crate::i18n::t("zc-dashboard-col-paid-tok"),
-                    crate::i18n::t("zc-dashboard-col-free-tok"),
-                    crate::i18n::t("zc-dashboard-col-reqs")
+                    crate::i18n::t("oc-dashboard-col-period"),
+                    crate::i18n::t("oc-dashboard-col-cost"),
+                    crate::i18n::t("oc-dashboard-col-paid-tok"),
+                    crate::i18n::t("oc-dashboard-col-free-tok"),
+                    crate::i18n::t("oc-dashboard-col-reqs")
                 ),
                 theme::dim_style(),
             )));
@@ -1518,7 +1518,7 @@ impl Dashboard {
         if !c.by_model.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-by-model"),
+                crate::i18n::t("oc-dashboard-section-by-model"),
                 theme::heading_style(),
             )));
             let mut models: Vec<_> = c.by_model.values().collect();
@@ -1546,7 +1546,7 @@ impl Dashboard {
         if !c.by_agent.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-by-agent"),
+                crate::i18n::t("oc-dashboard-section-by-agent"),
                 theme::heading_style(),
             )));
             let mut agents: Vec<_> = c.by_agent.values().collect();
@@ -1653,7 +1653,7 @@ impl Dashboard {
         let Some(idx) = self.selected_cron_index() else {
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-dashboard-no-job"),
+                    crate::i18n::t("oc-dashboard-no-job"),
                     theme::dim_style(),
                 )),
                 inner,
@@ -1674,34 +1674,34 @@ impl Dashboard {
         let mut lines = vec![
             detail_line("ID", &j.id),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-name"),
+                &crate::i18n::t("oc-dashboard-detail-name"),
                 j.name.as_deref().unwrap_or("\u{2014}"),
             ),
-            detail_line(&crate::i18n::t("zc-dashboard-detail-agent"), &j.agent_alias),
+            detail_line(&crate::i18n::t("oc-dashboard-detail-agent"), &j.agent_alias),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-enabled"),
+                &crate::i18n::t("oc-dashboard-detail-enabled"),
                 &if j.enabled {
-                    crate::i18n::t("zc-dashboard-yes")
+                    crate::i18n::t("oc-dashboard-yes")
                 } else {
-                    crate::i18n::t("zc-dashboard-no")
+                    crate::i18n::t("oc-dashboard-no")
                 },
             ),
-            detail_line(&crate::i18n::t("zc-dashboard-detail-schedule"), &sched_str),
+            detail_line(&crate::i18n::t("oc-dashboard-detail-schedule"), &sched_str),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-created"),
+                &crate::i18n::t("oc-dashboard-detail-created"),
                 &j.created_at,
             ),
-            detail_line(&crate::i18n::t("zc-dashboard-detail-next-run"), &j.next_run),
+            detail_line(&crate::i18n::t("oc-dashboard-detail-next-run"), &j.next_run),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-last-run"),
+                &crate::i18n::t("oc-dashboard-detail-last-run"),
                 j.last_run.as_deref().unwrap_or("\u{2014}"),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-last-status"),
+                &crate::i18n::t("oc-dashboard-detail-last-status"),
                 j.last_status.as_deref().unwrap_or("\u{2014}"),
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-actions"),
+                &crate::i18n::t("oc-dashboard-actions"),
                 &self.cron_action_hint(),
             ),
         ];
@@ -1709,7 +1709,7 @@ impl Dashboard {
         if !j.command.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-command"),
+                crate::i18n::t("oc-dashboard-section-command"),
                 theme::heading_style(),
             )));
             for l in j.command.lines() {
@@ -1719,7 +1719,7 @@ impl Dashboard {
         if let Some(ref prompt) = j.prompt {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-prompt"),
+                crate::i18n::t("oc-dashboard-section-prompt"),
                 theme::heading_style(),
             )));
             for l in prompt.lines() {
@@ -1729,7 +1729,7 @@ impl Dashboard {
         if let Some(ref output) = j.last_output {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-last-output"),
+                crate::i18n::t("oc-dashboard-section-last-output"),
                 theme::heading_style(),
             )));
             for l in output.lines() {
@@ -1742,7 +1742,7 @@ impl Dashboard {
         {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-section-manual-run"),
+                crate::i18n::t("oc-dashboard-section-manual-run"),
                 theme::heading_style(),
             )));
             for l in message.lines() {
@@ -1752,24 +1752,24 @@ impl Dashboard {
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            crate::i18n::t("zc-dashboard-section-recent-runs"),
+            crate::i18n::t("oc-dashboard-section-recent-runs"),
             theme::heading_style(),
         )));
         if self.cron_runs_job_id.as_deref() != Some(j.id.as_str()) {
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-loading-runs"),
+                crate::i18n::t("oc-dashboard-loading-runs"),
                 theme::dim_style(),
             )));
         } else if let Some(error) = &self.cron_runs_error {
             lines.push(Line::from(Span::styled(
-                format!("{}: {error}", crate::i18n::t("zc-dashboard-runs-error")),
+                format!("{}: {error}", crate::i18n::t("oc-dashboard-runs-error")),
                 theme::error_style(),
             )));
         } else if self.cron_runs.is_empty()
             && self.cron_trigger_inflight_job_id.as_deref() != Some(j.id.as_str())
         {
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-dashboard-no-runs"),
+                crate::i18n::t("oc-dashboard-no-runs"),
                 theme::dim_style(),
             )));
         } else {
@@ -1778,20 +1778,20 @@ impl Dashboard {
                     Span::styled("#... ", theme::dim_style()),
                     Span::styled(format!("{} ", truncate(&j.id, 24)), theme::dim_style()),
                     Span::styled(
-                        format!("{:<10}", crate::i18n::t("zc-dashboard-run-pending-status")),
+                        format!("{:<10}", crate::i18n::t("oc-dashboard-run-pending-status")),
                         theme::warn_style(),
                     ),
                     Span::styled(
                         format!(
                             "{}  {}",
-                            crate::i18n::t("zc-dashboard-run-pending-window"),
+                            crate::i18n::t("oc-dashboard-run-pending-window"),
                             format_duration_ms(None)
                         ),
                         theme::dim_style(),
                     ),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    format!("  {}", crate::i18n::t("zc-dashboard-run-pending-output")),
+                    format!("  {}", crate::i18n::t("oc-dashboard-run-pending-output")),
                     theme::dim_style(),
                 )));
             }
@@ -2065,7 +2065,7 @@ impl Dashboard {
     fn begin_agent_rename(&mut self) {
         let Some(idx) = self.selected_agent_index() else {
             self.agent_rename_message = Some(DashboardMessage {
-                text: crate::i18n::t("zc-dashboard-no-agent"),
+                text: crate::i18n::t("oc-dashboard-no-agent"),
                 level: DashboardMessageLevel::Warn,
             });
             return;
@@ -2114,7 +2114,7 @@ impl Dashboard {
         let to = rename.buf.trim().to_string();
         if to.is_empty() {
             self.agent_rename_message = Some(DashboardMessage {
-                text: crate::i18n::t("zc-dashboard-agent-rename-empty"),
+                text: crate::i18n::t("oc-dashboard-agent-rename-empty"),
                 level: DashboardMessageLevel::Error,
             });
             return;
@@ -2122,7 +2122,7 @@ impl Dashboard {
         if from == to {
             self.agent_rename = None;
             self.agent_rename_message = Some(DashboardMessage {
-                text: crate::i18n::t("zc-dashboard-agent-rename-unchanged"),
+                text: crate::i18n::t("oc-dashboard-agent-rename-unchanged"),
                 level: DashboardMessageLevel::Info,
             });
             return;
@@ -2144,7 +2144,7 @@ impl Dashboard {
                     if result.warnings.is_empty() {
                         self.agent_rename_message = Some(DashboardMessage {
                             text: crate::i18n::t_args(
-                                "zc-dashboard-agent-rename-success",
+                                "oc-dashboard-agent-rename-success",
                                 &[("from", &from), ("to", &to)],
                             ),
                             level: DashboardMessageLevel::Info,
@@ -2153,7 +2153,7 @@ impl Dashboard {
                         let warnings = result.warnings.join("; ");
                         self.agent_rename_message = Some(DashboardMessage {
                             text: crate::i18n::t_args(
-                                "zc-dashboard-agent-rename-success-warnings",
+                                "oc-dashboard-agent-rename-success-warnings",
                                 &[("from", &from), ("to", &to), ("warnings", &warnings)],
                             ),
                             level: DashboardMessageLevel::Warn,
@@ -2161,7 +2161,7 @@ impl Dashboard {
                     }
                 } else {
                     self.agent_rename_message = Some(DashboardMessage {
-                        text: crate::i18n::t("zc-dashboard-agent-rename-unchanged"),
+                        text: crate::i18n::t("oc-dashboard-agent-rename-unchanged"),
                         level: DashboardMessageLevel::Info,
                     });
                 }
@@ -2169,7 +2169,7 @@ impl Dashboard {
             Err(e) => {
                 self.agent_rename_message = Some(DashboardMessage {
                     text: crate::i18n::t_args(
-                        "zc-dashboard-agent-rename-failed",
+                        "oc-dashboard-agent-rename-failed",
                         &[("error", &e.to_string())],
                     ),
                     level: DashboardMessageLevel::Error,
@@ -2232,13 +2232,13 @@ impl Dashboard {
     fn trigger_selected_cron(&mut self) {
         let Some(idx) = self.selected_cron_index() else {
             self.cron_trigger_job_id = None;
-            self.cron_trigger_message = Some(crate::i18n::t("zc-dashboard-no-job"));
+            self.cron_trigger_message = Some(crate::i18n::t("oc-dashboard-no-job"));
             return;
         };
         let job_id = self.cron_jobs[idx].id.clone();
         if let Some(inflight_id) = self.cron_trigger_inflight_job_id.as_deref() {
             self.cron_trigger_message = Some(crate::i18n::t_args(
-                "zc-dashboard-run-already-running",
+                "oc-dashboard-run-already-running",
                 &[("id", inflight_id)],
             ));
             return;
@@ -2246,7 +2246,7 @@ impl Dashboard {
 
         self.cron_trigger_job_id = Some(job_id.clone());
         self.cron_trigger_message = Some(crate::i18n::t_args(
-            "zc-dashboard-run-running",
+            "oc-dashboard-run-running",
             &[("id", &job_id)],
         ));
         self.cron_trigger_inflight_job_id = Some(job_id.clone());
@@ -2285,9 +2285,9 @@ impl Dashboard {
             match update.result {
                 Ok(result) => {
                     let status = if result.success {
-                        crate::i18n::t("zc-dashboard-run-succeeded")
+                        crate::i18n::t("oc-dashboard-run-succeeded")
                     } else {
-                        crate::i18n::t("zc-dashboard-run-failed")
+                        crate::i18n::t("oc-dashboard-run-failed")
                     };
                     let output = result.output.trim();
                     self.cron_trigger_message = Some(if output.is_empty() {
@@ -2299,7 +2299,7 @@ impl Dashboard {
                 Err(e) => {
                     self.cron_trigger_message = Some(format!(
                         "{}: {e}",
-                        crate::i18n::t("zc-dashboard-run-failed")
+                        crate::i18n::t("oc-dashboard-run-failed")
                     ));
                 }
             }
@@ -2514,7 +2514,7 @@ impl Dashboard {
         let run = action_key_labels(D::TriggerCron).join("/");
         let refresh = action_key_labels(D::Refresh).join("/");
         crate::i18n::t_args(
-            "zc-dashboard-cron-action-hint",
+            "oc-dashboard-cron-action-hint",
             &[("run", &run), ("refresh", &refresh)],
         )
     }
@@ -2777,19 +2777,19 @@ fn cost_period_windows() -> Vec<(String, String, String)> {
     let quarter = (now.month() - 1) / 3; // 0..=3
     vec![
         (
-            crate::i18n::t("zc-dashboard-period-today"),
+            crate::i18n::t("oc-dashboard-period-today"),
             start(now.month(), now.day()),
             to.clone(),
         ),
         (
-            crate::i18n::t("zc-dashboard-period-month"),
+            crate::i18n::t("oc-dashboard-period-month"),
             start(now.month(), 1),
             to.clone(),
         ),
         (
             format!(
                 "{}{}",
-                crate::i18n::t("zc-dashboard-period-quarter-prefix"),
+                crate::i18n::t("oc-dashboard-period-quarter-prefix"),
                 quarter + 1
             ),
             start(quarter * 3 + 1, 1),
@@ -2798,7 +2798,7 @@ fn cost_period_windows() -> Vec<(String, String, String)> {
         (
             format!(
                 "{} {}",
-                crate::i18n::t("zc-dashboard-period-ytd"),
+                crate::i18n::t("oc-dashboard-period-ytd"),
                 now.year()
             ),
             start(1, 1),
@@ -2816,7 +2816,7 @@ fn org_section_lines(
     if let Some(err) = err {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            crate::i18n::t("zc-dashboard-section-org"),
+            crate::i18n::t("oc-dashboard-section-org"),
             theme::heading_style(),
         )));
         lines.push(Line::from(Span::styled(
@@ -2826,19 +2826,19 @@ fn org_section_lines(
     } else if let Some(org) = org {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            crate::i18n::t("zc-dashboard-section-org"),
+            crate::i18n::t("oc-dashboard-section-org"),
             theme::heading_style(),
         )));
         let org_label = org
             .org_label
             .clone()
-            .unwrap_or_else(|| crate::i18n::t("zc-dashboard-org-name"));
+            .unwrap_or_else(|| crate::i18n::t("oc-dashboard-org-name"));
         if let Some(ref scope) = org.org {
             lines.push(org_scope_line(&org_label, scope, frac));
         }
         if let Some(ref scope) = org.personal {
             lines.push(org_scope_line(
-                &crate::i18n::t("zc-dashboard-org-personal"),
+                &crate::i18n::t("oc-dashboard-org-personal"),
                 scope,
                 frac,
             ));
@@ -2848,14 +2848,14 @@ fn org_section_lines(
             if org.year != 0 {
                 note.push_str(&format!(
                     "{}{} ",
-                    crate::i18n::t("zc-dashboard-org-fy-prefix"),
+                    crate::i18n::t("oc-dashboard-org-fy-prefix"),
                     org.year
                 ));
             }
             if !org.generated.is_empty() {
                 note.push_str(&format!(
                     "{} {}",
-                    crate::i18n::t("zc-dashboard-org-asof"),
+                    crate::i18n::t("oc-dashboard-org-asof"),
                     org.generated
                 ));
             }
@@ -2881,7 +2881,7 @@ fn org_scope_line(label: &str, scope: &crate::client::OrgScopeStat, frac: f64) -
         Span::styled(
             format!(
                 "{} ${:>14.2}",
-                crate::i18n::t("zc-dashboard-period-ytd"),
+                crate::i18n::t("oc-dashboard-period-ytd"),
                 scope.ytd_cost_usd
             ),
             theme::accent_style(),
@@ -2890,14 +2890,14 @@ fn org_scope_line(label: &str, scope: &crate::client::OrgScopeStat, frac: f64) -
             format!(
                 "  {:>10} {}",
                 format_tokens(scope.ytd_tokens),
-                crate::i18n::t("zc-dashboard-org-tok")
+                crate::i18n::t("oc-dashboard-org-tok")
             ),
             theme::dim_style(),
         ),
         Span::styled(
             format!(
                 "   {} ${proj:>14.2}",
-                crate::i18n::t("zc-dashboard-org-projyr")
+                crate::i18n::t("oc-dashboard-org-projyr")
             ),
             theme::warn_style(),
         ),
@@ -2929,20 +2929,20 @@ fn format_uptime(secs: u64) -> String {
 }
 
 const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
-    "zc-dashboard-label-daemon",
-    "zc-dashboard-label-socket",
-    "zc-dashboard-label-endpoint",
-    "zc-dashboard-label-server",
-    "zc-dashboard-label-protocol",
-    "zc-dashboard-label-config",
-    "zc-dashboard-label-workspace",
-    "zc-dashboard-label-code-cwd",
-    "zc-dashboard-label-chat-cwd",
-    "zc-dashboard-label-daemon-memory",
-    "zc-dashboard-label-daemon-cpu",
+    "oc-dashboard-label-daemon",
+    "oc-dashboard-label-socket",
+    "oc-dashboard-label-endpoint",
+    "oc-dashboard-label-server",
+    "oc-dashboard-label-protocol",
+    "oc-dashboard-label-config",
+    "oc-dashboard-label-workspace",
+    "oc-dashboard-label-code-cwd",
+    "oc-dashboard-label-chat-cwd",
+    "oc-dashboard-label-daemon-memory",
+    "oc-dashboard-label-daemon-cpu",
 ];
 
-const HEALTH_STATUS_LABEL_KEYS: &[&str] = &["zc-dashboard-label-uptime", "zc-dashboard-label-pid"];
+const HEALTH_STATUS_LABEL_KEYS: &[&str] = &["oc-dashboard-label-uptime", "oc-dashboard-label-pid"];
 
 fn overview_status_label_width() -> usize {
     status_label_width(
@@ -2968,7 +2968,7 @@ fn health_status_lines(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<
     if let Some(uptime) = obj.get("uptime_seconds").and_then(|v| v.as_u64()) {
         lines.push(Line::from(vec![
             Span::styled(
-                status_label("zc-dashboard-label-uptime", label_width),
+                status_label("oc-dashboard-label-uptime", label_width),
                 theme::dim_style(),
             ),
             Span::styled(format_uptime(uptime), theme::body_style()),
@@ -2977,7 +2977,7 @@ fn health_status_lines(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<
     if let Some(pid) = obj.get("pid").and_then(|v| v.as_u64()) {
         lines.push(Line::from(vec![
             Span::styled(
-                status_label("zc-dashboard-label-pid", label_width),
+                status_label("oc-dashboard-label-pid", label_width),
                 theme::dim_style(),
             ),
             Span::styled(pid.to_string(), theme::body_style()),
@@ -3021,7 +3021,7 @@ fn overview_status_lines(
     let label_width = overview_status_label_width();
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            status_label("zc-dashboard-label-daemon", label_width),
+            status_label("oc-dashboard-label-daemon", label_width),
             theme::dim_style(),
         ),
         Span::styled(
@@ -3038,7 +3038,7 @@ fn overview_status_lines(
         {
             lines.push(Line::from(vec![
                 Span::styled(
-                    status_label("zc-dashboard-label-socket", label_width),
+                    status_label("oc-dashboard-label-socket", label_width),
                     theme::dim_style(),
                 ),
                 Span::styled(socket.to_string(), theme::body_style()),
@@ -3047,7 +3047,7 @@ fn overview_status_lines(
     } else if is_remote_connection(connect_label) {
         lines.push(Line::from(vec![
             Span::styled(
-                status_label("zc-dashboard-label-endpoint", label_width),
+                status_label("oc-dashboard-label-endpoint", label_width),
                 theme::dim_style(),
             ),
             Span::styled(remote_endpoint_label(connect_label), theme::body_style()),
@@ -3056,7 +3056,7 @@ fn overview_status_lines(
 
     if insecure_tls {
         lines.push(Line::from(Span::styled(
-            crate::i18n::t("zc-dashboard-label-insecure-tls"),
+            crate::i18n::t("oc-dashboard-label-insecure-tls"),
             theme::warn_style(),
         )));
     }
@@ -3064,14 +3064,14 @@ fn overview_status_lines(
     lines.extend([
         Line::from(vec![
             Span::styled(
-                status_label("zc-dashboard-label-server", label_width),
+                status_label("oc-dashboard-label-server", label_width),
                 theme::dim_style(),
             ),
             Span::styled(format!("v{}", status.server_version), theme::body_style()),
         ]),
         Line::from(vec![
             Span::styled(
-                status_label("zc-dashboard-label-protocol", label_width),
+                status_label("oc-dashboard-label-protocol", label_width),
                 theme::dim_style(),
             ),
             Span::styled(format!("{}", status.protocol_version), theme::body_style()),
@@ -3085,7 +3085,7 @@ fn overview_status_lines(
     {
         let mut spans = vec![
             Span::styled(
-                status_label("zc-dashboard-label-config", label_width),
+                status_label("oc-dashboard-label-config", label_width),
                 theme::dim_style(),
             ),
             Span::styled(config_path.to_string(), theme::body_style()),
@@ -3124,7 +3124,7 @@ fn overview_status_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    status_label("zc-dashboard-label-daemon-memory", label_width),
+                    status_label("oc-dashboard-label-daemon-memory", label_width),
                     theme::dim_style(),
                 ),
                 Span::styled(val, theme::body_style()),
@@ -3137,7 +3137,7 @@ fn overview_status_lines(
                 .unwrap_or(0);
             let val = if ncpu > 0 {
                 crate::i18n::t_args(
-                    "zc-dashboard-cpu-with-cores",
+                    "oc-dashboard-cpu-with-cores",
                     &[("cpu", &format!("{cpu:.1}%")), ("cores", &ncpu.to_string())],
                 )
             } else {
@@ -3145,7 +3145,7 @@ fn overview_status_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    status_label("zc-dashboard-label-daemon-cpu", label_width),
+                    status_label("oc-dashboard-label-daemon-cpu", label_width),
                     theme::dim_style(),
                 ),
                 Span::styled(val, theme::body_style()),
@@ -3157,18 +3157,18 @@ fn overview_status_lines(
                 .unwrap_or(0);
             let val = if ncpu > 0 {
                 crate::i18n::t_args(
-                    "zc-dashboard-cpu-with-cores",
+                    "oc-dashboard-cpu-with-cores",
                     &[
-                        ("cpu", &crate::i18n::t("zc-dashboard-loading")),
+                        ("cpu", &crate::i18n::t("oc-dashboard-loading")),
                         ("cores", &ncpu.to_string()),
                     ],
                 )
             } else {
-                crate::i18n::t("zc-dashboard-loading")
+                crate::i18n::t("oc-dashboard-loading")
             };
             lines.push(Line::from(vec![
                 Span::styled(
-                    status_label("zc-dashboard-label-daemon-cpu", label_width),
+                    status_label("oc-dashboard-label-daemon-cpu", label_width),
                     theme::dim_style(),
                 ),
                 Span::styled(val, theme::dim_style()),
@@ -3177,10 +3177,10 @@ fn overview_status_lines(
     } else {
         lines.push(Line::from(vec![
             Span::styled(
-                status_label("zc-dashboard-label-daemon-cpu", label_width),
+                status_label("oc-dashboard-label-daemon-cpu", label_width),
                 theme::dim_style(),
             ),
-            Span::styled(crate::i18n::t("zc-dashboard-loading"), theme::dim_style()),
+            Span::styled(crate::i18n::t("oc-dashboard-loading"), theme::dim_style()),
         ]));
     }
 
@@ -3189,9 +3189,9 @@ fn overview_status_lines(
 
 fn config_kind_label(kind: &str) -> String {
     match kind {
-        "default" => crate::i18n::t("zc-dashboard-config-kind-default"),
-        "custom" => crate::i18n::t("zc-dashboard-config-kind-custom"),
-        "temporary" => crate::i18n::t("zc-dashboard-config-kind-temporary"),
+        "default" => crate::i18n::t("oc-dashboard-config-kind-default"),
+        "custom" => crate::i18n::t("oc-dashboard-config-kind-custom"),
+        "temporary" => crate::i18n::t("oc-dashboard-config-kind-temporary"),
         other => other.to_string(),
     }
 }
@@ -3207,9 +3207,9 @@ fn config_kind_style(kind: &str) -> Style {
 
 fn daemon_label(connect_label: &str) -> String {
     if is_local_connection(connect_label) {
-        crate::i18n::t("zc-dashboard-daemon-local")
+        crate::i18n::t("oc-dashboard-daemon-local")
     } else if is_remote_connection(connect_label) {
-        crate::i18n::t("zc-dashboard-daemon-remote")
+        crate::i18n::t("oc-dashboard-daemon-remote")
     } else {
         connect_label.to_string()
     }
@@ -3255,13 +3255,13 @@ fn workspace_lines(
     match (code_cwd, chat_cwd) {
         (Some(code), Some(chat)) if code != chat => vec![
             status_row(
-                "zc-dashboard-label-code-cwd",
+                "oc-dashboard-label-code-cwd",
                 code,
                 theme::body_style(),
                 label_width,
             ),
             status_row(
-                "zc-dashboard-label-chat-cwd",
+                "oc-dashboard-label-chat-cwd",
                 chat,
                 theme::body_style(),
                 label_width,
@@ -3269,7 +3269,7 @@ fn workspace_lines(
         ],
         (Some(cwd), _) | (_, Some(cwd)) => {
             vec![status_row(
-                "zc-dashboard-label-workspace",
+                "oc-dashboard-label-workspace",
                 cwd,
                 theme::body_style(),
                 label_width,
@@ -3351,10 +3351,10 @@ mod tests {
             server_version: "0.8.2".into(),
             protocol_version: 1,
             active_sessions: 2,
-            config_dir: Some("/tmp/zc-profile".into()),
-            config_file: Some("/tmp/zc-profile/config.toml".into()),
+            config_dir: Some("/tmp/oc-profile".into()),
+            config_file: Some("/tmp/oc-profile/config.toml".into()),
             config_kind: Some("temporary".into()),
-            local_ipc_endpoint: Some("/tmp/zc-profile/data/daemon.sock".into()),
+            local_ipc_endpoint: Some("/tmp/oc-profile/data/daemon.sock".into()),
         }
     }
 
@@ -3371,11 +3371,11 @@ mod tests {
         ));
 
         assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-daemon-local")),
+            text.contains(&crate::i18n::t("oc-dashboard-daemon-local")),
             "daemon label: {text}"
         );
         assert!(
-            text.contains("/tmp/zc-profile/data/daemon.sock"),
+            text.contains("/tmp/oc-profile/data/daemon.sock"),
             "local socket: {text}"
         );
         assert!(
@@ -3401,7 +3401,7 @@ mod tests {
         ));
 
         assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-daemon-remote")),
+            text.contains(&crate::i18n::t("oc-dashboard-daemon-remote")),
             "daemon label: {text}"
         );
         assert!(
@@ -3409,11 +3409,11 @@ mod tests {
             "remote endpoint: {text}"
         );
         assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-label-insecure-tls")),
+            text.contains(&crate::i18n::t("oc-dashboard-label-insecure-tls")),
             "insecure TLS warning: {text}"
         );
         assert!(
-            !text.contains("/tmp/zc-profile/data/daemon.sock"),
+            !text.contains("/tmp/oc-profile/data/daemon.sock"),
             "remote view must not label socket as endpoint: {text}"
         );
     }
@@ -3454,11 +3454,11 @@ mod tests {
         ));
 
         assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-label-workspace")),
+            text.contains(&crate::i18n::t("oc-dashboard-label-workspace")),
             "shared workspace row: {text}"
         );
-        assert!(!text.contains(&crate::i18n::t("zc-dashboard-label-code-cwd")));
-        assert!(!text.contains(&crate::i18n::t("zc-dashboard-label-chat-cwd")));
+        assert!(!text.contains(&crate::i18n::t("oc-dashboard-label-code-cwd")));
+        assert!(!text.contains(&crate::i18n::t("oc-dashboard-label-chat-cwd")));
         assert!(text.contains("/work/shared"), "workspace value: {text}");
     }
 
@@ -3475,11 +3475,11 @@ mod tests {
         ));
 
         assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-label-code-cwd")),
+            text.contains(&crate::i18n::t("oc-dashboard-label-code-cwd")),
             "code cwd row: {text}"
         );
         assert!(
-            text.contains(&crate::i18n::t("zc-dashboard-label-chat-cwd")),
+            text.contains(&crate::i18n::t("oc-dashboard-label-chat-cwd")),
             "chat cwd row: {text}"
         );
         assert!(text.contains("/work/code"), "code cwd value: {text}");
@@ -3505,16 +3505,16 @@ mod tests {
             None,
         ));
 
-        let daemon_memory = crate::i18n::t("zc-dashboard-label-daemon-memory");
-        let daemon_cpu = crate::i18n::t("zc-dashboard-label-daemon-cpu");
+        let daemon_memory = crate::i18n::t("oc-dashboard-label-daemon-memory");
+        let daemon_cpu = crate::i18n::t("oc-dashboard-label-daemon-cpu");
         assert!(text.contains(&daemon_memory), "daemon memory label: {text}");
         assert!(text.contains(&daemon_cpu), "daemon CPU label: {text}");
         assert!(text.contains("1.0M / 4.0M (25.0%)"), "memory: {text}");
         assert!(
             text.contains(&crate::i18n::t_args(
-                "zc-dashboard-cpu-with-cores",
+                "oc-dashboard-cpu-with-cores",
                 &[
-                    ("cpu", &crate::i18n::t("zc-dashboard-loading")),
+                    ("cpu", &crate::i18n::t("oc-dashboard-loading")),
                     ("cores", "8"),
                 ],
             )),
@@ -3555,7 +3555,7 @@ mod tests {
             "status values must share a column: {value_columns:?}"
         );
         let daemon_memory_width = crate::display_width::display_width(&crate::i18n::t(
-            "zc-dashboard-label-daemon-memory",
+            "oc-dashboard-label-daemon-memory",
         ));
         assert!(
             value_columns[0] > daemon_memory_width,
@@ -3597,11 +3597,11 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0].spans[0].content.as_ref(),
-            status_label("zc-dashboard-label-uptime", health_status_label_width())
+            status_label("oc-dashboard-label-uptime", health_status_label_width())
         );
         assert_eq!(
             lines[1].spans[0].content.as_ref(),
-            status_label("zc-dashboard-label-pid", health_status_label_width())
+            status_label("oc-dashboard-label-pid", health_status_label_width())
         );
         assert_eq!(lines[0].spans[1].content.as_ref(), "1m");
         assert_eq!(lines[1].spans[1].content.as_ref(), "1234");
@@ -3613,7 +3613,7 @@ mod tests {
         assert_eq!(value_columns[0], value_columns[1]);
         assert!(
             value_columns[0]
-                > crate::display_width::display_width(&crate::i18n::t("zc-dashboard-label-uptime")),
+                > crate::display_width::display_width(&crate::i18n::t("oc-dashboard-label-uptime")),
             "translated uptime label must retain a separating cell"
         );
     }
@@ -3638,7 +3638,7 @@ mod tests {
 
         assert!(
             text.contains(&crate::i18n::t_args(
-                "zc-dashboard-cpu-with-cores",
+                "oc-dashboard-cpu-with-cores",
                 &[("cpu", "12.3%"), ("cores", "8")],
             )),
             "cpu value: {text}"

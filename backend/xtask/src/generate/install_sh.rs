@@ -321,7 +321,7 @@ interactive_feature_picker() {
     esac
   done
 
-  # Apps default-on set (zerocode); features pre-checked from the crate's
+  # Apps default-on set (omnescode); features pre-checked from the crate's
   # `default = [...]` list, expanded transitively so aggregate defaults like
   # `default-channels` pre-check their leaf channel-* rows.
   selected_apps="$DEFAULT_APPS"
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn route_contract_comes_from_canonical_routes() {
         let contract = render_route_contract(&spec::install_routes().unwrap()).unwrap();
-        assert!(contract.contains("DEFAULT_APPS=\"zerocode\""));
+        assert!(contract.contains("DEFAULT_APPS=\"omnescode\""));
         assert!(contract.contains("PIPED_INSTALL_MODE=\"prebuilt\""));
         assert!(contract.contains("QUICKSTART_COMMAND=\"omnesagent quickstart\""));
         assert!(contract.contains("QUICKSTART_SUBCOMMAND=\"quickstart\""));
@@ -744,7 +744,7 @@ mod tests {
         let mut divergent_defaults = spec::install_routes().unwrap();
         mutate_unix_variant(&mut divergent_defaults, RouteId::UnixGuided, |variant| {
             variant.apps = AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(&[
-                "zerocode",
+                "omnescode",
                 "omnesagent-desktop",
             ]);
         });
@@ -752,7 +752,7 @@ mod tests {
 
         let mut wrong_policy = spec::install_routes().unwrap();
         mutate_unix_variant(&mut wrong_policy, RouteId::UnixFast, |variant| {
-            variant.apps = AppPolicy::ArchiveOptional(&["zerocode"]);
+            variant.apps = AppPolicy::ArchiveOptional(&["omnescode"]);
         });
         assert!(render_route_contract(&wrong_policy).is_err());
     }

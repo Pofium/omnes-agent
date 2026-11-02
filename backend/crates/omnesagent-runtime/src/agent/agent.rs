@@ -2166,7 +2166,7 @@ impl Agent {
     /// consumers of the final text, e.g. the gateway web UI's `done` frame)
     /// and streamed as a trailing [`TurnEvent::Chunk`] (rendered by streaming
     /// consumers that discard the final text on a clean finish, e.g. the
-    /// ZeroCode TUI).
+    /// OmnesCode TUI).
     async fn append_model_fallback_notice(
         response: String,
         fallback: Option<&omnesagent_providers::reliable::ProviderFallbackInfo>,
@@ -4097,7 +4097,7 @@ mod tests {
         }
         assert!(
             chunk_carried_notice,
-            "the notice must also be streamed for delta-only consumers (ZeroCode)"
+            "the notice must also be streamed for delta-only consumers (OmnesCode)"
         );
     }
 
@@ -5590,7 +5590,7 @@ mod tests {
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
             agent
-                .turn_streamed_with_steering_state("hi from zerocode", event_tx, None, None)
+                .turn_streamed_with_steering_state("hi from omnescode", event_tx, None, None)
                 .await
                 .expect("streamed Agent turn should succeed");
 
@@ -5613,7 +5613,7 @@ mod tests {
             );
             assert!(
                 user.content.starts_with("[CURRENT DATE & TIME:")
-                    && user.content.ends_with("\n\nhi from zerocode"),
+                    && user.content.ends_with("\n\nhi from omnescode"),
                 "provider must receive the labeled envelope and original text: {}",
                 user.content
             );
@@ -7082,7 +7082,7 @@ mod tests {
         agent.history().iter().any(|m| match m {
             ConversationMessage::ToolResults(results) => results
                 .iter()
-                .any(|r| r.content.contains("[receipt: zc-receipt-")),
+                .any(|r| r.content.contains("[receipt: oc-receipt-")),
             _ => false,
         })
     }
@@ -7175,7 +7175,7 @@ mod tests {
             .await
             .expect("streamed turn should succeed");
         assert!(
-            response.contains("---\nTool receipts:") && response.contains("zc-receipt-"),
+            response.contains("---\nTool receipts:") && response.contains("oc-receipt-"),
             "show_in_response must append the Tool receipts block to the reply, got: {response}"
         );
     }

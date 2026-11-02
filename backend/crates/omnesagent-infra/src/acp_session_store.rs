@@ -1067,7 +1067,7 @@ mod tests {
                 "sess-surface",
                 "alpha",
                 "/tmp/proj",
-                Some("zerocode_code"),
+                Some("omnescode_code"),
             )
             .unwrap();
         assert_eq!(
@@ -1077,7 +1077,7 @@ mod tests {
                 .unwrap()
                 .interaction_surface
                 .as_deref(),
-            Some("zerocode_code")
+            Some("omnescode_code")
         );
 
         store
@@ -1085,15 +1085,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .bind_interaction_surface_if_unset("sess-legacy", "zerocode_code")
+                .bind_interaction_surface_if_unset("sess-legacy", "omnescode_code")
                 .unwrap(),
-            "zerocode_code"
+            "omnescode_code"
         );
         assert_eq!(
             store
                 .bind_interaction_surface_if_unset("sess-legacy", "different_surface")
                 .unwrap(),
-            "zerocode_code",
+            "omnescode_code",
             "a later caller must not relabel an already-bound session"
         );
     }

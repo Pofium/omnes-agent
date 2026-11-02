@@ -108,7 +108,7 @@ fn prepare_enrollment_request() -> Result<(String, String, zeroize::Zeroizing<St
 
     // The private key stays here; only the CSR is sent. Desktop generates a
     // software P-256 key; a mobile build swaps in a hardware-keystore CsrSigner.
-    let (csr_pem, key_pem) = software_csr("zerocode")?;
+    let (csr_pem, key_pem) = software_csr("omnescode")?;
     Ok((code, csr_pem, key_pem))
 }
 
@@ -144,7 +144,7 @@ fn cache_confirmed_response(
     );
     if !resp.relay_profile.relay_url.is_empty() {
         eprintln!(
-            "Reach this daemon through its relay with: zerocode --relay {} --relay-node {}",
+            "Reach this daemon through its relay with: omnescode --relay {} --relay-node {}",
             resp.relay_profile.relay_url, resp.relay_profile.node_id
         );
     } else {
@@ -179,11 +179,11 @@ pub async fn maybe_renew(client: &crate::client::RpcClient, config_dir: &Path) {
     }
     match renew(client, config_dir).await {
         Ok(not_after) => {
-            eprintln!("zerocode: renewed client certificate (valid through unix {not_after}).");
+            eprintln!("omnescode: renewed client certificate (valid through unix {not_after}).");
         }
         Err(e) => {
             eprintln!(
-                "zerocode: certificate renewal skipped ({e:#}); the current cert is still valid."
+                "omnescode: certificate renewal skipped ({e:#}); the current cert is still valid."
             );
         }
     }
@@ -192,7 +192,7 @@ pub async fn maybe_renew(client: &crate::client::RpcClient, config_dir: &Path) {
 /// Generate a fresh keypair + CSR, renew over `cert/renew`, and re-cache the
 /// result (including any rotated relay node-id the daemon hands back).
 async fn renew(client: &crate::client::RpcClient, config_dir: &Path) -> Result<i64> {
-    let (csr_pem, key_pem) = software_csr("zerocode").context("generating renewal CSR")?;
+    let (csr_pem, key_pem) = software_csr("omnescode").context("generating renewal CSR")?;
     let resp: EnrollResponse = client
         .call("cert/renew", serde_json::json!({ "csr_pem": csr_pem }))
         .await
@@ -538,7 +538,7 @@ const PUBLISH_MARKER: &str = ".publish.pending";
 /// First line of the marker. A marker that does not start with this tag was not
 /// written by this publication contract, so recovery refuses it rather than
 /// guessing which files belong together.
-const PUBLISH_MANIFEST_TAG: &str = "zerocode-publish-v1";
+const PUBLISH_MANIFEST_TAG: &str = "omnescode-publish-v1";
 
 /// Durable record of the generation that is CURRENTLY published. It is written
 /// after the last rename and before the marker is cleared, so it outlives the
@@ -554,7 +554,7 @@ const STAGED_PUBLISHED_MANIFEST: &str = ".published.manifest.tmp";
 
 /// First line of the published-generation record. Distinct from the marker tag,
 /// so neither file can ever be parsed as the other.
-const PUBLISHED_MANIFEST_TAG: &str = "zerocode-published-v1";
+const PUBLISHED_MANIFEST_TAG: &str = "omnescode-published-v1";
 
 /// Lock file serialising credential publication within one config directory.
 const PUBLISH_LOCK: &str = ".publish.lock";
@@ -671,7 +671,7 @@ fn mark_generation(staged: &StagedGeneration) -> Result<()> {
 /// Exclusive inter-process lock over one config directory's credential cache.
 ///
 /// Publication stages under FIXED `.tmp` names and one FIXED marker, so two
-/// zerocode processes sharing a config directory interleave without this: one
+/// omnescode processes sharing a config directory interleave without this: one
 /// can classify a generation while the other overwrites the staged files under
 /// it, and the first then publishes a mixed set or records a manifest that
 /// describes neither generation. The crash-phase tests cannot see this, because
@@ -682,7 +682,7 @@ fn mark_generation(staged: &StagedGeneration) -> Result<()> {
 /// `std::fs::File::try_lock` is the primitive: `flock(LOCK_EX)` on Unix,
 /// `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK` on Windows. One call, no
 /// dependency, and no platform-specific code to review. On Unix the lock is
-/// advisory, which binds every process that takes it - every zerocode - and
+/// advisory, which binds every process that takes it - every omnescode - and
 /// leaves an operator's own edits to the directory unaffected.
 #[derive(Debug)]
 struct PublishLock {
@@ -714,7 +714,7 @@ impl PublishLock {
                     if std::time::Instant::now() >= deadline {
                         anyhow::bail!(
                             "another process is publishing credentials and still holds {} \
-                             after {}s. Let the other zerocode finish enrolling or renewing, \
+                             after {}s. Let the other omnescode finish enrolling or renewing, \
                              then try again.",
                             path.display(),
                             wait.as_secs()
@@ -776,7 +776,7 @@ fn lock_existing_cache(tls_dir: &Path) -> Result<Option<PublishLock>> {
 /// missing generation the marker and the published manifest exist to prevent.
 ///
 /// Residual Windows risk: another process holding the destination open without
-/// delete-sharing (a scanner, a second zerocode) can still make the call fail.
+/// delete-sharing (a scanner, a second omnescode) can still make the call fail.
 /// That failure is fail-safe, not fail-open - the error propagates with the
 /// marker still on disk and the previous generation intact, so the next run
 /// recovers.
@@ -996,7 +996,7 @@ fn adopt_published_generation(tls_dir: &Path) -> Result<()> {
     }
     if let Err(e) = record_published_generation(tls_dir, &digests) {
         eprintln!(
-            "zerocode: could not record the published credential generation ({e:#}); \
+            "omnescode: could not record the published credential generation ({e:#}); \
              an interrupted publication may go undetected until the next enrollment."
         );
     }
@@ -1081,7 +1081,7 @@ fn cache_materials(config_dir: &Path, resp: &EnrollResponse, key_pem: &str) -> R
     std::fs::create_dir_all(&tls_dir).with_context(|| format!("creating {}", tls_dir.display()))?;
     // The directory entry must be durable before it holds credentials.
     sync_dir_where_supported(config_dir)?;
-    // Held across the whole sequence below: another zerocode sharing this config
+    // Held across the whole sequence below: another omnescode sharing this config
     // directory stages under the same fixed names, and an interleaving between
     // the classification and the four renames publishes a mixed set.
     let _lock = PublishLock::acquire(&tls_dir)?;
@@ -2028,7 +2028,7 @@ mod tests {
     }
 
     /// The CA preflight runs before anything is trusted, so a silent endpoint
-    /// here stalls `zerocode --enroll` before the operator is ever prompted.
+    /// here stalls `omnescode --enroll` before the operator is ever prompted.
     #[tokio::test(start_paused = true)]
     async fn a_silent_endpoint_cannot_stall_the_trust_fetch() {
         let (addr, server) = accept_then_silent_listener().await;

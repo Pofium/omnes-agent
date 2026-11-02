@@ -49,7 +49,7 @@ impl CleanupReport {
     pub(crate) fn notice(self) -> Option<String> {
         (self.failed_count() > 0).then(|| {
             crate::i18n::t_args(
-                "zc-input-clipboard-cleanup-error",
+                "oc-input-clipboard-cleanup-error",
                 &[("count", &self.failed_count().to_string())],
             )
         })

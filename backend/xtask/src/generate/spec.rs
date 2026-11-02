@@ -117,7 +117,7 @@ pub enum QuickstartHandoff {
 }
 
 pub const QUICKSTART_COMMAND: &str = "omnesagent quickstart";
-pub const ZEROCODE_APP: &str = "zerocode";
+pub const OMNESCODE_APP: &str = "omnescode";
 
 /// Platform-specific first-run semantics within one user-visible route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,7 +250,7 @@ impl InstallRoute {
     }
 }
 
-const ZEROCODE_APPS: &[&str] = &[ZEROCODE_APP];
+const OMNESCODE_APPS: &[&str] = &[OMNESCODE_APP];
 
 const UNIX_FAST_ROUTE: InstallRoute = InstallRoute {
     id: RouteId::UnixFast,
@@ -259,7 +259,7 @@ const UNIX_FAST_ROUTE: InstallRoute = InstallRoute {
         invocation: Invocation::PipedScript,
         interaction: Interaction::NonInteractive,
         branch: BranchPolicy::PreferPrebuiltThenSource,
-        apps: AppPolicy::ArchiveOptionalOrSourceDefaults(ZEROCODE_APPS),
+        apps: AppPolicy::ArchiveOptionalOrSourceDefaults(OMNESCODE_APPS),
         features: FeaturePolicy::Fixed,
         path_effect: PathEffect::ProfileUpdateRequiresReload,
         handoff: QuickstartHandoff::PrintCommand,
@@ -275,7 +275,7 @@ const UNIX_GUIDED_ROUTE: InstallRoute = InstallRoute {
         invocation: Invocation::InteractiveScript,
         interaction: Interaction::Guided,
         branch: BranchPolicy::UserChoice,
-        apps: AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(ZEROCODE_APPS),
+        apps: AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(OMNESCODE_APPS),
         features: FeaturePolicy::Selectable,
         path_effect: PathEffect::ProfileUpdateRequiresReload,
         handoff: QuickstartHandoff::OfferCliOrBrowser,
@@ -291,7 +291,7 @@ const WINDOWS_PREBUILT_ROUTE: InstallRoute = InstallRoute {
         invocation: Invocation::ManualPrebuilt,
         interaction: Interaction::NonInteractive,
         branch: BranchPolicy::PrebuiltOnly,
-        apps: AppPolicy::ArchiveOptional(ZEROCODE_APPS),
+        apps: AppPolicy::ArchiveOptional(OMNESCODE_APPS),
         features: FeaturePolicy::Fixed,
         path_effect: PathEffect::CurrentAndFutureShell,
         handoff: QuickstartHandoff::RunAutomatically,
@@ -308,7 +308,7 @@ const ADVANCED_SOURCE_ROUTE: InstallRoute = InstallRoute {
             invocation: Invocation::SourceScript,
             interaction: Interaction::Guided,
             branch: BranchPolicy::SourceOnly,
-            apps: AppPolicy::SourceDefaultsSelectable(ZEROCODE_APPS),
+            apps: AppPolicy::SourceDefaultsSelectable(OMNESCODE_APPS),
             features: FeaturePolicy::Selectable,
             path_effect: PathEffect::ProfileUpdateRequiresReload,
             handoff: QuickstartHandoff::OfferCliOrBrowser,
@@ -406,7 +406,7 @@ pub enum Action {
     DownloadPrebuilt,
     /// Install the main binary into BinDir.
     InstallBinary,
-    /// Install a named app binary (e.g. zerocode) into BinDir.
+    /// Install a named app binary (e.g. omnescode) into BinDir.
     InstallApp { app: String },
     /// Bootstrap the Rust toolchain via rustup.
     InstallToolchain,
@@ -1240,7 +1240,7 @@ mod tests {
                 Platform::Unix,
                 |variant| {
                     variant.apps =
-                        AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(ZEROCODE_APPS);
+                        AppPolicy::ArchiveOptionalOrSourceDefaultsSelectable(OMNESCODE_APPS);
                 },
             ),
             mutated_variant(
@@ -1298,7 +1298,7 @@ mod tests {
         let incompatible_mixed_branch_policy = mutated_variant(
             route(&routes, RouteId::UnixFast),
             Platform::Unix,
-            |variant| variant.apps = AppPolicy::ArchiveOptional(ZEROCODE_APPS),
+            |variant| variant.apps = AppPolicy::ArchiveOptional(OMNESCODE_APPS),
         );
         assert!(
             incompatible_mixed_branch_policy
@@ -1311,7 +1311,7 @@ mod tests {
         let source_with_archive_policy = mutated_variant(
             route(&routes, RouteId::AdvancedSource),
             Platform::Unix,
-            |variant| variant.apps = AppPolicy::ArchiveOptional(ZEROCODE_APPS),
+            |variant| variant.apps = AppPolicy::ArchiveOptional(OMNESCODE_APPS),
         );
         assert!(
             source_with_archive_policy
@@ -1324,7 +1324,7 @@ mod tests {
         let archive_with_app_selection = mutated_variant(
             route(&routes, RouteId::WindowsPrebuilt),
             Platform::Windows,
-            |variant| variant.apps = AppPolicy::SourceDefaultsSelectable(ZEROCODE_APPS),
+            |variant| variant.apps = AppPolicy::SourceDefaultsSelectable(OMNESCODE_APPS),
         );
         assert!(
             archive_with_app_selection
@@ -1693,7 +1693,7 @@ mod tests {
             "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
         ));
         assert!(manual.contains(
-            "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
+            "run: $BUILD_CMD --release --locked -p omnescode --target ${{ matrix.target }}"
         ));
         assert!(manual.contains(
             "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
@@ -1703,7 +1703,7 @@ mod tests {
                 .matches("if: matrix.target != 'aarch64-linux-android'")
                 .count(),
             4,
-            "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
+            "the OmnesCode and ZeroRelay builds and uploads must all skip Android"
         );
         assert!(!manual.contains("excluded_features"));
 
@@ -1712,7 +1712,7 @@ mod tests {
         let omnesagent_upload = manual
             .find("name: omnesagent-manual-${{ inputs.distribution }}-${{ matrix.target }}")
             .unwrap();
-        let companion = manual.find("- name: Build ZeroCode companion").unwrap();
+        let companion = manual.find("- name: Build OmnesCode companion").unwrap();
         assert!(
             target_env < release_step
                 && release_step < omnesagent_upload

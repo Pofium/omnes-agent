@@ -4,7 +4,7 @@
 //! The relay plane is WebSocket-only. A non-upgrade request gets a plain 404 and
 //! the connection is closed - the relay serves no HTTP content of its own, so
 //! there is no code-origin trust to reason about. Browser enrollment is handled
-//! natively by `zerocode`, which keeps the relay a blind forwarder.
+//! natively by `omnescode`, which keeps the relay a blind forwarder.
 
 use anyhow::{Context, Result};
 use std::io::Cursor;
@@ -53,7 +53,7 @@ where
     }
 
     let body = "this is a OmnesAgent relay endpoint; it speaks only the \
-                omnesagent.relay.v1 WebSocket protocol. Enroll with zerocode.\n";
+                omnesagent.relay.v1 WebSocket protocol. Enroll with omnescode.\n";
     let response = http_response("404 Not Found", "text/plain; charset=utf-8", body);
     stream.write_all(&response).await?;
     let _ = stream.shutdown().await;

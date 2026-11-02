@@ -11,7 +11,7 @@ const SERIAL_ALLOWED_PATH_PREFIXES: &[&str] = &[
 ];
 
 #[cfg(feature = "dev-sim")]
-const DEV_SIM_SERIAL_PATH_PREFIX: &str = "/tmp/zc-sim-";
+const DEV_SIM_SERIAL_PATH_PREFIX: &str = "/tmp/oc-sim-";
 
 pub fn is_serial_path_allowed(path: &str) -> bool {
     SERIAL_ALLOWED_PATH_PREFIXES

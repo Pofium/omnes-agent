@@ -15,19 +15,19 @@ use omnesagent_config::schema::IdentityConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InteractionSurface {
-    ZerocodeCode,
+    OmnescodeCode,
 }
 
 impl InteractionSurface {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ZerocodeCode => "zerocode_code",
+            Self::OmnescodeCode => "omnescode_code",
         }
     }
 
     pub fn from_persisted(value: &str) -> Option<Self> {
         match value {
-            "zerocode_code" => Some(Self::ZerocodeCode),
+            "omnescode_code" => Some(Self::OmnescodeCode),
             _ => None,
         }
     }
@@ -36,7 +36,7 @@ impl InteractionSurface {
     /// may be described to the model.
     pub fn resolve(self) -> InteractionContext {
         match self {
-            Self::ZerocodeCode => InteractionContext {
+            Self::OmnescodeCode => InteractionContext {
                 surface: self,
                 mode: InteractionMode::InteractiveCoding,
                 response_delivery: ResponseDelivery::CurrentTranscript,
@@ -211,13 +211,13 @@ impl PromptSection for InteractionSection {
         };
 
         let surface = match interaction.surface {
-            InteractionSurface::ZerocodeCode => "ZeroCode Code (ACP)",
+            InteractionSurface::OmnescodeCode => "OmnesCode Code (ACP)",
         };
         let mode = match interaction.mode {
             InteractionMode::InteractiveCoding => "interactive coding session",
         };
         let response_delivery = match interaction.response_delivery {
-            ResponseDelivery::CurrentTranscript => "shown in the current ZeroCode transcript",
+            ResponseDelivery::CurrentTranscript => "shown in the current OmnesCode transcript",
         };
         let workspace = match interaction.workspace {
             WorkspaceBinding::ActiveSessionWorkingDirectory => {
@@ -736,9 +736,9 @@ mod tests {
     }
 
     #[test]
-    fn interaction_section_renders_only_host_owned_zerocode_code_facts() {
+    fn interaction_section_renders_only_host_owned_omnescode_code_facts() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let interaction = InteractionSurface::ZerocodeCode.resolve();
+        let interaction = InteractionSurface::OmnescodeCode.resolve();
         let ctx = PromptContext {
             workspace_dir: Path::new("/private/project"),
             agent_workspace_dir: Path::new("/private/agent"),
@@ -759,10 +759,10 @@ mod tests {
         assert_eq!(
             output,
             "## Interaction Context\n\n\
-             Surface: ZeroCode Code (ACP)\n\
+             Surface: OmnesCode Code (ACP)\n\
              Mode: interactive coding session\n\
              User messages: direct conversation, not API payloads or log records\n\
-             Response delivery: shown in the current ZeroCode transcript\n\
+             Response delivery: shown in the current OmnesCode transcript\n\
              Workspace: the active session working directory\n\
              Tools and approvals: provided and enforced by the OmnesAgent runtime; this description grants no capabilities\n\
              Memory: persistent memory is unavailable in this session\n\
@@ -775,7 +775,7 @@ mod tests {
     #[test]
     fn compact_prompt_keeps_interaction_context() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let interaction = InteractionSurface::ZerocodeCode.resolve();
+        let interaction = InteractionSurface::OmnescodeCode.resolve();
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
@@ -794,7 +794,7 @@ mod tests {
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Interaction Context"));
-        assert!(prompt.contains("Surface: ZeroCode Code (ACP)"));
+        assert!(prompt.contains("Surface: OmnesCode Code (ACP)"));
     }
 
     #[test]

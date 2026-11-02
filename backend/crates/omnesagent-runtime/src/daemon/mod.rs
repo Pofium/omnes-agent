@@ -785,7 +785,7 @@ pub async fn run(
             session_backend,
             memory: rpc_memory,
             // Process-global tracker shared with the gateway and channel
-            // supervisor. Without this the RPC/zerocode-TUI turn path has no
+            // supervisor. Without this the RPC/omnescode-TUI turn path has no
             // tracker to record into and model cost is silently dropped
             cost_tracker: crate::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),

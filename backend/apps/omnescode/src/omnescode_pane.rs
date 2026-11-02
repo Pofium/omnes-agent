@@ -1,4 +1,4 @@
-//! The local `zerocode` config pane: theme selector, keybinding list,
+//! The local `omnescode` config pane: theme selector, keybinding list,
 //! and preset picker, plus the chord-capture modal for per-action
 //! rebinding. All surfaces walk the canonical registries (`theme_names`,
 //! `KEY_PRESETS`, each action enum's `variants()`) — nothing is
@@ -20,7 +20,7 @@ use crate::config::{TodoTrackerSection, WssSection};
 use crate::keymap::{Chord, overrides, reserved_reason};
 use crate::theme;
 
-/// Which sub-pane of the zerocode tab is focused.
+/// Which sub-pane of the omnescode tab is focused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Theme,
@@ -56,13 +56,13 @@ enum PaneCursor {
 impl Focus {
     fn fluent_key(self) -> &'static str {
         match self {
-            Self::Theme => "zc-zerocode-tab-theme",
-            Self::AgentTheme => "zc-zerocode-tab-agent-theme",
-            Self::Presets => "zc-zerocode-tab-presets",
-            Self::Bindings => "zc-zerocode-tab-bindings",
-            Self::Locale => "zc-zerocode-tab-locale",
-            Self::Connection => "zc-zerocode-tab-connection",
-            Self::TodoTracker => "zc-zerocode-tab-todo-tracker",
+            Self::Theme => "oc-omnescode-tab-theme",
+            Self::AgentTheme => "oc-omnescode-tab-agent-theme",
+            Self::Presets => "oc-omnescode-tab-presets",
+            Self::Bindings => "oc-omnescode-tab-bindings",
+            Self::Locale => "oc-omnescode-tab-locale",
+            Self::Connection => "oc-omnescode-tab-connection",
+            Self::TodoTracker => "oc-omnescode-tab-todo-tracker",
         }
     }
 }
@@ -83,9 +83,9 @@ const CONN_FIELDS: [ConnField; 3] = [
 impl ConnField {
     fn fluent_key(self) -> &'static str {
         match self {
-            Self::Uri => "zc-zerocode-conn-uri",
-            Self::SkipVerify => "zc-zerocode-conn-skip-verify",
-            Self::SkipVerifyRoutes => "zc-zerocode-conn-skip-verify-routes",
+            Self::Uri => "oc-omnescode-conn-uri",
+            Self::SkipVerify => "oc-omnescode-conn-skip-verify",
+            Self::SkipVerifyRoutes => "oc-omnescode-conn-skip-verify-routes",
         }
     }
 
@@ -120,11 +120,11 @@ const TRACKER_FIELDS: [TrackerField; 5] = [
 impl TrackerField {
     fn fluent_key(self) -> &'static str {
         match self {
-            Self::Enabled => "zc-zerocode-tracker-enabled",
-            Self::EnabledAtStart => "zc-zerocode-tracker-enabled-at-start",
-            Self::Location => "zc-zerocode-tracker-location",
-            Self::Width => "zc-zerocode-tracker-width",
-            Self::MaxHeight => "zc-zerocode-tracker-max-height",
+            Self::Enabled => "oc-omnescode-tracker-enabled",
+            Self::EnabledAtStart => "oc-omnescode-tracker-enabled-at-start",
+            Self::Location => "oc-omnescode-tracker-location",
+            Self::Width => "oc-omnescode-tracker-width",
+            Self::MaxHeight => "oc-omnescode-tracker-max-height",
         }
     }
 }
@@ -145,7 +145,7 @@ struct Capture {
     error: Option<String>,
 }
 
-pub(crate) struct ZerocodePane {
+pub(crate) struct OmnescodePane {
     config_dir: PathBuf,
     focus: Focus,
     /// Which split side holds the live cursor. Section navigation is on the left
@@ -185,7 +185,7 @@ pub(crate) struct ZerocodePane {
     // Locale: registry from the daemon (locales/list), fed by config_manager.
     locales: Vec<crate::client::LocaleOption>,
     locale_cursor: usize,
-    /// Selected locale persisted to zerocode-config.toml (the active one).
+    /// Selected locale persisted to omnescode-config.toml (the active one).
     active_locale: Option<String>,
     /// Set when the user requests "Download locale file"; config_manager (which
     /// holds the RpcClient) drains this, performs the async fetch, and writes.
@@ -282,7 +282,7 @@ struct TrackerEdit {
     buf: String,
 }
 
-impl ZerocodePane {
+impl OmnescodePane {
     pub(crate) fn new(config_dir: &Path) -> Self {
         let themes: Vec<String> = theme::theme_names().map(str::to_string).collect();
         let presets: Vec<String> = config::keybindings::preset_names()
@@ -455,7 +455,7 @@ impl ZerocodePane {
         let (style, symbol) = self.list_highlight(self.cursor == PaneCursor::Sections, false);
         frame.render_stateful_widget(
             List::new(items)
-                .block(theme::panel_block(" zerocode "))
+                .block(theme::panel_block(" omnescode "))
                 .highlight_style(style)
                 .highlight_symbol(symbol),
             area,
@@ -542,9 +542,9 @@ impl ZerocodePane {
             // Distinguish "still loading" from "loaded, none enabled": the
             // latter is terminal and must not read as a spinner.
             let (msg_key, style) = if self.agents_loaded {
-                ("zc-zerocode-agent-theme-no-agents", theme::dim_style())
+                ("oc-omnescode-agent-theme-no-agents", theme::dim_style())
             } else {
-                ("zc-zerocode-agent-theme-loading", theme::dim_style())
+                ("oc-omnescode-agent-theme-loading", theme::dim_style())
             };
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(Line::from(Span::styled(
@@ -612,7 +612,7 @@ impl ZerocodePane {
                 .join("/")
         };
         crate::i18n::t_args(
-            "zc-zerocode-agent-theme-hint",
+            "oc-omnescode-agent-theme-hint",
             &[
                 ("assign", &label(A::Enter)),
                 ("clear", &label(A::DeleteRow)),
@@ -707,12 +707,12 @@ impl ZerocodePane {
         if self.locales.is_empty() {
             let (msg, style) = if let Some(err) = &self.list_error {
                 (
-                    crate::i18n::t_args("zc-zerocode-locale-list-failed", &[("err", err)]),
+                    crate::i18n::t_args("oc-omnescode-locale-list-failed", &[("err", err)]),
                     theme::error_style(),
                 )
             } else {
                 (
-                    crate::i18n::t("zc-zerocode-locale-loading"),
+                    crate::i18n::t("oc-omnescode-locale-loading"),
                     theme::dim_style(),
                 )
             };
@@ -721,7 +721,7 @@ impl ZerocodePane {
 
         // Download action row.
         items.push(ListItem::new(Line::from(Span::styled(
-            crate::i18n::t("zc-zerocode-locale-download"),
+            crate::i18n::t("oc-omnescode-locale-download"),
             theme::accent_style().add_modifier(Modifier::BOLD),
         ))));
 
@@ -744,7 +744,7 @@ impl ZerocodePane {
                 .uri
                 .clone()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| crate::i18n::t("zc-zerocode-conn-unset")),
+                .unwrap_or_else(|| crate::i18n::t("oc-omnescode-conn-unset")),
             ConnField::SkipVerify => if self.conn.tls.skip_verify {
                 "true"
             } else {
@@ -753,7 +753,7 @@ impl ZerocodePane {
             .to_string(),
             ConnField::SkipVerifyRoutes => {
                 if self.conn.tls.skip_verify_routes.is_empty() {
-                    crate::i18n::t("zc-zerocode-conn-no-routes")
+                    crate::i18n::t("oc-omnescode-conn-no-routes")
                 } else {
                     self.conn.tls.skip_verify_routes.join(", ")
                 }
@@ -766,9 +766,9 @@ impl ZerocodePane {
             use ratatui::layout::{Constraint, Direction, Layout};
             let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
             let hint = match edit.field {
-                ConnField::SkipVerify => crate::i18n::t("zc-zerocode-conn-edit-bool"),
-                ConnField::SkipVerifyRoutes => crate::i18n::t("zc-zerocode-conn-edit-routes"),
-                ConnField::Uri => crate::i18n::t("zc-zerocode-conn-edit-text"),
+                ConnField::SkipVerify => crate::i18n::t("oc-omnescode-conn-edit-bool"),
+                ConnField::SkipVerifyRoutes => crate::i18n::t("oc-omnescode-conn-edit-routes"),
+                ConnField::Uri => crate::i18n::t("oc-omnescode-conn-edit-text"),
             };
             let rows = Layout::default()
                 .direction(Direction::Vertical)
@@ -818,7 +818,7 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&crate::i18n::t(
-                    "zc-zerocode-conn-title",
+                    "oc-omnescode-conn-title",
                 )))
                 .highlight_style(self.detail_highlight().0)
                 .highlight_symbol(self.detail_highlight().1),
@@ -860,11 +860,11 @@ impl ZerocodePane {
             let title = format!(" {} ", crate::i18n::t(edit.field.fluent_key()));
             let hint = match edit.field {
                 TrackerField::Enabled | TrackerField::EnabledAtStart => {
-                    crate::i18n::t("zc-zerocode-tracker-edit-bool")
+                    crate::i18n::t("oc-omnescode-tracker-edit-bool")
                 }
-                TrackerField::Location => crate::i18n::t("zc-zerocode-tracker-edit-location"),
+                TrackerField::Location => crate::i18n::t("oc-omnescode-tracker-edit-location"),
                 TrackerField::Width | TrackerField::MaxHeight => {
-                    crate::i18n::t("zc-zerocode-tracker-edit-number")
+                    crate::i18n::t("oc-omnescode-tracker-edit-number")
                 }
             };
             let rows = Layout::default()
@@ -936,7 +936,7 @@ impl ZerocodePane {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(&crate::i18n::t(
-                        "zc-zerocode-tracker-title",
+                        "oc-omnescode-tracker-title",
                     )))
                     .highlight_style(self.detail_highlight().0)
                     .highlight_symbol(self.detail_highlight().1),
@@ -949,7 +949,7 @@ impl ZerocodePane {
         frame.render_stateful_widget(
             List::new(items)
                 .block(theme::panel_block(&crate::i18n::t(
-                    "zc-zerocode-tracker-title",
+                    "oc-omnescode-tracker-title",
                 )))
                 .highlight_style(self.detail_highlight().0)
                 .highlight_symbol(self.detail_highlight().1),
@@ -1026,7 +1026,7 @@ impl ZerocodePane {
             }
         }
         self.status = Some(crate::i18n::t_args(
-            "zc-zerocode-locale-downloaded",
+            "oc-omnescode-locale-downloaded",
             &[
                 ("written", &written.join(", ")),
                 ("locale", locale),
@@ -1039,7 +1039,7 @@ impl ZerocodePane {
     /// without crashing or orphaning the request.
     pub(crate) fn report_fetch_error(&mut self, locale: &str, err: &str) {
         self.status = Some(crate::i18n::t_args(
-            "zc-zerocode-locale-fetch-failed",
+            "oc-omnescode-locale-fetch-failed",
             &[("locale", locale), ("err", err)],
         ));
     }
@@ -1050,7 +1050,7 @@ impl ZerocodePane {
     pub(crate) fn report_list_error(&mut self, err: &str) {
         self.list_error = Some(err.to_string());
         self.status = Some(crate::i18n::t_args(
-            "zc-zerocode-locale-list-failed",
+            "oc-omnescode-locale-list-failed",
             &[("err", err)],
         ));
     }
@@ -1071,11 +1071,11 @@ impl ZerocodePane {
                 Some(code) => {
                     self.pending_fetch = Some(code.clone());
                     self.status = Some(crate::i18n::t_args(
-                        "zc-zerocode-locale-fetching",
+                        "oc-omnescode-locale-fetching",
                         &[("locale", &code)],
                     ));
                 }
-                None => self.status = Some(crate::i18n::t("zc-zerocode-locale-pick-first")),
+                None => self.status = Some(crate::i18n::t("oc-omnescode-locale-pick-first")),
             }
         }
     }
@@ -1085,7 +1085,7 @@ impl ZerocodePane {
             Ok(()) => {
                 self.active_locale = Some(code.to_string());
                 self.status = Some(crate::i18n::t_args(
-                    "zc-zerocode-locale-set",
+                    "oc-omnescode-locale-set",
                     &[("locale", code)],
                 ));
             }
@@ -1122,7 +1122,7 @@ impl ZerocodePane {
                 theme::heading_style(),
             )),
             Line::from(Span::styled(
-                crate::i18n::t("zc-zerocode-capture-prompt"),
+                crate::i18n::t("oc-omnescode-capture-prompt"),
                 theme::body_style(),
             )),
         ];
@@ -1130,7 +1130,7 @@ impl ZerocodePane {
             lines.push(Line::from(Span::styled(err.clone(), theme::warn_style())));
         }
         lines.push(Line::from(Span::styled(
-            crate::i18n::t_args("zc-zerocode-hint-cancel", &[("keys", "Esc")]),
+            crate::i18n::t_args("oc-omnescode-hint-cancel", &[("keys", "Esc")]),
             theme::dim_style(),
         )));
 
@@ -1141,7 +1141,7 @@ impl ZerocodePane {
                     .borders(Borders::ALL)
                     .border_style(theme::approval_border_style())
                     .title(Span::styled(
-                        format!(" {} ", crate::i18n::t("zc-zerocode-capture-modal-title")),
+                        format!(" {} ", crate::i18n::t("oc-omnescode-capture-modal-title")),
                         theme::title_style(),
                     )),
             ),
@@ -1220,7 +1220,7 @@ impl ZerocodePane {
 
     fn begin_agent_assign(&mut self) {
         let Some(alias) = self.agents.get(self.agent_cursor).cloned() else {
-            self.status = Some(crate::i18n::t("zc-zerocode-agent-theme-no-agents"));
+            self.status = Some(crate::i18n::t("oc-omnescode-agent-theme-no-agents"));
             return;
         };
         if let Some(name) = self.agent_overrides.get(&alias)
@@ -1246,7 +1246,7 @@ impl ZerocodePane {
             return;
         };
         if !self.agent_overrides.contains_key(&alias) {
-            self.status = Some(crate::i18n::t("zc-zerocode-agent-theme-none"));
+            self.status = Some(crate::i18n::t("oc-omnescode-agent-theme-none"));
             return;
         }
         match config::persist_agent_theme_clear(&self.config_dir, &alias) {
@@ -1254,7 +1254,7 @@ impl ZerocodePane {
                 self.agent_overrides.remove(&alias);
                 theme::clear_agent_override(&alias);
                 self.status = Some(crate::i18n::t_args(
-                    "zc-zerocode-agent-theme-cleared",
+                    "oc-omnescode-agent-theme-cleared",
                     &[("agent", &alias)],
                 ));
             }
@@ -1378,7 +1378,7 @@ impl ZerocodePane {
             ),
         };
         match config::persist_connection_field(&self.config_dir, field.leaf_path(), value) {
-            Ok(()) => self.status = Some(crate::i18n::t("zc-zerocode-conn-saved")),
+            Ok(()) => self.status = Some(crate::i18n::t("oc-omnescode-conn-saved")),
             Err(e) => self.status = Some(format!("save failed: {e}")),
         }
     }
@@ -1497,7 +1497,7 @@ impl ZerocodePane {
     /// The one-line banner text for an unreadable tracker section.
     fn tracker_load_banner(&self) -> String {
         crate::i18n::t_args(
-            "zc-zerocode-tracker-load-error",
+            "oc-omnescode-tracker-load-error",
             &[("error", self.tracker_load_error.as_deref().unwrap_or(""))],
         )
     }
@@ -1511,13 +1511,13 @@ impl ZerocodePane {
         // status is echoed on the shared section tab bar, so repeating the
         // whole sentence here would print it twice on one screen. Point at the
         // banner instead.
-        self.status = Some(crate::i18n::t("zc-zerocode-tracker-edit-refused"));
+        self.status = Some(crate::i18n::t("oc-omnescode-tracker-edit-refused"));
     }
 
     fn set_ui_validation_error(&mut self, error: config::UiSectionValidationError) {
         let key = match error {
             config::UiSectionValidationError::PositiveRequired => {
-                "zc-zerocode-config-positive-required"
+                "oc-omnescode-config-positive-required"
             }
         };
         self.status = Some(crate::i18n::t(key));
@@ -1525,7 +1525,7 @@ impl ZerocodePane {
 
     fn set_ui_save_error(&mut self, error: &anyhow::Error) {
         self.status = Some(crate::i18n::t_args(
-            "zc-zerocode-config-save-failed",
+            "oc-omnescode-config-save-failed",
             &[("error", &error.to_string())],
         ));
     }
@@ -1582,12 +1582,12 @@ impl ZerocodePane {
                 let persisted_resolved = loaded.resolve_todo_tracker();
                 if loaded.todotracker != written || persisted_resolved != written.resolve() {
                     self.tracker = loaded.todotracker;
-                    self.status = Some(crate::i18n::t("zc-zerocode-config-save-mismatch"));
+                    self.status = Some(crate::i18n::t("oc-omnescode-config-save-mismatch"));
                     return;
                 }
                 self.tracker = written;
                 // The write to disk is correct, but new sessions resolve
-                // through `ensure_and_load`, which layers `ZEROCODE_todotracker__*`
+                // through `ensure_and_load`, which layers `OMNESCODE_todotracker__*`
                 // environment overrides on top. Report what the next session
                 // will actually see:
                 //   - resolves to the saved value  -> plain success
@@ -1599,22 +1599,22 @@ impl ZerocodePane {
                 // invalid) landed on disk, but must not report the ordinary
                 // success message: the section is not yet usable.
                 if loaded.todotracker.validate().is_err() {
-                    self.status = Some(crate::i18n::t("zc-zerocode-tracker-saved-still-invalid"));
+                    self.status = Some(crate::i18n::t("oc-omnescode-tracker-saved-still-invalid"));
                     return;
                 }
                 let key = match config::ensure_and_load(&self.config_dir) {
                     // An effective section that a session boundary would
-                    // reject (e.g. `ZEROCODE_todotracker__width=0`) must not
+                    // reject (e.g. `OMNESCODE_todotracker__width=0`) must not
                     // be reported as a mere shadowing override — the next
                     // session keeps its current settings instead.
                     Ok(effective) if effective.validate_todo_tracker().is_err() => {
-                        "zc-zerocode-tracker-saved-resolve-error"
+                        "oc-omnescode-tracker-saved-resolve-error"
                     }
                     Ok(effective) if effective.resolve_todo_tracker() != persisted_resolved => {
-                        "zc-zerocode-tracker-saved-env-override"
+                        "oc-omnescode-tracker-saved-env-override"
                     }
-                    Ok(_) => "zc-zerocode-tracker-saved",
-                    Err(_) => "zc-zerocode-tracker-saved-resolve-error",
+                    Ok(_) => "oc-omnescode-tracker-saved",
+                    Err(_) => "oc-omnescode-tracker-saved-resolve-error",
                 };
                 self.status = Some(crate::i18n::t(key));
             }
@@ -1629,7 +1629,7 @@ impl ZerocodePane {
         let parsed = match edit.buf.trim().parse::<u16>() {
             Ok(value) => value,
             Err(_) => {
-                self.status = Some(crate::i18n::t("zc-zerocode-config-invalid-number"));
+                self.status = Some(crate::i18n::t("oc-omnescode-config-invalid-number"));
                 return;
             }
         };
@@ -1715,7 +1715,7 @@ impl ZerocodePane {
                         theme::set_agent_override(&alias, t);
                     }
                     self.status = Some(crate::i18n::t_args(
-                        "zc-zerocode-agent-theme-set",
+                        "oc-omnescode-agent-theme-set",
                         &[("agent", &alias), ("theme", &name)],
                     ));
                 }
@@ -1853,8 +1853,8 @@ impl ZerocodePane {
 
         if self.capture.is_some() {
             return HelpNode::entries(vec![
-                E::key("any key", crate::i18n::t("zc-zerocode-capture-assign")),
-                E::new(keys(A::Back), crate::i18n::t("zc-zerocode-capture-cancel")),
+                E::key("any key", crate::i18n::t("oc-omnescode-capture-assign")),
+                E::new(keys(A::Back), crate::i18n::t("oc-omnescode-capture-cancel")),
             ]);
         }
 
@@ -1863,8 +1863,8 @@ impl ZerocodePane {
                 Vec::<String>::new(),
                 format!(
                     "{}: {}",
-                    crate::i18n::t("zc-zerocode-help-mouse-label"),
-                    crate::i18n::t("zc-zerocode-help-mouse-desc"),
+                    crate::i18n::t("oc-omnescode-help-mouse-label"),
+                    crate::i18n::t("oc-omnescode-help-mouse-desc"),
                 ),
             )
         };
@@ -1874,11 +1874,11 @@ impl ZerocodePane {
             return HelpNode::entries(vec![
                 E::new(
                     [keys(A::Up), keys(A::Down)].concat(),
-                    crate::i18n::t("zc-zerocode-help-choose-section"),
+                    crate::i18n::t("oc-omnescode-help-choose-section"),
                 ),
                 E::new(
                     [keys(A::TabRight), keys(A::Enter)].concat(),
-                    crate::i18n::t("zc-zerocode-help-open-section"),
+                    crate::i18n::t("oc-omnescode-help-open-section"),
                 ),
                 E::spacer(),
                 mouse(),
@@ -1888,69 +1888,69 @@ impl ZerocodePane {
         // Cursor in the detail pane: navigate rows, act, walk back.
         let mut entries = vec![E::new(
             [keys(A::Up), keys(A::Down)].concat(),
-            crate::i18n::t("zc-zerocode-help-navigate-rows"),
+            crate::i18n::t("oc-omnescode-help-navigate-rows"),
         )];
         match self.focus {
             Focus::Theme => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-apply-theme"),
+                    crate::i18n::t("oc-omnescode-help-apply-theme"),
                 ));
             }
             Focus::AgentTheme if self.assigning_theme() => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-assign-agent-theme"),
+                    crate::i18n::t("oc-omnescode-help-assign-agent-theme"),
                 ));
             }
             Focus::AgentTheme => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-pick-agent"),
+                    crate::i18n::t("oc-omnescode-help-pick-agent"),
                 ));
                 entries.push(E::new(
                     keys(A::DeleteRow),
-                    crate::i18n::t("zc-zerocode-help-clear-agent-theme"),
+                    crate::i18n::t("oc-omnescode-help-clear-agent-theme"),
                 ));
             }
             Focus::Presets => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-apply-preset"),
+                    crate::i18n::t("oc-omnescode-help-apply-preset"),
                 ));
             }
             Focus::Bindings => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-rebind"),
+                    crate::i18n::t("oc-omnescode-help-rebind"),
                 ));
                 entries.push(E::new(
                     keys(A::DeleteRow),
-                    crate::i18n::t("zc-zerocode-help-reset-default"),
+                    crate::i18n::t("oc-omnescode-help-reset-default"),
                 ));
             }
             Focus::Locale => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-locale"),
+                    crate::i18n::t("oc-omnescode-help-locale"),
                 ));
             }
             Focus::Connection => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-conn"),
+                    crate::i18n::t("oc-omnescode-help-conn"),
                 ));
             }
             Focus::TodoTracker => {
                 entries.push(E::new(
                     keys(A::Enter),
-                    crate::i18n::t("zc-zerocode-help-todo-tracker"),
+                    crate::i18n::t("oc-omnescode-help-todo-tracker"),
                 ));
             }
         }
         entries.push(E::new(
             [keys(A::TabLeft), keys(A::Back)].concat(),
-            crate::i18n::t("zc-zerocode-help-back-to-sections"),
+            crate::i18n::t("oc-omnescode-help-back-to-sections"),
         ));
         entries.push(E::spacer());
         entries.push(mouse());
@@ -2190,14 +2190,14 @@ mod tests {
     // Park the section cursor on `target` within the left section list, leaving
     // the cursor in the Sections pane (the split-pane model navigates sections
     // with Up/Down while the cursor is on the left).
-    fn focus_section(pane: &mut ZerocodePane, target: Focus) {
+    fn focus_section(pane: &mut OmnescodePane, target: Focus) {
         while pane.focus != target {
             pane.handle_key(key(KeyCode::Down));
         }
     }
 
     /// Park the binding cursor on `action_key`, returning its row index.
-    fn focus_binding(pane: &mut ZerocodePane, action_key: &str) -> usize {
+    fn focus_binding(pane: &mut OmnescodePane, action_key: &str) -> usize {
         pane.rebuild_rows();
         let idx = pane
             .rows
@@ -2235,7 +2235,7 @@ mod tests {
             given_explicit_row("input_bar.clear_input", vec![alt_backspace.clone()]);
 
             let dir = tempfile::tempdir().unwrap();
-            let mut pane = ZerocodePane::new(dir.path());
+            let mut pane = OmnescodePane::new(dir.path());
             let row = focus_binding(&mut pane, "input_bar.delete_previous_word");
 
             if capture {
@@ -2281,7 +2281,7 @@ mod tests {
         given_explicit_row("input_bar.clear_input", vec![Chord::primary('a')]);
 
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         let row = focus_binding(&mut pane, "input_bar.delete_previous_word");
         pane.capture = Some(Capture { row, error: None });
         pane.handle_capture_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
@@ -2309,7 +2309,7 @@ mod tests {
         crate::keymap::overrides::reset();
 
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         let row = focus_binding(&mut pane, "input_bar.delete_previous_word");
         pane.capture = Some(Capture { row, error: None });
         // alt+d is bound by no default in this repo.
@@ -2328,7 +2328,7 @@ mod tests {
         crate::keymap::overrides::reset();
     }
 
-    fn edit_tracker_number(pane: &mut ZerocodePane, field: TrackerField, value: &str) {
+    fn edit_tracker_number(pane: &mut OmnescodePane, field: TrackerField, value: &str) {
         pane.tracker_cursor = TRACKER_FIELDS
             .iter()
             .position(|candidate| *candidate == field)
@@ -2344,7 +2344,7 @@ mod tests {
     // Current-head smoke of the Config-pane Todo-tracker save path, driven
     // through the real edit/persist/resolve functions (no interactive TUI is
     // available in CI). Run with:
-    //   cargo test -p zerocode --bin zerocode -- --ignored --nocapture smoke_config_pane_save
+    //   cargo test -p omnescode --bin omnescode -- --ignored --nocapture smoke_config_pane_save
     // Prints the observable status/disk/effective values for each scenario so
     // the user-facing contract can be eyeballed. Serializes on the env lock
     // because it mutates process env.
@@ -2367,7 +2367,7 @@ mod tests {
 
         // Scenario A: no override — a saved value is exactly what sessions use.
         {
-            let mut pane = ZerocodePane::new(dir.path());
+            let mut pane = OmnescodePane::new(dir.path());
             edit_tracker_number(&mut pane, TrackerField::Width, "48");
             eprintln!(
                 "A. no override      -> saved width 48 | disk={} | effective={} | status={:?}",
@@ -2379,15 +2379,15 @@ mod tests {
             assert_eq!(effective(dir.path()), 48);
             assert_eq!(
                 pane.status.as_deref(),
-                Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+                Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str())
             );
         }
 
-        // Scenario B: an active ZEROCODE_todotracker__width override shadows the
+        // Scenario B: an active OMNESCODE_todotracker__width override shadows the
         // save — the pane must not claim sessions will use the saved value.
         {
-            let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
-            let mut pane = ZerocodePane::new(dir.path());
+            let _v = crate::test_support::EnvVarGuard::set("OMNESCODE_todotracker__width", "77");
+            let mut pane = OmnescodePane::new(dir.path());
             edit_tracker_number(&mut pane, TrackerField::Width, "52");
             eprintln!(
                 "B. width override=77 -> saved width 52 | disk={} | effective={} | status={:?}",
@@ -2403,13 +2403,13 @@ mod tests {
             assert_eq!(effective(dir.path()), 77, "sessions still see the override");
             assert_eq!(
                 pane.status.as_deref(),
-                Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override").as_str())
+                Some(crate::i18n::t("oc-omnescode-tracker-saved-env-override").as_str())
             );
         }
 
         // Scenario C: a malformed edit is rejected, not silently saved.
         {
-            let mut pane = ZerocodePane::new(dir.path());
+            let mut pane = OmnescodePane::new(dir.path());
             let before = disk(dir.path());
             edit_tracker_number(&mut pane, TrackerField::Width, "not-a-number");
             eprintln!(
@@ -2421,7 +2421,7 @@ mod tests {
             assert_eq!(disk(dir.path()), before, "malformed edit must not persist");
             assert_eq!(
                 pane.status.as_deref(),
-                Some(crate::i18n::t("zc-zerocode-config-invalid-number").as_str())
+                Some(crate::i18n::t("oc-omnescode-config-invalid-number").as_str())
             );
         }
 
@@ -2429,8 +2429,8 @@ mod tests {
         // the disk write succeeds but the pane must not promise sessions will
         // use it; it reports the resolve-error status.
         {
-            let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
-            let mut pane = ZerocodePane::new(dir.path());
+            let _v = crate::test_support::EnvVarGuard::set("OMNESCODE_todotracker__nope", "1");
+            let mut pane = OmnescodePane::new(dir.path());
             edit_tracker_number(&mut pane, TrackerField::Width, "40");
             eprintln!(
                 "D. resolve error     -> saved width 40 | disk={} | ensure_and_load=Err | status={:?}",
@@ -2441,7 +2441,7 @@ mod tests {
             assert!(config::ensure_and_load(dir.path()).is_err());
             assert_eq!(
                 pane.status.as_deref(),
-                Some(crate::i18n::t("zc-zerocode-tracker-saved-resolve-error").as_str())
+                Some(crate::i18n::t("oc-omnescode-tracker-saved-resolve-error").as_str())
             );
         }
 
@@ -2460,24 +2460,24 @@ mod tests {
             ..TodoTrackerSection::default()
         };
         config::persist_todotracker(dir.path(), &original).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
 
         edit_tracker_number(&mut pane, TrackerField::Width, "not-a-number");
 
         // Asserts what is *persisted*, so load without env overrides: this
         // contract is about the file, and reading through `ensure_and_load`
-        // would let a concurrent `ZEROCODE_todotracker__*` test change the
+        // would let a concurrent `OMNESCODE_todotracker__*` test change the
         // observed value.
         let reloaded = config::load_persisted(dir.path()).unwrap();
         assert_eq!(reloaded.todotracker, original);
         assert_eq!(reloaded.todotracker.width, 40);
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-config-invalid-number").as_str())
+            Some(crate::i18n::t("oc-omnescode-config-invalid-number").as_str())
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str())
         );
     }
 
@@ -2497,7 +2497,7 @@ mod tests {
             ..TodoTrackerSection::default()
         };
         config::persist_todotracker(dir.path(), &original).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
 
         edit_tracker_number(&mut pane, TrackerField::Width, "0");
 
@@ -2507,11 +2507,11 @@ mod tests {
         assert_eq!(reloaded.todotracker.width, 40);
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-config-positive-required").as_str())
+            Some(crate::i18n::t("oc-omnescode-config-positive-required").as_str())
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str())
         );
     }
 
@@ -2526,7 +2526,7 @@ mod tests {
         let _guard = crate::test_support::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
 
         edit_tracker_number(&mut pane, TrackerField::Width, "52");
 
@@ -2538,7 +2538,7 @@ mod tests {
         assert_eq!(pane.tracker.width, 52);
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str())
         );
     }
 
@@ -2555,7 +2555,7 @@ mod tests {
     /// the defects that matter on a shared surface — a banner that wraps and
     /// pushes widgets off their rows, or a message printed twice on one
     /// screen. Both are invisible to a `contains()` check over joined cells.
-    fn render_rows(pane: &mut ZerocodePane, w: u16, h: u16) -> Vec<String> {
+    fn render_rows(pane: &mut OmnescodePane, w: u16, h: u16) -> Vec<String> {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::layout::Rect;
@@ -2573,13 +2573,13 @@ mod tests {
             .collect()
     }
 
-    fn malformed_pane(dir: &std::path::Path) -> ZerocodePane {
+    fn malformed_pane(dir: &std::path::Path) -> OmnescodePane {
         std::fs::write(
             config::config_path(dir),
             "[todotracker]\nwidth = \"oops\"\n",
         )
         .unwrap();
-        let mut pane = ZerocodePane::new(dir);
+        let mut pane = OmnescodePane::new(dir);
         pane.focus = Focus::TodoTracker;
         pane
     }
@@ -2618,7 +2618,7 @@ mod tests {
             // The widgets below must keep their rows: the section list starts
             // at row 0 and the tracker panel border sits on row 1.
             assert!(
-                rows[0].contains("zerocode"),
+                rows[0].contains("omnescode"),
                 "the section list header must still be on row 0 at {width} cols"
             );
             assert!(
@@ -2630,7 +2630,7 @@ mod tests {
     }
 
     // Truncation must never cost the user the diagnosis. An interactive smoke
-    // showed the banner cut at "...zerocode-config.to…", because the parser
+    // showed the banner cut at "...omnescode-config.to…", because the parser
     // detail sat behind ~190 characters of boilerplate that repeated the
     // section name and the file path. The actionable part must come early
     // enough to survive a narrow terminal.
@@ -2754,11 +2754,11 @@ mod tests {
         let banner = &rows[0];
 
         assert!(
-            banner.contains("[todotracker]") && banner.contains("zerocode-config.toml"),
+            banner.contains("[todotracker]") && banner.contains("omnescode-config.toml"),
             "the banner must name the section and the file: {banner}"
         );
         assert!(
-            !banner.contains("zc-zerocode-tracker-load-error"),
+            !banner.contains("oc-omnescode-tracker-load-error"),
             "the warning must be translated, not a raw Fluent key: {banner}"
         );
         // `toml` embeds a newline before "in `width`"; flattening it without
@@ -2822,7 +2822,7 @@ mod tests {
         let _guard = crate::test_support::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         assert!(
             pane.tracker_load_error.is_none(),
             "precondition: the pane must open cleanly on valid data"
@@ -2845,7 +2845,7 @@ mod tests {
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
             "a refused write must never report a successful save"
         );
     }
@@ -2865,7 +2865,7 @@ mod tests {
             )
             .unwrap();
 
-            let mut pane = ZerocodePane::new(dir.path());
+            let mut pane = OmnescodePane::new(dir.path());
 
             // Repair the first field. The other is still zero at this point.
             let (a, b) = match first {
@@ -2903,7 +2903,7 @@ mod tests {
                 .expect("the repaired section must be valid");
             assert_eq!(
                 pane.status.as_deref(),
-                Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+                Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
                 "a completed repair must report success"
             );
         }
@@ -2923,7 +2923,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         edit_tracker_number(&mut pane, TrackerField::Width, "44");
 
         // The edit landed...
@@ -2938,12 +2938,12 @@ mod tests {
         let status = pane.status.as_deref().expect("a save must set a status");
         assert_ne!(
             Some(status),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
             "a partial repair must not report the ordinary success"
         );
         assert_eq!(
             status,
-            crate::i18n::t("zc-zerocode-tracker-saved-still-invalid").as_str(),
+            crate::i18n::t("oc-omnescode-tracker-saved-still-invalid").as_str(),
             "the user must be told the section is still invalid"
         );
     }
@@ -2963,7 +2963,7 @@ mod tests {
 
         // The pane opens: the section parses, so this is not the type-malformed
         // path; the user edits width directly to a usable value.
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         edit_tracker_number(&mut pane, TrackerField::Width, "44");
 
         let repaired = config::load_persisted(dir.path()).unwrap();
@@ -2973,7 +2973,7 @@ mod tests {
         );
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
             "a successful repair must report success"
         );
     }
@@ -3004,7 +3004,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         assert!(
             pane.tracker_load_error.is_none(),
             "precondition: the pane must open cleanly on valid data"
@@ -3031,12 +3031,12 @@ mod tests {
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
             "the section is still invalid, so ordinary success must not be reported"
         );
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved-still-invalid").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved-still-invalid").as_str()),
             "the user must be told the section is still invalid"
         );
     }
@@ -3056,7 +3056,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         std::fs::write(
             config::config_path(dir.path()),
             "[todotracker]\nenabled = true\nenabled_at_start = false\nlocation = \"right\"\nwidth = 44\nmax_height = 0\n",
@@ -3082,7 +3082,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         std::fs::write(
             config::config_path(dir.path()),
             "[todotracker]\nenabled = false\nenabled_at_start = true\nlocation = \"left\"\nwidth = 0\nmax_height = 5\n",
@@ -3121,7 +3121,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         std::fs::write(
             config::config_path(dir.path()),
             "[todotracker]\nenabled = true\nenabled_at_start = false\nlocation = \"right\"\nwidth = 77\nmax_height = 9\n",
@@ -3213,7 +3213,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Pane opens on a perfectly valid file, so no load error is recorded.
         config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         assert!(
             pane.tracker_load_error.is_none(),
             "precondition: the pane must open cleanly on valid data"
@@ -3237,7 +3237,7 @@ mod tests {
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
             "a refused write must never report a successful save"
         );
         // The refusal must be legible, naming the section and the reason,
@@ -3281,7 +3281,7 @@ mod tests {
         let malformed = "[theme]\nname = \"nord\"\n\n[todotracker]\nwidth = \"oops\"\n";
         std::fs::write(config::config_path(dir.path()), malformed).unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
 
         // An unrelated edit: toggle `enabled`, nothing to do with `width`.
         pane.tracker_cursor = TRACKER_FIELDS
@@ -3297,7 +3297,7 @@ mod tests {
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
             "a refused edit must never report a successful save"
         );
     }
@@ -3311,7 +3311,7 @@ mod tests {
         let malformed = "[todotracker]\nmax_height = \"nope\"\n";
         std::fs::write(config::config_path(dir.path()), malformed).unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         // The editor must refuse to open at all: there is no real persisted
         // value to edit, so offering a prefilled default would invite a save
         // that silently replaces the malformed section.
@@ -3332,7 +3332,7 @@ mod tests {
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str()),
             "a refused edit must never report a successful save"
         );
     }
@@ -3349,7 +3349,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         pane.tracker_cursor = TRACKER_FIELDS
             .iter()
             .position(|c| *c == TrackerField::Enabled)
@@ -3378,7 +3378,7 @@ mod tests {
             "[todotracker]\nwidth = 32\n",
         )
         .unwrap();
-        let mut repaired = ZerocodePane::new(dir.path());
+        let mut repaired = OmnescodePane::new(dir.path());
         repaired.tracker_cursor = TRACKER_FIELDS
             .iter()
             .position(|c| *c == TrackerField::Enabled)
@@ -3396,7 +3396,7 @@ mod tests {
     }
 
     // A save writes to disk correctly, but runtime sessions resolve through
-    // `ensure_and_load`, which layers `ZEROCODE_todotracker__*` overrides on
+    // `ensure_and_load`, which layers `OMNESCODE_todotracker__*` overrides on
     // top. When such an override shadows the saved field, the pane must not
     // promise that new sessions will use the just-saved value — it reports the
     // env-override status instead so the feedback stays truthful.
@@ -3405,10 +3405,10 @@ mod tests {
         let _guard = crate::test_support::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
 
         // An override pins width to 77 for every resolved session.
-        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+        let _v = crate::test_support::EnvVarGuard::set("OMNESCODE_todotracker__width", "77");
 
         // The user saves width 52. It lands on disk verbatim...
         edit_tracker_number(&mut pane, TrackerField::Width, "52");
@@ -3430,11 +3430,11 @@ mod tests {
         );
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved-env-override").as_str())
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str())
         );
     }
 
@@ -3445,7 +3445,7 @@ mod tests {
         let _guard = crate::test_support::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
 
         edit_tracker_number(&mut pane, TrackerField::Width, "52");
 
@@ -3458,12 +3458,12 @@ mod tests {
         );
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str())
         );
     }
 
     // When the effective resolution itself fails (here: a bogus, hard-erroring
-    // ZEROCODE_todotracker__* override), a disk write still succeeds — but the
+    // OMNESCODE_todotracker__* override), a disk write still succeeds — but the
     // pane must not claim "New Code sessions will use this", because the next
     // session's resolution errors. It reports the distinct resolve-error status.
     #[test]
@@ -3471,10 +3471,10 @@ mod tests {
         let _guard = crate::test_support::env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
 
         // An unknown override makes ensure_and_load hard-error.
-        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        let _v = crate::test_support::EnvVarGuard::set("OMNESCODE_todotracker__nope", "1");
         assert!(
             config::ensure_and_load(dir.path()).is_err(),
             "precondition: the bogus override should make effective resolution fail"
@@ -3493,18 +3493,18 @@ mod tests {
         // ...but the status reflects the resolution failure, not plain success.
         assert_eq!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved-resolve-error").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved-resolve-error").as_str())
         );
         assert_ne!(
             pane.status.as_deref(),
-            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            Some(crate::i18n::t("oc-omnescode-tracker-saved").as_str())
         );
     }
 
     #[test]
     fn locale_tab_never_claims_text_input() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         // Down moves the cursor through the section list (cursor starts left).
         while pane.focus != Focus::Locale {
             pane.handle_key(key(KeyCode::Down));
@@ -3522,7 +3522,7 @@ mod tests {
     #[test]
     fn list_error_stops_needing_list() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         while pane.focus != Focus::Locale {
             pane.handle_key(key(KeyCode::Down));
         }
@@ -3537,14 +3537,14 @@ mod tests {
     #[test]
     fn wants_text_input_false_when_locale_buffer_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let pane = ZerocodePane::new(dir.path());
+        let pane = OmnescodePane::new(dir.path());
         assert!(!pane.wants_text_input());
     }
 
     #[test]
     fn agent_assign_preserves_global_theme_cursor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         pane.set_agents(vec!["coder".to_string()]);
 
         // Park the global theme selection on a known, non-zero row.
@@ -3589,7 +3589,7 @@ mod tests {
     #[test]
     fn assign_mode_keeps_agent_themes_focus() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         pane.set_agents(vec!["coder".to_string()]);
         focus_section(&mut pane, Focus::AgentTheme);
         pane.handle_key(key(KeyCode::Enter)); // into detail
@@ -3603,7 +3603,7 @@ mod tests {
     #[test]
     fn leaving_agent_themes_ends_assign() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         pane.set_agents(vec!["coder".to_string()]);
         focus_section(&mut pane, Focus::AgentTheme);
         pane.handle_key(key(KeyCode::Enter)); // into detail
@@ -3620,7 +3620,7 @@ mod tests {
     #[test]
     fn right_enters_detail_left_returns_to_sections() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         assert_eq!(pane.cursor, PaneCursor::Sections);
         let start = pane.focus;
         assert!(pane.handle_key(key(KeyCode::Right)));
@@ -3641,7 +3641,7 @@ mod tests {
     #[test]
     fn esc_walks_back_to_sections() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         pane.handle_key(key(KeyCode::Right));
         assert_eq!(pane.cursor, PaneCursor::Detail);
         pane.handle_key(key(KeyCode::Esc));
@@ -3653,7 +3653,7 @@ mod tests {
     #[test]
     fn up_down_navigate_sections_when_cursor_in_sections() {
         let dir = tempfile::tempdir().unwrap();
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = OmnescodePane::new(dir.path());
         let first = pane.focus;
         pane.handle_key(key(KeyCode::Down));
         assert_ne!(

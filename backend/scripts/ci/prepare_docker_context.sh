@@ -34,7 +34,7 @@ case "$mode" in
     tar xzf "$artifact_dir/omnesagent-x86_64-unknown-linux-gnu.tar.gz" -C "$context_dir/bin/amd64"
     tar xzf "$artifact_dir/omnesagent-aarch64-unknown-linux-gnu.tar.gz" -C "$context_dir/bin/arm64"
     for arch in amd64 arm64; do
-      for bin in omnesagent zerocode; do
+      for bin in omnesagent omnescode; do
         [[ -x "$context_dir/bin/$arch/$bin" ]] || {
           echo "missing executable: $context_dir/bin/$arch/$bin" >&2
           exit 1
@@ -49,7 +49,7 @@ case "$mode" in
   smoke)
     for arch in amd64 arm64; do
       mkdir -p "$context_dir/bin/$arch/web/dist"
-      for bin in omnesagent zerocode; do
+      for bin in omnesagent omnescode; do
         cat > "$context_dir/bin/$arch/$bin" <<EOF
 #!/usr/bin/env sh
 echo "$bin smoke binary"

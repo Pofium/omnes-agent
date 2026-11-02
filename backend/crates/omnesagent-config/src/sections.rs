@@ -54,7 +54,7 @@ pub enum SectionGroup {
 impl SectionGroup {
     /// UI label. These exact strings are what `ConfigSectionEntry.group`
     /// carries on the wire and what the dashboard's `GROUP_ORDER`
-    /// (web/src/pages/Config.tsx) and the zerocode Config pane group
+    /// (web/src/pages/Config.tsx) and the omnescode Config pane group
     /// by — change one, change all of them together.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -84,7 +84,7 @@ impl std::fmt::Display for SectionGroup {
 }
 
 /// Canonical display order for section groups across every Config
-/// surface (dashboard sidebar, zerocode Config pane). "All sections"
+/// surface (dashboard sidebar, omnescode Config pane). "All sections"
 /// is not a group — a surface that offers a flat default view renders
 /// that view itself; this list orders the grouped presentation.
 pub const SECTION_GROUPS: &[SectionGroup] = &[
@@ -193,7 +193,7 @@ macro_rules! sections {
             }
 
             /// Human-readable section label shown in every Config surface
-            /// (gateway dashboard sidebar, zerocode Config pane, docs).
+            /// (gateway dashboard sidebar, omnescode Config pane, docs).
             /// Single source of truth — derived from the canonical wire key
             /// so the gateway, runtime, and docs cannot disagree.
             #[must_use]

@@ -227,7 +227,7 @@ pub fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
 pub fn fluent_catalog_roots_named(root: &Path) -> Vec<(&'static str, PathBuf)> {
     vec![
         ("runtime", root.join("crates/omnesagent-runtime/locales")),
-        ("zerocode", root.join("apps/omnescode/locales")),
+        ("omnescode", root.join("apps/omnescode/locales")),
     ]
 }
 
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn clear_stray_po_artifacts_removes_only_generated() {
-        let dir = std::env::temp_dir().join(format!("zc-po-stray-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oc-po-stray-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for name in ["fr.po", "messages.pot", "ja.failures.log"] {
             std::fs::write(dir.join(name), b"x").unwrap();
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn clear_stray_po_artifacts_refuses_unknown_files() {
-        let dir = std::env::temp_dir().join(format!("zc-po-keep-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oc-po-keep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("fr.po"), b"x").unwrap();
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
@@ -443,7 +443,7 @@ mod tests {
         // path had under a non-default CARGO_TARGET_DIR.
         // SAFETY: single-threaded body; env is saved and restored.
         let prev = std::env::var_os("CARGO_TARGET_DIR");
-        let alt = std::env::temp_dir().join("zc-xtask-target-dir-test");
+        let alt = std::env::temp_dir().join("oc-xtask-target-dir-test");
         unsafe {
             std::env::set_var("CARGO_TARGET_DIR", &alt);
         }

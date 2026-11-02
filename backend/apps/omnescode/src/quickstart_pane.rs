@@ -75,14 +75,14 @@ impl Selector {
 
     fn fluent_key(self) -> &'static str {
         match self {
-            Selector::ModelProvider => "zc-quickstart-selector-model-provider",
-            Selector::RiskProfile => "zc-quickstart-selector-risk-profile",
-            Selector::RuntimeProfile => "zc-quickstart-selector-runtime-profile",
-            Selector::Memory => "zc-quickstart-selector-memory",
-            Selector::Channels => "zc-quickstart-selector-channels",
-            Selector::PeerGroups => "zc-quickstart-selector-peer-groups",
-            Selector::Agent => "zc-quickstart-selector-agent",
-            Selector::Submit => "zc-quickstart-selector-submit",
+            Selector::ModelProvider => "oc-quickstart-selector-model-provider",
+            Selector::RiskProfile => "oc-quickstart-selector-risk-profile",
+            Selector::RuntimeProfile => "oc-quickstart-selector-runtime-profile",
+            Selector::Memory => "oc-quickstart-selector-memory",
+            Selector::Channels => "oc-quickstart-selector-channels",
+            Selector::PeerGroups => "oc-quickstart-selector-peer-groups",
+            Selector::Agent => "oc-quickstart-selector-agent",
+            Selector::Submit => "oc-quickstart-selector-submit",
         }
     }
 
@@ -158,11 +158,11 @@ fn first_incomplete_required_selector(form: &FormState) -> Option<Selector> {
 fn incomplete_submit_error(form: &FormState) -> Option<QuickstartError> {
     let sel = first_incomplete_required_selector(form)?;
     let message_key = match sel {
-        Selector::ModelProvider => "zc-quickstart-missing-model-provider",
-        Selector::RiskProfile => "zc-quickstart-missing-risk-profile",
-        Selector::RuntimeProfile => "zc-quickstart-missing-runtime-profile",
-        Selector::Memory => "zc-quickstart-missing-memory",
-        Selector::Agent => "zc-quickstart-missing-agent",
+        Selector::ModelProvider => "oc-quickstart-missing-model-provider",
+        Selector::RiskProfile => "oc-quickstart-missing-risk-profile",
+        Selector::RuntimeProfile => "oc-quickstart-missing-runtime-profile",
+        Selector::Memory => "oc-quickstart-missing-memory",
+        Selector::Agent => "oc-quickstart-missing-agent",
         Selector::Channels | Selector::PeerGroups | Selector::Submit => return None,
     };
     Some(QuickstartError {
@@ -233,7 +233,7 @@ fn existing_opt(alias: String) -> PickerOption {
     PickerOption {
         label: format!("Use existing: {alias}"),
         value: alias,
-        help: crate::i18n::t("zc-quickstart-reuse-alias-help"),
+        help: crate::i18n::t("oc-quickstart-reuse-alias-help"),
         kind: PickerOptionKind::Choice { use_existing: true },
     }
 }
@@ -242,7 +242,7 @@ fn existing_provider_opt(alias: String) -> PickerOption {
     PickerOption {
         label: alias.clone(),
         value: alias,
-        help: crate::i18n::t("zc-quickstart-reuse-alias-help"),
+        help: crate::i18n::t("oc-quickstart-reuse-alias-help"),
         kind: PickerOptionKind::Choice { use_existing: true },
     }
 }
@@ -260,14 +260,14 @@ fn existing_provider_toggle_opt(hidden_count: usize, expanded: bool) -> PickerOp
     let label = if expanded {
         format!(
             "  {}",
-            crate::i18n::t("zc-quickstart-existing-providers-show-fewer")
+            crate::i18n::t("oc-quickstart-existing-providers-show-fewer")
         )
     } else {
         let count = hidden_count.to_string();
         format!(
             "  {}",
             crate::i18n::t_args(
-                "zc-quickstart-existing-providers-show-more",
+                "oc-quickstart-existing-providers-show-more",
                 &[("count", count.as_str())],
             )
         )
@@ -331,18 +331,18 @@ fn risk_options() -> [PickerOption; 3] {
     [
         opt(
             "locked_down",
-            crate::i18n::t("zc-quickstart-risk-locked-down"),
-            crate::i18n::t("zc-quickstart-risk-locked-down-desc"),
+            crate::i18n::t("oc-quickstart-risk-locked-down"),
+            crate::i18n::t("oc-quickstart-risk-locked-down-desc"),
         ),
         opt(
             "balanced",
-            crate::i18n::t("zc-quickstart-risk-balanced"),
-            crate::i18n::t("zc-quickstart-risk-balanced-desc"),
+            crate::i18n::t("oc-quickstart-risk-balanced"),
+            crate::i18n::t("oc-quickstart-risk-balanced-desc"),
         ),
         opt(
             "yolo",
-            crate::i18n::t("zc-quickstart-risk-yolo"),
-            crate::i18n::t("zc-quickstart-risk-yolo-desc"),
+            crate::i18n::t("oc-quickstart-risk-yolo"),
+            crate::i18n::t("oc-quickstart-risk-yolo-desc"),
         ),
     ]
 }
@@ -354,20 +354,20 @@ fn runtime_picker_options(snapshot: Option<&QuickstartStateResult>) -> Vec<Picke
         .map(|preset| {
             let localized = match preset.preset_name.as_str() {
                 "tight" => Some((
-                    "zc-quickstart-runtime-tight",
-                    "zc-quickstart-runtime-tight-desc",
+                    "oc-quickstart-runtime-tight",
+                    "oc-quickstart-runtime-tight-desc",
                 )),
                 "local_small" => Some((
-                    "zc-quickstart-runtime-local-small",
-                    "zc-quickstart-runtime-local-small-desc",
+                    "oc-quickstart-runtime-local-small",
+                    "oc-quickstart-runtime-local-small-desc",
                 )),
                 "balanced" => Some((
-                    "zc-quickstart-runtime-balanced",
-                    "zc-quickstart-runtime-balanced-desc",
+                    "oc-quickstart-runtime-balanced",
+                    "oc-quickstart-runtime-balanced-desc",
                 )),
                 "unbounded" => Some((
-                    "zc-quickstart-runtime-unbounded",
-                    "zc-quickstart-runtime-unbounded-desc",
+                    "oc-quickstart-runtime-unbounded",
+                    "oc-quickstart-runtime-unbounded-desc",
                 )),
                 _ => None,
             };
@@ -427,9 +427,9 @@ fn provider_type_options(snapshot: Option<&QuickstartStateResult>) -> Vec<Picker
             value: t.kind.clone(),
             label: t.display_name.clone(),
             help: if t.local {
-                crate::i18n::t("zc-quickstart-provider-local")
+                crate::i18n::t("oc-quickstart-provider-local")
             } else {
-                crate::i18n::t("zc-quickstart-provider-cloud")
+                crate::i18n::t("oc-quickstart-provider-cloud")
             },
             kind: PickerOptionKind::Choice {
                 use_existing: false,
@@ -467,7 +467,7 @@ fn model_provider_picker_options(
     let existing = ordered_existing_provider_refs(&snap.model_providers);
     if !existing.is_empty() {
         options.push(header_opt(crate::i18n::t(
-            "zc-quickstart-existing-providers-heading",
+            "oc-quickstart-existing-providers-heading",
         )));
         let visible_count = if existing_expanded {
             existing.len()
@@ -486,7 +486,7 @@ fn model_provider_picker_options(
     }
 
     options.push(header_opt(crate::i18n::t(
-        "zc-quickstart-new-provider-heading",
+        "oc-quickstart-new-provider-heading",
     )));
     options.extend(provider_type_options(snapshot));
     options
@@ -674,7 +674,7 @@ impl FormState {
                     self.agent_name.clone()
                 }
             }
-            Selector::Submit => crate::i18n::t("zc-quickstart-submit-create"),
+            Selector::Submit => crate::i18n::t("oc-quickstart-submit-create"),
         }
     }
 
@@ -1696,7 +1696,7 @@ impl QuickstartPane {
                             self.active_modal = Some(Modal::TextInput(TextInputModal {
                                 selector: Selector::PeerGroups,
                                 label: "external_peers",
-                                help: crate::i18n::t("zc-quickstart-help-external-peers"),
+                                help: crate::i18n::t("oc-quickstart-help-external-peers"),
                                 buf: String::new(),
                                 is_secret: false,
                                 peer_group_channel: Some(chosen),
@@ -2448,7 +2448,7 @@ impl QuickstartPane {
 
     fn draw_title(&self, frame: &mut Frame, area: Rect) {
         let title = Paragraph::new(Line::from(vec![
-            Span::styled(crate::i18n::t("zc-quickstart-title"), theme::accent_style()),
+            Span::styled(crate::i18n::t("oc-quickstart-title"), theme::accent_style()),
             Span::raw("  — create one working agent end-to-end."),
         ]));
         frame.render_widget(title, area);
@@ -2501,9 +2501,9 @@ impl QuickstartPane {
     fn draw_status_strip(&self, frame: &mut Frame, area: Rect) {
         let can_create = self.can_create();
         let label = if self.busy {
-            crate::i18n::t("zc-quickstart-status-submitting")
+            crate::i18n::t("oc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
-            crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
+            crate::i18n::t_args("oc-quickstart-status-created", &[("alias", alias.as_str())])
         } else if let Some(first) = self.last_errors.first() {
             // Name the first actionable field error so the user knows
             // which field is invalid, instead of only a count. The
@@ -2518,14 +2518,14 @@ impl QuickstartPane {
             let more = self.last_errors.len().saturating_sub(1);
             let suffix = if more > 0 {
                 crate::i18n::t_args(
-                    "zc-quickstart-status-more-errors",
+                    "oc-quickstart-status-more-errors",
                     &[("count", &more.to_string())],
                 )
             } else {
                 String::new()
             };
             crate::i18n::t_args(
-                "zc-quickstart-status-first-error",
+                "oc-quickstart-status-first-error",
                 &[
                     ("where", where_.trim()),
                     ("field", &field_part),
@@ -2534,9 +2534,9 @@ impl QuickstartPane {
                 ],
             )
         } else if can_create {
-            crate::i18n::t_args("zc-quickstart-status-can-create", &[("chord", "c")])
+            crate::i18n::t_args("oc-quickstart-status-can-create", &[("chord", "c")])
         } else {
-            crate::i18n::t_args("zc-quickstart-status-hint", &[("chord", "c")])
+            crate::i18n::t_args("oc-quickstart-status-hint", &[("chord", "c")])
         };
         let style = if self.applied_alias.is_some() || can_create {
             Style::default()
@@ -2727,7 +2727,7 @@ fn model_provider_alias_duplicate_error(
         step: QuickstartStep::ModelProvider,
         field: "alias".into(),
         message: crate::i18n::t_args(
-            "zc-quickstart-provider-alias-exists",
+            "oc-quickstart-provider-alias-exists",
             &[("alias", dotted.as_str())],
         ),
     })
@@ -2827,8 +2827,8 @@ fn model_provider_alias_row() -> FieldFormRow {
     FieldFormRow {
         descriptor: QuickstartFieldDescriptor {
             key: "alias".to_string(),
-            label: crate::i18n::t("zc-quickstart-field-label-alias"),
-            help: crate::i18n::t("zc-quickstart-field-help-alias"),
+            label: crate::i18n::t("oc-quickstart-field-label-alias"),
+            help: crate::i18n::t("oc-quickstart-field-help-alias"),
             kind: crate::client::QuickstartFieldKind::String,
             is_secret: false,
             enum_variants: None,
@@ -2906,7 +2906,7 @@ fn missing_template_error(filename: &str) -> QuickstartError {
     QuickstartError {
         step: QuickstartStep::Agent,
         field: filename.to_string(),
-        message: crate::i18n::t_args("zc-quickstart-no-template", &[("filename", filename)]),
+        message: crate::i18n::t_args("oc-quickstart-no-template", &[("filename", filename)]),
     }
 }
 
@@ -2953,9 +2953,9 @@ fn draw_modal(
                 lines,
                 format!(
                     "↑/↓ {move_v}   Enter {pick}   Esc {cancel}",
-                    move_v = crate::i18n::t("zc-quickstart-modal-action-move"),
-                    pick = crate::i18n::t("zc-quickstart-modal-action-pick"),
-                    cancel = crate::i18n::t("zc-quickstart-modal-action-cancel"),
+                    move_v = crate::i18n::t("oc-quickstart-modal-action-move"),
+                    pick = crate::i18n::t("oc-quickstart-modal-action-pick"),
+                    cancel = crate::i18n::t("oc-quickstart-modal-action-cancel"),
                 ),
                 cursor_lines,
             )
@@ -2981,8 +2981,8 @@ fn draw_modal(
                 lines,
                 format!(
                     "Enter {accept}   Esc {cancel}",
-                    accept = crate::i18n::t("zc-quickstart-modal-action-accept"),
-                    cancel = crate::i18n::t("zc-quickstart-modal-action-cancel"),
+                    accept = crate::i18n::t("oc-quickstart-modal-action-accept"),
+                    cancel = crate::i18n::t("oc-quickstart-modal-action-cancel"),
                 ),
                 Vec::new(),
             )
@@ -2992,7 +2992,7 @@ fn draw_modal(
             let mut cursor_lines = Vec::with_capacity(f.fields.len());
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{} ", crate::i18n::t("zc-quickstart-modal-type-prefix")),
+                    format!("{} ", crate::i18n::t("oc-quickstart-modal-type-prefix")),
                     theme::dim_style(),
                 ),
                 Span::styled(f.type_key.as_str(), theme::accent_style()),
@@ -3031,12 +3031,12 @@ fn draw_modal(
                     (
                         if f.model_catalog_state == ModelCatalogState::Retrying {
                             crate::i18n::t_args(
-                                "zc-quickstart-model-retrying",
+                                "oc-quickstart-model-retrying",
                                 &[("provider", f.type_key.as_str())],
                             )
                         } else {
                             crate::i18n::t_args(
-                                "zc-quickstart-model-loading",
+                                "oc-quickstart-model-loading",
                                 &[("provider", f.type_key.as_str())],
                             )
                         },
@@ -3047,7 +3047,7 @@ fn draw_modal(
                     && is_empty_buf
                 {
                     (
-                        crate::i18n::t("zc-quickstart-model-catalog-empty"),
+                        crate::i18n::t("oc-quickstart-model-catalog-empty"),
                         theme::dim_style().add_modifier(Modifier::ITALIC),
                     )
                 } else if show_ghost {
@@ -3096,10 +3096,10 @@ fn draw_modal(
                 lines,
                 format!(
                     "Tab/↑/↓ {move_v}   ←/→ {pick_enum}   Enter {accept}   Esc {cancel}",
-                    move_v = crate::i18n::t("zc-quickstart-modal-action-move"),
-                    pick_enum = crate::i18n::t("zc-quickstart-modal-action-pick-on-enum"),
-                    accept = crate::i18n::t("zc-quickstart-modal-action-accept"),
-                    cancel = crate::i18n::t("zc-quickstart-modal-action-cancel"),
+                    move_v = crate::i18n::t("oc-quickstart-modal-action-move"),
+                    pick_enum = crate::i18n::t("oc-quickstart-modal-action-pick-on-enum"),
+                    accept = crate::i18n::t("oc-quickstart-modal-action-accept"),
+                    cancel = crate::i18n::t("oc-quickstart-modal-action-cancel"),
                 ),
                 cursor_lines,
             )
@@ -3111,7 +3111,7 @@ fn draw_modal(
             let row_count = drafts + 2;
             if drafts == 0 {
                 lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-quickstart-channels-empty"),
+                    crate::i18n::t("oc-quickstart-channels-empty"),
                     theme::dim_style(),
                 )));
                 lines.push(Line::from(""));
@@ -3144,25 +3144,25 @@ fn draw_modal(
             let done_idx = drafts + 1;
             cursor_lines.push(lines.len());
             lines.push(action_row_line(
-                &crate::i18n::t("zc-quickstart-channels-add"),
+                &crate::i18n::t("oc-quickstart-channels-add"),
                 cl.cursor == add_idx,
             ));
             cursor_lines.push(lines.len());
             lines.push(action_row_line(
-                &crate::i18n::t("zc-quickstart-action-done"),
+                &crate::i18n::t("oc-quickstart-action-done"),
                 cl.cursor == done_idx,
             ));
             let _ = row_count; // already encoded by the cursor styling above.
             (
-                format!(" {} ", crate::i18n::t("zc-quickstart-block-channels")),
+                format!(" {} ", crate::i18n::t("oc-quickstart-block-channels")),
                 Vec::new(),
                 lines,
                 format!(
                     "↑/↓ {move_v}   Enter {activate}   d {delete}   Esc {close}",
-                    move_v = crate::i18n::t("zc-quickstart-modal-action-move"),
-                    activate = crate::i18n::t("zc-quickstart-modal-action-activate"),
-                    delete = crate::i18n::t("zc-quickstart-modal-action-delete"),
-                    close = crate::i18n::t("zc-quickstart-modal-action-close"),
+                    move_v = crate::i18n::t("oc-quickstart-modal-action-move"),
+                    activate = crate::i18n::t("oc-quickstart-modal-action-activate"),
+                    delete = crate::i18n::t("oc-quickstart-modal-action-delete"),
+                    close = crate::i18n::t("oc-quickstart-modal-action-close"),
                 ),
                 cursor_lines,
             )
@@ -3174,7 +3174,7 @@ fn draw_modal(
             let row_count = drafts + 2;
             if drafts == 0 {
                 lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-quickstart-no-peer-groups"),
+                    crate::i18n::t("oc-quickstart-no-peer-groups"),
                     theme::dim_style(),
                 )));
                 lines.push(Line::from(""));
@@ -3205,25 +3205,25 @@ fn draw_modal(
             let done_idx = drafts + 1;
             cursor_lines.push(lines.len());
             lines.push(action_row_line(
-                &crate::i18n::t("zc-quickstart-peers-add"),
+                &crate::i18n::t("oc-quickstart-peers-add"),
                 pl.cursor == add_idx,
             ));
             cursor_lines.push(lines.len());
             lines.push(action_row_line(
-                &crate::i18n::t("zc-quickstart-action-done"),
+                &crate::i18n::t("oc-quickstart-action-done"),
                 pl.cursor == done_idx,
             ));
             let _ = row_count;
             (
-                format!(" {} ", crate::i18n::t("zc-quickstart-block-peers")),
+                format!(" {} ", crate::i18n::t("oc-quickstart-block-peers")),
                 Vec::new(),
                 lines,
                 format!(
                     "↑/↓ {move_v}   Enter {activate}   d {delete}   Esc {close}",
-                    move_v = crate::i18n::t("zc-quickstart-modal-action-move"),
-                    activate = crate::i18n::t("zc-quickstart-modal-action-activate"),
-                    delete = crate::i18n::t("zc-quickstart-modal-action-delete"),
-                    close = crate::i18n::t("zc-quickstart-modal-action-close"),
+                    move_v = crate::i18n::t("oc-quickstart-modal-action-move"),
+                    activate = crate::i18n::t("oc-quickstart-modal-action-activate"),
+                    delete = crate::i18n::t("oc-quickstart-modal-action-delete"),
+                    close = crate::i18n::t("oc-quickstart-modal-action-close"),
                 ),
                 cursor_lines,
             )
@@ -3281,7 +3281,7 @@ fn draw_modal(
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
                     Span::styled(
-                        format!("{:14}", crate::i18n::t("zc-quickstart-agent-name-field")),
+                        format!("{:14}", crate::i18n::t("oc-quickstart-agent-name-field")),
                         name_style,
                     ),
                     Span::styled("  ", Style::default()),
@@ -3296,7 +3296,7 @@ fn draw_modal(
                 if !a.filenames.is_empty() {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        crate::i18n::t("zc-quickstart-personality-help"),
+                        crate::i18n::t("oc-quickstart-personality-help"),
                         theme::dim_style(),
                     )));
                 }
@@ -3316,7 +3316,7 @@ fn draw_modal(
                         "—".to_string()
                     } else {
                         crate::i18n::t_args(
-                            "zc-quickstart-file-bytes",
+                            "oc-quickstart-file-bytes",
                             &[("bytes", &content.len().to_string())],
                         )
                     };
@@ -3333,20 +3333,20 @@ fn draw_modal(
                 let last_row = a.filenames.len() + 1;
                 let on_save = a.cursor == last_row;
                 lines.push(action_row_line(
-                    &crate::i18n::t("zc-quickstart-save-and-close"),
+                    &crate::i18n::t("oc-quickstart-save-and-close"),
                     on_save,
                 ));
 
                 (
-                    format!(" {} ", crate::i18n::t("zc-quickstart-block-agent")),
+                    format!(" {} ", crate::i18n::t("oc-quickstart-block-agent")),
                     Vec::new(),
                     lines,
                     format!(
                         "↑/↓ {move_v}   {edit_name}   e/t/c {on_files}   Esc {save}",
-                        move_v = crate::i18n::t("zc-quickstart-modal-action-move"),
-                        edit_name = crate::i18n::t("zc-quickstart-modal-action-edit-name"),
-                        on_files = crate::i18n::t("zc-quickstart-modal-action-on-file-rows"),
-                        save = crate::i18n::t("zc-quickstart-modal-action-save"),
+                        move_v = crate::i18n::t("oc-quickstart-modal-action-move"),
+                        edit_name = crate::i18n::t("oc-quickstart-modal-action-edit-name"),
+                        on_files = crate::i18n::t("oc-quickstart-modal-action-on-file-rows"),
+                        save = crate::i18n::t("oc-quickstart-modal-action-save"),
                     ),
                     cursor_lines,
                 )
@@ -3764,11 +3764,11 @@ mod tests {
 
         assert_eq!(
             options[0].label,
-            crate::i18n::t("zc-quickstart-runtime-tight")
+            crate::i18n::t("oc-quickstart-runtime-tight")
         );
         assert_eq!(
             options[0].help,
-            crate::i18n::t("zc-quickstart-runtime-tight-desc")
+            crate::i18n::t("oc-quickstart-runtime-tight-desc")
         );
         assert_eq!(options[1].label, "Future Runtime");
         assert_eq!(options[1].help, "Future runtime help.");

@@ -3106,14 +3106,14 @@ permissions = ["http_client"]
             #[cfg(windows)]
             let mut process = {
                 let mut process = tokio::process::Command::new("cmd.exe");
-                process.args(["/D", "/S", "/C", "echo zc-runtime"]);
+                process.args(["/D", "/S", "/C", "echo oc-runtime"]);
                 process
             };
             #[cfg(not(windows))]
             let mut process = tokio::process::Command::new("/bin/sh");
             #[cfg(not(windows))]
             process
-                .args(["-c", "printf '%s' \"$0\"", "zc-runtime"])
+                .args(["-c", "printf '%s' \"$0\"", "oc-runtime"])
                 .current_dir(workspace_dir);
             #[cfg(windows)]
             process.current_dir(workspace_dir);
@@ -3217,7 +3217,7 @@ permissions = ["http_client"]
                 "{tool_name} unexpected error: {:?}",
                 result.error
             );
-            assert_eq!(result.output.trim(), "zc-runtime");
+            assert_eq!(result.output.trim(), "oc-runtime");
             let command = seen_command
                 .lock()
                 .unwrap()

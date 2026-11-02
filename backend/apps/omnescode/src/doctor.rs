@@ -41,9 +41,9 @@ impl DoctorFilter {
 
     fn label(self) -> String {
         match self {
-            Self::All => crate::i18n::t("zc-doctor-filter-all"),
-            Self::Problems => crate::i18n::t("zc-doctor-filter-problems"),
-            Self::Errors => crate::i18n::t("zc-doctor-filter-errors"),
+            Self::All => crate::i18n::t("oc-doctor-filter-all"),
+            Self::Problems => crate::i18n::t("oc-doctor-filter-problems"),
+            Self::Errors => crate::i18n::t("oc-doctor-filter-errors"),
         }
     }
 
@@ -157,7 +157,7 @@ impl Doctor {
     fn draw_summary(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let block = Block::default()
             .title(Span::styled(
-                format!(" {} ", crate::i18n::t("zc-doctor-title")),
+                format!(" {} ", crate::i18n::t("oc-doctor-title")),
                 theme::title_style(),
             ))
             .borders(Borders::ALL)
@@ -169,12 +169,12 @@ impl Doctor {
         self.last_filter_area = None;
         if self.is_loading() {
             spans.push(Span::styled(
-                crate::i18n::t("zc-doctor-loading"),
+                crate::i18n::t("oc-doctor-loading"),
                 theme::dim_style(),
             ));
         } else if let Some(error) = &self.error {
             spans.push(Span::styled(
-                crate::i18n::t_args("zc-doctor-error", &[("error", error)]),
+                crate::i18n::t_args("oc-doctor-error", &[("error", error)]),
                 severity_style(DoctorSeverity::Error),
             ));
         } else if let Some(result) = &self.result {
@@ -185,7 +185,7 @@ impl Doctor {
             spans.push(Span::styled(filter_status, theme::dim_style()));
         } else {
             spans.push(Span::styled(
-                crate::i18n::t("zc-doctor-no-results"),
+                crate::i18n::t("oc-doctor-no-results"),
                 theme::dim_style(),
             ));
         }
@@ -215,7 +215,7 @@ impl Doctor {
             .collect();
 
         let title =
-            crate::i18n::t_args("zc-doctor-list-title", &[("filter", &self.filter.label())]);
+            crate::i18n::t_args("oc-doctor-list-title", &[("filter", &self.filter.label())]);
         let list = List::new(items)
             .block(
                 Block::default()
@@ -230,7 +230,7 @@ impl Doctor {
     fn draw_detail(&self, frame: &mut ratatui::Frame, area: Rect) {
         let block = Block::default()
             .title(Span::styled(
-                format!(" {} ", crate::i18n::t("zc-doctor-detail-title")),
+                format!(" {} ", crate::i18n::t("oc-doctor-detail-title")),
                 theme::title_style(),
             ))
             .borders(Borders::ALL)
@@ -240,12 +240,12 @@ impl Doctor {
 
         let lines = if let Some(error) = &self.error {
             vec![Line::from(Span::styled(
-                crate::i18n::t_args("zc-doctor-error", &[("error", error)]),
+                crate::i18n::t_args("oc-doctor-error", &[("error", error)]),
                 severity_style(DoctorSeverity::Error),
             ))]
         } else if self.is_loading() {
             vec![Line::from(Span::styled(
-                crate::i18n::t("zc-doctor-loading"),
+                crate::i18n::t("oc-doctor-loading"),
                 theme::dim_style(),
             ))]
         } else {
@@ -256,7 +256,7 @@ impl Doctor {
             // post-mortem log navigation.
             if let Some(log_path) = self.result.as_ref().and_then(|r| r.log_path.as_deref()) {
                 out.push(Line::from(Span::styled(
-                    crate::i18n::t_args("zc-doctor-log-path", &[("path", log_path)]),
+                    crate::i18n::t_args("oc-doctor-log-path", &[("path", log_path)]),
                     theme::body_style(),
                 )));
                 out.push(Line::from(""));
@@ -272,11 +272,11 @@ impl Doctor {
                 .is_some_and(|r| r.timed_out_phase.is_some());
             if is_partial {
                 out.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-doctor-partial-banner"),
+                    crate::i18n::t("oc-doctor-partial-banner"),
                     severity_style(DoctorSeverity::Warn),
                 )));
                 out.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-doctor-partial-hint"),
+                    crate::i18n::t("oc-doctor-partial-hint"),
                     theme::dim_style(),
                 )));
             }
@@ -285,7 +285,7 @@ impl Doctor {
                 out.extend(detail_lines(entry));
             } else if !is_partial {
                 out.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-doctor-no-selection"),
+                    crate::i18n::t("oc-doctor-no-selection"),
                     theme::dim_style(),
                 )));
             }
@@ -400,11 +400,11 @@ impl Doctor {
         let warnings = result.summary.warnings.to_string();
         let errors = result.summary.errors.to_string();
         let summary = crate::i18n::t_args(
-            "zc-doctor-summary",
+            "oc-doctor-summary",
             &[("ok", &ok), ("warnings", &warnings), ("errors", &errors)],
         );
         let filter_status = crate::i18n::t_args(
-            "zc-doctor-filter-status",
+            "oc-doctor-filter-status",
             &[("filter", &self.filter.label())],
         );
         (summary, filter_status)
@@ -461,7 +461,7 @@ impl crate::widgets::HelpContext for Doctor {
         use crate::widgets::{HelpEntry as E, HelpNode};
         let mut entries = crate::help::help_entries::<crate::keymap::DoctorTabAction>();
         entries.push(E::spacer());
-        entries.push(E::desc(crate::i18n::t("zc-doctor-help-mouse")));
+        entries.push(E::desc(crate::i18n::t("oc-doctor-help-mouse")));
         HelpNode::entries(entries)
     }
 }
@@ -509,7 +509,7 @@ fn detail_lines(entry: &DoctorResultEntry) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                format!("{}: ", crate::i18n::t("zc-doctor-label-message")),
+                format!("{}: ", crate::i18n::t("oc-doctor-label-message")),
                 theme::dim_style(),
             ),
             Span::raw(entry.message.clone()),
@@ -544,7 +544,7 @@ fn truncate_first_line(s: &str, max: usize) -> String {
 
 fn format_doctor_error(error: &str) -> String {
     if error.contains("Unknown method") || error.contains("-32601") {
-        return crate::i18n::t("zc-doctor-error-unsupported-daemon");
+        return crate::i18n::t("oc-doctor-error-unsupported-daemon");
     }
     // Whole-RPC timeout: the daemon may have failed to return for any
     // reason (model-probe deadline, network drop, daemon overload, etc.).
@@ -554,7 +554,7 @@ fn format_doctor_error(error: &str) -> String {
         return format!(
             "{}\n\n{}",
             error,
-            crate::i18n::t("zc-doctor-error-daemon-timeout"),
+            crate::i18n::t("oc-doctor-error-daemon-timeout"),
         );
     }
     error.to_string()
@@ -662,9 +662,9 @@ mod tests {
         // the daemon may have timed out for any reason. The assertions compare
         // against the localized catalogue values so the suite passes under any
         // shipped locale.
-        let daemon_busy = crate::i18n::t("zc-doctor-error-daemon-timeout");
-        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
-        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
+        let daemon_busy = crate::i18n::t("oc-doctor-error-daemon-timeout");
+        let partial_banner = crate::i18n::t("oc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("oc-doctor-partial-hint");
 
         let message = format_doctor_error("RPC doctor/run: request timed out");
 
@@ -690,9 +690,9 @@ mod tests {
     #[test]
     fn doctor_timeout_discriminator_pins_each_path_to_its_own_text() {
         // Error path — generic daemon-side timeout text only.
-        let daemon_busy = crate::i18n::t("zc-doctor-error-daemon-timeout");
-        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
-        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
+        let daemon_busy = crate::i18n::t("oc-doctor-error-daemon-timeout");
+        let partial_banner = crate::i18n::t("oc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("oc-doctor-partial-hint");
         let error_msg = format_doctor_error("RPC doctor/run: request timed out");
         assert!(
             error_msg.contains(&daemon_busy),
@@ -875,26 +875,30 @@ mod tests {
         let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
 
         // The path must be discoverable in the detail panel. The detail panel
-        // inner width is narrower than the path, so ratatui's wrap may split
-        // the path across two lines — both halves must be present.
+        // inner width is narrower than the path, so ratatui's wrap splits it
+        // across lines. Drop the panel's vertical borders and all whitespace
+        // before matching so the assertion validates the whole path survives
+        // the wrap regardless of the exact split column.
+        let unwrapped: String = rendered
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect();
         assert!(
-            rendered.contains("trace-2026-07-13T08-30"),
-            "first half of resolved log path must render in detail panel; got:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("-00Z.jsonl"),
-            "second half of resolved log path must render in detail panel; got:\n{rendered}"
+            unwrapped.contains(
+                "/home/operator/.local/share/omnesagent/logs/trace-2026-07-13T08-30-00Z.jsonl"
+            ),
+            "resolved log path must render intact in the detail panel; got:\n{rendered}"
         );
         // The "No diagnostic selected" line should also be present so the
         // operator sees the discoverability affordance is part of the
         // empty-selection fallback rather than a hidden field.
         assert!(
-            rendered.contains(&crate::i18n::t("zc-doctor-no-selection")),
+            rendered.contains(&crate::i18n::t("oc-doctor-no-selection")),
             "fallback hint must render alongside log_path; got:\n{rendered}"
         );
 
         println!(
-            "\n=== CAPTURE: zerocode doctor with log_persistence = \"file\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+            "\n=== CAPTURE: omnescode doctor with log_persistence = \"file\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
         );
     }
 
@@ -939,12 +943,12 @@ mod tests {
         );
         // The fallback no-selection line should still render.
         assert!(
-            rendered.contains(&crate::i18n::t("zc-doctor-no-selection")),
+            rendered.contains(&crate::i18n::t("oc-doctor-no-selection")),
             "fallback hint must still render when persistence is disabled; got:\n{rendered}"
         );
 
         println!(
-            "\n=== CAPTURE: zerocode doctor with log_persistence = \"none\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+            "\n=== CAPTURE: omnescode doctor with log_persistence = \"none\" (120x24) ===\n{rendered}\n=== END CAPTURE ==="
         );
     }
 
@@ -971,7 +975,7 @@ mod tests {
 
         let rendered = render_buffer_to_string(terminal.backend().buffer(), area);
         assert!(
-            rendered.contains(&crate::i18n::t("zc-doctor-no-selection")),
+            rendered.contains(&crate::i18n::t("oc-doctor-no-selection")),
             "the disconnected empty state must render the no-selection hint; got:\n{rendered}"
         );
     }
@@ -986,7 +990,7 @@ mod tests {
     /// via `Doctor::draw` against a `ratatui::backend::TestBackend` at
     /// 120x24 so it can be regenerated on demand:
     ///
-    ///   cargo test --locked --bin zerocode -p zerocode \
+    ///   cargo test --locked --bin omnescode -p omnescode \
     ///     render_screenshot -- --nocapture
     #[tokio::test]
     async fn render_screenshot_partial_results_banner() {
@@ -1012,8 +1016,8 @@ mod tests {
 
         // The partial-results banner must be discoverable in the detail panel,
         // above the selected entry's `detail_lines` content.
-        let partial_banner = crate::i18n::t("zc-doctor-partial-banner");
-        let partial_hint = crate::i18n::t("zc-doctor-partial-hint");
+        let partial_banner = crate::i18n::t("oc-doctor-partial-banner");
+        let partial_hint = crate::i18n::t("oc-doctor-partial-hint");
         assert!(
             rendered.contains(&partial_banner),
             "partial-results banner must render in detail panel; got:\n{rendered}"
@@ -1041,7 +1045,7 @@ mod tests {
         );
 
         println!(
-            "\n=== CAPTURE: zerocode doctor with probe_models timed_out (120x24) ===\n{rendered}\n=== END CAPTURE ==="
+            "\n=== CAPTURE: omnescode doctor with probe_models timed_out (120x24) ===\n{rendered}\n=== END CAPTURE ==="
         );
     }
 

@@ -145,20 +145,20 @@ enum OmnesagentPane {
 }
 
 /// Top-level Config sub-tab: the daemon RPC editor (`omnesagent`) first,
-/// the local client config (`zerocode`) second.
+/// the local client config (`omnescode`) second.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConfigSection {
     Omnesagent,
-    Zerocode,
+    Omnescode,
 }
 
-const CONFIG_SECTIONS: [ConfigSection; 2] = [ConfigSection::Omnesagent, ConfigSection::Zerocode];
+const CONFIG_SECTIONS: [ConfigSection; 2] = [ConfigSection::Omnesagent, ConfigSection::Omnescode];
 
 impl ConfigSection {
     fn label(self) -> &'static str {
         match self {
             Self::Omnesagent => "omnesagent",
-            Self::Zerocode => "zerocode",
+            Self::Omnescode => "omnescode",
         }
     }
 }
@@ -202,11 +202,11 @@ fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static 
         PropKind::Integer => value
             .parse::<i64>()
             .err()
-            .map(|_| "zc-config-status-invalid-integer"),
+            .map(|_| "oc-config-status-invalid-integer"),
         PropKind::Float => value
             .parse::<f64>()
             .err()
-            .map(|_| "zc-config-status-invalid-float"),
+            .map(|_| "oc-config-status-invalid-float"),
         _ => None,
     }
 }
@@ -275,7 +275,7 @@ pub(crate) struct App {
     /// render.
     config_dir_display: String,
     section: ConfigSection,
-    zerocode: crate::zerocode_pane::ZerocodePane,
+    omnescode: crate::omnescode_pane::OmnescodePane,
     section_tab_area: Option<Rect>,
     screen: Screen,
     omnesagent_pane: OmnesagentPane,
@@ -357,7 +357,7 @@ impl App {
             rpc,
             config_dir_display: shorten_home(config_dir),
             section: ConfigSection::Omnesagent,
-            zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
+            omnescode: crate::omnescode_pane::OmnescodePane::new(config_dir),
             section_tab_area: None,
             screen: Screen::SectionList,
             omnesagent_pane: OmnesagentPane::Sections,
@@ -418,7 +418,7 @@ impl App {
         self.sections.sort_by_key(|s| Self::group_rank(&s.group));
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
-        // first paint, matching the zerocode Config tab.
+        // first paint, matching the omnescode Config tab.
         if !self.sections.is_empty() {
             self.load_section_content(self.section_cursor).await?;
         }
@@ -426,7 +426,7 @@ impl App {
     }
 
     /// Draw the current screen into the given area, beneath the Config
-    /// section sub-tab bar (`omnesagent` / `zerocode`).
+    /// section sub-tab bar (`omnesagent` / `omnescode`).
     pub(crate) fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
         use ratatui::layout::{Constraint, Direction, Layout};
         let chunks = Layout::default()
@@ -441,8 +441,8 @@ impl App {
         self.section_tab_area = Some(chunks[0]);
         let body = chunks[1];
 
-        if self.section == ConfigSection::Zerocode {
-            self.zerocode.draw(frame, body);
+        if self.section == ConfigSection::Omnescode {
+            self.omnescode.draw(frame, body);
             return;
         }
 
@@ -513,19 +513,19 @@ impl App {
     fn bottom_hint(&self) -> String {
         use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as T};
 
-        let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
+        let default = || format!(" ?={}", crate::i18n::t("oc-config-footer-action-help"));
 
         match &self.screen {
             Screen::FieldList { .. } if self.omnesagent_pane == OmnesagentPane::Detail => {
                 if self.filter.is_some() {
-                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    let help = crate::i18n::t("oc-config-footer-action-help");
                     format!(
                         " {}  {}={}  {}={}  ?={}",
                         nav_keys(),
                         tab_key(T::Enter),
-                        crate::i18n::t("zc-config-footer-action-edit"),
+                        crate::i18n::t("oc-config-footer-action-edit"),
                         tab_key(T::Back),
-                        crate::i18n::t("zc-config-footer-action-clear-filter"),
+                        crate::i18n::t("oc-config-footer-action-clear-filter"),
                         help,
                     )
                 } else if self.is_composite_tab() {
@@ -534,30 +534,30 @@ impl App {
                             format!(
                                 " {}={}  {}={}",
                                 editor_key(E::Save),
-                                crate::i18n::t("zc-config-footer-action-save"),
+                                crate::i18n::t("oc-config-footer-action-save"),
                                 editor_key(E::Cancel),
-                                crate::i18n::t("zc-config-footer-action-back-to-files"),
+                                crate::i18n::t("oc-config-footer-action-back-to-files"),
                             )
                         }
                         Some(ConfigTab::Skills) if self.skills_active.is_some() => {
                             format!(
                                 " {}={}  {}={}",
                                 editor_key(E::Save),
-                                crate::i18n::t("zc-config-footer-action-save"),
+                                crate::i18n::t("oc-config-footer-action-save"),
                                 editor_key(E::Cancel),
-                                crate::i18n::t("zc-config-footer-action-back-to-skills"),
+                                crate::i18n::t("oc-config-footer-action-back-to-skills"),
                             )
                         }
                         _ => default(),
                     }
                 } else {
-                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    let help = crate::i18n::t("oc-config-footer-action-help");
                     format!(
                         " {}={}  {}={}  ?={}",
                         tab_key(T::Enter),
-                        crate::i18n::t("zc-config-footer-action-edit"),
+                        crate::i18n::t("oc-config-footer-action-edit"),
                         tab_key(T::DeleteRow),
-                        crate::i18n::t("zc-config-footer-action-reset"),
+                        crate::i18n::t("oc-config-footer-action-reset"),
                         help,
                     )
                 }
@@ -566,50 +566,50 @@ impl App {
                 format!(
                     " {}={}  {}={}",
                     editor_key(E::Confirm),
-                    crate::i18n::t("zc-config-footer-action-create"),
+                    crate::i18n::t("oc-config-footer-action-create"),
                     editor_key(E::Cancel),
-                    crate::i18n::t("zc-config-footer-action-cancel"),
+                    crate::i18n::t("oc-config-footer-action-cancel"),
                 )
             }
             Screen::FieldEdit { field_idx, .. } => {
                 if self.is_select_edit() {
                     if self.filter.is_some() {
-                        let help = crate::i18n::t("zc-config-footer-action-help");
+                        let help = crate::i18n::t("oc-config-footer-action-help");
                         format!(
                             " {}  {}={}  {}={}  ?={}",
                             nav_keys(),
                             tab_key(T::Enter),
-                            crate::i18n::t("zc-config-footer-action-save"),
+                            crate::i18n::t("oc-config-footer-action-save"),
                             tab_key(T::Back),
-                            crate::i18n::t("zc-config-footer-action-clear-filter"),
+                            crate::i18n::t("oc-config-footer-action-clear-filter"),
                             help,
                         )
                     } else {
                         format!(
                             " {}={}  {}={}",
                             tab_key(T::Enter),
-                            crate::i18n::t("zc-config-footer-action-save"),
+                            crate::i18n::t("oc-config-footer-action-save"),
                             tab_key(T::Back),
-                            crate::i18n::t("zc-config-footer-action-cancel"),
+                            crate::i18n::t("oc-config-footer-action-cancel"),
                         )
                     }
                 } else if self.fields[*field_idx].kind == PropKind::StringArray {
                     format!(
                         " {}={}  {}={}  {}={}",
                         editor_key(E::Confirm),
-                        crate::i18n::t("zc-config-footer-action-new-line"),
+                        crate::i18n::t("oc-config-footer-action-new-line"),
                         editor_key(E::Save),
-                        crate::i18n::t("zc-config-footer-action-save"),
+                        crate::i18n::t("oc-config-footer-action-save"),
                         editor_key(E::Cancel),
-                        crate::i18n::t("zc-config-footer-action-cancel"),
+                        crate::i18n::t("oc-config-footer-action-cancel"),
                     )
                 } else {
                     format!(
                         " {}={}  {}={}",
                         editor_key(E::Confirm),
-                        crate::i18n::t("zc-config-footer-action-save"),
+                        crate::i18n::t("oc-config-footer-action-save"),
                         editor_key(E::Cancel),
-                        crate::i18n::t("zc-config-footer-action-cancel"),
+                        crate::i18n::t("oc-config-footer-action-cancel"),
                     )
                 }
             }
@@ -618,7 +618,7 @@ impl App {
     }
 
     /// Highlight style + symbol for the right (detail) pane lists, mirroring
-    /// `zerocode_pane::ZerocodePane::detail_highlight`: the active selection
+    /// `omnescode_pane::OmnescodePane::detail_highlight`: the active selection
     /// style and "› " gutter when the detail pane holds focus, the dim "you
     /// are here" marker when focus has stepped back to the section list.
     fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
@@ -643,9 +643,9 @@ impl App {
             };
             spans.push(Span::styled(sec.label(), style));
         }
-        // Surface the zerocode pane's last status inline on the bar.
-        if self.section == ConfigSection::Zerocode
-            && let Some(msg) = self.zerocode.status()
+        // Surface the omnescode pane's last status inline on the bar.
+        if self.section == ConfigSection::Omnescode
+            && let Some(msg) = self.omnescode.status()
         {
             spans.push(Span::styled("   ", theme::dim_style()));
             spans.push(Span::styled(msg.to_string(), theme::warn_style()));
@@ -668,29 +668,29 @@ impl App {
         self.status_msg = None;
 
         // Tab / Shift+Tab cycle the outer Config section (omnesagent ↔
-        // zerocode) from anywhere — neither is bound inside the daemon
-        // editor or the zerocode pane, so there is no shadowing.
+        // omnescode) from anywhere — neither is bound inside the daemon
+        // editor or the omnescode pane, so there is no shadowing.
         if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
             use crate::keymap::ConfigTabAction;
             if action == ConfigTabAction::SectionNext {
                 self.cycle_section(1);
-                self.sync_zerocode_locales().await;
+                self.sync_omnescode_locales().await;
                 return Ok(false);
             }
             if action == ConfigTabAction::SectionPrev {
                 self.cycle_section(-1);
-                self.sync_zerocode_locales().await;
+                self.sync_omnescode_locales().await;
                 return Ok(false);
             }
         }
 
-        if self.section == ConfigSection::Zerocode {
-            if !self.zerocode.handle_key(key) {
-                // Left/Back at the zerocode section level was not consumed:
+        if self.section == ConfigSection::Omnescode {
+            if !self.omnescode.handle_key(key) {
+                // Left/Back at the omnescode section level was not consumed:
                 // cross back to the outer left (omnesagent) pane.
                 self.cycle_section(-1);
             }
-            self.sync_zerocode_locales().await;
+            self.sync_omnescode_locales().await;
             return Ok(false);
         }
 
@@ -766,9 +766,9 @@ impl App {
             }
         }
 
-        if self.section == ConfigSection::Zerocode {
-            self.zerocode.handle_mouse(mouse);
-            self.sync_zerocode_locales().await;
+        if self.section == ConfigSection::Omnescode {
+            self.omnescode.handle_mouse(mouse);
+            self.sync_omnescode_locales().await;
             return Ok(());
         }
 
@@ -1293,33 +1293,33 @@ impl App {
         Ok(())
     }
 
-    /// Bridge the sync zerocode pane to the async RPC client: lazily load the
+    /// Bridge the sync omnescode pane to the async RPC client: lazily load the
     /// locale registry when the Locale tab needs it, and drain a queued
     /// "download locale file" request. Errors surface to the pane status line —
     /// no crash, no orphaned request.
-    async fn sync_zerocode_locales(&mut self) {
-        if self.section != ConfigSection::Zerocode {
+    async fn sync_omnescode_locales(&mut self) {
+        if self.section != ConfigSection::Omnescode {
             return;
         }
-        if self.zerocode.locale_needs_list() {
+        if self.omnescode.locale_needs_list() {
             match self.rpc.locales_list().await {
-                Ok(locales) => self.zerocode.set_locales(locales),
+                Ok(locales) => self.omnescode.set_locales(locales),
                 // Surface the failure instead of silently retrying forever on
                 // every keypress with the tab stuck on "loading locales…".
-                Err(e) => self.zerocode.report_list_error(&e.to_string()),
+                Err(e) => self.omnescode.report_list_error(&e.to_string()),
             }
         }
-        if let Some(locale) = self.zerocode.take_pending_fetch() {
+        if let Some(locale) = self.omnescode.take_pending_fetch() {
             match self.rpc.locales_fetch(&locale, &[]).await {
                 Ok(res) => self
-                    .zerocode
+                    .omnescode
                     .apply_fetched(&locale, &res.catalogs, &res.skipped),
-                Err(e) => self.zerocode.report_fetch_error(&locale, &e.to_string()),
+                Err(e) => self.omnescode.report_fetch_error(&locale, &e.to_string()),
             }
         }
         // Agent theme overrides: feed the same enabled-agent list the Code/Chat
         // pickers walk, fetched lazily when the AgentTheme tab is first focused.
-        if self.zerocode.agents_needs_list() {
+        if self.omnescode.agents_needs_list() {
             match self.rpc.agents_status().await {
                 Ok(res) => {
                     let aliases = res
@@ -1328,9 +1328,9 @@ impl App {
                         .filter(|a| a.enabled)
                         .map(|a| a.alias)
                         .collect();
-                    self.zerocode.set_agents(aliases);
+                    self.omnescode.set_agents(aliases);
                 }
-                Err(e) => self.zerocode.report_agents_error(&e.to_string()),
+                Err(e) => self.omnescode.report_agents_error(&e.to_string()),
             }
         }
     }
@@ -1967,7 +1967,7 @@ impl App {
                     match self.rpc.config_map_key_delete(&map_path, &alias).await {
                         Ok(()) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-alias-deleted",
+                                "oc-config-status-alias-deleted",
                                 &[("alias", &alias)],
                             ));
                             self.load_aliases(&map_path).await?;
@@ -1977,7 +1977,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-delete-failed",
+                                "oc-config-status-delete-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -2050,7 +2050,7 @@ impl App {
                 match self.rpc.config_map_key_delete(&base, &resource).await {
                     Ok(()) => {
                         self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-status-alias-deleted",
+                            "oc-config-status-alias-deleted",
                             &[("alias", &resource)],
                         ));
                         self.load_cost_resources().await?;
@@ -2060,7 +2060,7 @@ impl App {
                     }
                     Err(e) => {
                         self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-status-delete-failed",
+                            "oc-config-status-delete-failed",
                             &[("err", &e.to_string())],
                         ));
                     }
@@ -2218,7 +2218,7 @@ impl App {
             Some(ConfigEditorAction::Confirm) => {
                 let name = self.edit_buf.trim().to_string();
                 if name.is_empty() {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-empty"));
+                    self.status_msg = Some(crate::i18n::t("oc-config-status-alias-empty"));
                     return Ok(());
                 }
                 if let Screen::AliasCreate {
@@ -2244,7 +2244,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-alias-create-failed",
+                                "oc-config-status-alias-create-failed",
                                 &[("err", &e.to_string())],
                             ));
                             self.restore_alias_list_from_create_back(
@@ -2311,7 +2311,7 @@ impl App {
         match action {
             // Left switches the field sub-tab leftward; once on the leftmost
             // sub-tab (or when the section has none) it walks back one breadcrumb
-            // level, so Left is a continuous "out" gesture like the zerocode tab.
+            // level, so Left is a continuous "out" gesture like the omnescode tab.
             Some(ConfigTabAction::TabLeft) if !self.tab_names.is_empty() && self.active_tab > 0 => {
                 self.active_tab = self.active_tab.saturating_sub(1);
                 self.field_cursor = self.tab_field_indices().first().copied().unwrap_or(0);
@@ -2376,7 +2376,7 @@ impl App {
                         match self.rpc.config_delete(&prop).await {
                             Ok(()) => {
                                 self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-field-reset",
+                                    "oc-config-status-field-reset",
                                     &[("prop", &prop)],
                                 ));
                                 self.load_fields(&prefix).await?;
@@ -2385,7 +2385,7 @@ impl App {
                             }
                             Err(e) => {
                                 self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-delete-failed",
+                                    "oc-config-status-delete-failed",
                                     &[("err", &e.to_string())],
                                 ));
                             }
@@ -2411,26 +2411,26 @@ impl App {
         }
         match self.tab_names[self.active_tab] {
             ConfigTab::Personality if self.personality_files.is_empty() => {
-                self.status_msg = Some(crate::i18n::t("zc-config-status-loading-personality"));
+                self.status_msg = Some(crate::i18n::t("oc-config-status-loading-personality"));
                 let _ = self.draw(term);
                 match self.load_personality_files().await {
                     Ok(()) => self.status_msg = None,
                     Err(e) => {
                         self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-status-load-failed",
+                            "oc-config-status-load-failed",
                             &[("err", &e.to_string())],
                         ));
                     }
                 }
             }
             ConfigTab::Skills if self.skills_list.is_empty() => {
-                self.status_msg = Some(crate::i18n::t("zc-config-status-loading-skills"));
+                self.status_msg = Some(crate::i18n::t("oc-config-status-loading-skills"));
                 let _ = self.draw(term);
                 match self.load_skills_list().await {
                     Ok(()) => self.status_msg = None,
                     Err(e) => {
                         self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-status-load-failed",
+                            "oc-config-status-load-failed",
                             &[("err", &e.to_string())],
                         ));
                     }
@@ -2505,7 +2505,7 @@ impl App {
                 if let Some(file) = self.personality_files.get(self.personality_cursor) {
                     let filename = file.filename.clone();
                     self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-personality-loading-file",
+                        "oc-config-status-personality-loading-file",
                         &[("filename", &filename)],
                     ));
                     let _ = self.draw(term);
@@ -2532,14 +2532,14 @@ impl App {
                                                 self.personality_loaded =
                                                     self.personality_content.clone();
                                                 self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-personality-saved-file",
+                                                    "oc-config-status-personality-saved-file",
                                                     &[("filename", &filename)],
                                                 ));
                                                 let _ = self.load_personality_files().await;
                                             }
                                             Err(e) => {
                                                 self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-save-failed",
+                                                    "oc-config-status-save-failed",
                                                     &[("err", &e.to_string())],
                                                 ));
                                             }
@@ -2556,7 +2556,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-load-failed",
+                                "oc-config-status-load-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -2568,7 +2568,7 @@ impl App {
                 if let Some(file) = self.personality_files.get(self.personality_cursor) {
                     let filename = file.filename.clone();
                     let agent = self.personality_agent.clone();
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-fetching-templates"));
+                    self.status_msg = Some(crate::i18n::t("oc-config-status-fetching-templates"));
                     let _ = self.draw(term);
                     match self.rpc.personality_templates(Some(&agent)).await {
                         Ok(result) => {
@@ -2612,21 +2612,21 @@ impl App {
                                     }
                                     Err(_) => {
                                         self.status_msg = Some(crate::i18n::t_args(
-                                            "zc-config-status-template-loaded",
+                                            "oc-config-status-template-loaded",
                                             &[("filename", &filename)],
                                         ));
                                     }
                                 }
                             } else {
                                 self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-template-missing",
+                                    "oc-config-status-template-missing",
                                     &[("filename", &filename)],
                                 ));
                             }
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-template-fetch-failed",
+                                "oc-config-status-template-fetch-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -2645,7 +2645,7 @@ impl App {
             Some(ConfigEditorAction::Cancel) => {
                 // Back to file picker. Warn if dirty.
                 if self.personality_content != self.personality_loaded {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-unsaved-discarded"));
+                    self.status_msg = Some(crate::i18n::t("oc-config-status-unsaved-discarded"));
                 }
                 self.personality_active_file = None;
             }
@@ -2656,13 +2656,13 @@ impl App {
                     let content = self.personality_content.clone();
                     if content.chars().count() > self.personality_max_chars {
                         self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-personality-over-limit",
+                            "oc-config-personality-over-limit",
                             &[("limit", &self.personality_max_chars.to_string())],
                         ));
                         return Ok(());
                     }
                     self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-personality-saving-file",
+                        "oc-config-status-personality-saving-file",
                         &[("filename", &filename)],
                     ));
                     let _ = self.draw(term);
@@ -2670,7 +2670,7 @@ impl App {
                         Ok(_) => {
                             self.personality_loaded = self.personality_content.clone();
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-personality-saved-file",
+                                "oc-config-status-personality-saved-file",
                                 &[("filename", &filename)],
                             ));
                             let _ = self.load_personality_files().await;
@@ -2678,7 +2678,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-save-failed",
+                                "oc-config-status-save-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -2765,7 +2765,7 @@ impl App {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
                     self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-skill-loading",
+                        "oc-config-status-skill-loading",
                         &[("name", &name)],
                     ));
                     let _ = self.draw(term);
@@ -2787,13 +2787,13 @@ impl App {
                                             Ok(_) => {
                                                 self.skills_body_loaded = self.skills_body.clone();
                                                 self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-skill-saved",
+                                                    "oc-config-status-skill-saved",
                                                     &[("name", &name)],
                                                 ));
                                             }
                                             Err(e) => {
                                                 self.status_msg = Some(crate::i18n::t_args(
-                                                    "zc-config-status-save-failed",
+                                                    "oc-config-status-save-failed",
                                                     &[("err", &e.to_string())],
                                                 ));
                                             }
@@ -2811,7 +2811,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-load-failed",
+                                "oc-config-status-load-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -2823,21 +2823,21 @@ impl App {
                     let name = skill.name.clone();
                     let bundle = self.skills_bundle.clone();
                     self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-skill-deleting",
+                        "oc-config-status-skill-deleting",
                         &[("name", &name)],
                     ));
                     let _ = self.draw(term);
                     match self.rpc.skills_delete(&bundle, &name).await {
                         Ok(_) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-skill-archived",
+                                "oc-config-status-skill-archived",
                                 &[("name", &name)],
                             ));
                             let _ = self.load_skills_list().await;
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-delete-failed",
+                                "oc-config-status-delete-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -2855,7 +2855,7 @@ impl App {
         match action {
             Some(ConfigEditorAction::Cancel) => {
                 if self.skills_body != self.skills_body_loaded {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-unsaved-discarded"));
+                    self.status_msg = Some(crate::i18n::t("oc-config-status-unsaved-discarded"));
                 }
                 self.skills_active = None;
             }
@@ -2866,7 +2866,7 @@ impl App {
                     let frontmatter = self.skills_frontmatter.clone();
                     let body = self.skills_body.clone();
                     self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-skill-saving",
+                        "oc-config-status-skill-saving",
                         &[("name", &name)],
                     ));
                     let _ = self.draw(term);
@@ -2879,13 +2879,13 @@ impl App {
                             self.skills_body_loaded = self.skills_body.clone();
                             self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-skill-saved",
+                                "oc-config-status-skill-saved",
                                 &[("name", &name)],
                             ));
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-save-failed",
+                                "oc-config-status-save-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -2929,7 +2929,7 @@ impl App {
 
                 // Show loading indicator before the blocking RPC call.
                 self.status_msg = Some(crate::i18n::t_args(
-                    "zc-config-status-fetching-models",
+                    "oc-config-status-fetching-models",
                     &[("family", &family)],
                 ));
                 let _ = self.draw(term);
@@ -2945,11 +2945,11 @@ impl App {
                         self.status_msg = None;
                     }
                     Ok(_) => {
-                        self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
+                        self.status_msg = Some(crate::i18n::t("oc-config-status-no-models"));
                     }
                     Err(_) => {
                         self.status_msg =
-                            Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
+                            Some(crate::i18n::t("oc-config-status-model-fetch-failed"));
                     }
                 }
             }
@@ -2958,7 +2958,7 @@ impl App {
         // Alias-reference fields resolve their picker list generically from
         // the field's `alias_source` — no per-path special-casing.
         if let Some(source) = self.fields[idx].alias_source {
-            self.status_msg = Some(crate::i18n::t("zc-config-status-loading-aliases"));
+            self.status_msg = Some(crate::i18n::t("oc-config-status-loading-aliases"));
             let _ = self.draw(term);
             match self.rpc.config_resolve_alias_source(source).await {
                 Ok(values) if !values.is_empty() => {
@@ -2968,10 +2968,10 @@ impl App {
                     self.status_msg = None;
                 }
                 Ok(_) => {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-aliases"));
+                    self.status_msg = Some(crate::i18n::t("oc-config-status-no-aliases"));
                 }
                 Err(_) => {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-fetch-failed"));
+                    self.status_msg = Some(crate::i18n::t("oc-config-status-alias-fetch-failed"));
                 }
             }
         }
@@ -3211,7 +3211,7 @@ impl App {
                         match self.rpc.config_set(&prop, value).await {
                             Ok(()) => {
                                 self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-field-set",
+                                    "oc-config-status-field-set",
                                     &[("prop", &prop)],
                                 ));
                                 self.load_fields(&prefix).await?;
@@ -3219,7 +3219,7 @@ impl App {
                             }
                             Err(e) => {
                                 self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-set-failed",
+                                    "oc-config-status-set-failed",
                                     &[("err", &e.to_string())],
                                 ));
                             }
@@ -3260,7 +3260,7 @@ impl App {
                     match self.rpc.config_set(&prop, value).await {
                         Ok(()) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-field-set",
+                                "oc-config-status-field-set",
                                 &[("prop", &prop)],
                             ));
                             self.load_fields(&prefix).await?;
@@ -3268,7 +3268,7 @@ impl App {
                         }
                         Err(e) => {
                             self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-set-failed",
+                                "oc-config-status-set-failed",
                                 &[("err", &e.to_string())],
                             ));
                         }
@@ -3351,7 +3351,7 @@ impl App {
             match self.rpc.config_set(&prop, value).await {
                 Ok(()) => {
                     self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-field-set",
+                        "oc-config-status-field-set",
                         &[("prop", &prop)],
                     ));
                     self.load_fields(&prefix).await?;
@@ -3359,7 +3359,7 @@ impl App {
                 }
                 Err(e) => {
                     self.status_msg = Some(crate::i18n::t_args(
-                        "zc-config-status-set-failed",
+                        "oc-config-status-set-failed",
                         &[("err", &e.to_string())],
                     ));
                 }
@@ -3547,7 +3547,7 @@ impl App {
         );
 
         let line = crate::i18n::t_args(
-            "zc-config-section-detail-hint",
+            "oc-config-section-detail-hint",
             &[
                 ("open", &tab_key(crate::keymap::ConfigTabAction::Enter)),
                 ("into", &tab_key(crate::keymap::ConfigTabAction::TabRight)),
@@ -3787,12 +3787,12 @@ impl App {
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
-        bc.push(crate::i18n::t("zc-config-breadcrumb-new"));
+        bc.push(crate::i18n::t("oc-config-breadcrumb-new"));
         render_breadcrumb(frame, r.breadcrumb, &bc);
 
         frame.render_widget(
             Paragraph::new(Span::styled(
-                crate::i18n::t("zc-config-alias-create-hint"),
+                crate::i18n::t("oc-config-alias-create-hint"),
                 theme::dim_style(),
             )),
             r.help,
@@ -3923,7 +3923,7 @@ impl App {
                     let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
                     format!(
                         "  \u{2500}\u{2192} {}",
-                        crate::i18n::t_args("zc-config-field-edit-hint", &[("keys", &enter_key)])
+                        crate::i18n::t_args("oc-config-field-edit-hint", &[("keys", &enter_key)])
                     )
                 } else {
                     String::new()
@@ -4002,7 +4002,7 @@ impl App {
             // File picker mode.
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t("zc-config-personality-help-blurb"),
+                    crate::i18n::t("oc-config-personality-help-blurb"),
                     theme::dim_style(),
                 ))
                 .wrap(Wrap { trim: false }),
@@ -4096,7 +4096,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     crate::i18n::t_args(
-                        "zc-config-skills-help-blurb",
+                        "oc-config-skills-help-blurb",
                         &[
                             (
                                 "enter_chord",
@@ -4221,13 +4221,13 @@ impl App {
                     .wrap(Wrap { trim: false }),
                 r.help,
             );
-            let type_prefix = crate::i18n::t("zc-config-field-type-prefix");
+            let type_prefix = crate::i18n::t("oc-config-field-type-prefix");
             let kind_hint = if field.is_secret {
-                let suffix = crate::i18n::t("zc-config-field-type-secret-suffix");
+                let suffix = crate::i18n::t("oc-config-field-type-secret-suffix");
                 format!("{type_prefix} {} {suffix}", field.kind.wire_name())
             } else if field.kind == PropKind::StringArray {
                 let suffix = crate::i18n::t_args(
-                    "zc-config-field-type-string-array-suffix",
+                    "oc-config-field-type-string-array-suffix",
                     &[("newline_chord", "Enter"), ("save_chord", "Ctrl+S")],
                 );
                 format!("{type_prefix} {} {suffix}", field.kind.wire_name())
@@ -4348,8 +4348,8 @@ impl App {
 
     /// Whether the pane is in a text-input mode (filter, edit buf, alias create, editors).
     pub(crate) fn wants_text_input(&self) -> bool {
-        if self.section == ConfigSection::Zerocode {
-            return self.zerocode.wants_text_input();
+        if self.section == ConfigSection::Omnescode {
+            return self.omnescode.wants_text_input();
         }
         if self.filter.is_some() {
             return true;
@@ -4404,10 +4404,10 @@ impl crate::widgets::HelpContext for App {
         // Section switch is available in either sub-tab.
         let section_nav = E::new(
             [tab_keys(A::SectionNext), tab_keys(A::SectionPrev)].concat(),
-            crate::i18n::t("zc-config-help-switch-section"),
+            crate::i18n::t("oc-config-help-switch-section"),
         );
-        if self.section == ConfigSection::Zerocode {
-            let mut node = self.zerocode.help_context();
+        if self.section == ConfigSection::Omnescode {
+            let mut node = self.omnescode.help_context();
             node.entries.insert(0, section_nav);
             return node;
         }
@@ -4423,30 +4423,30 @@ impl App {
         use crate::widgets::{HelpEntry as E, HelpNode};
 
         // All chords resolve from the live keymap so overrides/vim/emacs show.
-        let nav = || E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate"));
+        let nav = || E::new(nav_keys_split(), crate::i18n::t("oc-config-help-navigate"));
         let k = |a: A, label: &str| E::new(tab_keys(a), crate::i18n::t(label));
         let help = || {
             E::new(
                 crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
-                crate::i18n::t("zc-config-help-this-help"),
+                crate::i18n::t("oc-config-help-this-help"),
             )
         };
         let filter = || {
             E::new(
                 tab_keys(A::BeginSearch),
-                crate::i18n::t("zc-config-help-filter"),
+                crate::i18n::t("oc-config-help-filter"),
             )
         };
-        let clear_filter = || k(A::Back, "zc-config-help-clear-filter");
-        let back = || k(A::Back, "zc-config-help-back");
-        let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
+        let clear_filter = || k(A::Back, "oc-config-help-clear-filter");
+        let back = || k(A::Back, "oc-config-help-back");
+        let mouse_open = || E::key("Mouse", crate::i18n::t("oc-config-help-mouse-open"));
 
         match &self.screen {
             Screen::SectionList => {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
                         nav(),
-                        k(A::Enter, "zc-config-help-open-section"),
+                        k(A::Enter, "oc-config-help-open-section"),
                         clear_filter(),
                         help(),
                     ])
@@ -4454,9 +4454,9 @@ impl App {
                     let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
                     HelpNode::entries(vec![
                         nav(),
-                        E::new(open, crate::i18n::t("zc-config-help-open-section")),
+                        E::new(open, crate::i18n::t("oc-config-help-open-section")),
                         filter(),
-                        k(A::Back, "zc-config-help-quit"),
+                        k(A::Back, "oc-config-help-quit"),
                         help(),
                         E::spacer(),
                         mouse_open(),
@@ -4467,7 +4467,7 @@ impl App {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
                         nav(),
-                        k(A::Enter, "zc-config-help-open-type"),
+                        k(A::Enter, "oc-config-help-open-type"),
                         clear_filter(),
                         help(),
                     ])
@@ -4475,7 +4475,7 @@ impl App {
                     let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
                     HelpNode::entries(vec![
                         nav(),
-                        E::new(open, crate::i18n::t("zc-config-help-open-type")),
+                        E::new(open, crate::i18n::t("oc-config-help-open-type")),
                         filter(),
                         back(),
                         help(),
@@ -4488,7 +4488,7 @@ impl App {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
                         nav(),
-                        k(A::Enter, "zc-config-help-open-alias"),
+                        k(A::Enter, "oc-config-help-open-alias"),
                         clear_filter(),
                         help(),
                     ])
@@ -4497,10 +4497,10 @@ impl App {
                         nav(),
                         E::new(
                             switch_tabs_keys(),
-                            crate::i18n::t("zc-config-help-switch-tabs"),
+                            crate::i18n::t("oc-config-help-switch-tabs"),
                         ),
-                        k(A::Enter, "zc-config-help-open-alias"),
-                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        k(A::Enter, "oc-config-help-open-alias"),
+                        k(A::ToggleSecret, "oc-config-help-delete-alias"),
                         back(),
                         help(),
                         E::spacer(),
@@ -4510,8 +4510,8 @@ impl App {
                     let open = [tab_keys(A::Enter), tab_keys(A::TabRight)].concat();
                     HelpNode::entries(vec![
                         nav(),
-                        E::new(open, crate::i18n::t("zc-config-help-open-alias")),
-                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        E::new(open, crate::i18n::t("oc-config-help-open-alias")),
+                        k(A::ToggleSecret, "oc-config-help-delete-alias"),
                         filter(),
                         back(),
                         help(),
@@ -4523,11 +4523,11 @@ impl App {
             Screen::AliasCreate { .. } => HelpNode::entries(vec![
                 E::new(
                     vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
-                    crate::i18n::t("zc-config-help-create-alias"),
+                    crate::i18n::t("oc-config-help-create-alias"),
                 ),
                 E::new(
                     vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
-                    crate::i18n::t("zc-config-help-cancel"),
+                    crate::i18n::t("oc-config-help-cancel"),
                 ),
                 help(),
             ]),
@@ -4535,7 +4535,7 @@ impl App {
                 if self.filter.is_some() {
                     HelpNode::entries(vec![
                         nav(),
-                        k(A::Enter, "zc-config-help-edit-field"),
+                        k(A::Enter, "oc-config-help-edit-field"),
                         clear_filter(),
                         help(),
                     ])
@@ -4546,11 +4546,11 @@ impl App {
                                 HelpNode::entries(vec![
                                     E::new(
                                         vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
-                                        crate::i18n::t("zc-config-help-save"),
+                                        crate::i18n::t("oc-config-help-save"),
                                     ),
                                     E::new(
                                         vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
-                                        crate::i18n::t("zc-config-help-back-to-files"),
+                                        crate::i18n::t("oc-config-help-back-to-files"),
                                     ),
                                     help(),
                                 ])
@@ -4558,15 +4558,15 @@ impl App {
                                 HelpNode::entries(vec![
                                     E::new(
                                         switch_tabs_keys(),
-                                        crate::i18n::t("zc-config-help-switch-tabs"),
+                                        crate::i18n::t("oc-config-help-switch-tabs"),
                                     ),
                                     nav(),
-                                    k(A::Enter, "zc-config-help-edit-file"),
-                                    k(A::ApplyTemplate, "zc-config-help-fill-from-template"),
+                                    k(A::Enter, "oc-config-help-edit-file"),
+                                    k(A::ApplyTemplate, "oc-config-help-fill-from-template"),
                                     back(),
                                     help(),
                                     E::spacer(),
-                                    E::key("Mouse", crate::i18n::t("zc-config-help-mouse-tabs")),
+                                    E::key("Mouse", crate::i18n::t("oc-config-help-mouse-tabs")),
                                 ])
                             }
                         }
@@ -4575,11 +4575,11 @@ impl App {
                                 HelpNode::entries(vec![
                                     E::new(
                                         vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
-                                        crate::i18n::t("zc-config-help-save"),
+                                        crate::i18n::t("oc-config-help-save"),
                                     ),
                                     E::new(
                                         vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
-                                        crate::i18n::t("zc-config-help-back-to-skills"),
+                                        crate::i18n::t("oc-config-help-back-to-skills"),
                                     ),
                                     help(),
                                 ])
@@ -4587,15 +4587,15 @@ impl App {
                                 HelpNode::entries(vec![
                                     E::new(
                                         switch_tabs_keys(),
-                                        crate::i18n::t("zc-config-help-switch-tabs"),
+                                        crate::i18n::t("oc-config-help-switch-tabs"),
                                     ),
                                     nav(),
-                                    k(A::Enter, "zc-config-help-edit-skill"),
-                                    k(A::ToggleSecret, "zc-config-help-archive-skill"),
+                                    k(A::Enter, "oc-config-help-edit-skill"),
+                                    k(A::ToggleSecret, "oc-config-help-archive-skill"),
                                     back(),
                                     help(),
                                     E::spacer(),
-                                    E::key("Mouse", crate::i18n::t("zc-config-help-mouse-tabs")),
+                                    E::key("Mouse", crate::i18n::t("oc-config-help-mouse-tabs")),
                                 ])
                             }
                         }
@@ -4615,34 +4615,34 @@ impl App {
                     if self.filter.is_some() {
                         HelpNode::entries(vec![
                             nav(),
-                            k(A::Enter, "zc-config-help-save-selection"),
+                            k(A::Enter, "oc-config-help-save-selection"),
                             clear_filter(),
                             help(),
                         ])
                     } else {
                         HelpNode::entries(vec![
                             nav(),
-                            k(A::Enter, "zc-config-help-save-selection"),
+                            k(A::Enter, "oc-config-help-save-selection"),
                             filter(),
-                            k(A::Back, "zc-config-help-cancel"),
+                            k(A::Back, "oc-config-help-cancel"),
                             help(),
                             E::spacer(),
-                            E::key("Mouse", crate::i18n::t("zc-config-help-mouse-save")),
+                            E::key("Mouse", crate::i18n::t("oc-config-help-mouse-save")),
                         ])
                     }
                 } else if is_string_array {
                     HelpNode::entries(vec![
                         E::new(
                             vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
-                            crate::i18n::t("zc-config-help-new-line-entry"),
+                            crate::i18n::t("oc-config-help-new-line-entry"),
                         ),
                         E::new(
                             vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
-                            crate::i18n::t("zc-config-help-save-array"),
+                            crate::i18n::t("oc-config-help-save-array"),
                         ),
                         E::new(
                             vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
-                            crate::i18n::t("zc-config-help-cancel"),
+                            crate::i18n::t("oc-config-help-cancel"),
                         ),
                         help(),
                     ])
@@ -4650,11 +4650,11 @@ impl App {
                     HelpNode::entries(vec![
                         E::new(
                             vec![editor_key(crate::keymap::ConfigEditorAction::Confirm)],
-                            crate::i18n::t("zc-config-help-save-value"),
+                            crate::i18n::t("oc-config-help-save-value"),
                         ),
                         E::new(
                             vec![editor_key(crate::keymap::ConfigEditorAction::Cancel)],
-                            crate::i18n::t("zc-config-help-cancel"),
+                            crate::i18n::t("oc-config-help-cancel"),
                         ),
                         help(),
                     ])
@@ -4673,38 +4673,38 @@ impl App {
         if has_tabs {
             entries.push(E::new(
                 switch_tabs_keys(),
-                crate::i18n::t("zc-config-help-switch-tabs"),
+                crate::i18n::t("oc-config-help-switch-tabs"),
             ));
         }
         entries.push(E::new(
             nav_keys_split(),
-            crate::i18n::t("zc-config-help-navigate"),
+            crate::i18n::t("oc-config-help-navigate"),
         ));
         entries.push(E::new(
             tab_keys(A::Enter),
-            crate::i18n::t("zc-config-help-edit-field"),
+            crate::i18n::t("oc-config-help-edit-field"),
         ));
         entries.push(E::new(
             tab_keys(A::DeleteRow),
-            crate::i18n::t("zc-config-help-reset-default"),
+            crate::i18n::t("oc-config-help-reset-default"),
         ));
         entries.push(E::new(
             tab_keys(A::BeginSearch),
-            crate::i18n::t("zc-config-help-filter"),
+            crate::i18n::t("oc-config-help-filter"),
         ));
         entries.push(E::new(
             tab_keys(A::Back),
-            crate::i18n::t("zc-config-help-back"),
+            crate::i18n::t("oc-config-help-back"),
         ));
         entries.push(E::new(
             crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
-            crate::i18n::t("zc-config-help-this-help"),
+            crate::i18n::t("oc-config-help-this-help"),
         ));
         entries.push(E::spacer());
         let mouse = if has_tabs {
-            crate::i18n::t("zc-config-help-mouse-tabs-edit")
+            crate::i18n::t("oc-config-help-mouse-tabs-edit")
         } else {
-            crate::i18n::t("zc-config-help-mouse-edit")
+            crate::i18n::t("oc-config-help-mouse-edit")
         };
         entries.push(E::key("Mouse", mouse));
         HelpNode::entries(entries)
@@ -4836,7 +4836,7 @@ mod tests {
     fn config_scalar_validation_rejects_invalid_integer() {
         assert_eq!(
             scalar_validation_status_key(PropKind::Integer, "20a"),
-            Some("zc-config-status-invalid-integer")
+            Some("oc-config-status-invalid-integer")
         );
         assert_eq!(scalar_validation_status_key(PropKind::Integer, "20"), None);
     }
@@ -4845,7 +4845,7 @@ mod tests {
     fn config_scalar_validation_rejects_invalid_float() {
         assert_eq!(
             scalar_validation_status_key(PropKind::Float, "0.7x"),
-            Some("zc-config-status-invalid-float")
+            Some("oc-config-status-invalid-float")
         );
         assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
     }
@@ -4901,7 +4901,7 @@ mod tests {
 
         assert!(manager.claims_pane_navigation(&word_left));
 
-        manager.section = ConfigSection::Zerocode;
+        manager.section = ConfigSection::Omnescode;
         assert!(!manager.claims_pane_navigation(&word_left));
 
         manager.section = ConfigSection::Omnesagent;

@@ -1,7 +1,7 @@
 //! Blueprint graph projection of a `Sop`.
 //!
 //! Projects the linear step list plus routing metadata into a node/wire
-//! graph for visual editors (web node canvas, zerocode SOP pane) and text
+//! graph for visual editors (web node canvas, omnescode SOP pane) and text
 //! renderers. Pure projection: building a graph never mutates the SOP.
 
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use super::types::{Sop, SopStep};
 pub type ToolSpecs = HashMap<String, ToolSpec>;
 
 // Graph wire shape lives in the leaf crate `omnesagent-sop-graph` so the
-// runtime projection, the gateway JSON Schema, and the zerocode TUI all read
+// runtime projection, the gateway JSON Schema, and the omnescode TUI all read
 // one definition. Re-exported here so the projection logic below and every
 // downstream `crate::sop::graph::GraphPin` path keep working unchanged.
 pub use omnesagent_sop_graph::{
@@ -1137,8 +1137,8 @@ mod tests {
         assert!(node(2).tool_calls.is_empty(), "unreached step has no calls");
     }
 
-    /// Pins the JSON wire shape consumed by zerocode's `SopGraphView` mirror
-    /// (`apps/zerocode/src/client.rs`, mod sop_method_tests). If this changes,
+    /// Pins the JSON wire shape consumed by omnescode's `SopGraphView` mirror
+    /// (`apps/omnescode/src/client.rs`, mod sop_method_tests). If this changes,
     /// fix both sides together.
     #[test]
     fn graph_serializes_to_the_pinned_wire_shape() {

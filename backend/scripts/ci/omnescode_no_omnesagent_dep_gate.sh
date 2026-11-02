@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-echo "==> zerocode gate: no omnesagent-* crate dependency"
+echo "==> omnescode gate: no omnesagent-* crate dependency"
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -62,12 +62,12 @@ PY
 )"
 
 if [ -n "$offending" ]; then
-    echo "::error file=${manifest}::zerocode must not depend on any omnesagent-* crate; found:"
+    echo "::error file=${manifest}::omnescode must not depend on any omnesagent-* crate; found:"
     while IFS= read -r dep; do
         echo "  - ${dep}"
     done <<<"$offending"
-    echo "zerocode is an RPC-only surface: everything it knows must come over the wire, not by linking backend crates."
+    echo "omnescode is an RPC-only surface: everything it knows must come over the wire, not by linking backend crates."
     exit 1
 fi
 
-echo "zerocode gate passed: no omnesagent-* dependencies."
+echo "omnescode gate passed: no omnesagent-* dependencies."

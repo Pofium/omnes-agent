@@ -19,7 +19,7 @@ static DEPTH: OnceLock<ColorDepth> = OnceLock::new();
 pub(crate) fn active() -> ColorDepth {
     *DEPTH.get_or_init(|| {
         detect_from_env(
-            std::env::var("ZEROCODE_COLOR").ok().as_deref(),
+            std::env::var("OMNESCODE_COLOR").ok().as_deref(),
             std::env::var("COLORTERM").ok().as_deref(),
             std::env::var("TERM").ok().as_deref(),
             std::env::var("TERM_PROGRAM").ok().as_deref(),
@@ -29,7 +29,7 @@ pub(crate) fn active() -> ColorDepth {
 }
 
 /// Pure detection core, split out for testing. `override_var` is the value
-/// of `ZEROCODE_COLOR` (`truecolor`/`24bit`, `256`, `16`/`ansi`), which
+/// of `OMNESCODE_COLOR` (`truecolor`/`24bit`, `256`, `16`/`ansi`), which
 /// short-circuits auto-detection when set to a recognised value.
 fn detect_from_env(
     override_var: Option<&str>,

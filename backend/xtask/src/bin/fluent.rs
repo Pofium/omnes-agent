@@ -12,7 +12,7 @@ struct Cli {
 enum Cmd {
     /// Scan Rust source for user-facing strings and report en.ftl coverage
     Scan {
-        /// Restrict to one catalogue family (`runtime` or `zerocode`).
+        /// Restrict to one catalogue family (`runtime` or `omnescode`).
         /// Defaults to all catalogues.
         #[arg(long)]
         catalog: Option<String>,
@@ -33,7 +33,7 @@ enum Cmd {
         /// ~/.omnesagent). Mirrors `omnesagent --config-dir`.
         #[arg(long)]
         config_dir: Option<String>,
-        /// Restrict to one catalogue family (`runtime` or `zerocode`).
+        /// Restrict to one catalogue family (`runtime` or `omnescode`).
         /// Defaults to all catalogues.
         #[arg(long)]
         catalog: Option<String>,
@@ -43,14 +43,14 @@ enum Cmd {
     },
     /// Show translation coverage per locale
     Stats {
-        /// Restrict to one catalogue family (`runtime` or `zerocode`).
+        /// Restrict to one catalogue family (`runtime` or `omnescode`).
         /// Defaults to all catalogues.
         #[arg(long)]
         catalog: Option<String>,
     },
     /// Validate .ftl syntax for all locales
     Check {
-        /// Restrict to one catalogue family (`runtime` or `zerocode`).
+        /// Restrict to one catalogue family (`runtime` or `omnescode`).
         /// Defaults to all catalogues.
         #[arg(long)]
         catalog: Option<String>,

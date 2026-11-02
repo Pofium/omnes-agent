@@ -1613,12 +1613,12 @@ mod tests {
         use crate::agent::prompt::InteractionSurface;
 
         assert_eq!(
-            serde_json::to_value(InteractionSurface::ZerocodeCode).unwrap(),
-            json!("zerocode_code")
+            serde_json::to_value(InteractionSurface::OmnescodeCode).unwrap(),
+            json!("omnescode_code")
         );
         assert_eq!(
-            serde_json::from_value::<InteractionSurface>(json!("zerocode_code")).unwrap(),
-            InteractionSurface::ZerocodeCode
+            serde_json::from_value::<InteractionSurface>(json!("omnescode_code")).unwrap(),
+            InteractionSurface::OmnescodeCode
         );
         assert!(
             serde_json::from_value::<InteractionSurface>(json!("client_authored_claims")).is_err()

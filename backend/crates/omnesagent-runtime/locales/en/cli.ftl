@@ -945,7 +945,7 @@ turn-stream-interrupted = [stream interrupted]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn
-# surfaces (WS, RPC/ZeroCode, ACP).
+# surfaces (WS, RPC/OmnesCode, ACP).
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
@@ -1127,12 +1127,12 @@ cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
 cli-mtls-issued-ca-path = {"  "}CA:   {$path}
 cli-mtls-dropin-line-1 = Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /
-cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and zerocode finds
+cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and omnescode finds
 cli-mtls-dropin-line-3 = {"  "}the material automatically - no --tls-* flags needed.
 cli-mtls-relay-connect-header = Reach this daemon THROUGH its configured relay:
 cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca is the RELAY's CA - copy it from the relay to the client;
 cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert is the DAEMON's CA, already in the bundle.)
-cli-mtls-direct-connect-header = Connect with zerocode (direct):
+cli-mtls-direct-connect-header = Connect with omnescode (direct):
 cli-mtls-revoked-certificate = Revoked certificate {$fingerprint}.
 cli-mtls-revoke-no-active-fingerprint = No active certificate with fingerprint {$fingerprint} (already revoked or never issued).
 cli-mtls-revoked-device-certs = Revoked {$count} active certificate(s) for device '{$device}'.

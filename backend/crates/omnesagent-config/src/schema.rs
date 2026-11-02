@@ -9891,7 +9891,7 @@ pub struct ClaudeCodeRunnerConfig {
     /// SSH host for session handoff links (e.g. "myhost.example.com")
     #[serde(default)]
     pub ssh_host: Option<String>,
-    /// Prefix for tmux session names (default: "zc-claude-")
+    /// Prefix for tmux session names (default: "oc-claude-")
     #[serde(default = "default_claude_code_runner_tmux_prefix")]
     pub tmux_prefix: String,
     /// Session time-to-live in seconds before auto-cleanup (default: 3600)
@@ -9900,7 +9900,7 @@ pub struct ClaudeCodeRunnerConfig {
 }
 
 fn default_claude_code_runner_tmux_prefix() -> String {
-    "zc-claude-".into()
+    "oc-claude-".into()
 }
 
 fn default_claude_code_runner_session_ttl() -> u64 {
@@ -19701,7 +19701,7 @@ fn default_config_and_data_dirs() -> Result<(PathBuf, PathBuf)> {
 /// resolution a daemon uses to lock its state before loading the config,
 /// `Config::load_or_init`, which sets `config.data_dir`, and the V2-to-V3
 /// filesystem migration's targets. A daemon refuses to start when the first
-/// two disagree. Outside this crate, `zerocode` derives the same
+/// two disagree. Outside this crate, `omnescode` derives the same
 /// `<config-dir>/data` for its daemon socket; keep them in step.
 pub(crate) fn install_data_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("data")
@@ -19727,11 +19727,11 @@ fn default_config_dir() -> Result<PathBuf> {
     Ok(home.join(".omnesagent"))
 }
 
-/// Canonical on-disk directory for a locale's runtime/zerocode FTL catalogues:
+/// Canonical on-disk directory for a locale's runtime/omnescode FTL catalogues:
 /// `<config_dir>/data/ftl/<locale>/`. This is where `omnesagent locales fetch`
 /// writes downloaded translations and where the runtime i18n loader reads them.
 /// `<config_dir>` honors `OMNESAGENT_CONFIG_DIR` and otherwise defaults to
-/// `~/.omnesagent`. The zerocode binary mirrors this path inline (it carries no
+/// `~/.omnesagent`. The omnescode binary mirrors this path inline (it carries no
 /// `omnesagent-*` dependency).
 pub fn ftl_locale_dir(locale: &str) -> Result<PathBuf> {
     Ok(install_data_dir(&default_config_dir()?)
@@ -19756,9 +19756,9 @@ pub const FTL_CATALOGS: &[(&str, &str, &str)] = &[
         "tools.ftl",
     ),
     (
-        "zerocode",
-        "apps/omnescode/locales/{locale}/zerocode.ftl",
-        "zerocode.ftl",
+        "omnescode",
+        "apps/omnescode/locales/{locale}/omnescode.ftl",
+        "omnescode.ftl",
     ),
 ];
 
@@ -39710,7 +39710,7 @@ model = "gpt-4o"
 
     #[test]
     async fn map_key_create_survives_incremental_save() {
-        // Repro for the zerocode "providers vanish after restart" report:
+        // Repro for the omnescode "providers vanish after restart" report:
         // the RPC config/map-key-create path is create_map_key + mark_dirty
         // + save_dirty. The new alias must reach config.toml, otherwise it
         // exists only in-memory and a daemon restart silently drops it

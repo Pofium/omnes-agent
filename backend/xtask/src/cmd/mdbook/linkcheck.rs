@@ -138,17 +138,17 @@ mod tests {
 
     #[test]
     fn extract_hrefs_pulls_quoted_links() {
-        let html = r#"<a href="./config.html">x</a> <a href="../zerocode/overview.html#sec">y</a>"#;
+        let html = r#"<a href="./config.html">x</a> <a href="../omnescode/overview.html#sec">y</a>"#;
         assert_eq!(
             extract_hrefs(html),
-            vec!["./config.html", "../zerocode/overview.html#sec"]
+            vec!["./config.html", "../omnescode/overview.html#sec"]
         );
     }
 
     #[test]
     fn is_checkable_skips_external_anchor_and_site_absolute() {
         assert!(is_checkable("./config.html"));
-        assert!(is_checkable("../zerocode/running.html"));
+        assert!(is_checkable("../omnescode/running.html"));
         assert!(!is_checkable("https://example.com"));
         assert!(!is_checkable("#section"));
         assert!(!is_checkable("/_shared/theme/custom.css"));
@@ -159,8 +159,8 @@ mod tests {
     #[test]
     fn normalize_resolves_parent_segments() {
         let p = normalize(Path::new(
-            "/book/en/getting-started/../zerocode/overview.html",
+            "/book/en/getting-started/../omnescode/overview.html",
         ));
-        assert_eq!(p, PathBuf::from("/book/en/zerocode/overview.html"));
+        assert_eq!(p, PathBuf::from("/book/en/omnescode/overview.html"));
     }
 }

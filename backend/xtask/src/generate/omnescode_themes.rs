@@ -5,16 +5,16 @@ use serde_json::{Map, Value};
 
 const REGISTRY: &str = "web/src/contexts/themes.json";
 
-/// Render the checked-in ZeroCode theme table from the dashboard registry.
+/// Render the checked-in OmnesCode theme table from the dashboard registry.
 ///
 /// `themes.json` stays canonical. The generated Rust lives inside the
-/// `zerocode` package so `cargo package` does not depend on files outside the
+/// `omnescode` package so `cargo package` does not depend on files outside the
 /// package directory; the existing installer drift gate checks the materialized
 /// table on every PR.
 pub fn render_file(root: &Path, _current: &str) -> Result<String> {
     render(
         &std::fs::read_to_string(root.join(REGISTRY))
-            .with_context(|| format!("read canonical ZeroCode theme registry {REGISTRY}"))?,
+            .with_context(|| format!("read canonical OmnesCode theme registry {REGISTRY}"))?,
     )
 }
 

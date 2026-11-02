@@ -197,7 +197,7 @@ fn render_config_where(path: &str, depth: usize) -> anyhow::Result<String> {
 
 Open [`/config/{route}`](http://127.0.0.1:42617/config/{route}) in the web dashboard.
 
-#### zerocode
+#### omnescode
 
 In the **Config** pane, under **{label}**.
 
@@ -377,7 +377,7 @@ fn config_section_label(path: &str) -> anyhow::Result<String> {
 
 /// Render a secret-field setter widget. Secrets are stored encrypted; they must
 /// never be hand-written into `config.toml`. Tabs cover only the surfaces that
-/// encrypt on write: the gateway dashboard, zerocode, and `omnesagent config set`
+/// encrypt on write: the gateway dashboard, omnescode, and `omnesagent config set`
 /// (masked input). The arg is the full dotted path to the secret field.
 fn render_secret_config(path: &str) -> String {
     let path = path.trim();
@@ -395,7 +395,7 @@ fn render_secret_config(path: &str) -> String {
 
 Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field there.
 
-#### zerocode
+#### omnescode
 
 In the **Config** pane, set the `{display_path}` field (input is masked).
 
@@ -410,7 +410,7 @@ omnesagent config set {path}    # prompts for masked input, stores encrypted
 }
 
 /// Render a set-it-any-surface widget for a single non-secret config field.
-/// Same three-surface tabs as `secret-config` (gateway dashboard, zerocode,
+/// Same three-surface tabs as `secret-config` (gateway dashboard, omnescode,
 /// `omnesagent config set`) minus the masked-secret framing. The arg is the full
 /// dotted path to the field, e.g. `channels.git.<alias>.app_id`. Used by setup
 /// guides that walk each required field individually.
@@ -425,7 +425,7 @@ fn render_config_set(path: &str) -> String {
 
 Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field there.
 
-#### zerocode
+#### omnescode
 
 In the **Config** pane, set the `{display_path}` field.
 
@@ -506,7 +506,7 @@ Set the thread behavior on any surface:
 
 Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and toggle the `{display_path}` field.
 
-#### zerocode
+#### omnescode
 
 In the **Config** pane, set the `{display_path}` field.
 
@@ -594,7 +594,7 @@ Set it on any surface:
 
 Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{display_path}` field.
 
-#### zerocode
+#### omnescode
 
 In the **Config** pane, set the `{display_path}` field.
 
@@ -683,7 +683,7 @@ fn render_example(p: &PeerParams) -> String {
     format!(
         "A {key} peer group named e.g. `my_{key}_group` sets `channel = \"{key}\"`, \
 allows `{example}` in `external_peers`, names {agents}{ignore}. Set it through \
-the gateway dashboard, zerocode, or `omnesagent config set`.",
+the gateway dashboard, omnescode, or `omnesagent config set`.",
         key = p.key,
         agents = agents,
         example = p.sender_example,

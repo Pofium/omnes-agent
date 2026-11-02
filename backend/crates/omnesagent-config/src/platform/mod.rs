@@ -310,7 +310,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn native_build_rejects_bare_name_not_on_path() {
-        let err = NativeRuntime::with_shell("zc-no-such-shell-on-path".into())
+        let err = NativeRuntime::with_shell("oc-no-such-shell-on-path".into())
             .build_shell_command("echo test", &std::env::temp_dir())
             .unwrap_err();
         assert!(

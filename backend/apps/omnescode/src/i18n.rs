@@ -10,7 +10,7 @@ static LOCALE: OnceLock<String> = OnceLock::new();
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 static REPORTED_MISSING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-const EN_FTL: &str = include_str!("../locales/en/zerocode.ftl");
+const EN_FTL: &str = include_str!("../locales/en/omnescode.ftl");
 
 struct FtlSources {
     locale: String,
@@ -115,9 +115,9 @@ fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String
 }
 
 fn load_ftl_from_disk(locale: &str) -> Option<String> {
-    let filename = format!("{locale}/zerocode.ftl");
+    let filename = format!("{locale}/omnescode.ftl");
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(explicit) = std::env::var("ZEROCODE_LOCALE_DIR") {
+    if let Ok(explicit) = std::env::var("OMNESCODE_LOCALE_DIR") {
         candidates.push(PathBuf::from(explicit).join(&filename));
     }
     candidates.push(config_dir().join("data").join("ftl").join(&filename));
@@ -132,7 +132,7 @@ fn load_ftl_from_disk(locale: &str) -> Option<String> {
 /// Resolve the OmnesAgent config directory with the same precedence as
 /// `client::resolve_config_dir`: the `--config-dir` flag (passed to `init` and
 /// cached in `CONFIG_DIR`) first, then `OMNESAGENT_CONFIG_DIR`, then `~/.omnesagent`.
-/// This keeps the FTL read path aligned with the flag the rest of zerocode uses.
+/// This keeps the FTL read path aligned with the flag the rest of omnescode uses.
 pub(crate) fn config_dir() -> PathBuf {
     if let Some(dir) = CONFIG_DIR.get() {
         return dir.clone();
@@ -153,10 +153,13 @@ fn locale_from_config() -> Option<String> {
 }
 
 /// Path-pure core of [`locale_from_config`]: read the `locale` key from
-/// `<dir>/zerocode-config.toml`. Kept separate so the read path can be tested
+/// `<dir>/omnescode-config.toml`, falling back to a leftover pre-rebrand
+/// `zerocode-config.toml`. Kept separate so the read path can be tested
 /// against the writer's filename without touching process-global state.
 fn locale_from_config_dir(dir: &std::path::Path) -> Option<String> {
-    let contents = std::fs::read_to_string(dir.join("zerocode-config.toml")).ok()?;
+    let contents = ["omnescode-config.toml", "zerocode-config.toml"]
+        .into_iter()
+        .find_map(|name| std::fs::read_to_string(dir.join(name)).ok())?;
     let table = contents.parse::<toml::Table>().ok()?;
     let locale = table.get("locale").and_then(|v| v.as_str())?;
     let trimmed = locale.trim();
@@ -213,7 +216,7 @@ fn record_missing(key: &str) {
     if let Ok(mut guard) = set.lock()
         && guard.insert(key.to_string())
     {
-        eprintln!("zerocode: missing i18n key: {key}");
+        eprintln!("omnescode: missing i18n key: {key}");
     }
 }
 
@@ -224,12 +227,12 @@ mod tests {
     #[test]
     fn en_catalogue_parses() {
         let map = format_ftl_messages(EN_FTL, "en");
-        assert!(map.contains_key("zc-pane-dashboard"));
-        assert!(map.contains_key("zc-pane-chat"));
+        assert!(map.contains_key("oc-pane-dashboard"));
+        assert!(map.contains_key("oc-pane-chat"));
         let mismatch = format_ftl_message(
             EN_FTL,
             "en",
-            "zc-error-daemon-version-mismatch",
+            "oc-error-daemon-version-mismatch",
             &[("client_version", "0.8.1"), ("server_version", "0.8.0")],
         )
         .unwrap();
@@ -237,37 +240,37 @@ mod tests {
         assert!(mismatch.contains("0.8.0"));
     }
 
-    // Every Config-pane key the zerocode UI section renders must resolve
+    // Every Config-pane key the omnescode UI section renders must resolve
     // through the *same* Fluent bundle the TUI uses, never falling back to the
     // raw `{key}` identifier. Code and catalog can drift independently, so this
-    // pins the exact keys `zerocode_pane.rs` looks up for the Todo tracker UI.
+    // pins the exact keys `omnescode_pane.rs` looks up for the Todo tracker UI.
     #[test]
     fn todo_tracker_config_keys_resolve() {
         let map = format_ftl_messages(EN_FTL, "en");
         const KEYS: &[&str] = &[
             // Section tabs
-            "zc-zerocode-tab-todo-tracker",
+            "oc-omnescode-tab-todo-tracker",
             // Todo tracker section
-            "zc-zerocode-tracker-title",
-            "zc-zerocode-tracker-enabled",
-            "zc-zerocode-tracker-enabled-at-start",
-            "zc-zerocode-tracker-location",
-            "zc-zerocode-tracker-width",
-            "zc-zerocode-tracker-max-height",
-            "zc-zerocode-tracker-saved",
-            "zc-zerocode-tracker-saved-env-override",
-            "zc-zerocode-tracker-saved-resolve-error",
-            "zc-zerocode-tracker-saved-still-invalid",
-            "zc-zerocode-tracker-edit-refused",
-            "zc-zerocode-tracker-edit-number",
-            "zc-zerocode-tracker-edit-bool",
-            "zc-zerocode-tracker-edit-location",
+            "oc-omnescode-tracker-title",
+            "oc-omnescode-tracker-enabled",
+            "oc-omnescode-tracker-enabled-at-start",
+            "oc-omnescode-tracker-location",
+            "oc-omnescode-tracker-width",
+            "oc-omnescode-tracker-max-height",
+            "oc-omnescode-tracker-saved",
+            "oc-omnescode-tracker-saved-env-override",
+            "oc-omnescode-tracker-saved-resolve-error",
+            "oc-omnescode-tracker-saved-still-invalid",
+            "oc-omnescode-tracker-edit-refused",
+            "oc-omnescode-tracker-edit-number",
+            "oc-omnescode-tracker-edit-bool",
+            "oc-omnescode-tracker-edit-location",
             // Shared Config-pane validation/status keys
-            "zc-zerocode-config-invalid-number",
-            "zc-zerocode-config-positive-required",
-            "zc-zerocode-config-save-mismatch",
+            "oc-omnescode-config-invalid-number",
+            "oc-omnescode-config-positive-required",
+            "oc-omnescode-config-save-mismatch",
             // Help hints
-            "zc-zerocode-help-todo-tracker",
+            "oc-omnescode-help-todo-tracker",
         ];
         for key in KEYS {
             let value = map
@@ -287,17 +290,17 @@ mod tests {
         let save_failed = format_ftl_message(
             EN_FTL,
             "en",
-            "zc-zerocode-config-save-failed",
+            "oc-omnescode-config-save-failed",
             &[("error", "disk unavailable")],
         )
         .expect("argument-bearing Config-pane save error key must format");
         assert!(save_failed.contains("disk unavailable"));
         assert_ne!(
             t_args(
-                "zc-zerocode-config-save-failed",
+                "oc-omnescode-config-save-failed",
                 &[("error", "disk unavailable")]
             ),
-            "{zc-zerocode-config-save-failed}"
+            "{oc-omnescode-config-save-failed}"
         );
 
         // The malformed-section prompt carries the parser detail, so it is
@@ -305,7 +308,7 @@ mod tests {
         let load_error = format_ftl_message(
             EN_FTL,
             "en",
-            "zc-zerocode-tracker-load-error",
+            "oc-omnescode-tracker-load-error",
             &[("error", "invalid type: string")],
         )
         .expect("argument-bearing tracker load error key must format");
@@ -317,17 +320,17 @@ mod tests {
     fn argument_messages_format_in_all_builtin_catalogues() {
         let catalogues = [
             ("en", EN_FTL),
-            ("es", include_str!("../locales/es/zerocode.ftl")),
-            ("fr", include_str!("../locales/fr/zerocode.ftl")),
-            ("ja", include_str!("../locales/ja/zerocode.ftl")),
-            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+            ("es", include_str!("../locales/es/omnescode.ftl")),
+            ("fr", include_str!("../locales/fr/omnescode.ftl")),
+            ("ja", include_str!("../locales/ja/omnescode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/omnescode.ftl")),
         ];
 
         for (locale, source) in catalogues {
             let timeout = format_ftl_message(
                 source,
                 locale,
-                "zc-error-daemon-initialize-timeout",
+                "oc-error-daemon-initialize-timeout",
                 &[("seconds", "10")],
             )
             .unwrap_or_else(|| panic!("timeout message must format for {locale}"));
@@ -336,7 +339,7 @@ mod tests {
             let controls = format_ftl_message(
                 source,
                 locale,
-                "zc-app-help-controls",
+                "oc-app-help-controls",
                 &[("up", "↑"), ("down", "↓"), ("cancel", "Esc")],
             )
             .unwrap_or_else(|| panic!("help controls must format for {locale}"));
@@ -350,17 +353,17 @@ mod tests {
     fn spawned_daemon_startup_failure_formats_in_all_builtin_catalogues() {
         let catalogues = [
             ("en", EN_FTL),
-            ("es", include_str!("../locales/es/zerocode.ftl")),
-            ("fr", include_str!("../locales/fr/zerocode.ftl")),
-            ("ja", include_str!("../locales/ja/zerocode.ftl")),
-            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+            ("es", include_str!("../locales/es/omnescode.ftl")),
+            ("fr", include_str!("../locales/fr/omnescode.ftl")),
+            ("ja", include_str!("../locales/ja/omnescode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/omnescode.ftl")),
         ];
 
         for (locale, source) in catalogues {
             let failure = format_ftl_message(
                 source,
                 locale,
-                "zc-error-spawned-daemon-startup",
+                "oc-error-spawned-daemon-startup",
                 &[("details", "test failure")],
             )
             .unwrap_or_else(|| panic!("spawned-daemon failure must format for {locale}"));
@@ -375,17 +378,17 @@ mod tests {
         // diagnostics never fall back to a bare `{key}` placeholder.
         let catalogues = [
             ("en", EN_FTL),
-            ("es", include_str!("../locales/es/zerocode.ftl")),
-            ("fr", include_str!("../locales/fr/zerocode.ftl")),
-            ("ja", include_str!("../locales/ja/zerocode.ftl")),
-            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+            ("es", include_str!("../locales/es/omnescode.ftl")),
+            ("fr", include_str!("../locales/fr/omnescode.ftl")),
+            ("ja", include_str!("../locales/ja/omnescode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/omnescode.ftl")),
         ];
 
         for (locale, source) in catalogues {
             for key in [
-                "zc-doctor-error-daemon-timeout",
-                "zc-doctor-partial-banner",
-                "zc-doctor-partial-hint",
+                "oc-doctor-error-daemon-timeout",
+                "oc-doctor-partial-banner",
+                "oc-doctor-partial-hint",
             ] {
                 assert!(
                     format_ftl_message(source, locale, key, &[]).is_some(),
@@ -396,13 +399,13 @@ mod tests {
             let log_path = format_ftl_message(
                 source,
                 locale,
-                "zc-doctor-log-path",
+                "oc-doctor-log-path",
                 &[("path", "/tmp/trace-2026-08-01.jsonl")],
             )
-            .unwrap_or_else(|| panic!("zc-doctor-log-path must format for {locale}"));
+            .unwrap_or_else(|| panic!("oc-doctor-log-path must format for {locale}"));
             assert!(
                 log_path.contains("/tmp/trace-2026-08-01.jsonl"),
-                "zc-doctor-log-path must embed the resolved path for {locale}: {log_path}"
+                "oc-doctor-log-path must embed the resolved path for {locale}: {log_path}"
             );
         }
     }
@@ -413,25 +416,25 @@ mod tests {
             ("en", EN_FTL, "Daemon Memory", "Daemon CPU"),
             (
                 "es",
-                include_str!("../locales/es/zerocode.ftl"),
+                include_str!("../locales/es/omnescode.ftl"),
                 "Memoria del demonio",
                 "CPU del demonio",
             ),
             (
                 "fr",
-                include_str!("../locales/fr/zerocode.ftl"),
+                include_str!("../locales/fr/omnescode.ftl"),
                 "Mémoire du démon",
                 "CPU du démon",
             ),
             (
                 "ja",
-                include_str!("../locales/ja/zerocode.ftl"),
+                include_str!("../locales/ja/omnescode.ftl"),
                 "デーモンメモリ",
                 "デーモン CPU",
             ),
             (
                 "zh-CN",
-                include_str!("../locales/zh-CN/zerocode.ftl"),
+                include_str!("../locales/zh-CN/omnescode.ftl"),
                 "守护进程内存",
                 "守护进程 CPU",
             ),
@@ -439,13 +442,13 @@ mod tests {
 
         for (locale, source, expected_memory, expected_cpu) in catalogues {
             assert_eq!(
-                format_ftl_message(source, locale, "zc-dashboard-label-daemon-memory", &[],)
+                format_ftl_message(source, locale, "oc-dashboard-label-daemon-memory", &[],)
                     .as_deref(),
                 Some(expected_memory),
                 "daemon memory label for {locale}"
             );
             assert_eq!(
-                format_ftl_message(source, locale, "zc-dashboard-label-daemon-cpu", &[]).as_deref(),
+                format_ftl_message(source, locale, "oc-dashboard-label-daemon-cpu", &[]).as_deref(),
                 Some(expected_cpu),
                 "daemon CPU label for {locale}"
             );
@@ -454,8 +457,8 @@ mod tests {
 
     #[test]
     fn missing_key_returns_brace_form() {
-        let value = t("zc-definitely-not-a-real-key");
-        assert_eq!(value, "{zc-definitely-not-a-real-key}");
+        let value = t("oc-definitely-not-a-real-key");
+        assert_eq!(value, "{oc-definitely-not-a-real-key}");
     }
 
     #[test]

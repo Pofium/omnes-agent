@@ -6,7 +6,7 @@
 //!
 //! `zerorelay` is a standalone networking app (not daemon-path code), so bare
 //! `tokio::spawn` is the right primitive here; the `omnesagent_spawn::spawn!` rule
-//! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption (and lib.rs).
+//! is for in-daemon tasks. Mirrors the `apps/omnescode` exemption (and lib.rs).
 #![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
@@ -637,7 +637,7 @@ fn provision_tls_acceptor(
         "    daemon  [relay] relay_ca_path = \"{}\"",
         mats.ca_cert_path.display()
     );
-    eprintln!("    zerocode  --relay-ca {}", mats.ca_cert_path.display());
+    eprintln!("    omnescode  --relay-ca {}", mats.ca_cert_path.display());
     Ok(acceptor)
 }
 

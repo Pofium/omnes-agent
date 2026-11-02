@@ -12193,7 +12193,7 @@ mod tests {
         let store = std::sync::Arc::new(FailingSaveLeasedStore::healthy());
         let mut sop = deterministic_sop("det-cp-state-file-fails");
         let location_file = std::env::temp_dir().join(format!(
-            "zc-state-location-file-{}",
+            "oc-state-location-file-{}",
             now_iso8601().replace(':', "-")
         ));
         std::fs::write(&location_file, "not a directory").unwrap();
@@ -15472,7 +15472,7 @@ type = "manual"
         // Fix 0b: a resolved run must not leave a stale `<run_id>.state.json`
         // claiming it is still paused — the run store and approval ledger are
         // the durable record, the snapshot is only a rehydration artifact.
-        let dir = std::env::temp_dir().join(format!("zc-snapshot-cleanup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oc-snapshot-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut sop = capability_checkpoint_sop("cp-snapshot");
         sop.location = Some(dir.clone());
@@ -15556,7 +15556,7 @@ type = "manual"
     fn engine_restores_runs_from_store() {
         use super::super::store::SqliteRunStore;
         let path =
-            std::env::temp_dir().join(format!("zc-sop-engine-restore-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("oc-sop-engine-restore-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         // Seed a WaitingApproval run directly into a durable store.
         let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
@@ -15600,7 +15600,7 @@ type = "manual"
     fn engine_persist_bumps_revision_across_active_and_terminal() {
         use super::super::store::SqliteRunStore;
         let path =
-            std::env::temp_dir().join(format!("zc-sop-engine-persist-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("oc-sop-engine-persist-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
@@ -15660,7 +15660,7 @@ type = "manual"
     fn deterministic_active_run_persists_and_restores_before_terminal() {
         use super::super::store::SqliteRunStore;
         let path =
-            std::env::temp_dir().join(format!("zc-sop-det-restore-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("oc-sop-det-restore-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
 
@@ -16195,7 +16195,7 @@ type = "manual"
     fn engine_restores_finished_runs_from_store() {
         use super::super::store::SqliteRunStore;
         let path = std::env::temp_dir().join(format!(
-            "zc-sop-engine-restore-fin-{}.db",
+            "oc-sop-engine-restore-fin-{}.db",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

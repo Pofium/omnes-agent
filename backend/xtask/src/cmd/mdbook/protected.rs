@@ -11,7 +11,7 @@ pub struct ProtectedLiteral {
 const DOC_LOCAL_TERMS: &[&str] = &[
     "OmnesAgent",
     "OmnesAgent Maturity Framework",
-    "zerocode",
+    "omnescode",
     "ACP",
     "MCP",
     "TOML",
@@ -27,7 +27,7 @@ const COMMAND_PREFIXES: &[&str] = &[
     "bash",
     "cd",
     "omnesagent",
-    "zerocode",
+    "omnescode",
     "cargo",
     "git",
     "gh",
