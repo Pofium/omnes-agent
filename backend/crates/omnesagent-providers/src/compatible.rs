@@ -9277,12 +9277,13 @@ mod tests {
              a default-config boundary pass would have trimmed to 4: {content}"
         );
 
-        // The default policy is what the boundary used before this fix. With
-        // per-image eviction the same five-image message is trimmed to the
-        // default cap of 4 — the oldest image is evicted even though the
-        // operator's configuration had accepted all five. That boundary-side
-        // re-trim is the data loss the configured policy prevents, so pin it
-        // so a regression cannot quietly restore the default-config pass.
+        // The default policy is what the boundary used before this fix. The
+        // boundary trims in batches, so the same five-image message drops to
+        // the low-water mark of 2 under the default cap of 4 — images evicted
+        // even though the operator's configuration had accepted all five.
+        // That boundary-side re-trim is the data loss the configured policy
+        // prevents, so pin it so a regression cannot quietly restore the
+        // default-config pass.
         let default_provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("Test")
             .base_url("https://example.invalid/v1")
@@ -9298,9 +9299,9 @@ mod tests {
             .matches("[IMAGE:data:image/png;base64,")
             .count();
         assert_eq!(
-            default_surviving, 4,
-            "under the default max_images = 4 the boundary pass evicts the oldest image; \
-             that re-trim is what the configured policy prevents"
+            default_surviving, 2,
+            "under the default max_images = 4 the boundary pass evicts down to the \
+             low-water mark of 2; that re-trim is what the configured policy prevents"
         );
     }
     #[tokio::test]
