@@ -1569,9 +1569,21 @@ async fn prepare_messages_inner(
         let cleaned_text = parsed.cleaned;
         let refs = parsed.refs;
         if refs.is_empty() {
+            // A message with no loadable marker leaves preparation
+            // byte-for-byte as it arrived, matching the no-image fast path
+            // above: the rewritten text is whitespace-trimmed, and applying
+            // it here would strip leading indentation from user-supplied
+            // code whenever some other message in the history carries an
+            // image. Only a rejected marker changes the text, and that
+            // rewrite must still be dispatched in place of the raw marker.
+            let content = if parsed.rejected_count == 0 {
+                message.content.clone()
+            } else {
+                cleaned_text
+            };
             normalized_messages.push(ChatMessage {
                 role: message.role.clone(),
-                content: cleaned_text,
+                content,
             });
             continue;
         }
@@ -7822,6 +7834,69 @@ mod tests {
         assert_eq!(cleaned, "Please inspect this screenshot");
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_keeps_marker_free_user_text_verbatim_beside_an_image() {
+        // An image anywhere in the history sends every user message through
+        // full preparation. Messages without a loadable marker must still
+        // leave it unchanged: leading indentation of pasted code and
+        // trailing newlines are content.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("sample.png");
+        std::fs::write(&image_path, valid_png()).unwrap();
+
+        let pasted_code = "    fn indented() {\n        body();\n    }\n\n";
+        let placeholder = format!("  see {IMAGE_MARKER_PREFIX}<path>] in the docs  \n");
+        let messages = vec![
+            ChatMessage::user(pasted_code),
+            ChatMessage::user(placeholder.clone()),
+            ChatMessage::user(format!(
+                "and this {IMAGE_MARKER_PREFIX}{}]",
+                image_path.display()
+            )),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .unwrap();
+
+        assert!(prepared.contains_images, "the real image must survive");
+        assert_eq!(prepared.messages.len(), 3);
+        assert_eq!(prepared.messages[0].content, pasted_code);
+        assert_eq!(prepared.messages[1].content, placeholder);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_rewrites_rejected_marker_in_user_text_beside_an_image() {
+        // The verbatim pass-through covers text without a refused marker
+        // only. A user message whose sole marker is refused still dispatches
+        // the rewrite, never the raw marker body.
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("sample.png");
+        std::fs::write(&image_path, valid_png()).unwrap();
+
+        let payload = "A".repeat(MAX_IMAGE_MARKER_BYTES + 1);
+        let data_uri_head = concat!("data:image/png", ";base64,");
+        let messages = vec![
+            ChatMessage::user(format!(
+                "  look {IMAGE_MARKER_PREFIX}{data_uri_head}{payload}]"
+            )),
+            ChatMessage::user(format!(
+                "and this {IMAGE_MARKER_PREFIX}{}]",
+                image_path.display()
+            )),
+        ];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("a refused marker must not fail preparation");
+
+        assert!(prepared.contains_images, "the real image must survive");
+        let rewritten = &prepared.messages[0].content;
+        assert!(rewritten.contains("look"));
+        assert!(rewritten.contains(REJECTED_IMAGE_MARKER_NOTE));
+        assert!(!rewritten.contains(&payload[..128]));
     }
 
     #[tokio::test]
