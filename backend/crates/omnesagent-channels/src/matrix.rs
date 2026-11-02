@@ -6211,6 +6211,21 @@ mod tests {
         }
 
         #[test]
+        fn echoed_media_placeholder_delivered_as_prose() {
+            // A text-only model sees the degradation placeholder in its
+            // history and may repeat it; the reply must reach the room as
+            // readable text, not as a marker or a stray bracket span.
+            let reply = format!(
+                "I can't view that, it shows as {}.",
+                omnesagent_providers::multimodal::MEDIA_PLACEHOLDER
+            );
+            let (text, ms) = parse(&reply);
+            assert_eq!(text, reply);
+            assert!(ms.is_empty());
+            assert!(!text.contains('['));
+        }
+
+        #[test]
         fn multiple_markers_with_text_in_between() {
             let (text, ms) =
                 parse("before [image:https://x/y.jpg] middle [file:/tmp/doc.pdf] after");

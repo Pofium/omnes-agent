@@ -190,9 +190,10 @@ pub(crate) fn looks_like_image_rejection(e: &anyhow::Error) -> bool {
 /// (content policy, unsupported format, oversized media) rejects every later
 /// turn that re-prepares the same marker — the session can never move past
 /// it. Mirror the context-overflow recovery: rewrite the offending markers to
-/// the same `[media attachment]` placeholder the non-vision degrade path uses
-/// (surrounding text survives) and let the caller retry. Returns whether any
-/// marker was actually removed; `false` leaves the history untouched so the
+/// the same `(media attachment omitted)` placeholder the non-vision degrade
+/// path uses (surrounding text survives) and let the caller retry. Returns
+/// whether any marker was actually removed; `false` leaves the history
+/// untouched so the
 /// turn fails exactly as it would have before.
 pub(crate) fn try_recover_image_rejection(
     history: &mut Vec<ChatMessage>,
@@ -282,7 +283,10 @@ mod tests {
         assert_eq!(history.len(), 4);
         assert_eq!(
             history[1].content,
-            "look at this [media attachment] please"
+            format!(
+                "look at this {} please",
+                omnesagent_providers::multimodal::MEDIA_PLACEHOLDER
+            )
         );
         assert!(!history[1].content.contains("[IMAGE:"));
         assert!(!history[3].content.contains("[IMAGE:"));

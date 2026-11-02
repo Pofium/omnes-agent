@@ -4255,15 +4255,15 @@ fn sanitize_channel_response_with_leak_detection(
     )
 }
 
-/// Remove `[media attachment]` placeholders a model echoed from degraded
-/// history. The placeholder is an internal contract token (`strip_media_markers`
-/// rewrites `[IMAGE:...]`/`[AUDIO:...]` markers to it before the request), and
-/// when a non-vision model quotes it verbatim the end user sees a raw internal
-/// artifact. Lines that carried only the placeholder are dropped; surrounding
-/// text keeps its line structure. Content without the placeholder is returned
-/// untouched.
+/// Remove `(media attachment omitted)` placeholders a model echoed from
+/// degraded history. The placeholder is an internal contract token
+/// (`strip_media_markers` rewrites `[IMAGE:...]`/`[AUDIO:...]` markers to it
+/// before the request), and when a non-vision model quotes it verbatim the end
+/// user sees an internal artifact. Lines that carried only the placeholder are
+/// dropped; surrounding text keeps its line structure. Content without the
+/// placeholder is returned untouched.
 fn strip_media_attachment_placeholder_echoes(content: &str) -> String {
-    let placeholder = omnesagent_providers::multimodal::MEDIA_ATTACHMENT_PLACEHOLDER;
+    let placeholder = omnesagent_providers::multimodal::MEDIA_PLACEHOLDER;
     if !content.contains(placeholder) {
         return content.to_string();
     }
@@ -4306,9 +4306,9 @@ fn sanitize_channel_response_for_format_with_leak_detection(
     let trimmed_response = response.trim();
     let trimmed_response = strip_think_tags_inline(trimmed_response).trim().to_string();
     let trimmed_response = trimmed_response.as_str();
-    // Model replies echo the internal `[media attachment]` placeholder that
-    // degraded history carries (issue: the placeholder reaching end users).
-    // Scrub the echo before the rest of the guardrail chain runs.
+    // Model replies echo the internal `(media attachment omitted)` placeholder
+    // that degraded history carries (issue: the placeholder reaching end
+    // users). Scrub the echo before the rest of the guardrail chain runs.
     let trimmed_response = strip_media_attachment_placeholder_echoes(trimmed_response);
     let trimmed_response = trimmed_response.as_str();
     // Final channel guardrail: reuse the parser classifier so channel cleanup
@@ -16763,10 +16763,14 @@ api_key = "anthropic-key"
 
     #[test]
     fn sanitize_channel_response_strips_echoed_media_attachment_placeholder() {
-        // Degraded history carries `[media attachment]`; a non-vision model
-        // quoting it verbatim must not ship the internal artifact to the user.
-        let reply = "Here is what I can see:\n[media attachment]\n\nLet me know if you want details.";
-        let sanitized = sanitize_channel_response(reply, &[]);
+        // Degraded history carries `(media attachment omitted)`; a non-vision
+        // model quoting it verbatim must not ship the internal artifact to the
+        // user.
+        let reply = format!(
+            "Here is what I can see:\n{}\n\nLet me know if you want details.",
+            omnesagent_providers::multimodal::MEDIA_PLACEHOLDER
+        );
+        let sanitized = sanitize_channel_response(&reply, &[]);
         assert_eq!(
             sanitized,
             "Here is what I can see:\n\nLet me know if you want details."
@@ -16777,7 +16781,8 @@ api_key = "anthropic-key"
     fn sanitize_channel_response_placeholder_only_reply_scrubs_empty_and_plain_text_survives() {
         // A reply that is nothing but the echoed placeholder scrubs to empty;
         // the delivery layer substitutes its nonempty fallback for that.
-        let sanitized = sanitize_channel_response("[media attachment]", &[]);
+        let sanitized =
+            sanitize_channel_response(omnesagent_providers::multimodal::MEDIA_PLACEHOLDER, &[]);
         assert!(sanitized.trim().is_empty());
 
         // Ordinary prose that merely mentions attachments passes through.
