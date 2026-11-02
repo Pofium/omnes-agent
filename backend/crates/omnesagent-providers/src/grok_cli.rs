@@ -1236,7 +1236,7 @@ mod tests {
 
     #[test]
     fn binary_lookup_ignores_relative_path_entries() {
-        const CHILD_ENV: &str = "ZEROCLAW_TEST_GROK_PATH_SHADOW";
+        const CHILD_ENV: &str = "OMNESAGENT_TEST_GROK_PATH_SHADOW";
         if let Some(trusted) = std::env::var_os(CHILD_ENV) {
             let trusted = PathBuf::from(trusted);
             for relative in ["", ".", "bin"] {

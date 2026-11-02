@@ -107,12 +107,12 @@ async fn acp_stdio_identical_guard_suppression_shows_the_notice_once_and_ends_th
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_omnesagent"))
         .arg("acp")
-        .env("ZEROCLAW_CONFIG_DIR", dir.path())
+        .env("OMNESAGENT_CONFIG_DIR", dir.path())
         .env("RUST_LOG", "off")
         .env("LANG", "en_US.UTF-8")
         .env("LC_ALL", "en_US.UTF-8")
         .env_remove("LANGUAGE")
-        .env_remove("ZEROCLAW_WORKSPACE")
+        .env_remove("OMNESAGENT_WORKSPACE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -198,7 +198,7 @@ async fn acp_stdio_identical_guard_suppression_shows_the_notice_once_and_ends_th
     let _ = child.wait();
     let _ = reader.join();
 
-    if let Ok(path) = std::env::var("ZEROCLAW_ACP_FRAMES_OUT") {
+    if let Ok(path) = std::env::var("OMNESAGENT_ACP_FRAMES_OUT") {
         let dump: Vec<String> = frames.iter().map(ToString::to_string).collect();
         let _ = std::fs::write(path, dump.join("\n") + "\n");
     }

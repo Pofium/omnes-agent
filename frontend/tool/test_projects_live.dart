@@ -1,5 +1,5 @@
 // ignore_for_file: avoid_print
-// Pure Dart integration test for Projects and Files via ZeroClaw Gateway.
+// Pure Dart integration test for Projects and Files via OmnesAgent Gateway.
 import 'dart:convert';
 import 'dart:io';
 

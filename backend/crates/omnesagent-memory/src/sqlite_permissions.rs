@@ -592,7 +592,7 @@ mod tests {
                     "sqlite_permissions::tests::sqlite_storage_lock_probe",
                     "--ignored",
                 ])
-                .env("ZEROCLAW_SQLITE_LOCK_PROBE_PATH", &db)
+                .env("OMNESAGENT_SQLITE_LOCK_PROBE_PATH", &db)
                 .output()
                 .unwrap();
             assert!(
@@ -631,7 +631,7 @@ mod tests {
     #[test]
     #[ignore = "subprocess probe for sqlite_storage_inspection_preserves_live_database_locks"]
     fn sqlite_storage_lock_probe() {
-        let Some(db) = std::env::var_os("ZEROCLAW_SQLITE_LOCK_PROBE_PATH") else {
+        let Some(db) = std::env::var_os("OMNESAGENT_SQLITE_LOCK_PROBE_PATH") else {
             // Broad ignored-test runs do not provide the parent-owned lock fixture.
             return;
         };

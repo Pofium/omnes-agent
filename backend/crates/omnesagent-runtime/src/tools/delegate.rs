@@ -4303,7 +4303,7 @@ mod tests {
                     "--exact",
                     "control_plane::boot::tests::live_owner_process_helper",
                 ])
-                .env("ZEROCLAW_LIVE_OWNER_TEST_HELPER", "1")
+                .env("OMNESAGENT_LIVE_OWNER_TEST_HELPER", "1")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()

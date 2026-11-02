@@ -1,4 +1,4 @@
-// Models for OmnesAgent/ZeroClaw WebSocket Gateway frames.
+// Models for OmnesAgent WebSocket Gateway frames.
 // Mirrors web/src/types/api.ts and web/src/contexts/turnStream.logic.ts
 
 import 'trajectory_step.dart';
