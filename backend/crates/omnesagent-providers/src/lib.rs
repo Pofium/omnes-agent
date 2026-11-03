@@ -91,6 +91,37 @@ const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
+
+/// Test-only override for the Qwen OAuth token endpoint URL.
+/// When set via [`set_qwen_oauth_endpoint_for_test`], the refresh
+/// function uses this URL instead of the hardcoded production endpoint.
+/// Gated on `test-helpers` feature so downstream crates can use it in
+/// their own tests.
+#[cfg(any(test, feature = "test-helpers"))]
+static QWEN_OAUTH_ENDPOINT_OVERRIDE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// Override the Qwen OAuth token endpoint for deterministic testing.
+/// Call with `None` to restore the production endpoint after a test.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_qwen_oauth_endpoint_for_test(url: Option<String>) {
+    *QWEN_OAUTH_ENDPOINT_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = url;
+}
+
+/// Return the active Qwen OAuth token endpoint: the test override
+/// when running under `#[cfg(test)]`, or the production constant.
+fn qwen_oauth_token_endpoint() -> String {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Ok(guard) = QWEN_OAUTH_ENDPOINT_OVERRIDE.read()
+        && let Some(ref url) = *guard
+    {
+        return url.clone();
+    }
+    QWEN_OAUTH_TOKEN_ENDPOINT.to_string()
+}
+
 const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -327,7 +358,7 @@ pub(crate) fn refresh_qwen_oauth_access_token(
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
     let response = client
-        .post(QWEN_OAUTH_TOKEN_ENDPOINT)
+        .post(qwen_oauth_token_endpoint())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -2518,7 +2549,10 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/omnesagent-qwen-oauth-home-{}-file", std::process::id());
+        let fake_home = format!(
+            "/tmp/omnesagent-qwen-oauth-home-{}-file",
+            std::process::id()
+        );
         let creds_dir = PathBuf::from(&fake_home).join(".qwen");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let creds_path = creds_dir.join("oauth_creds.json");
@@ -2542,7 +2576,10 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_returns_none_without_cache() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/omnesagent-qwen-oauth-home-{}-empty", std::process::id());
+        let fake_home = format!(
+            "/tmp/omnesagent-qwen-oauth-home-{}-empty",
+            std::process::id()
+        );
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
@@ -3231,9 +3268,9 @@ mod tests {
     #[tokio::test]
     async fn routed_alias_uses_call_model_instead_of_configured_pin() {
         use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use omnesagent_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
         use serde_json::{Value, json};
         use std::sync::{Arc, Mutex};
-        use omnesagent_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
 
         type Capture = Arc<Mutex<Option<String>>>;
 
@@ -3666,10 +3703,10 @@ mod tests {
         // operator's policy, dropping allowed attachments. Drive a real request
         // and count the images that actually leave.
         use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
-        use serde_json::{Value, json};
-        use std::sync::{Arc, Mutex};
         use omnesagent_api::model_provider::ChatRequest;
         use omnesagent_config::schema::Config;
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
 
         type Capture = Arc<Mutex<Option<String>>>;
 
@@ -5466,10 +5503,9 @@ mod tests {
         let n = omnesagent_config::providers::MAX_FALLBACK_DEPTH + 50;
         for i in 0..n {
             let fallback = if i + 1 < n {
-                vec![omnesagent_config::providers::ModelProviderRef::new(format!(
-                    "openai.a{}",
-                    i + 1
-                ))]
+                vec![omnesagent_config::providers::ModelProviderRef::new(
+                    format!("openai.a{}", i + 1),
+                )]
             } else {
                 vec![]
             };

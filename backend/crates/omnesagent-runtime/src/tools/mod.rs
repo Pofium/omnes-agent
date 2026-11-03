@@ -167,12 +167,12 @@ use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
+use omnesagent_config::schema::{AliasedAgentConfig, Config};
+use omnesagent_memory::Memory;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
-use omnesagent_config::schema::{AliasedAgentConfig, Config};
-use omnesagent_memory::Memory;
 
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn omnesagent_api::channel::Channel>>>>;
@@ -1054,10 +1054,11 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — registered using the calling agent's provider
+    // LLM task tool — registered using the calling agent's provider.
+    // Preserves family + alias identity so alias-specific typed config
+    // (e.g. requires_openai_auth) survives into llm_task execution.
     if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
-        let llm_task_provider = family.to_string();
         let llm_task_model = entry
             .model
             .clone()
@@ -1066,7 +1067,9 @@ pub fn all_tools_with_runtime(
             omnesagent_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
-            llm_task_provider,
+            config.clone(),
+            family.to_string(),
+            alias.to_string(),
             llm_task_model,
             entry.temperature,
             entry.api_key.clone(),
@@ -1739,9 +1742,12 @@ pub fn all_tools_with_runtime(
                 Err(e) => {
                     ::omnesagent_log::record!(
                         ERROR,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
-                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Fail
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "microsoft365: failed to initialize tool"
                     );
                 }
@@ -1910,9 +1916,12 @@ pub fn all_tools_with_runtime(
                 Err(e) => {
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
-                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Note
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "Failed to load WASM plugins"
                     );
                 }
@@ -2051,13 +2060,16 @@ fn register_plugin_tools(
                 if !claim_plugin_tool_name(registered_names, tool.name()) {
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Load)
-                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "plugin": manifest.name,
-                                "tool": tool.name(),
-                                "error_key": "plugin_tool_name_conflict",
-                            })),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Load
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "tool": tool.name(),
+                            "error_key": "plugin_tool_name_conflict",
+                        })),
                         "Plugin tool conflicts with an already registered tool"
                     );
                     continue;
@@ -2096,11 +2108,11 @@ fn register_plugin_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use omnesagent_config::schema::{
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
         MemoryConfig, SopApprovalConfig,
     };
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
@@ -2488,8 +2500,9 @@ permissions = ["http_client"]
         write_tool_package(plugins.path(), "shell");
         write_tool_package(plugins.path(), "novel-tool");
 
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
         let config = plugin_activation_config(plugins.path());
 
         // `shell` is already taken by a native tool; `novel-tool` is free.
@@ -2515,8 +2528,9 @@ permissions = ["http_client"]
         write_tool_package(plugins.path(), "alpha");
         write_tool_package(plugins.path(), "beta");
 
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
         let config = plugin_activation_config(plugins.path());
 
         let probed = tool_packages_reaching_construction(&config, &host, &[]);
@@ -2571,8 +2585,9 @@ permissions = ["http_client"]
     fn shared_ceiling_keeps_an_unadmitted_tool_and_skill_out_of_the_real_loaders() {
         let plugins = TempDir::new().unwrap();
         let mut config = mixed_capability_fixture(&plugins);
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
 
         // Control: a ceiling wide enough for every candidate loads all of them,
         // so the assertions below cannot pass for want of a working fixture.
@@ -2610,8 +2625,9 @@ permissions = ["http_client"]
         let plugins = TempDir::new().unwrap();
         let mut config = mixed_capability_fixture(&plugins);
         config.plugins.max_active_instances = 2;
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
 
         let first_tools = tool_packages_reaching_construction(&config, &host, &[]);
         let second_tools = tool_packages_reaching_construction(&config, &host, &[]);
@@ -2655,8 +2671,9 @@ permissions = ["http_client"]
         write_tool_package(plugins.path(), "zeta");
         write_skill_package(plugins.path(), "beta");
 
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
 
         let mut config = Config::default();
         config.plugins.enabled = true;
@@ -3713,7 +3730,8 @@ permissions = ["http_client"]
         );
 
         // The old hardcoded "default" must fail — proving the fix is load-bearing.
-        let mem_default = omnesagent_memory::create_memory_for_agent(&config, "default", None).await;
+        let mem_default =
+            omnesagent_memory::create_memory_for_agent(&config, "default", None).await;
         assert!(
             mem_default.is_err(),
             "create_memory_for_agent(\"default\") must fail when agents.default is absent"
@@ -4231,7 +4249,8 @@ permissions = ["http_client"]
         let browser = BrowserConfig::default();
         let http = omnesagent_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
-        cfg.skills.prompt_injection_mode = omnesagent_config::schema::SkillsPromptInjectionMode::Full;
+        cfg.skills.prompt_injection_mode =
+            omnesagent_config::schema::SkillsPromptInjectionMode::Full;
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
@@ -4323,7 +4342,8 @@ permissions = ["http_client"]
         let mut cfg = test_config(&tmp);
         // Global stays Full; a runtime profile flips this agent to Compact and
         // the agent selects it via `runtime_profile`.
-        cfg.skills.prompt_injection_mode = omnesagent_config::schema::SkillsPromptInjectionMode::Full;
+        cfg.skills.prompt_injection_mode =
+            omnesagent_config::schema::SkillsPromptInjectionMode::Full;
         cfg.runtime_profiles.insert(
             "compact_profile".to_string(),
             omnesagent_config::schema::RuntimeProfileConfig {
@@ -4481,6 +4501,119 @@ permissions = ["http_client"]
         );
     }
 
+    // ── Regression: alias-specific provider config ───────────────────
+
+    /// Regression test: llm_task must preserve alias-specific
+    /// provider configuration so that families with typed alias fields
+    /// (e.g. OpenAI with `requires_openai_auth`) are constructed via the
+    /// alias-aware factory, not the legacy name-only factory.
+    ///
+    /// This test goes through the real `all_tools_with_runtime` registration
+    /// path — the same code that runs in production — then calls `execute()`
+    /// on the resulting `llm_task` tool and checks the error message.
+    ///
+    /// - On old master: `LlmTaskTool` stores only the family name ("openai"),
+    ///   `execute()` uses `create_model_provider_with_options("openai", …)`
+    ///   which passes `config=None, alias="default"` → falls back to
+    ///   `openai_missing_entry_fallback_config()` (requires_openai_auth=false)
+    ///   → creates standard `OpenAiModelProvider` → fails with a generic
+    ///   HTTP/auth error that does NOT mention "openai-codex".
+    ///
+    /// - On fixed branch: `LlmTaskTool` stores config + family + alias,
+    ///   `execute()` uses `create_model_provider_for_alias(&config, "openai",
+    ///   "codex", …)` → finds the typed alias with requires_openai_auth=true
+    ///   → creates `OpenAiCodexModelProvider` → fails at OAuth credential
+    ///   resolution with an error mentioning "openai-codex".
+    #[tokio::test]
+    async fn llm_task_uses_alias_aware_provider_for_alias_config() {
+        use omnesagent_config::schema::{
+            HttpRequestConfig, ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+            WebFetchConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+
+        // Config: agent "test-agent" with model_provider = "openai.codex",
+        // where codex has requires_openai_auth = true.
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.codex".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(omnesagent_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &HttpRequestConfig::default(),
+            &WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let llm_task = tools
+            .iter()
+            .find(|t| t.name() == "llm_task")
+            .expect("llm_task must be registered for agent with model_provider");
+
+        let result = llm_task
+            .execute(serde_json::json!({"prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "execute must fail without credentials");
+        let error = result.error.expect("error must be present");
+
+        // The alias-aware factory routes openai.codex (requires_openai_auth=true)
+        // to OpenAiCodexModelProvider, whose credential resolution fails with
+        // an error mentioning "openai-codex".  The legacy factory would create
+        // a standard OpenAI provider whose error does NOT mention "openai-codex".
+        assert!(
+            error.contains("openai-codex"),
+            "llm_task should construct the Codex provider for \
+             openai.codex (requires_openai_auth=true), producing an \
+             openai-codex credential error; got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn file_download_factory_seam_reflects_live_config_revocation() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
@@ -4603,7 +4736,9 @@ mod wrapper_spec_forwarding_tests {
 
     impl ::omnesagent_api::attribution::Attributable for ArcSchemaTool {
         fn role(&self) -> ::omnesagent_api::attribution::Role {
-            ::omnesagent_api::attribution::Role::Tool(::omnesagent_api::attribution::ToolKind::Plugin)
+            ::omnesagent_api::attribution::Role::Tool(
+                ::omnesagent_api::attribution::ToolKind::Plugin,
+            )
         }
         fn alias(&self) -> &str {
             "arc-schema-tool"

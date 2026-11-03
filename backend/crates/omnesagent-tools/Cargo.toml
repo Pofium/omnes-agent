@@ -77,6 +77,7 @@ test-helpers = []
 
 [dev-dependencies]
 omnesagent-infra.workspace = true
+omnesagent-providers = { workspace = true, features = ["test-helpers"] }
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
