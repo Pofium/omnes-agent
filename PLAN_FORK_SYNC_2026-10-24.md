@@ -24,7 +24,7 @@
 ## 2. Этап 0 — подготовка (½ дня)
 
 1. Ветка `feat/fork-sync-v0.8.6` от `main`.
-2. Прогнать baseline: `cargo check --workspace`, покрейтовые тесты (api/channels/gateway/runtime), `flutter analyze` — зафиксировать известные pre-existing падения (runtime: 7 flaky denial/stream-тестов — проходят поодиночке; channels: 5 сетевых link_enricher).
+2. Прогнать baseline: `cargo check --workspace`, покрейтовые тесты (api/channels/gateway/runtime), `flutter analyze` — зафиксировать известные pre-existing падения (runtime: 7 flaky denial/stream-тестов — проходят поодиночке; channels: 5 сетевых link_enricher; architecture: 13 пре-существующих — `container_release`/`release_workflow`/`desktop_release` читают файлы корня репо (`.github/`, `Dockerfile`, `docker-compose.yml`), которых нет под `backend/`, + `cli_fluent_coverage` ловит литералы в `backend/src/main.rs` от фичи `24e0eaefd` (Ralph); к волне 5 отношения не имеют).
 3. Правило: **один PR апстрима = один коммит** (conventional, с номером PR в subject), после каждого — `cargo check -p <крейт>` + целевые тесты крейта. Не смешивать с собственными фичами.
 
 ## 3. Этап 1 — Security (P0) — Завершено 100%
