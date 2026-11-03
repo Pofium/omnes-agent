@@ -96,7 +96,7 @@ tool-project-intel = 项目交付智能：生成状态报告、检测风险、�
 tool-proxy-config = 管理 OmnesAgent 代理设置（范围：environment | omnesagent | services），包括运行时和进程环境变量应用
 tool-pushover = 向你的设备发送 Pushover 通知。需要 .env 文件中的 PUSHOVER_TOKEN 和 PUSHOVER_USER_KEY。
 tool-schedule = 管理仅限 shell 的定时任务。操作：create/add/once/list/get/cancel/remove/pause/resume。警告：此工具创建的 shell 任务输出仅被记录，不会投递到任何频道。要向 Discord/Telegram/Slack/Matrix 发送定时消息，请使用 cron_add 工具，并设置 job_type='agent' 和如 {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"} 的 delivery 配置。
-tool-screenshot = 捕获当前屏幕的截图。返回文件路径和 base64 编码的 PNG 数据。
+tool-screenshot = 捕获当前屏幕的截图。返回已保存文件的路径。
 tool-security-ops = 用于托管网络安全服务的安全运营工具。操作：triage_alert（对告警分类/排序）、run_playbook（执行事件响应步骤）、parse_vulnerability（解析扫描结果）、generate_report（创建安全态势报告）、list_playbooks（列出可用 playbook）、alert_stats（汇总告警指标）。
 tool-shell = 在工作区目录中执行 shell 命令
 tool-sop-advance = 报告当前 SOP 步骤的结果并推进到下一步。提供 run_id、步骤是成功还是失败，以及简要的输出摘要。

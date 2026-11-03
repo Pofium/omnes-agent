@@ -96,7 +96,7 @@ tool-project-intel = プロジェクト配信インテリジェンス：ステ�
 tool-proxy-config = OmnesAgentプロキシ設定を管理（スコープ：environment | omnesagent | services）。ランタイムおよびプロセス環境アプリケーション含む
 tool-pushover = Pushover通知をデバイスに送信します。.envファイルにPUSHOVER_TOKENおよびPUSHOVER_USER_KEYが必要。
 tool-schedule = スケジュール済みシェルのみのタスクを管理します。アクション：create/add/once/list/get/cancel/remove/pause/resume。警告：このツールは、出力がログに記録されるのみで、チャネルに配信されないシェルジョブを作成します。Discord/Telegram/Slack/Matrixにスケジュール済みメッセージを送信するには、job_type='agent'とdelivery配信設定（例：{"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}）付きのcron_addツールを使用してください。
-tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。ファイルパスと基数64エンコード済みPNGデータを返します。
+tool-screenshot = 現在の画面のスクリーンショットをキャプチャします。保存先のファイルパスを返します。
 tool-security-ops = 管理型サイバーセキュリティサービス向けセキュリティ操作ツール。アクション：triage_alert（アラートの分類/優先順位付け）、run_playbook（インシデント対応ステップの実行）、parse_vulnerability（スキャン結果の解析）、generate_report（セキュリティ態勢レポートの作成）、list_playbooks（利用可能なプレイブックをリスト）、alert_stats（アラートメトリクスを要約）。
 tool-shell = ワークスペースディレクトリ内でシェルコマンドを実行
 tool-sop-advance = 現在のSOPステップの結果を報告し、次のステップに進む。run_id、ステップが成功したか失敗したか、簡潔な出力要約を指定します。
