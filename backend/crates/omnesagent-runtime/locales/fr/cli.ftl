@@ -1049,3 +1049,4 @@ cli-delegate-error-invalid-semantic-completion = L'agent '{$agent_name}' a écho
 cli-agent-error-invalid-semantic-completion = Le fournisseur de modèle a renvoyé une réponse sémantique non valide.
 cli-delegate-error-incomplete-after-provider-tools = L'agent '{$agent_name}' a échoué : le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
 cli-agent-error-incomplete-after-provider-tools = Le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
+tool-git-operations-error-docker-runtime-write-unsupported = Les commandes d’écriture Git ne sont pas disponibles avec l’environnement d’exécution Docker, car elles ne peuvent pas être confinées à son conteneur.

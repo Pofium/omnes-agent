@@ -1045,3 +1045,4 @@ cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败�
 cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
 cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
 cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。
+tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在 Docker 运行时中不可用，因为无法将其限制在其容器内。

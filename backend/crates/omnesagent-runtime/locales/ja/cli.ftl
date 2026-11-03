@@ -1046,3 +1046,4 @@ cli-delegate-error-invalid-semantic-completion = エージェント '{$agent_nam
 cli-agent-error-invalid-semantic-completion = モデルプロバイダーが無効なセマンティック完了を返しました。
 cli-delegate-error-incomplete-after-provider-tools = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
 cli-agent-error-incomplete-after-provider-tools = モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
+tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
