@@ -3,17 +3,17 @@
 > **Дата:** 2026-10-24
 > **Горизонт:** наш форк отпочкован на `43123a81d` = PR #10628 = релиз **v0.8.5** (2026-09-05). Апстрим с тех пор ушёл на **644 коммита** — весь цикл **v0.8.6** (релиз 2026-10-18) + пост-релизные коммиты (до #11927).
 > **Апстрим-клон:** `C:\Users\ipres\tmp\zeroclaw-audit\upstream` (origin/master). Список коммитов: `C:\Users\ipres\tmp\zeroclaw-audit\upstream_since_sync.txt`.
-> **Методика:** cherry-pick по одному PR с переименованием `zeroclaw-*` → `omnesagent-*`, `zerocode` → наш бинарник. Вердикты выверены побайтовым сравнением файлов с v0.8.5-блобами: **~40 критичных файлов у нас вообще не разошлись** с точкой форка (policy.rs, security/*, rpc/transport|session|wss, gateway/api_pairing|api_webhook|webhook_ingress|sse|static_files, infra/session_store, approval_gate, tunnel/tailscale) — на них cherry-pick ложится чисто.
+> **Методика:** cherry-pick по одному PR с переименованием `zeroclaw-*` → `omnesagent-*`, `zerocode` → наш бинарник. Вердикты выверены побайтовым сравнением файлов с v0.8.5-блобами: **~40 критичных файлов у нас вообще не разошлись** с точкой форка (policy.rs, security/\*, rpc/transport|session|wss, gateway/api_pairing|api_webhook|webhook_ingress|sse|static_files, infra/session_store, approval_gate, tunnel/tailscale) — на них cherry-pick ложится чисто.
 
 ## 1. Сводка вердиктов (4 подсистемы, ~340 содержательных коммитов)
 
-| Область | PORT-CLEAN | PORT-ADAPT | ALREADY | N/A |
-|---|---|---|---|---|
-| security / gateway / rpc / daemon / acp | 22 | 36 | 4 | 16 |
-| runtime / turn / parser / multimodal | 28 | 60 | 1 | 35 |
-| providers / tools / mcp / cost / deps | 26 | 24 | 3 | 12 |
-| channels / config / memory / skills | 26 | 54 | 1 | 16 |
-| **Итого** | **~102** | **~174** | **9** | **~79** |
+| Область                                 | PORT-CLEAN | PORT-ADAPT | ALREADY | N/A     |
+| --------------------------------------- | ---------- | ---------- | ------- | ------- |
+| security / gateway / rpc / daemon / acp | 22         | 36         | 4       | 16      |
+| runtime / turn / parser / multimodal    | 28         | 60         | 1       | 35      |
+| providers / tools / mcp / cost / deps   | 26         | 24         | 3       | 12      |
+| channels / config / memory / skills     | 26         | 54         | 1       | 16      |
+| **Итого**                               | **~102**   | **~174**   | **9**   | **~79** |
 
 `ALREADY` подтверждены evidence: copilot hardening #10370, served-model attribution #10415, warmup #10651 (портированы в фазе D); env-rebind #11222/#11133 (эквивалент); null-device (частично); paircode admin (частично — см. §3.1).
 
@@ -29,27 +29,28 @@
 
 ## 3. Этап 1 — Security (P0) — Завершено 100%
 
-| # | Коммит | PR | Баг | Наш статус | Коммит в ветке |
-|---|---|---|---|---|---|
-| 1.1 | `48169a1a3` | #11029 | **Approval-bypass на git**: глобальные опции (`-C`, `-c`, `--git-dir`, `--attr-source`) прятали write-сабкоманду от risk-классификатора. **У нас баг шире**: `command_risk_level` (policy.rs:2110) берёт `args.first()` без скипа глобальных опций → `git -C /repo commit` = Low, без approval | PORT-ADAPT | `86dcdfb5e` |
-| 1.2 | `b9ec3e9a8` | #11451 | **Windows key file без DACL** — ключ шифрования секрет-стора читается любым локальным пользователем. Мы под Windows | PORT-CLEAN | `6ce6fa9e1` |
-| 1.3 | `ad0dd3dec`+`be354a7ac`+`ece3b744e` | #11253,#11755,#11924 | **wasmtime 47.0.4 → 48.0.7** (RUSTSEC-2026-0313..0316 sandbox escape) | PORT-CLEAN | `889e97dda` |
-| 1.4 | `01a6b1e6a` | #11678 | quinn-proto 0.11.15 → 0.11.19 (RUSTSEC-2026-0338..0342) | PORT-CLEAN | `2b9a14fb7` |
-| 1.5 | `df6421301`/`0a6974d3e` | #12010,#11998 | tokio 1.53.3 (RUSTSEC-2026-0386) + ctutils 0.4.5 (RUSTSEC-2026-0385) | PORT-CLEAN | `05e92fafd` |
-| 1.6 | `baa3a58ef` | #10015 | **SSRF**: datasheet-загрузки без ограничений. Фикс — эталонный паттерн: https-only, allowlist хостов, ревалидация каждого redirect-hop, 25MB cap, таймауты | PORT-CLEAN | `0189987c3` |
-| 1.7 | `df941bca5` | #10070 | file_download против SSRF: private-host блокировка по умолчанию, metadata/credential-хосты всегда | PORT-CLEAN | `214d44ff9` |
-| 1.8 | `2208f8cec` | #11026 | redact proxy credentials из snapshots | PORT-CLEAN | `8525f6613` |
-| 1.9 | `631da1cf3` | #10664 | **Публичный /health отдаёт `last_error` компонентов** (внутренние URL). У нас жив: `/health` в `is_public_path` + `snapshot_json()` (health/mod.rs:13) | PORT-ADAPT | `7b542a2eb` |
-| 1.10 | `79987a5c4` | #11455 | TOCTOU/symlink-swap в раздаче static files; cap-std по file-handle | PORT-CLEAN | `45d53bc75` |
-| 1.11 | `51bd1d039` | #11656 | `firejail_args` декларирован, но молча игнорируется — security-deception fix | PORT-CLEAN | `602c2f6c3` |
-| 1.12 | `949e415d0` | #10381 | **Bare-лаунчеры (`docker`, `firejail`, `bwrap`) резолвятся ПОСЛЕ установки workspace-cwd** → на Windows CreateProcess найдёт подменный exe в workspace агента | PORT-ADAPT | `e7b5e8384` |
-| 1.13 | `402cee32c` | #11177 | Сузить `/admin/paircode/new` до admin-сессии (сейчас bearer pairing-токен тоже может ротировать коды) | PORT-ADAPT | `76db7aad7` |
+| #    | Коммит                              | PR                   | Баг                                                                                                                                                                                                                                                                                            | Наш статус | Коммит в ветке |
+| ---- | ----------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | -------------- |
+| 1.1  | `48169a1a3`                         | #11029               | **Approval-bypass на git**: глобальные опции (`-C`, `-c`, `--git-dir`, `--attr-source`) прятали write-сабкоманду от risk-классификатора. **У нас баг шире**: `command_risk_level` (policy.rs:2110) берёт `args.first()` без скипа глобальных опций → `git -C /repo commit` = Low, без approval | PORT-ADAPT | `86dcdfb5e`    |
+| 1.2  | `b9ec3e9a8`                         | #11451               | **Windows key file без DACL** — ключ шифрования секрет-стора читается любым локальным пользователем. Мы под Windows                                                                                                                                                                            | PORT-CLEAN | `6ce6fa9e1`    |
+| 1.3  | `ad0dd3dec`+`be354a7ac`+`ece3b744e` | #11253,#11755,#11924 | **wasmtime 47.0.4 → 48.0.7** (RUSTSEC-2026-0313..0316 sandbox escape)                                                                                                                                                                                                                          | PORT-CLEAN | `889e97dda`    |
+| 1.4  | `01a6b1e6a`                         | #11678               | quinn-proto 0.11.15 → 0.11.19 (RUSTSEC-2026-0338..0342)                                                                                                                                                                                                                                        | PORT-CLEAN | `2b9a14fb7`    |
+| 1.5  | `df6421301`/`0a6974d3e`             | #12010,#11998        | tokio 1.53.3 (RUSTSEC-2026-0386) + ctutils 0.4.5 (RUSTSEC-2026-0385)                                                                                                                                                                                                                           | PORT-CLEAN | `05e92fafd`    |
+| 1.6  | `baa3a58ef`                         | #10015               | **SSRF**: datasheet-загрузки без ограничений. Фикс — эталонный паттерн: https-only, allowlist хостов, ревалидация каждого redirect-hop, 25MB cap, таймауты                                                                                                                                     | PORT-CLEAN | `0189987c3`    |
+| 1.7  | `df941bca5`                         | #10070               | file_download против SSRF: private-host блокировка по умолчанию, metadata/credential-хосты всегда                                                                                                                                                                                              | PORT-CLEAN | `214d44ff9`    |
+| 1.8  | `2208f8cec`                         | #11026               | redact proxy credentials из snapshots                                                                                                                                                                                                                                                          | PORT-CLEAN | `8525f6613`    |
+| 1.9  | `631da1cf3`                         | #10664               | **Публичный /health отдаёт `last_error` компонентов** (внутренние URL). У нас жив: `/health` в `is_public_path` + `snapshot_json()` (health/mod.rs:13)                                                                                                                                         | PORT-ADAPT | `7b542a2eb`    |
+| 1.10 | `79987a5c4`                         | #11455               | TOCTOU/symlink-swap в раздаче static files; cap-std по file-handle                                                                                                                                                                                                                             | PORT-CLEAN | `45d53bc75`    |
+| 1.11 | `51bd1d039`                         | #11656               | `firejail_args` декларирован, но молча игнорируется — security-deception fix                                                                                                                                                                                                                   | PORT-CLEAN | `602c2f6c3`    |
+| 1.12 | `949e415d0`                         | #10381               | **Bare-лаунчеры (`docker`, `firejail`, `bwrap`) резолвятся ПОСЛЕ установки workspace-cwd** → на Windows CreateProcess найдёт подменный exe в workspace агента                                                                                                                                  | PORT-ADAPT | `e7b5e8384`    |
+| 1.13 | `402cee32c`                         | #11177               | Сузить `/admin/paircode/new` до admin-сессии (сейчас bearer pairing-токен тоже может ротировать коды)                                                                                                                                                                                          | PORT-ADAPT | `76db7aad7`    |
 
 **DoD этапа 1:** все RUSTSEC-позиции в Cargo.lock обновлены (`cargo audit` чист или решения зафиксированы), git-классификатор протестирован на bypass-матрице, `/health` не содержит `last_error`, DLL-паттерны закрыты.
 
 ## 4. Этап 2 — Прод-баги ядра (P1) — Завершено 100%
 
 ### 4.1 Промпт-кэш и токены [ВЫПОЛНЕНО]
+
 - `6ab38e3a6` (#10959) — **sort tool specs**: 8 строк, стабилизирует префикс кэша. [ВЫПОЛНЕНО: `00d78a696`]
 - `7808fcd68` (#10862) — дата вне cached system prompt (иначе кэш умирает ежедневно). [ВЫПОЛНЕНО: `156942ad3`]
 - `bd5494b67` (#11801) — wall-clock дата из channel/agent::run промптов. [ВЫПОЛНЕНО: `eeaaeb76b`]
@@ -58,24 +59,28 @@
 - `a55179236` (#10890) — per-image стоимость в estimate_history_tokens; `55b078b9f` (#10555) — cap image-promotion. [ВЫПОЛНЕНО: `98ace5c44`]
 
 ### 4.2 Parser и tool-вызовы [ВЫПОЛНЕНО]
+
 - `3500014d9`+`83a06780a` (#11188,#11025) — **`browser_open`/`web_search` конвертируются в `curl`** у GLM-стиль моделей + алиасы не нормализуются в xml/minimax-форматах [ВЫПОЛНЕНО: `b618a37b2`, `f779df4bf`].
 - `44655c34c`+`2d85371f3` (#11479,#10914) — recover structured native tool arguments (стрингифицированные object/array аргументы) [ВЫПОЛНЕНО: `8bf5c1b38`, `f1359b99b`].
 - `e8627d2e8` (#11201) — сериализация file_edit+file_write в одном batch (гонка read-modify-write теряет правки) [ВЫПОЛНЕНО: `4b569cf33`].
 - `2d85371f3` (base) — preserve string arguments при fallback parsing [ВЫПОЛНЕНО: `f1359b99b`].
 
 ### 4.3 Стримы и надёжность провайдеров [ВЫПОЛНЕНО]
+
 - `f72e4d656` (#10442) — **OpenRouter стрим умирает по request timeout** [ВЫПОЛНЕНО: `136906d35`].
 - `9d3fd8db0`+`2d4bed5b7` (#10803,#11170) — retry-ядро reliable.rs: retry budget single-candidate recovery, overload-классификация, retry до send [ВЫПОЛНЕНО: `20e330911`, `d737e042d`].
 - `2eb7df78b` (#10886) — timeout_secs → streaming idle floor 300s [ВЫПОЛНЕНО: `8181da07e`].
 - `9862c149a`+`e66c219e6` (#10397,#10566) — **MCP token blowup** (CallToolResult дублировал payload) + materialization картинок [ВЫПОЛНЕНО: `fe93ab07c`, `624ba61b5`].
 
 ### 4.4 Steering и turn-цикл [ВЫПОЛНЕНО]
+
 - `3b8ed46fc` (#11617) — **close steering channel при выходе** [ВЫПОЛНЕНО: `1ee579f4e`].
 - `4f41bfa61`+`9ce12530b`+`2125a1301` (#11725,#11181,#11132) — доставка steering на следующем шаге цикла [ВЫПОЛНЕНО: `9f8af9a2b`].
 - `64b703012` (#10696) — low-water trim target [ВЫПОЛНЕНО: `318b76eb1`].
 - `c25324e96` (#10935) — stream-guard не глотает прозу с цитатой tool-result [ВЫПОЛНЕНО: `5ba5d6542`].
 
 ### 4.5 Каналы и память [ВЫПОЛНЕНО]
+
 - `0695c9f8f` (#9753) — **absent vs empty `allowed_tools`** (deny-all семантика) [ВЫПОЛНЕНО: `6eebc35dc`].
 - `87e3c2235` (#11650) — **Telegram 429**: ждать `retry_after`, не долбить в flood [ВЫПОЛНЕНО: `20026f6b4`].
 - `28a34bfc7` (#11669) — Lark flat post-контент молча дропался [ВЫПОЛНЕНО: `8f373cb27`].
@@ -86,6 +91,7 @@
 - `e6fe7a8c9` (#10692) — per-agent transcription binding [ALREADY: `7053551ee`].
 
 ### 4.6 Windows-пакет (мы целевая платформа) [ВЫПОЛНЕНО]
+
 - `31a7137fb` (#10954) — PowerShell UTF-8 output [ВЫПОЛНЕНО: `18483a8d1`].
 - `c4c2d667a` (#11400) — doctor: замена models_cache.json при открытом reader [ВЫПОЛНЕНО: `420786e33`].
 - `9c2bfaf50` (#11398) — замена JSONL session-файла, удерживаемого reader [ВЫПОЛНЕНО: `703933983`].
@@ -99,6 +105,7 @@
 ## 5. Этап 3 — PORT-ADAPT средние (выравнивание с нашими особенностями) — начат 25.10.2026
 
 ### 5.1 Config-батч [5/7 ВЫПОЛНЕНО]
+
 - `ba23a8a2e` (#10612) детерминизм итерации провайдеров [ВЫПОЛНЕНО: `34bfdd6f2`]
 - `6ddfc6cbe` (#10686) openai-chat→openai миграция [ВЫПОЛНЕНО: `29253e39f`]
 - `09556e0ab` (#10589) max_image_size_mb default 20 [ВЫПОЛНЕНО: `5b04b89dc`; docs-часть пропущена — нет mdbook]
@@ -108,6 +115,7 @@
 - `e16fd898b` (#11260) context budget unclamp — **SKIP (N/A)**: баг живёт в машинерии #9535 (`ResolvedContextLimits::legacy_fallback`), которая у нас не портирована; наш `effective_context_budget()` явный бюджет не зажимает.
 
 ### 5.2 Skills/HTTP [3/3 ВЫПОЛНЕНО]
+
 - `7b84f9c80` (#11512) единый deadline на skill-HTTP (DNS вне reqwest timeout) [ВЫПОЛНЕНО: `4f02fb7eb`; 24 теста, ключ локали en/cli.ftl добавлен вручную, docs пропущены]
 - `96da19523` (#11804) GIT_TERMINAL_PROMPT=0 в open-skills sync [ВЫПОЛНЕНО: `ec4e6d873`]
 - `88be24ac4` (#11599) native_tools для всех compat-семейств [ВЫПОЛНЕНО: `6dc0973f2`; 17 тестов]
@@ -115,6 +123,7 @@
 ### 5.3 Остальное (статус на 25.10.2026, вторая волна)
 
 **Провайдеры — ЗАКРЫТО (8 позиций):**
+
 - `5ea5333c5` (#10829) grok resolve до spawn [ВЫПОЛНЕНО: `8f60da5cd`; libc/windows-sys в Cargo.toml вручную]
 - `bab3fb4a7` (#10830) grok ACP frame limits [ВЫПОЛНЕНО: `80c9dba72`]
 - `4244a30d2`+`4123877c9` (#10604/#10853) opencode session header + redirects [ВЫПОЛНЕНО: `dcea5ea68`; openai.rs вручную]
@@ -122,9 +131,10 @@
 - `5ee21b7d6` (#11659) snake_case overflow [ВЫПОЛНЕНО: `7a0c0c20c`]
 - `e8d2e5fc8` (#11350-note) model_switch note [ВЫПОЛНЕНО: `ab40a1f66`]
 - `a647de344` (#10552) multimodal config threading [ВЫПОЛНЕНО: `dbd4f5320`]
-- `e941e0ca6` (#10519) llm_task alias-aware — **ОТЛОЖЕН** (ADAPT ~534 строки: наш llm_task реорганизован в omnesagent-tools, связанная смена сигнатуры LlmTaskTool::new через 2 крейта)
+- `e941e0ca6` (#10519) llm_task alias-aware [ВЫПОЛНЕНО: `b85a7c147`. 5 файлов: `LlmTaskTool` теперь несёт `config`/`family`/`alias` и строит провайдера через `create_model_provider_for_alias` на `spawn_blocking` (OAuth-рефреш Qwen/MiniMax синхронно драйвит `reqwest::blocking::Client`); новый anonymous-фичер `test-helpers` в `omnesagent-providers` с `set_qwen_oauth_endpoint_for_test`; портирован регрессионный тест `llm_task_uses_alias_aware_provider_for_alias_config` в runtime и wiremock-пара OAuth-тестов в tools. Верификация: `cargo check --tests` по 3 крейтам — 0 ошибок; `cargo test -p omnesagent-tools --lib llm_task` — 14/14; `cargo test -p omnesagent-providers --lib oauth` — 63/63; runtime-регрессия — 1/1. **Известный предсуществующий фон**: 7 тестов `omnesagent-tools` (`image_gen` 3 + `mcp_transport` 4) падают на raw-loopback сокетах (`hyper::Error(UnexpectedMessage)` / WSAECONNABORTED 10053) — воспроизведено на HEAD без наших правок, к порту отношения не имеют]
 
 **Gateway/daemon — частично (волна 4, 30.10–01.11):**
+
 - `77ae057e0` (#10455) config write invariants [ВЫПОЛНЕНО: `3d7c5233f`]
 - `21fbd9538` (#10093) subprocess изоляция манифеста [ВЫПОЛНЕНО: `9fa482e89`]
 - `feea19d41` (#11518) EOF ≠ решение оператора [ВЫПОЛНЕНО: `bc350a430`; prompt_cli → io::Result, unix-child тест пропущен]
@@ -133,6 +143,7 @@
 - `49fa46bb1` (#10538), `fa31aee26` (#10637), `23950c9a1` (#11901) — **НЕ НАЧАТЫ, крупные**: #10538 переписывает ws.rs (+1148 строк, detach-survival архитектуры у нас нет — our ws.rs живёт по-другому), #11901 +1699 строк lib.rs (drain/admission), #10637 зависит от #10538. Отложить до архитектурного решения (см. §6) или отдельной многодневной работой.
 
 **RPC-кластер — ЗАКРЫТ (волна 4, ручная работа через Edit, как предписано):**
+
 - `5a2a6250a` (#10775) preserve live sessions при отказе mode-replacement [ВЫПОЛНЕНО: `dd431ac7a`; ADAPT: наш session/new не имел resume_existing/insert_if_absent — введены publish_prepared+insert_if_absent в session.rs (полный апстрим-тест capacity+fenced), захват generation под permit, staging кандидата + единая точка rollback; 4 апстрим-теста портированы (recovery-ассерпт адаптирован: у нас same-ID re-create = replacement, gen+1); rpc:: 337/337 зелёные]
 - `25d543835` (#11151) memory agent-param — **N/A**: чинится через `memory_plane`/`list_for_principal`/`selector_agent` (principal-изоляция RFC #7141/#8289), которого у нас нет (серия отложена, §6.1); наш `agent`-параметр в memory-методах отсутствует как класс
 - `61b0ec88b` (#11330) configure fence — **ALREADY**: наш `handle_session_configure` захватывает generation как ПЕРВЫЙ шаг и ре-верифицирует под локом (gap «ownership-check→capture» отсутствует, т.к. authz-предвар нет); апстримов fencing на `authorized.live_generation` непортируем до #8289
@@ -140,6 +151,7 @@
 - `59f21a316` (#11291) — **SKIP**: зависит от `f0ae8c8bd` (#11171 bounded local transport)
 
 **Cost — ЗАКРЫТ (волна 4):**
+
 - `36a6f119c` (#11350) trackers по ledger path [ВЫПОЛНЕНО: `648185b15`; баг был жив: единственный OnceLock крал трекер чужого ledger; +новый тест]
 - `f1527d7e1` (#11557) rejected ledger records [ВЫПОЛНЕНО: `82c0eba97`; ADAPT хитов: ручной перенос в our tracker (строки разошлись); for_each_record → Result<usize>, поле+wire rejected_records, 3 апстрим-теста; config 52 зелёных]
 - `91958a0b7` (#10718) conversation attribution [ВЫПОЛНЕНО: `223b76268`; CostRecord.conversation_id (additive JSONL), record_usage_attributed, TOOL_LOOP_SESSION_KEY в tool-loop; тест атрибуции двух чатов на одном демоне зелёный]
@@ -147,6 +159,7 @@
 - `7007365f4` (#11692) warn_at_percent [ВЫПОЛНЕНО волной 4; apps/zerocode-часть N/A — наш клиент свой: TurnEvent::BudgetWarning+BudgetWarningPeriod (api), announce_budget_warning (try_send, one-per-turn latch) до enforce_tool_loop_budget, SessionUpdateEvent::BudgetWarning + dispatch-маппинг, ACP-мост: custom `_omnesagent/budget_warning`; 3 provider_call теста + dispatch тест зелёные; frontend-отображение — Этап 6 §8.1]
 
 **Memory-кластер — ЗАКРЫТО (4/5):**
+
 - `3ed28c40b` (#10091) + `6108618d1` (#10835) + `72324ab20` (#11458) — цепочка sqlite_permissions [ВЫПОЛНЕНО одной комиссией: `8cc7ed8dc`; модуль создан апстримом 13.09 (после нашей базы), 512 тестов крейта зелёные]
 - `6c23e02b6` (#10567) дата recall [ВЫПОЛНЕНО: `a21c3963e`; 29 тестов memory_inject]
 - `18bc1fccc` (#10252) category-scoped grants — **ОТЛОЖЕН** (17 файлов/1606 строк, наш qdrant.rs переписан под ob2h — требуется ручная реконструкция поверх agent_scoped.rs с учётом trust/kag-полей)
@@ -155,9 +168,12 @@
 Методика: пофайловый разбор (`git apply --reject --directory=backend` + `resolve_*.py`), brand-нормализация, тесты провайдеров (181 multimodal) зелёные. Падения runtime/channels — пре-существующие (подтверждено `git stash` на HEAD: 7 channels + 7 runtime платформенных/тайминговых).
 Остаётся отдельным пререквизитом: **#10938** (`340de4cc0`, «tool attachments explicitly», 54 файла/5980 строк, новый крейт-модуль `api/src/tool_carrier.rs`) — не входил в §5.3, разбирать отдельно.
 
+**#10938 — ЗАБЛОКИРОВАН (03.11), попытка порта откачена.** Проверено: форк существенно отстаёт от родителя PR (`340de4cc0^`) в ключевых файлах — `providers/src/compatible.rs` (−6038 строк), `providers/src/multimodal.rs` (−1449), `runtime/src/agent/history.rs` (−443); кроме того отсутствуют модули `runtime/src/agent/turn/media_degrade.rs` (59 строк до PR) и `providers/src/hailo_ollama.rs` (1561 строка). Из 44 файлов ядро `api` (tool_carrier.rs + `tool.rs`/`media.rs`) было внесено и проходило 222 теста, но интеграционный слой провайдеров/рантайма дал десятки ошибок (`classify`, `rebuild_carrier`, `RenderedMarker`, `parse_user_message_image_refs`, `tool_carrier_content` — все лежат в отброшенных хунках). PR опирается на промежуточный слой изменений, которых в форке нет. Условие разблокировки: сначала синк предшествующих PR, выровнявших `compatible.rs`/`multimodal.rs`/`history.rs` с родителем #10938. Рабочее дерево возвращено к `33204898e` (чистое).
+
 ## 5.4 РЕГРЕССИЯ ЭТАПА 2 — ИСПРАВЛЕНА (25.10, `cd35a83a9`)
 
 `20e330911` (#10803) ломал 2 теста `streaming_fallback_tests`. Две причины, обе устранены:
+
 1. **Порт был неполный**: механизм `terminal_provider_keys` (типизированный терминальный маркер блокирует повторный допуск провайдера) отсутствовал — добавлен во все 4 dispatch-цикла (объявление, проверка при допуске, вставка в non-retryable ветке), как в апстриме (master :2535/:2745 и аналоги).
 2. **Устаревшие тесты**: апстрим сменил семантику в #8966 (18.09, ДО слияния #10803) — single-candidate stream failure восстанавливается одним non-stream вызовом (recovery, не replay); compatible-флоу делает 2 запроса с терминальной классификацией. Наши тесты обновлены по мастер-образцам: `stream_failure_without_fallback_recovers_via_non_streaming` (переименован), compatible-тест ждёт `request_count == 2`.
 
@@ -170,12 +186,13 @@
 ## 5.6 Волна 4 (30.10–01.11) — итоги
 
 Закрыты RPC-кластер и Cost-кластер (см. §5.3). Ключевое:
+
 - **#10775 (`dd431ac7a`)** — самый рискованный порт волны: session/new перестроен на candidate-staging + `publish_prepared` (generation-фенс, capacity-нейтральная замена). До порта баг был жив в нашей форме: `insert` молча заменял живую инкарнацию, а rollback ошибочной подготовки удалял новую, не восстанавливая старую. Тесты: `rpc::` 337/337 + 4 портированных апстрим-теста + session-store capacity/fence тест.
 - **#9939** — B1-порт (#9939 config/tracker) был неполным без runtime/CLI-витрины; дозакрыто [ВЫПОЛНЕНО: `7605cfd91`; helper, `status`, ftl, unit+component 7/7 e2e; попутно component-таргет не компилировался ДО нас (struct-дрейф AppState/MemoryEntry) — починен тем же коммитом].
 - **#11692** [ВЫПОЛНЕНО: `1d39f10c4`] — витрина warn_at_percent: TurnEvent::BudgetWarning → session/update `budget_warning`, gateway-WS кадр (Flutter), ACP custom-метод; однократно за turn, try_send. Frontend-рендер — Этап 6 §8.1.
 - Регрессий не обнаружено: config cost 52/52, runtime agent::cost 20/20, provider_call budget_warning 3/3, dispatch notification тесты зелёные.
 
-Остаток этапа 3 на будущее: мультимодальный кластер (§5.3, ручной), gateway-тройка (перенесена в §6), отложенные #10519/#10252.
+Остаток этапа 3 на будущее: gateway-тройка (перенесена в §6), отложенный #10252 (#10519 закрыт в `b85a7c147`).
 
 ## 6. Этап 4 — Архитектурные решения (требуют решения владельца, НЕ чери-пикать бездумно)
 
@@ -192,20 +209,20 @@
 
 ## 7. Этап 5 — Не портируем / чиним сами
 
-| Наша проблема | Апстрим |
-|---|---|
-| whatsapp_storage.rs:1268 cleanup cron (TODO wacore-0.6) | файла нет (чужой стек) — **чинить самим** |
-| transcription.rs:886 RAM-буфер аудио | streaming upload апстрим тоже не сделал |
-| pairing.rs:82 sync mutex | не чинил |
-| schema.rs god-file 43.9k строк | у апстрима тот же размер — **декомпозировать самим** |
-| lark.rs:1219 multi_message | порт `441df1313` даст инфраструктуру, lark-карточка отдельной работой |
-| ingress SOP-gate no-op (turn/mod.rs TODO(PR C)) | апстрим-механика другая; закрывать нашим PR C |
-| eval replay-only | апстримная CI-replay (#9212) не переносится 1:1 |
-| acp_channel.listen bails, alias_refs cascade, cloudflare runtime | апстримных фиксов нет |
-| Старый `_`-join interruption keys | портим `ecac0dbce` (этап 2) |
-| Trust-stamping Phase 1 (safety_net) | перекрывается серией #8289 при её принятии |
+| Наша проблема                                                    | Апстрим                                                               |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------- |
+| whatsapp_storage.rs:1268 cleanup cron (TODO wacore-0.6)          | файла нет (чужой стек) — **чинить самим**                             |
+| transcription.rs:886 RAM-буфер аудио                             | streaming upload апстрим тоже не сделал                               |
+| pairing.rs:82 sync mutex                                         | не чинил                                                              |
+| schema.rs god-file 43.9k строк                                   | у апстрима тот же размер — **декомпозировать самим**                  |
+| lark.rs:1219 multi_message                                       | порт `441df1313` даст инфраструктуру, lark-карточка отдельной работой |
+| ingress SOP-gate no-op (turn/mod.rs TODO(PR C))                  | апстрим-механика другая; закрывать нашим PR C                         |
+| eval replay-only                                                 | апстримная CI-replay (#9212) не переносится 1:1                       |
+| acp_channel.listen bails, alias_refs cascade, cloudflare runtime | апстримных фиксов нет                                                 |
+| Старый `_`-join interruption keys                                | портим `ecac0dbce` (этап 2)                                           |
+| Trust-stamping Phase 1 (safety_net)                              | перекрывается серией #8289 при её принятии                            |
 
-N/A-кластеры (переписаны у нас): delegate/agents-bundle/eval/intake, Hailo, seatbelt (macOS), большая часть backend feat(*).
+N/A-кластеры (переписаны у нас): delegate/agents-bundle/eval/intake, Hailo, seatbelt (macOS), большая часть backend feat(\*).
 
 ---
 
@@ -214,6 +231,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 Изменения в протоколах, событиях и API бэкенда v0.8.6, требующие отражения во фронтенде (клиентское приложение Flutter в `frontend/shared`, `frontend/desktop`, `frontend/web`):
 
 ### 8.1 Кадры WebSocket и Модели Данных (`frontend/shared/lib/core/gateway/models/`)
+
 1. **`ContextBudgetSnapshot` & `ContextBudgetFrame`** (#10716, #11692, #8966):
    - Добавить поля: `cacheReadTokens`, `cacheWriteTokens`, `cacheCreationInputTokens` в модель расхода контекста.
    - Добавить атрибуцию провайдера (`activeProvider`, `servingModel`) и флаг превышения порога предупреждения `warnAtPercent`.
@@ -227,6 +245,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
    - Добавить явное поле `attachments` (вложенные изображения/файлы) вместо парсинга Markdown-тегов из текстового вывода инструмента.
 
 ### 8.2 Шлюз и RPC API (`frontend/shared/lib/core/gateway/gateway_http.dart`)
+
 1. **SOP Run Details API** (#9930 `sops/run-detail`):
    - Реализовать метод `Future<Map<String, dynamic>?> sopsRunDetail(String runId)` для получения графовой истории выполнения шагов, входных и выходных параметров каждого узла.
 2. **Атомарное переименование SOP** (#10233, #10527):
@@ -239,6 +258,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
    - Замена устаревшего типа `openai-chat` на `openai` в формах настроек провайдеров.
 
 ### 8.3 Рабочая Область и Turn-цикл (`frontend/desktop/lib/features/workspace/`)
+
 1. **Steering UX и Очередь Сообщений** (#11617, #11725, #11181):
    - При вводе сообщения пользователем во время активного шага инструментов отображать статус «Сообщение принято, будет учтено на следующем шаге» (вместо блокировки поля ввода).
 2. **Мультимодальность и Слэш-команда `/upload`** (#10578):
@@ -248,6 +268,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
    - Отображение таймера ожидания (`Retry-After`) при паузах доставки в подключенных каналах.
 
 ### 8.4 Автоматизации и SOP Studio (`frontend/desktop/lib/features/automations/`)
+
 1. **Decision Models в инспекторе шагов** (#11085, #11134):
    - Поддержка выбора и настройки Decision Model для условных переходов в SOP Studio (`SopStudioController`).
 2. **Детальный инспектор выполнения шагов**:
@@ -256,6 +277,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
    - Кнопка переименования в тулбаре SOP Studio с валидацией имени.
 
 ### 8.5 Настройки и Безопасность (`frontend/desktop/lib/features/settings/`)
+
 1. **Вкладка Config / Secrets**:
    - UI для добавления/удаления/маскированного просмотра секретных ключей без утечки в открытый текст.
 2. **Дизайн-система (Normative AGENTS.md)**:
@@ -266,15 +288,15 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 
 ## 9. Порядок и оценка объёма
 
-| Этап | Позиций | Оценка | Ответвления/риски |
-|---|---|---|---|
-| 0 подготовка | — | 0.5 дня | ВЫПОЛНЕНО |
-| 1 security | 13 | 3–4 дня | ВЫПОЛНЕНО 100% (см. §3) |
-| 2 прод-баги | 42 | 8–10 дней | ВЫПОЛНЕНО: все 6 секций 4.1–4.6 завершены |
-| 3 ADAPT средние | ~40 | 10–12 дней | **Волна 4 (30.10–01.11): этапы 3.1–3.5 закрыты.** Готово 25 портированных позиций: config 5, skills 3, провайдеры 8, cost 5 (#11350/#11557/#10718/#11692 + #9939 B1-закрытие), gateway 3, RPC 1 (#10775), memory 4 (волна 3); вердикты закрытия: #11330 ALREADY, #11452/#11151 N/A (все трое — предок #8289 отложен); SKIP 7 обоснованы (10519, 10252, 11083, 11291, tailscale×2, e16fd898b). Остаток этапа 3: 3 крупных gateway (#10538/#10637/#11901 — перенесены в §6-класс решений) + multimodal-кластер (ручной, 8 позиций) + 2 отложенных (10519/10252) |
-| 4 архитектурные | 9 решений | по решению | серии #8289, live-revisions — недели; +gateway-тройка #10538/#10637/#11901 (архитектура ws/drain у нас другая) |
-| 5 собственные фиксы | ~8 | 2–3 дня | whatsapp cleanup, RAM-буфер аудио, god-file split |
-| 6 frontend адаптация | ~16 | 4–5 дней | Flutter gateway models, SOP Studio, Steering UX, Token Budget |
+| Этап                 | Позиций   | Оценка     | Ответвления/риски                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | --------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0 подготовка         | —         | 0.5 дня    | ВЫПОЛНЕНО                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 1 security           | 13        | 3–4 дня    | ВЫПОЛНЕНО 100% (см. §3)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 2 прод-баги          | 42        | 8–10 дней  | ВЫПОЛНЕНО: все 6 секций 4.1–4.6 завершены                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 3 ADAPT средние      | ~40       | 10–12 дней | **Волна 4 (30.10–01.11): этапы 3.1–3.5 закрыты.** Готово 25 портированных позиций: config 5, skills 3, провайдеры 8, cost 5 (#11350/#11557/#10718/#11692 + #9939 B1-закрытие), gateway 3, RPC 1 (#10775), memory 4 (волна 3); вердикты закрытия: #11330 ALREADY, #11452/#11151 N/A (все трое — предок #8289 отложен); SKIP 7 обоснованы (10519, 10252, 11083, 11291, tailscale×2, e16fd898b). Остаток этапа 3: 3 крупных gateway (#10538/#10637/#11901 — перенесены в §6-класс решений) + multimodal-кластер (ручной, 8 позиций) + 2 отложенных (10519/10252) |
+| 4 архитектурные      | 9 решений | по решению | серии #8289, live-revisions — недели; +gateway-тройка #10538/#10637/#11901 (архитектура ws/drain у нас другая)                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 5 собственные фиксы  | ~8        | 2–3 дня    | whatsapp cleanup, RAM-буфер аудио, god-file split                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 6 frontend адаптация | ~16       | 4–5 дней   | Flutter gateway models, SOP Studio, Steering UX, Token Budget                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 **Манифест этапа 1–2** (минимальный высокий ROI — ~15 дней суммарно): security-P0 + prompt-cache-цепочка + parser + OpenRouter/reliable + MCP blowup + steering close + Windows-пакет + канальные фиксы (allowed_tools, Telegram 429, Lark, transcription) — **100% ВЫПОЛНЕНО**.
 
