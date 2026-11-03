@@ -1,13 +1,13 @@
 use crate::util_helpers::MaybeSet;
 use async_trait::async_trait;
-use serde_json::{Value, json};
-use std::fs;
-use std::sync::Arc;
 use omnesagent_api::tool::{Tool, ToolOutput, ToolResult};
 use omnesagent_config::policy::SecurityPolicy;
 use omnesagent_config::schema::{
     Config, ProxyConfig, ProxyScope, runtime_proxy_config, set_runtime_proxy_config,
 };
+use serde_json::{Value, json};
+use std::fs;
+use std::sync::Arc;
 
 pub struct ProxyConfigTool {
     config: Arc<Config>,
@@ -103,9 +103,12 @@ impl ProxyConfigTool {
                 let value = item.as_str().ok_or_else(|| {
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
-                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"field": field})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Reject
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"field": field})),
                         "proxy_config: array element must be a string"
                     );
                     anyhow::Error::msg(format!("'{field}' array must only contain strings"))
@@ -544,9 +547,9 @@ impl Tool for ProxyConfigTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use omnesagent_config::autonomy::AutonomyLevel;
     use omnesagent_config::policy::SecurityPolicy;
+    use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -620,8 +623,6 @@ mod tests {
         );
     }
 
-    static PROXY_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[test]
     fn proxy_display_redacts_userinfo_and_invalid_values() {
         for (raw, expected) in [
@@ -691,7 +692,10 @@ mod tests {
             return;
         }
 
-        let _proxy_state = PROXY_STATE_LOCK.lock().await;
+        // The production `set` path writes the process-global runtime proxy
+        // state; hold the shared test guard so concurrent reader tests see a
+        // consistent value and this test's writes are restored afterwards.
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
         for args in [
@@ -755,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
-        let _proxy_state = PROXY_STATE_LOCK.lock().await;
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -790,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_null_proxy_url_clears_existing_value() {
-        let _proxy_state = PROXY_STATE_LOCK.lock().await;
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
