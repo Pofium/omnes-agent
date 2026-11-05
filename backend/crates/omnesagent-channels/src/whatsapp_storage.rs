@@ -375,10 +375,10 @@ impl RusqliteStore {
             );
 
             -- Index supporting `delete_expired_sent_messages`
-            -- (WHERE device_id = ? AND created_at < ?). Without it the cleanup
-            -- pass would full-scan `sent_messages`, which grows unbounded until
-            -- the periodic cleanup hook lands. `IF NOT EXISTS` keeps re-init
-            -- idempotent across restarts.
+            -- (WHERE device_id = ? AND created_at < ?). Without it the periodic
+            -- cleanup pass — driven by the upstream keepalive's
+            -- sent_message_ttl_secs — would full-scan `sent_messages`.
+            -- `IF NOT EXISTS` keeps re-init idempotent across restarts.
             CREATE INDEX IF NOT EXISTS idx_sent_messages_device_created
                 ON sent_messages(device_id, created_at);",
         ))?;
@@ -1265,9 +1265,13 @@ impl ProtocolStore for RusqliteStore {
     }
 
     /// Delete sent messages older than `cutoff_timestamp` (unix seconds).
-    /// TODO(wacore-0.6): wire to a periodic cleanup cron in the daemon. The
-    /// current implementation is correct but the table will grow unbounded
-    /// until the cron is hooked up.
+    ///
+    /// No daemon-side cron is needed: the upstream whatsapp-rust keepalive
+    /// already drives this every ~12 ticks (≈5 min) while the socket is
+    /// connected, deriving the cutoff from `CacheConfig::sent_message_ttl_secs`
+    /// (default 300 s). Our `Bot::builder()` keeps that default, so this custom
+    /// rusqlite backend is exactly the one the keepalive prunes (see
+    /// `keepalive.rs::keepalive_loop`).
     async fn delete_expired_sent_messages(
         &self,
         cutoff_timestamp: i64,
@@ -1815,6 +1819,56 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn delete_expired_sent_messages_prunes_only_older_than_cutoff() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+
+        // `store_sent_message` stamps `created_at` with the current unix time.
+        ProtocolStore::store_sent_message(&store, "chat@s.whatsapp.net", "msg-old", b"old")
+            .await
+            .unwrap();
+        ProtocolStore::store_sent_message(&store, "chat@s.whatsapp.net", "msg-new", b"new")
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Cutoff in the past: nothing is older than it, so no row is pruned —
+        // this is the steady state the keepalive maintains between expiry
+        // passes. (`take_sent_message` is deliberately not used to probe
+        // existence here: it is a destructive SELECT+DELETE.)
+        let deleted = ProtocolStore::delete_expired_sent_messages(&store, now - 60)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+
+        // Cutoff in the future: every stored message is older than the cutoff
+        // and gets pruned, and the returned count matches the rows removed.
+        let deleted = ProtocolStore::delete_expired_sent_messages(&store, now + 60)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        // A second pass finds nothing left to prune.
+        let deleted = ProtocolStore::delete_expired_sent_messages(&store, now + 60)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+
+        // The rows are actually gone, not merely absent from the count.
+        for message_id in ["msg-old", "msg-new"] {
+            assert!(
+                ProtocolStore::take_sent_message(&store, "chat@s.whatsapp.net", message_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{message_id} should have been pruned"
+            );
+        }
     }
 
     #[cfg(feature = "whatsapp-web")]
