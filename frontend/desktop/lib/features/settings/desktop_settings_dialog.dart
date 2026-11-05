@@ -629,14 +629,67 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       isAdminOperating = true;
       adminActionMsg = 'Генерация одноразового paircode...';
     });
-    final code = await _httpClient.adminPaircodeNew();
+    var result = await _httpClient.adminPaircodeNew();
+    if (result.needsAdminToken && mounted) {
+      final token = await _promptAdminToken();
+      if (token != null && token.isNotEmpty) {
+        await GatewayConfig.setAdminToken(token);
+        result = await _httpClient.adminPaircodeNew();
+      }
+    }
     if (mounted) {
       setState(() {
         isAdminOperating = false;
-        adminGeneratedPaircode = code;
-        adminActionMsg = code != null ? 'Сгенерирован код: $code' : 'Ошибка генерации кода';
+        adminGeneratedPaircode = result.code;
+        if (result.code != null) {
+          adminActionMsg = 'Сгенерирован код: ${result.code}';
+        } else if (result.pairingDisabled) {
+          adminActionMsg = result.message ?? 'Pairing отключён для этого шлюза';
+        } else {
+          adminActionMsg = result.message ?? 'Ошибка генерации кода';
+        }
       });
     }
+  }
+
+  /// Prompts for the gateway admin token (master key) required by the
+  /// localhost-only /admin/paircode endpoints. Returns null when cancelled.
+  Future<String?> _promptAdminToken() async {
+    final controller = TextEditingController();
+    final entered = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: DesktopTheme.bgSurface,
+        title: Text(DesktopI18n.tr('Мастер-ключ шлюза', 'Gateway master key')),
+        content: TextField(
+          controller: controller,
+          obscureText: true,
+          autofocus: true,
+          decoration: InputDecoration(
+            labelText: DesktopI18n.tr('Админ-токен', 'Admin token'),
+            hintText: DesktopI18n.tr(
+              'Запустите `omnesagent gateway get-paircode` на хосте шлюза',
+              'Run `omnesagent gateway get-paircode` on the gateway host',
+            ),
+            border: const OutlineInputBorder(),
+          ),
+          onSubmitted: (value) => Navigator.of(ctx).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(DesktopI18n.cancel),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: Colors.black),
+            onPressed: () => Navigator.of(ctx).pop(controller.text),
+            child: Text(DesktopI18n.save),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return entered?.trim();
   }
 
   void _initNodesWs() {

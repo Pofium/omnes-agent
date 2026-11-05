@@ -10,16 +10,19 @@ class GatewayConfig {
   static const String _urlKey = "gateway_url";
   static const String _agentKey = "gateway_agent_alias";
   static const String _tokenKey = "gateway_bearer_token";
+  static const String _adminTokenKey = "gateway_admin_token";
 
   static String? _overrideHttpUrl;
   static String? _overrideAgentAlias;
   static String? _overrideToken;
+  static String? _overrideAdminToken;
 
   /// Sets mock overrides for unit testing without platform channel storage.
-  static void setMockOverrides({String? httpUrl, String? agentAlias, String? token}) {
+  static void setMockOverrides({String? httpUrl, String? agentAlias, String? token, String? adminToken}) {
     _overrideHttpUrl = httpUrl;
     _overrideAgentAlias = agentAlias;
     _overrideToken = token;
+    _overrideAdminToken = adminToken;
   }
 
   static GetStorage get _box => GetStorage();
@@ -150,6 +153,26 @@ class GatewayConfig {
   static Future<void> setToken(String token) async {
     try {
       await _box.write(_tokenKey, token);
+    } catch (_) {}
+  }
+
+  /// Retrieves the gateway admin token (master key) used to authorize the
+  /// localhost-only `/admin/paircode*` endpoints via the
+  /// `x-omnesagent-admin-token` header. Resolution order: explicit override
+  /// (tests) then stored value; returns an empty string when unset.
+  static Future<String> getAdminToken() async {
+    if (_overrideAdminToken != null) return _overrideAdminToken!;
+    try {
+      final stored = _box.read<String>(_adminTokenKey);
+      if (stored != null && stored.trim().isNotEmpty) return stored.trim();
+    } catch (_) {}
+    return '';
+  }
+
+  /// Stores the gateway admin token (master key). Blank values clear it.
+  static Future<void> setAdminToken(String token) async {
+    try {
+      await _box.write(_adminTokenKey, token.trim());
     } catch (_) {}
   }
 }
