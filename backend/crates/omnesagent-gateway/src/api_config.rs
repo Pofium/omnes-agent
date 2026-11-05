@@ -246,6 +246,7 @@ fn prop_kind_wire(kind: omnesagent_config::traits::PropKind) -> &'static str {
         PropKind::StringArray => "string-array",
         PropKind::ObjectArray => "object-array",
         PropKind::Object => "object",
+        PropKind::SecretMap => "secret-map",
     }
 }
 
