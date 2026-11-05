@@ -100,6 +100,11 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   bool isConfigWizardLoading = false;
   String? configWizardStatusMsg;
 
+  // Config secret-map editor state (kind == "secret-map" rows).
+  List<dynamic> configSecretMapEntries = [];
+  bool isSecretMapsLoading = false;
+  String? secretMapsStatusMsg;
+
   // Node Discovery & Peers state
   late final NodesWsClient _nodesWsClient = NodesWsClient();
   List<NodePeerInfo> discoveredNodes = [];
@@ -355,6 +360,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     _loadSkills();
     _loadHostFs();
     _loadConfigWizard();
+    _loadSecretMaps();
     _loadWasmPlugins();
     _loadWebauthn();
     _loadCronSettings();
@@ -735,6 +741,49 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       });
       await _loadConfigWizard(section);
     }
+  }
+
+  /// Loads the per-property config list that feeds the secret-map editor.
+  ///
+  /// Only `kind == "secret-map"` containers and their secret
+  /// `<container>.<KEY>` rows are relevant; the rows carry masked values, so
+  /// the editor never sees clear-text secrets.
+  Future<void> _loadSecretMaps() async {
+    setState(() => isSecretMapsLoading = true);
+    try {
+      final entries = await _httpClient.configList();
+      if (mounted) {
+        setState(() {
+          configSecretMapEntries = entries;
+          isSecretMapsLoading = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => isSecretMapsLoading = false);
+    }
+  }
+
+  /// Adds (or replaces) one secret-map entry: `<container>.<KEY> = value`.
+  Future<bool> _addSecretMapEntry(String containerPath, String key, String value) async {
+    final ok = await _httpClient.setConfigProp(secretMapEntryPath(containerPath, key), value);
+    if (mounted) {
+      setState(() => secretMapsStatusMsg = ok
+          ? DesktopI18n.tr('Запись $key сохранена', 'Entry $key saved')
+          : DesktopI18n.tr('Не удалось сохранить запись $key', 'Failed to save entry $key'));
+    }
+    if (ok) await _loadSecretMaps();
+    return ok;
+  }
+
+  /// Removes one secret-map entry. Removing an entry IS the map's delete op.
+  Future<void> _removeSecretMapEntry(String entryPath) async {
+    final ok = await _httpClient.deleteConfigProp(entryPath);
+    if (mounted) {
+      setState(() => secretMapsStatusMsg = ok
+          ? DesktopI18n.tr('Запись удалена', 'Entry removed')
+          : DesktopI18n.tr('Не удалось удалить запись', 'Failed to remove entry'));
+    }
+    if (ok) await _loadSecretMaps();
   }
 
   Future<void> _loadWasmPlugins() async {
@@ -3995,11 +4044,115 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             ],
           ),
         ),
+        const SizedBox(height: 16),
+        _buildSecretMapsCard(),
       ],
     );
   }
 
-  // ── WASM Plugins UI ────────────────────────────────────────────────────────
+  /// Editor for `kind == "secret-map"` config fields (#11419).
+  ///
+  /// Each container is rendered with its masked entries plus an inline
+  /// "add entry" control; removing an entry is the map's delete operation.
+  Widget _buildSecretMapsCard() {
+    final groups = groupSecretMapEntries(configSecretMapEntries);
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurfaceElevated,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: DesktopTheme.borderSubtle),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const UiIcon('key', size: 20, color: DesktopTheme.accentCyan),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      DesktopI18n.tr('Секретные карты (Secret Maps)', 'Secret key/value maps'),
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      DesktopI18n.tr(
+                        'Секреты вида ключ-значение (MCP env/headers, extra_headers, otel_headers и др.). Значения маскирует шлюз.',
+                        'Secret key/value maps (MCP env/headers, extra_headers, otel_headers, ...). Values stay masked by the gateway.',
+                      ),
+                      style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              OutlinedButton.icon(
+                icon: const UiIcon('repeat', size: 14),
+                label: Text(DesktopI18n.tr('Обновить', 'Refresh')),
+                onPressed: isSecretMapsLoading ? null : _loadSecretMaps,
+              ),
+            ],
+          ),
+          if (secretMapsStatusMsg != null) ...[
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurface,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: DesktopTheme.accentCyan),
+              ),
+              child: Text(secretMapsStatusMsg!, style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary)),
+            ),
+          ],
+          const SizedBox(height: 14),
+          if (isSecretMapsLoading)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.all(16),
+                child: CircularProgressIndicator(strokeWidth: 2, color: DesktopTheme.accentCyan),
+              ),
+            )
+          else if (groups.isEmpty)
+            Container(
+              padding: const EdgeInsets.all(16),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: DesktopTheme.bgSurface,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                DesktopI18n.tr(
+                  'В текущей конфигурации нет полей-карт секретов.',
+                  'The current configuration exposes no secret key/value maps.',
+                ),
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+              ),
+            )
+          else
+            ListView.separated(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: groups.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (context, idx) {
+                final group = groups[idx];
+                return _SecretMapCard(
+                  group: group,
+                  onAdd: (key, value) => _addSecretMapEntry(group.path, key, value),
+                  onRemove: _removeSecretMapEntry,
+                );
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildPluginsSection() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -4429,4 +4582,239 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     super.dispose();
   }
 }
+
+/// Editable block for one secret key/value map (`kind == "secret-map"`).
+///
+/// Lists the container's entries — values stay masked, the gateway never sends
+/// them — and offers an inline control to add a new `<KEY> = value` entry.
+class _SecretMapCard extends StatefulWidget {
+  final SecretMapGroup group;
+  final Future<bool> Function(String key, String value) onAdd;
+  final Future<void> Function(String entryPath) onRemove;
+
+  const _SecretMapCard({
+    required this.group,
+    required this.onAdd,
+    required this.onRemove,
+  });
+
+  @override
+  State<_SecretMapCard> createState() => _SecretMapCardState();
+}
+
+class _SecretMapCardState extends State<_SecretMapCard> {
+  final TextEditingController _keyController = TextEditingController();
+  final TextEditingController _valueController = TextEditingController();
+  bool _obscureValue = true;
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _keyController.dispose();
+    _valueController.dispose();
+    super.dispose();
+  }
+
+  /// Validates the pending key/value pair and commits it to the gateway.
+  Future<void> _submit() async {
+    final key = _keyController.text.trim();
+    final value = _valueController.text;
+    final keyError = secretMapKeyError(key, widget.group.entryKeys);
+    if (keyError != null) {
+      setState(() => _error = keyError == SecretMapKeyError.exists
+          ? DesktopI18n.tr('Такая запись уже существует', 'That entry already exists')
+          : DesktopI18n.tr('Недопустимое имя ключа', 'Invalid entry name'));
+      return;
+    }
+    if (value.isEmpty) {
+      setState(() => _error = DesktopI18n.tr('Значение не может быть пустым', 'Value must not be empty'));
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final ok = await widget.onAdd(key, value);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (ok) {
+        _keyController.clear();
+        _valueController.clear();
+      } else {
+        _error = DesktopI18n.tr('Не удалось сохранить запись', 'Failed to save the entry');
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final group = widget.group;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurface,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: DesktopTheme.borderSubtle),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const UiIcon('lock', size: 14, color: DesktopTheme.accentCyan),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  group.path,
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
+                ),
+              ),
+              Text(
+                DesktopI18n.tr('${group.entryCount} записей', '${group.entryCount} entries'),
+                style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+              ),
+            ],
+          ),
+          if (group.description.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(group.description, style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted)),
+          ],
+          const SizedBox(height: 10),
+          if (group.entries.isEmpty)
+            Text(
+              DesktopI18n.tr('Пока нет записей', 'No entries yet'),
+              style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+            )
+          else
+            Container(
+              decoration: BoxDecoration(
+                border: Border(left: BorderSide(color: DesktopTheme.borderMedium, width: 2)),
+              ),
+              child: Column(
+                children: [
+                  for (final entry in group.entries)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 10, top: 2, bottom: 2),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              entry.key,
+                              style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
+                            ),
+                          ),
+                          Text(
+                            entry.populated ? '••••••' : '—',
+                            style: TextStyle(fontSize: 12, letterSpacing: 1, color: DesktopTheme.textMuted),
+                          ),
+                          const SizedBox(width: 6),
+                          IconButton(
+                            icon: const UiIcon('trash', size: 14, color: DesktopTheme.statusError),
+                            tooltip: DesktopI18n.tr('Удалить запись', 'Remove entry'),
+                            onPressed: _busy ? null : () => widget.onRemove(entry.path),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.bgSurfaceElevated,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: DesktopTheme.borderSubtle),
+                  ),
+                  child: TextField(
+                    controller: _keyController,
+                    enabled: !_busy,
+                    style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
+                    decoration: InputDecoration(
+                      hintText: DesktopI18n.tr('ИМЯ_КЛЮЧА', 'KEY_NAME'),
+                      hintStyle: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+                      border: InputBorder.none,
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(vertical: 10),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: DesktopTheme.bgSurfaceElevated,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: DesktopTheme.borderSubtle),
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _valueController,
+                          enabled: !_busy,
+                          obscureText: _obscureValue,
+                          style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary),
+                          decoration: InputDecoration(
+                            hintText: DesktopI18n.tr('Значение', 'Value'),
+                            hintStyle: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+                            border: InputBorder.none,
+                            isDense: true,
+                            contentPadding: const EdgeInsets.symmetric(vertical: 10),
+                          ),
+                          onSubmitted: (_) => _submit(),
+                        ),
+                      ),
+                      IconButton(
+                        icon: _obscureValue
+                            ? UiIcon('lock', size: 14, color: DesktopTheme.textMuted)
+                            : UiIcon('key', size: 14, color: DesktopTheme.textMuted),
+                        tooltip: DesktopI18n.tr('Показать / скрыть значение', 'Show / hide value'),
+                        onPressed: () => setState(() => _obscureValue = !_obscureValue),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                icon: _busy
+                    ? const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
+                      )
+                    : const UiIcon('plus', size: 14, color: Colors.black),
+                label: Text(
+                  DesktopI18n.tr('Добавить', 'Add'),
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                ),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: DesktopTheme.accentCyan,
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                ),
+                onPressed: _busy ? null : _submit,
+              ),
+            ],
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 6),
+            Text(_error!, style: const TextStyle(fontSize: 11, color: DesktopTheme.statusError)),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 

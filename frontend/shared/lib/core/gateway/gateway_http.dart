@@ -1998,7 +1998,10 @@ class GatewayHttpClient {
     return null;
   }
 
-  /// Fetches list of config files or properties via GET /api/config/list.
+  /// Fetches the per-property config list via GET /api/config/list.
+  ///
+  /// The gateway answers `{entries: [...], drifted: [...]}`; older builds used
+  /// `items`. Both shapes are accepted so the caller only ever sees rows.
   Future<List<dynamic>> configList() async {
     try {
       final base = GatewayConfig.getBaseUrl();
@@ -2008,6 +2011,7 @@ class GatewayHttpClient {
       if (res.statusCode == 200) {
         final data = _decodeBody(res);
         if (data is List) return data;
+        if (data is Map && data['entries'] is List) return data['entries'] as List;
         if (data is Map && data['items'] is List) return data['items'] as List;
       }
     } catch (_) {}

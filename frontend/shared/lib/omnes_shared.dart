@@ -1,6 +1,7 @@
 // Umbrella export file for omnes_shared package.
 
 export 'core/gateway/gateway_config.dart';
+export 'core/gateway/secret_map_logic.dart';
 export 'core/gateway/gateway_http.dart';
 export 'core/gateway/quickstart_submission.dart';
 export 'core/gateway/gateway_ws.dart';

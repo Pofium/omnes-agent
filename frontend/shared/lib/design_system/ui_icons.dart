@@ -53,6 +53,17 @@ const Map<String, String> kUiIconSvg = <String, String>{
   // Sparkles — AI features.
   'sparkles':
       '<path d="M12 3.5l1.8 4.7L18.5 10l-4.7 1.8L12 16.5l-1.8-4.7L5.5 10l4.7-1.8L12 3.5z" fill="none"/><path d="M19 15.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1z" fill="none"/>',
+  // Plus — add / new entry.
+  'plus': '<path d="M12 5v14" fill="none"/><path d="M5 12h14" fill="none"/>',
+  // Trash can — remove / delete.
+  'trash':
+      '<path d="M4 7h16" fill="none"/><path d="M9.2 7V4.8h5.6V7" fill="none"/><path d="M6.4 7l1 12.2h9.2l1-12.2" fill="none"/>',
+  // Padlock — secret / masked value.
+  'lock':
+      '<rect x="4.5" y="10.5" width="15" height="9.5" rx="2" fill="none"/><path d="M8 10.5V7.5a4 4 0 018 0v3" fill="none"/>',
+  // Key — config secret maps.
+  'key':
+      '<circle cx="8" cy="16" r="3.2" fill="none"/><path d="M10.4 13.6L20 4" fill="none"/><path d="M16.5 7.5l2.5 2.5" fill="none"/>',
 };
 
 /// SVG icon widget for the OmnesAgent UI (AGENTS.md: emoji are forbidden;
