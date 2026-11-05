@@ -61,6 +61,15 @@ class _DesktopCommandPaletteDialogState
         ),
         _CommandAction(
           category: DesktopI18n.tr('ЗАДАЧИ И ЦЕЛИ', 'GOAL & TASKS'),
+          title: DesktopI18n.tr('Прикрепить изображение (/upload)', 'Attach an image (/upload)'),
+          shortcut: '/upload',
+          icon: FontAwesomeIcons.image,
+          onExecute: () {
+            widget.controller?.pickFilesFromDisk();
+          },
+        ),
+        _CommandAction(
+          category: DesktopI18n.tr('ЗАДАЧИ И ЦЕЛИ', 'GOAL & TASKS'),
           title: DesktopI18n.cmdNewTask,
           shortcut: 'Ctrl + N',
           icon: FontAwesomeIcons.plus,

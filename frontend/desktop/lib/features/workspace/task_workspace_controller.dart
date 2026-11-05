@@ -1754,6 +1754,21 @@ if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     } catch (_) {}
   }
 
+  /// Applies a slash command chosen from the composer's suggestion menu.
+  ///
+  /// Commands that open a native picker (`/upload`) run immediately; any other
+  /// command fills the input with its usage form so the user can add arguments.
+  void applySlashCommand(SlashCommand command) {
+    inputController.clear();
+    if (command.name == 'upload') {
+      pickFilesFromDisk();
+    } else {
+      inputController.text = '${command.usage} ';
+      inputController.selection = TextSelection.collapsed(offset: inputController.text.length);
+    }
+    inputFocusNode.requestFocus();
+  }
+
   /// Extracts image from Windows Clipboard (e.g. after Win+Shift+S) and attaches as PNG
   Future<bool> pasteScreenshotFromClipboard() async {
     try {
@@ -2502,6 +2517,15 @@ $goalsText
         inputController.clear();
         attachments.clear();
       }
+      return;
+    }
+
+    // Slash command `/upload`: open the native picker instead of sending text.
+    if (isUploadCommand(rawText)) {
+      if (overrideText == null) {
+        inputController.clear();
+      }
+      pickFilesFromDisk();
       return;
     }
 
