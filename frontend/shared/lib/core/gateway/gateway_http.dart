@@ -1366,6 +1366,26 @@ class GatewayHttpClient {
     }
   }
 
+  /// Fetches the run overlay for one SOP run via
+  /// GET /api/sops/{name}/runs/{run_id}/overlay.
+  ///
+  /// The overlay projects the run onto the SOP graph: per-node states
+  /// (pending / active / completed / failed / skipped), the current step, and
+  /// the recorded step results. Returns `null` when the run, SOP, or SOP
+  /// subsystem is unavailable.
+  Future<Map<String, dynamic>?> sopRunOverlay(String name, String runId) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/sops/${Uri.encodeComponent(name)}/runs/${Uri.encodeComponent(runId)}/overlay');
+      final headers = await _authHeaders();
+      final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   /// Generates pure SOP wire draft via POST /api/sops/wire-draft.
   Future<Map<String, dynamic>?> sopWireDraft(Map<String, dynamic> spec) async {
     try {
