@@ -2307,12 +2307,71 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            _buildBudgetWarningBanner(),
             _buildApprovalsBanner(),
             _buildComposerCard(isHero: false),
           ],
         ),
       ),
     );
+  }
+
+  /// §8.1.1 (#11692): the gateway latches at most one `budget_warning` per turn
+  /// when recorded spend crosses `cost.warn_at_percent`. Shown as a passive
+  /// amber banner above the composer (no action required — the turn keeps
+  /// running); cleared when a new turn starts.
+  Widget _buildBudgetWarningBanner() {
+    return Obx(() {
+      final warning = widget.controller.budgetWarning.value;
+      if (warning == null) return const SizedBox.shrink();
+
+      final isMonthly = warning.period == 'month';
+      final periodLabel = isMonthly
+          ? DesktopI18n.tr('месячный лимит', 'monthly limit')
+          : DesktopI18n.tr('дневной лимит', 'daily limit');
+      final percent = warning.limitUsd > 0
+          ? (warning.currentUsd / warning.limitUsd * 100).clamp(0, 999).toStringAsFixed(0)
+          : '—';
+
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          decoration: BoxDecoration(
+            color: DesktopTheme.statusWarning.withOpacity(0.10),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: DesktopTheme.statusWarning.withOpacity(0.6), width: 1.2),
+          ),
+          child: Row(
+            children: [
+              UiIcon('warning', size: 18, color: DesktopTheme.statusWarning),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text.rich(
+                  TextSpan(
+                    style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
+                    children: [
+                      TextSpan(
+                        text: DesktopI18n.tr('Предупреждение о бюджете: ', 'Budget warning: '),
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: DesktopTheme.statusWarning,
+                        ),
+                      ),
+                      TextSpan(
+                        text: '\$${warning.currentUsd.toStringAsFixed(2)} / '
+                            '\$${warning.limitUsd.toStringAsFixed(2)} '
+                            '($percent%) — $periodLabel',
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    });
   }
 
   Widget _buildApprovalsBanner() {

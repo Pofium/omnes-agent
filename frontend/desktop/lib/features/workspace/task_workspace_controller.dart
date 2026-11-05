@@ -110,6 +110,9 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
   // DeepSeek / OmnesAgent Harness state
   final trajectorySteps = <TrajectoryStep>[].obs;
   final currentContextBudget = Rxn<ContextBudgetSnapshot>();
+  // Latest `cost.warn_at_percent` crossing reported by the gateway for the
+  // active turn; cleared when a new turn starts. Null means "no warning".
+  final budgetWarning = Rxn<BudgetWarningFrame>();
   final currentExecutionMode = AgentExecutionMode.fast.obs;
 
   // Project Rules Inspector
@@ -458,6 +461,7 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
     runTimelineSteps.assignAll(session.runTimelineSteps);
     trajectorySteps.clear();
     currentContextBudget.value = null;
+    budgetWarning.value = null;
     refreshGitStatus();
     attachments.clear();
     inputController.clear();
@@ -1310,6 +1314,9 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
       currentContextBudget.value = frame.budget;
       usedTokens.value = frame.budget.totalUsedTokens;
       maxTokens.value = frame.budget.maxWindowTokens;
+    } else if (frame is BudgetWarningFrame) {
+      // One per turn at most (backend latches it); a later turn replaces it.
+      budgetWarning.value = frame;
     } else if (frame is GroundingCitationFrame) {
       if (messages.isNotEmpty && messages.last.chatMessageType == ChatMessageType.bot) {
         messages.last.citations.add(frame.citation);
@@ -1504,6 +1511,7 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
     runTimelineSteps.clear();
     trajectorySteps.clear();
     currentContextBudget.value = null;
+    budgetWarning.value = null;
     activeGoal.value = null;
     inputController.clear();
 
