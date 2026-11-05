@@ -2844,11 +2844,7 @@ mod tests {
                 let disk_before = tokio::fs::read(&config.config_path).await.unwrap();
                 let live_before = config.gateway.webhook_secret.clone();
                 let mut state = test_state(config);
-                state.pairing = Arc::new(PairingGuard::new(
-                    true,
-                    &[token.to_string()],
-                    omnesagent_config::pairing::PairingCodePolicy::default(),
-                ));
+                state.pairing = Arc::new(PairingGuard::new(true, &[token.to_string()]));
                 let app = axum::Router::new()
                     .route("/api/config", patch(handle_patch))
                     .with_state(state.clone());
@@ -4571,10 +4567,11 @@ mod tests {
                 ])),
             )
             .await,
-        );
+        )
+        .await;
         assert_eq!(status, axum::http::StatusCode::OK);
 
-        let reloaded = state.config.load();
+        let reloaded = state.config.read();
         let profile = reloaded.risk_profiles.get("default").unwrap();
         assert!(!profile.deny_all_tools);
         assert_eq!(profile.allowed_tools, vec!["shell".to_string()]);
