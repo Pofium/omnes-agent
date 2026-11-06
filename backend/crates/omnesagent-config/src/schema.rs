@@ -316,6 +316,23 @@ pub use transcription::*;
 mod voice;
 pub use voice::*;
 
+// Dynamic node discovery config (the `[nodes]` section) lives in its own module;
+// re-exported here so `crate::schema::{NodesConfig, MdnsConfig}` are unchanged.
+mod nodes;
+pub use nodes::*;
+
+// Text-to-Speech config (the `[tts]` section) lives in its own module;
+// re-exported here so `crate::schema::{TtsConfig, TtsProviderConfig}` are
+// unchanged.
+mod tts;
+pub use tts::*;
+
+// MCP tool filtering groups (`[...tool_filter_groups]`) live in their own
+// module; re-exported here so `crate::schema::{ToolFilterGroup,
+// ToolFilterGroupMode}` are unchanged.
+mod tool_filter;
+pub use tool_filter::*;
+
 // Used by `Config::validate` and its tests, which live outside the security
 // module; kept as a schema-level helper rather than moving with the section.
 fn default_otp_gated_actions() -> Vec<String> {
@@ -3108,250 +3125,6 @@ impl Default for VerifiableIntentConfig {
             strictness: default_vi_strictness(),
         }
     }
-}
-
-// ── Nodes (Dynamic Node Discovery) ───────────────────────────────
-
-fn default_mdns_announce_interval_secs() -> u64 {
-    30
-}
-
-fn default_mdns_peer_ttl_secs() -> u64 {
-    90
-}
-
-fn default_mdns_max_peers() -> usize {
-    16
-}
-
-/// Configuration for LAN-local mDNS peer discovery (`[nodes.mdns]`).
-///
-/// This config controls only discovery behavior. The advertised gateway
-/// endpoint is derived from the running gateway's actual host, port, and path
-/// prefix at startup so `[nodes.mdns]` does not duplicate gateway listen state.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "nodes.mdns"]
-pub struct MdnsConfig {
-    /// Enable mDNS local peer discovery.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Human-readable node name advertised to LAN peers. Defaults to a stable
-    /// local fallback when unset.
-    #[serde(default)]
-    pub node_name: Option<String>,
-    /// Maximum number of unauthenticated LAN peer hints retained in memory.
-    #[serde(default = "default_mdns_max_peers")]
-    pub max_peers: usize,
-    /// How often this node re-broadcasts its presence, in seconds.
-    #[serde(default = "default_mdns_announce_interval_secs")]
-    pub announce_interval_secs: u64,
-    /// Seconds after the last announcement before a peer is evicted.
-    #[serde(default = "default_mdns_peer_ttl_secs")]
-    pub peer_ttl_secs: u64,
-}
-
-impl Default for MdnsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            node_name: None,
-            max_peers: default_mdns_max_peers(),
-            announce_interval_secs: default_mdns_announce_interval_secs(),
-            peer_ttl_secs: default_mdns_peer_ttl_secs(),
-        }
-    }
-}
-
-/// Configuration for the dynamic node discovery system (`[nodes]`).
-///
-/// When enabled, external processes/devices can connect via WebSocket
-/// at `/ws/nodes` and advertise their capabilities at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "nodes"]
-pub struct NodesConfig {
-    /// Enable dynamic node discovery endpoint.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum number of concurrent node connections.
-    #[serde(default = "default_max_nodes")]
-    pub max_nodes: usize,
-    /// Optional bearer token for node authentication.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub auth_token: Option<String>,
-    /// LAN-local mDNS peer discovery.
-    #[serde(default)]
-    #[nested]
-    pub mdns: MdnsConfig,
-}
-
-fn default_max_nodes() -> usize {
-    16
-}
-
-impl Default for NodesConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_nodes: default_max_nodes(),
-            auth_token: None,
-            mdns: MdnsConfig::default(),
-        }
-    }
-}
-
-// ── TTS (Text-to-Speech) ─────────────────────────────────────────
-
-fn default_tts_voice() -> String {
-    "alloy".into()
-}
-
-fn default_tts_format() -> String {
-    "mp3".into()
-}
-
-fn default_tts_max_text_length() -> usize {
-    4096
-}
-
-/// Text-to-Speech subsystem configuration (`[tts]`).
-///
-/// Per-instance TTS configs live under `[tts_providers.<type>.<alias>]`
-/// (parallel to `providers.models`). What remains here are the global
-/// runtime knobs that apply to every model_provider invocation.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "tts"]
-pub struct TtsConfig {
-    /// Enable TTS synthesis.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Default voice ID passed to the selected tts provider.
-    #[serde(default = "default_tts_voice")]
-    pub default_voice: String,
-    /// Default audio output format (`"mp3"`, `"opus"`, `"wav"`).
-    #[serde(default = "default_tts_format")]
-    pub default_format: String,
-    /// Maximum input text length in characters (default 4096).
-    #[serde(default = "default_tts_max_text_length")]
-    pub max_text_length: usize,
-}
-
-impl Default for TtsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            default_voice: default_tts_voice(),
-            default_format: default_tts_format(),
-            max_text_length: default_tts_max_text_length(),
-        }
-    }
-}
-
-/// Per-instance TTS model_provider configuration (`[tts_providers.<type>.<alias>]`).
-///
-/// Mirrors `ModelProviderConfig` in shape — one struct holds the union of
-/// fields across backends. Only the fields relevant to the selected backend
-/// (determined by the outer `<type>` map key) are read at runtime; others
-/// are quietly ignored.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "tts_provider"]
-#[serde(default)]
-pub struct TtsProviderConfig {
-    /// API key (openai, elevenlabs, google).
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
-    /// Model name. OpenAI uses this for `tts-1`/`tts-1-hd`; elevenlabs uses
-    /// it as the model_id (e.g. `eleven_monolingual_v1`).
-    pub model: Option<String>,
-    /// Voice override for this instance. When empty, falls back to
-    /// `[tts].default_voice`.
-    pub voice: Option<String>,
-    /// Playback speed multiplier (openai only; default `1.0`).
-    pub speed: Option<f64>,
-    /// Voice stability for elevenlabs (0.0-1.0; default `0.5`).
-    pub stability: Option<f64>,
-    /// Similarity boost for elevenlabs (0.0-1.0; default `0.5`).
-    pub similarity_boost: Option<f64>,
-    /// Language code for google (e.g. `en-US`).
-    pub language_code: Option<String>,
-    /// Path to backend binary (edge-tts subprocess; piper local server).
-    pub binary_path: Option<String>,
-    /// Audio response format sent to the TTS backend (e.g. `"opus"`, `"mp3"`,
-    /// `"wav"`). Defaults to `"opus"` for the OpenAI family. Override to
-    /// `"wav"` for Orpheus-class models (e.g. `canopylabs/orpheus-v1-english`
-    /// on Groq) or `"mp3"` for broader compatibility.
-    pub response_format: Option<String>,
-    /// Endpoint URI for HTTP-based backends. Overrides the family default
-    /// when pointing at a compatible third-party API (Groq, Azure, self-hosted
-    /// proxies). Set to the **full** URL — there is no separate path-suffix
-    /// field. Renamed from `api_url` for parity with `ModelProviderConfig.uri`.
-    #[serde(alias = "api_url")]
-    pub uri: Option<String>,
-}
-
-/// Determines when a `ToolFilterGroup` is active.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, omnesagent_macros::ConfigEnum,
-)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum ToolFilterGroupMode {
-    /// Tools in this group are always included in every turn.
-    Always,
-    /// Tools in this group are included only when the user message contains
-    /// at least one of the configured `keywords` (case-insensitive substring match).
-    #[default]
-    Dynamic,
-}
-
-/// A named group of MCP tool patterns with an activation mode.
-///
-/// Each group lists glob patterns for MCP tool names and an optional set of
-/// keywords that trigger inclusion in `dynamic` mode. MCP tools are named
-/// `<server>__<tool>` (double-underscore separator, e.g. `filesystem__read_file`).
-///
-/// Classification is by origin, not name shape: only tools that actually came
-/// from the MCP registry are subject to these groups. Built-in tools AND skill
-/// tools — which share the `<x>__<y>` naming convention (`{skill}__{tool}`) —
-/// always pass through and are never affected by `tool_filter_groups`.
-///
-/// Under `[mcp] deferred_loading = true`, `mode = "always"` entries are
-/// pre-activated at assembly time so matching tools are live from the first
-/// turn without a `tool_search` round-trip.
-///
-/// # Example
-/// ```toml
-/// [[runtime_profiles.default.tool_filter_groups]]
-/// mode = "always"
-/// tools = ["filesystem__*"]
-/// keywords = []
-///
-/// [[runtime_profiles.default.tool_filter_groups]]
-/// mode = "dynamic"
-/// tools = ["browser__*"]
-/// keywords = ["browse", "website", "url", "search"]
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct ToolFilterGroup {
-    /// Activation mode: `"always"` or `"dynamic"`.
-    #[serde(default)]
-    pub mode: ToolFilterGroupMode,
-    /// Glob patterns matching MCP tool names (single `*` wildcard supported).
-    #[serde(default)]
-    pub tools: Vec<String>,
-    /// Keywords that activate this group in `dynamic` mode (case-insensitive substring).
-    /// Ignored when `mode = "always"`.
-    #[serde(default)]
-    pub keywords: Vec<String>,
 }
 
 /// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
