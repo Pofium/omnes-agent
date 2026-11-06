@@ -129,6 +129,17 @@ pub use security::*;
 mod config_impl;
 pub use config_impl::*;
 
+// Conversational AI config (the `[conversational_ai]` section) lives in its
+// own module; re-exported here so `crate::schema::ConversationalAiConfig` is
+// unchanged.
+mod conversational_ai;
+pub use conversational_ai::*;
+
+// Security ops config (the `[security_ops]` section) lives in its own module;
+// re-exported here so `crate::schema::SecurityOpsConfig` is unchanged.
+mod security_ops;
+pub use security_ops::*;
+
 // Used by `Config::validate` and its tests, which live outside the security
 // module; kept as a schema-level helper rather than moving with the section.
 fn default_otp_gated_actions() -> Vec<String> {
@@ -9756,153 +9767,6 @@ fn default_cloud_ops_cost_threshold() -> f64 {
 
 fn default_cloud_ops_waf() -> Vec<String> {
     vec!["aws-waf".into()]
-}
-
-// ── Conversational AI ──────────────────────────────────────────────
-
-fn default_conversational_ai_language() -> String {
-    "en".into()
-}
-
-fn default_conversational_ai_supported_languages() -> Vec<String> {
-    vec!["en".into(), "de".into(), "fr".into(), "it".into()]
-}
-
-fn default_conversational_ai_escalation_threshold() -> f64 {
-    0.3
-}
-
-fn default_conversational_ai_max_turns() -> usize {
-    50
-}
-
-fn default_conversational_ai_timeout_secs() -> u64 {
-    1800
-}
-
-/// Conversational AI agent builder configuration (`[conversational_ai]` section).
-///
-/// **Status: Reserved for future use.** This configuration is parsed but not yet
-/// consumed by the runtime. Setting `enabled = true` will produce a startup warning.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "conversational_ai"]
-pub struct ConversationalAiConfig {
-    /// Enable conversational AI features. Default: false.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Default language for conversations (BCP-47 tag). Default: "en".
-    #[serde(default = "default_conversational_ai_language")]
-    pub default_language: String,
-    /// Supported languages for conversations. Default: [`en`, `de`, `fr`, `it`].
-    #[serde(default = "default_conversational_ai_supported_languages")]
-    pub supported_languages: Vec<String>,
-    /// Automatically detect user language from message content. Default: true.
-    #[serde(default = "default_true")]
-    pub auto_detect_language: bool,
-    /// Intent confidence below this threshold triggers escalation. Default: 0.3.
-    #[serde(default = "default_conversational_ai_escalation_threshold")]
-    pub escalation_confidence_threshold: f64,
-    /// Maximum conversation turns before auto-ending. Default: 50.
-    #[serde(default = "default_conversational_ai_max_turns")]
-    pub max_conversation_turns: usize,
-    /// Conversation timeout in seconds (inactivity). Default: 1800.
-    #[serde(default = "default_conversational_ai_timeout_secs")]
-    pub conversation_timeout_secs: u64,
-    /// Enable conversation analytics tracking. Default: false (privacy-by-default).
-    #[serde(default)]
-    pub analytics_enabled: bool,
-    /// Optional tool name for RAG-based knowledge base lookup during conversations.
-    #[serde(default)]
-    pub knowledge_base_tool: Option<String>,
-}
-
-impl ConversationalAiConfig {
-    /// Returns `true` when the feature is disabled (the default).
-    ///
-    /// Used by `#[serde(skip_serializing_if)]` to omit the entire
-    /// `[conversational_ai]` section from newly-generated config files,
-    /// avoiding user confusion over an undocumented / experimental section.
-    pub fn is_disabled(&self) -> bool {
-        !self.enabled
-    }
-}
-
-impl Default for ConversationalAiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            default_language: default_conversational_ai_language(),
-            supported_languages: default_conversational_ai_supported_languages(),
-            auto_detect_language: true,
-            escalation_confidence_threshold: default_conversational_ai_escalation_threshold(),
-            max_conversation_turns: default_conversational_ai_max_turns(),
-            conversation_timeout_secs: default_conversational_ai_timeout_secs(),
-            analytics_enabled: false,
-            knowledge_base_tool: None,
-        }
-    }
-}
-
-// ── Security ops config ─────────────────────────────────────────
-
-/// Managed Cybersecurity Service (MCSS) dashboard agent configuration (`[security_ops]`).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "security_ops"]
-pub struct SecurityOpsConfig {
-    /// Enable security operations tools.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Directory containing incident response playbook definitions (JSON).
-    #[serde(default = "default_playbooks_dir")]
-    pub playbooks_dir: String,
-    /// Automatically triage incoming alerts without user prompt.
-    #[serde(default)]
-    pub auto_triage: bool,
-    /// Require human approval before executing playbook actions.
-    #[serde(default = "default_require_approval")]
-    pub require_approval_for_actions: bool,
-    /// Maximum severity level that can be auto-remediated without approval.
-    /// One of: "low", "medium", "high", "critical". Default: "low".
-    #[serde(default = "default_max_auto_severity")]
-    pub max_auto_severity: String,
-    /// Directory for generated security reports.
-    #[serde(default = "default_report_output_dir")]
-    pub report_output_dir: String,
-    /// Optional SIEM webhook URL for alert ingestion.
-    #[serde(default)]
-    pub siem_integration: Option<String>,
-}
-
-fn default_playbooks_dir() -> String {
-    default_path_under_config_dir("playbooks")
-}
-
-fn default_require_approval() -> bool {
-    true
-}
-
-fn default_max_auto_severity() -> String {
-    "low".into()
-}
-
-fn default_report_output_dir() -> String {
-    default_path_under_config_dir("security-reports")
-}
-
-impl Default for SecurityOpsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            playbooks_dir: default_playbooks_dir(),
-            auto_triage: false,
-            require_approval_for_actions: true,
-            max_auto_severity: default_max_auto_severity(),
-            report_output_dir: default_report_output_dir(),
-            siem_integration: None,
-        }
-    }
 }
 
 // ── Config dir resolution ──────────────────────────────────────────
