@@ -74,6 +74,42 @@ pub use cron::*;
 mod runtime;
 pub use runtime::*;
 
+// Reliability & supervision config (the `[reliability]` section) lives in its
+// own module; re-exported here so `crate::schema::ReliabilityConfig` is unchanged.
+mod reliability;
+pub use reliability::*;
+
+// Model routing config (the `[[model_routes]]` table) lives in its own module;
+// re-exported here so `crate::schema::ModelRouteConfig` is unchanged.
+mod model_routing;
+pub use model_routing::*;
+
+// On-disk model cache schema lives in its own module; re-exported here so
+// `crate::schema::ModelCacheState` is unchanged.
+mod model_cache;
+pub use model_cache::*;
+
+// Embedding routing config (the `[[embedding_routes]]` table) lives in its own
+// module; re-exported here so `crate::schema::EmbeddingRouteConfig` is unchanged.
+mod embedding_routing;
+pub use embedding_routing::*;
+
+// Query classification config (the `[query_classification]` section) lives in
+// its own module; re-exported here so `crate::schema::<QueryClassificationType>`
+// is unchanged.
+mod query_classification;
+pub use query_classification::*;
+
+// Heartbeat config (the `[heartbeat]` section) lives in its own module;
+// re-exported here so `crate::schema::HeartbeatConfig` is unchanged.
+mod heartbeat;
+pub use heartbeat::*;
+
+// ACP server config (the `[acp]` section) lives in its own module;
+// re-exported here so `crate::schema::AcpConfig` is unchanged.
+mod acp;
+pub use acp::*;
+
 // Used by `SchedulerConfig::default`; shared with the cron module, so it is
 // kept as a schema-level helper rather than moving with the cron section.
 fn default_max_run_history() -> u32 {
@@ -8642,389 +8678,6 @@ pub struct McpBundleConfig {
     /// MCP server IDs removed from the grant. Deny wins: a name listed here is
     /// excluded even if another referenced bundle includes it.
     pub exclude: Vec<String>,
-}
-
-
-// ── Reliability / supervision ────────────────────────────────────
-
-/// Reliability and supervision configuration (`[reliability]` section).
-///
-/// Controls model_provider retries, API key rotation, and channel restart backoff.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "reliability"]
-pub struct ReliabilityConfig {
-    /// Retries per model_provider before bailing.
-    #[serde(default = "default_provider_retries")]
-    pub provider_retries: u32,
-    /// Base backoff (ms) for model_provider retry delay.
-    #[serde(default = "default_provider_backoff_ms")]
-    pub provider_backoff_ms: u64,
-    /// Additional API keys for round-robin rotation on rate-limit (429) errors.
-    /// The primary `api_key` is always tried first; these are extras.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_keys: Vec<String>,
-    /// Initial backoff for channel/daemon restarts.
-    #[serde(default = "default_channel_backoff_secs")]
-    pub channel_initial_backoff_secs: u64,
-    /// Max backoff for channel/daemon restarts.
-    #[serde(default = "default_channel_backoff_max_secs")]
-    pub channel_max_backoff_secs: u64,
-    /// Scheduler polling cadence in seconds.
-    #[serde(default = "default_scheduler_poll_secs")]
-    pub scheduler_poll_secs: u64,
-    /// Max retries for cron job execution attempts.
-    #[serde(default = "default_scheduler_retries")]
-    pub scheduler_retries: u32,
-}
-
-fn default_provider_retries() -> u32 {
-    2
-}
-
-fn default_provider_backoff_ms() -> u64 {
-    500
-}
-
-fn default_channel_backoff_secs() -> u64 {
-    2
-}
-
-fn default_channel_backoff_max_secs() -> u64 {
-    60
-}
-
-fn default_scheduler_poll_secs() -> u64 {
-    15
-}
-
-fn default_scheduler_retries() -> u32 {
-    2
-}
-
-impl Default for ReliabilityConfig {
-    fn default() -> Self {
-        Self {
-            provider_retries: default_provider_retries(),
-            provider_backoff_ms: default_provider_backoff_ms(),
-            api_keys: Vec::new(),
-            channel_initial_backoff_secs: default_channel_backoff_secs(),
-            channel_max_backoff_secs: default_channel_backoff_max_secs(),
-            scheduler_poll_secs: default_scheduler_poll_secs(),
-            scheduler_retries: default_scheduler_retries(),
-        }
-    }
-}
-
-
-// ── Model routing ────────────────────────────────────────────────
-
-/// Route a task hint to a specific model_provider + model.
-///
-/// ```toml
-/// [[model_routes]]
-/// hint = "reasoning"
-/// model_provider = "openrouter.default"
-/// model = "anthropic/claude-opus-4-20250514"
-///
-/// [[model_routes]]
-/// hint = "fast"
-/// model_provider = "groq.low-latency"
-/// model = "llama-3.3-70b-versatile"
-/// ```
-///
-/// Usage: pass `hint:reasoning` as the model parameter to route the request.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "model_routes"]
-pub struct ModelRouteConfig {
-    /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
-    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
-    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
-    /// are rejected by `Config::validate()`.
-    #[serde(default)]
-    pub hint: String,
-    /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
-    #[serde(default)]
-    pub model_provider: String,
-    /// Provider-local model identifier to use with that provider profile
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
-    #[serde(default)]
-    pub model: String,
-    /// Optional API key override for this route's model provider
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
-}
-
-// ── Model cache (shared between CLI refresh and channel reader) ──
-
-/// Canonical on-disk model cache schema. Written by `omnesagent models refresh`
-/// and read by the channel `/model` command. Both sides MUST use this type
-/// to prevent schema drift (single-source-of-truth rule).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct ModelCacheState {
-    pub entries: Vec<ModelCacheEntry>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct ModelCacheEntry {
-    pub model_provider: String,
-    pub models: Vec<String>,
-}
-
-// ── Embedding routing ───────────────────────────────────────────
-
-/// Route an embedding hint to a specific model_provider + model.
-///
-/// ```toml
-/// [[embedding_routes]]
-/// hint = "semantic"
-/// model_provider = "openai.embeddings"
-/// model = "text-embedding-3-small"
-/// dimensions = 1536
-///
-/// [memory]
-/// embedding_model = "hint:semantic"
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "embedding_routes"]
-pub struct EmbeddingRouteConfig {
-    /// Route hint name (e.g. "semantic", "archive", "faq")
-    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
-    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
-    /// are rejected by `Config::validate()`.
-    #[serde(default)]
-    pub hint: String,
-    /// Dotted embedding-capable provider profile ref
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
-    #[serde(default)]
-    pub model_provider: String,
-    /// Provider-local embedding model identifier to use with that provider profile
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
-    #[serde(default)]
-    pub model: String,
-    /// Optional embedding dimension override for this route
-    #[serde(default)]
-    pub dimensions: Option<usize>,
-    /// Optional API key override for this route's model_provider
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub api_key: Option<String>,
-}
-
-// ── Query Classification ─────────────────────────────────────────
-
-/// Automatic query classification — classifies user messages by keyword/pattern
-/// and routes to the appropriate model hint. Disabled by default.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "query_classification"]
-pub struct QueryClassificationConfig {
-    /// Enable automatic query classification. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Classification rules evaluated in priority order.
-    #[serde(default)]
-    pub rules: Vec<ClassificationRule>,
-}
-
-/// A single classification rule mapping message patterns to a model hint.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct ClassificationRule {
-    /// Must match a `[[model_routes]]` hint value.
-    pub hint: String,
-    /// Case-insensitive substring matches.
-    #[serde(default)]
-    pub keywords: Vec<String>,
-    /// Case-sensitive literal matches (for "```", "fn ", etc.).
-    #[serde(default)]
-    pub patterns: Vec<String>,
-    /// Only match if message length >= N chars.
-    #[serde(default)]
-    pub min_length: Option<usize>,
-    /// Only match if message length <= N chars.
-    #[serde(default)]
-    pub max_length: Option<usize>,
-    /// Higher priority rules are checked first.
-    #[serde(default)]
-    pub priority: i32,
-}
-
-// ── Heartbeat ────────────────────────────────────────────────────
-
-/// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "heartbeat"]
-#[allow(clippy::struct_excessive_bools)]
-pub struct HeartbeatConfig {
-    /// Enable periodic heartbeat pings. Default: `false`. When enabled,
-    /// `agent` must name a configured agent — there is no default agent
-    /// for heartbeat to fall through to.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Configured agent alias the heartbeat worker runs as. Required
-    /// when `enabled = true`; refers to a `[agents.<alias>]` entry.
-    #[serde(default)]
-    pub agent: String,
-    /// Interval in minutes between heartbeat pings. Minimum: `1`. Default: `30`.
-    #[serde(default = "default_heartbeat_interval")]
-    pub interval_minutes: u32,
-    /// Enable two-phase heartbeat: Phase 1 asks LLM whether to run, Phase 2
-    /// executes only when the LLM decides there is work to do. Saves API cost
-    /// during quiet periods. Default: `true`.
-    #[serde(default = "default_two_phase")]
-    pub two_phase: bool,
-    /// Optional fallback task text when `HEARTBEAT.md` has no task entries.
-    #[serde(default)]
-    pub message: Option<String>,
-    /// Optional delivery channel for heartbeat output (for example: `telegram`).
-    /// When omitted, auto-selects the first configured channel.
-    #[serde(default, alias = "channel")]
-    pub target: Option<String>,
-    /// Optional delivery recipient/chat identifier (required when `target` is
-    /// explicitly set).
-    #[serde(default, alias = "recipient")]
-    pub to: Option<String>,
-    /// Enable adaptive intervals that back off on failures and speed up for
-    /// high-priority tasks. Default: `false`.
-    #[serde(default)]
-    pub adaptive: bool,
-    /// Minimum interval in minutes when adaptive mode is enabled. Default: `5`.
-    #[serde(default = "default_heartbeat_min_interval")]
-    pub min_interval_minutes: u32,
-    /// Maximum interval in minutes when adaptive mode backs off. Default: `120`.
-    #[serde(default = "default_heartbeat_max_interval")]
-    pub max_interval_minutes: u32,
-    /// Dead-man's switch timeout in minutes. If the heartbeat has not ticked
-    /// within this window, an alert is sent. `0` disables. Default: `0`.
-    #[serde(default)]
-    pub deadman_timeout_minutes: u32,
-    /// Channel for dead-man's switch alerts (e.g. `telegram`). Falls back to
-    /// the heartbeat delivery channel.
-    #[serde(default)]
-    pub deadman_channel: Option<String>,
-    /// Recipient for dead-man's switch alerts. Falls back to `to`.
-    #[serde(default)]
-    pub deadman_to: Option<String>,
-    /// Maximum number of heartbeat run history records to retain. Default: `100`.
-    #[serde(default = "default_heartbeat_max_run_history")]
-    pub max_run_history: u32,
-    /// Load the channel session history before each heartbeat task execution so
-    /// the LLM has conversational context. Default: `false`.
-    ///
-    /// When `true`, the session file for the configured `target`/`to` is passed
-    /// to the agent as `session_state_file`, giving it access to the recent
-    /// conversation history — just as if the user had sent a message.
-    #[serde(default)]
-    pub load_session_context: bool,
-    /// Maximum wall-clock seconds allowed for a single agent invocation
-    /// (Phase 1 decision or Phase 2 task execution). `0` disables.
-    /// Default: `600` (10 minutes).
-    #[serde(default = "default_heartbeat_task_timeout")]
-    pub task_timeout_secs: u64,
-}
-
-fn default_heartbeat_interval() -> u32 {
-    30
-}
-
-fn default_two_phase() -> bool {
-    true
-}
-
-fn default_heartbeat_min_interval() -> u32 {
-    5
-}
-
-fn default_heartbeat_max_interval() -> u32 {
-    120
-}
-
-fn default_heartbeat_max_run_history() -> u32 {
-    100
-}
-
-fn default_heartbeat_task_timeout() -> u64 {
-    600
-}
-
-impl Default for HeartbeatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            agent: String::new(),
-            interval_minutes: default_heartbeat_interval(),
-            two_phase: true,
-            message: None,
-            target: None,
-            to: None,
-            adaptive: false,
-            min_interval_minutes: default_heartbeat_min_interval(),
-            max_interval_minutes: default_heartbeat_max_interval(),
-            deadman_timeout_minutes: 0,
-            deadman_channel: None,
-            deadman_to: None,
-            max_run_history: default_heartbeat_max_run_history(),
-            load_session_context: false,
-            task_timeout_secs: default_heartbeat_task_timeout(),
-        }
-    }
-}
-
-
-// ── ACP ──────────────────────────────────────────────────────────
-
-/// ACP (Agent Client Protocol) server configuration (`[acp]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "acp"]
-pub struct AcpConfig {
-    /// Agent alias to use when `session/new` omits `agentAlias` and more than
-    /// one agent is configured. When exactly one agent exists it is
-    /// auto-selected regardless of this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_agent: Option<String>,
-    /// Maximum number of concurrent ACP sessions. Default: `10`.
-    #[serde(default = "default_acp_max_sessions")]
-    pub max_sessions: usize,
-    /// Idle session timeout in seconds. Sessions with no activity for this
-    /// duration are eligible for eviction. Default: `3600` (1 hour).
-    #[serde(default = "default_acp_session_timeout_secs")]
-    pub session_timeout_secs: u64,
-}
-
-fn default_acp_max_sessions() -> usize {
-    10
-}
-
-fn default_acp_session_timeout_secs() -> u64 {
-    3600
-}
-
-impl Default for AcpConfig {
-    fn default() -> Self {
-        Self {
-            default_agent: None,
-            max_sessions: default_acp_max_sessions(),
-            session_timeout_secs: default_acp_session_timeout_secs(),
-        }
-    }
 }
 
 
