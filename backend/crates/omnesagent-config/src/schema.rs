@@ -39,6 +39,11 @@ pub use observability::*;
 mod memory;
 pub use memory::*;
 
+// Lifecycle hooks config (the `[hooks]` section) lives in its own module;
+// re-exported here so `crate::schema::{HooksConfig, ...}` paths are unchanged.
+mod hooks;
+pub use hooks::*;
+
 // Called from `Config::validate`; kept private to this module so it does not
 // move with the rest of the memory section.
 fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
@@ -8269,97 +8274,6 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-// ── Hooks ────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "hooks"]
-pub struct HooksConfig {
-    /// Enable lifecycle hook execution.
-    ///
-    /// Hooks run in-process with the same privileges as the main runtime.
-    /// Keep enabled hook handlers narrowly scoped and auditable.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default)]
-    #[nested]
-    pub builtin: BuiltinHooksConfig,
-}
-
-impl Default for HooksConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            builtin: BuiltinHooksConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "hooks.builtin"]
-pub struct BuiltinHooksConfig {
-    /// Enable the command-logger hook (logs tool calls for auditing).
-    #[serde(default)]
-    pub command_logger: bool,
-    /// Configuration for the webhook-audit hook.
-    ///
-    /// When enabled, POSTs a JSON payload to `url` for every tool invocation
-    /// that matches one of `tool_patterns`.
-    #[serde(default)]
-    #[nested]
-    pub webhook_audit: WebhookAuditConfig,
-}
-
-/// Configuration for the webhook-audit builtin hook.
-///
-/// Sends an HTTP POST with a JSON body to an external endpoint each time
-/// a tool call matches one of the configured patterns. Useful for
-/// centralised audit logging, SIEM ingestion, or compliance pipelines.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "hooks.builtin.webhook_audit"]
-pub struct WebhookAuditConfig {
-    /// Enable the webhook-audit hook. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Target URL that will receive the audit POST requests.
-    #[serde(default)]
-    pub url: String,
-    /// Glob patterns for tool names to audit (e.g. `["Bash", "Write"]`).
-    /// An empty list means **no** tools are audited.
-    #[serde(default)]
-    pub tool_patterns: Vec<String>,
-    /// Include tool call arguments in the audit payload. Default: `false`.
-    ///
-    /// Arguments are scrubbed for common credentials and recognised inline
-    /// image markers before export, but may still contain unrecognised secrets
-    /// or personal data.
-    /// The destination controls retention of exported payloads.
-    #[serde(default)]
-    pub include_args: bool,
-    /// Maximum size (in bytes) of serialised arguments included in a single
-    /// audit payload. Arguments exceeding this limit are truncated.
-    /// Default: `4096`.
-    #[serde(default = "default_max_args_bytes")]
-    pub max_args_bytes: u64,
-}
-
-fn default_max_args_bytes() -> u64 {
-    4096
-}
-
-impl Default for WebhookAuditConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: String::new(),
-            tool_patterns: Vec::new(),
-            include_args: false,
-            max_args_bytes: default_max_args_bytes(),
-        }
-    }
-}
 
 // ── Autonomy / Security ──────────────────────────────────────────
 //
