@@ -7,7 +7,7 @@
 //! `<Family>TranscriptionProviderConfig` path is unchanged.
 
 use super::{
-    default_local_whisper_max_audio_bytes, default_local_whisper_timeout_secs, TtsProviderConfig,
+    TtsProviderConfig, default_local_whisper_max_audio_bytes, default_local_whisper_timeout_secs,
 };
 use omnesagent_macros::Configurable;
 use serde::{Deserialize, Serialize};
