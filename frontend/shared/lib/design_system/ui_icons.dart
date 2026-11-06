@@ -64,6 +64,9 @@ const Map<String, String> kUiIconSvg = <String, String>{
   // Key — config secret maps.
   'key':
       '<circle cx="8" cy="16" r="3.2" fill="none"/><path d="M10.4 13.6L20 4" fill="none"/><path d="M16.5 7.5l2.5 2.5" fill="none"/>',
+  // Refresh — reload live state.
+  'refresh':
+      '<path d="M3.5 12a8.5 8.5 0 0114.6-5.9l2.4 2.1" fill="none"/><path d="M20.5 3.8v4.6h-4.6" fill="none"/><path d="M20.5 12a8.5 8.5 0 01-14.6 5.9l-2.4-2.1" fill="none"/><path d="M3.5 20.2v-4.6h4.6" fill="none"/>',
 };
 
 /// SVG icon widget for the OmnesAgent UI (AGENTS.md: emoji are forbidden;

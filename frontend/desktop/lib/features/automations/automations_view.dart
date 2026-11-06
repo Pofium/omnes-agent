@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
+import 'package:omnes_shared/design_system/ui_icons.dart';
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_i18n.dart';
 import 'sop_studio_controller.dart';
@@ -1375,47 +1376,365 @@ class _AutomationsViewState extends State<AutomationsView> {
             );
           }
           return Column(
-            children: sopController.sopRuns.map((run) {
-              final id = run['run_id']?.toString() ?? run['id']?.toString() ?? 'unknown';
-              final status = run['status']?.toString() ?? 'completed';
-              return Container(
-                margin: const EdgeInsets.only(bottom: 8),
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                decoration: BoxDecoration(
-                  color: DesktopTheme.bgSurfaceElevated,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: DesktopTheme.borderSubtle),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      status == 'completed' ? Icons.check_circle : Icons.error,
-                      size: 16,
-                      color: status == 'completed' ? const Color(0xFF10B981) : const Color(0xFFEF4444),
-                    ),
-                    const SizedBox(width: 10),
-                    Text(
-                      'Run #$id',
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontFamily: 'Consolas',
-                        fontWeight: FontWeight.bold,
-                        color: DesktopTheme.textPrimary,
+            children: [
+              for (final run in sopController.sopRuns)
+                Builder(builder: (_) {
+                  final id = run['run_id']?.toString() ?? run['id']?.toString() ?? 'unknown';
+                  final status = run['status']?.toString() ?? 'completed';
+                  final sopName = run['sop_name']?.toString();
+                  final isSelected = sopController.overlayRunId.value == id;
+                  return InkWell(
+                    onTap: () => sopController.loadRunOverlay(id, sopName: sopName),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Container(
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: DesktopTheme.bgSurfaceElevated,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: isSelected
+                              ? DesktopTheme.accentCyan.withOpacity(0.6)
+                              : DesktopTheme.borderSubtle,
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            status == 'completed' ? Icons.check_circle : Icons.error,
+                            size: 16,
+                            color: status == 'completed' ? const Color(0xFF10B981) : const Color(0xFFEF4444),
+                          ),
+                          const SizedBox(width: 10),
+                          Text(
+                            'Run #$id',
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontFamily: 'Consolas',
+                              fontWeight: FontWeight.bold,
+                              color: DesktopTheme.textPrimary,
+                            ),
+                          ),
+                          const Spacer(),
+                          Text(
+                            status,
+                            style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                          ),
+                          const SizedBox(width: 8),
+                          UiIcon(
+                            'search',
+                            size: 13,
+                            color: isSelected ? DesktopTheme.accentCyan : DesktopTheme.textMuted,
+                          ),
+                        ],
                       ),
                     ),
-                    const Spacer(),
-                    Text(
-                      status,
-                      style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
-                    ),
-                  ],
-                ),
-              );
-            }).toList(),
+                  );
+                }),
+              _buildRunInspectorPanel(),
+            ],
           );
         }),
       ],
     );
+  }
+
+  /// Step-execution inspector: projects the selected run's overlay onto its
+  /// graph steps, showing per-node states and the tool calls each step made.
+  Widget _buildRunInspectorPanel() {
+    return Obx(() {
+      if (sopController.overlayRunId.value == null) return const SizedBox.shrink();
+
+      if (sopController.overlayLoading.value) {
+        return const Padding(
+          padding: EdgeInsets.only(top: 16),
+          child: Center(
+            child: SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
+        );
+      }
+
+      final overlay = sopController.runOverlay.value;
+      if (overlay == null) return const SizedBox.shrink();
+
+      final runId = overlay['run_id']?.toString() ?? sopController.overlayRunId.value ?? '';
+      final sopName = overlay['sop_name']?.toString() ?? '';
+      final status = overlay['status']?.toString() ?? '';
+      final currentStep = overlay['current_step']?.toString() ?? '-';
+      final totalSteps = overlay['total_steps']?.toString() ?? '-';
+      final waiting = overlay['waiting'] == true;
+      final paused = overlay['paused'] == true;
+      final nodes = (overlay['nodes'] as List<dynamic>?) ?? const <dynamic>[];
+      final statusColor = _runStatusColor(status);
+
+      return Container(
+        margin: const EdgeInsets.only(top: 20),
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+        decoration: BoxDecoration(
+          color: DesktopTheme.bgSurfaceElevated,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: DesktopTheme.accentCyan.withOpacity(0.35)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                UiIcon('search', size: 14, color: DesktopTheme.accentCyan),
+                const SizedBox(width: 8),
+                Text(
+                  DesktopI18n.tr('Инспектор шагов', 'Step inspector'),
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.bold,
+                    color: DesktopTheme.textPrimary,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  'Run #$runId${sopName.isEmpty ? '' : ' · $sopName'}',
+                  style: TextStyle(fontSize: 11.5, fontFamily: 'Consolas', color: DesktopTheme.textMuted),
+                ),
+                const Spacer(),
+                _buildInspectorChip(_runStatusLabel(status), statusColor),
+                if (waiting) ...[
+                  const SizedBox(width: 6),
+                  _buildInspectorChip(
+                    DesktopI18n.tr('Ждёт подтверждения', 'Awaiting approval'),
+                    const Color(0xFFF59E0B),
+                  ),
+                ],
+                if (paused) ...[
+                  const SizedBox(width: 6),
+                  _buildInspectorChip(DesktopI18n.tr('На паузе', 'Paused'), const Color(0xFFF59E0B)),
+                ],
+                const SizedBox(width: 6),
+                _buildInspectorIconAction('refresh', () => sopController.loadRunOverlay(runId, sopName: sopName)),
+                const SizedBox(width: 2),
+                _buildInspectorIconAction('x', sopController.clearRunOverlay),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              DesktopI18n.tr('Прогресс: шаг $currentStep из $totalSteps', 'Progress: step $currentStep of $totalSteps'),
+              style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted),
+            ),
+            const SizedBox(height: 12),
+            if (nodes.isEmpty)
+              Text(
+                DesktopI18n.tr('Нет записанных шагов для этого запуска', 'No recorded steps for this run'),
+                style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+              )
+            else
+              for (final node in nodes) _buildRunInspectorNode(Map<String, dynamic>.from(node as Map)),
+          ],
+        ),
+      );
+    });
+  }
+
+  Widget _buildInspectorChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.14),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withOpacity(0.4)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(fontSize: 10.5, fontWeight: FontWeight.w600, color: color),
+      ),
+    );
+  }
+
+  Widget _buildInspectorIconAction(String glyph, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: UiIcon(glyph, size: 14, color: DesktopTheme.textMuted),
+      ),
+    );
+  }
+
+  Widget _buildRunInspectorNode(Map<String, dynamic> node) {
+    final step = node['step']?.toString() ?? '?';
+    final state = node['state']?.toString() ?? 'pending';
+    final style = _nodeStateStyle(state);
+    final toolCalls = (node['tool_calls'] as List<dynamic>?) ?? const <dynamic>[];
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurface,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: DesktopTheme.borderSubtle),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              UiIcon(style.glyph, size: 13, color: style.color),
+              const SizedBox(width: 8),
+              Text(
+                DesktopI18n.tr('Шаг $step', 'Step $step'),
+                style: TextStyle(
+                  fontSize: 12,
+                  fontFamily: 'Consolas',
+                  fontWeight: FontWeight.bold,
+                  color: DesktopTheme.textPrimary,
+                ),
+              ),
+              const SizedBox(width: 10),
+              _buildInspectorChip(style.label, style.color),
+              const Spacer(),
+              if (toolCalls.isNotEmpty)
+                Text(
+                  DesktopI18n.tr('${toolCalls.length} вызов(ов)', '${toolCalls.length} call(s)'),
+                  style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                ),
+            ],
+          ),
+          if (toolCalls.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            for (final call in toolCalls) _buildRunToolCallRow(Map<String, dynamic>.from(call as Map)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRunToolCallRow(Map<String, dynamic> call) {
+    final tool = call['tool']?.toString() ?? '';
+    final success = call['success'] == true;
+    final durationMs = call['duration_ms'];
+    final error = call['error']?.toString();
+    final output = call['output']?.toString() ?? '';
+    final detail = (error != null && error.isNotEmpty) ? error : output;
+    final color = success ? const Color(0xFF10B981) : const Color(0xFFEF4444);
+
+    return Container(
+      margin: const EdgeInsets.only(top: 6, left: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: DesktopTheme.bgSurfaceElevated,
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              UiIcon(success ? 'check' : 'warning', size: 12, color: color),
+              const SizedBox(width: 6),
+              Text(
+                tool,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontFamily: 'Consolas',
+                  fontWeight: FontWeight.w600,
+                  color: DesktopTheme.textPrimary,
+                ),
+              ),
+              const Spacer(),
+              if (durationMs is num)
+                Text(
+                  '${durationMs.toInt()} ms',
+                  style: TextStyle(fontSize: 10.5, color: DesktopTheme.textMuted),
+                ),
+            ],
+          ),
+          if (detail.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              _truncateForInspector(detail),
+              maxLines: 6,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 11,
+                fontFamily: 'Consolas',
+                color: DesktopTheme.textMuted,
+                height: 1.35,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Bilingual label + colour + glyph for one `NodeRunState` value (explicit
+  /// state switch — colour is never derived from substring matching).
+  ({String label, Color color, String glyph}) _nodeStateStyle(String state) {
+    switch (state) {
+      case 'completed':
+        return (label: DesktopI18n.tr('Завершён', 'Completed'), color: const Color(0xFF10B981), glyph: 'check');
+      case 'active':
+        return (label: DesktopI18n.tr('Выполняется', 'Active'), color: DesktopTheme.accentCyan, glyph: 'dot');
+      case 'failed':
+        return (label: DesktopI18n.tr('Ошибка', 'Failed'), color: const Color(0xFFEF4444), glyph: 'warning');
+      case 'skipped':
+        return (label: DesktopI18n.tr('Пропущен', 'Skipped'), color: const Color(0xFFF59E0B), glyph: 'x');
+      case 'pending':
+      default:
+        return (label: DesktopI18n.tr('Ожидает', 'Pending'), color: DesktopTheme.textMuted, glyph: 'dot');
+    }
+  }
+
+  Color _runStatusColor(String status) {
+    switch (status) {
+      case 'completed':
+        return const Color(0xFF10B981);
+      case 'failed':
+      case 'cancelled':
+        return const Color(0xFFEF4444);
+      case 'running':
+        return DesktopTheme.accentCyan;
+      case 'cancel_requested':
+      case 'waiting_approval':
+      case 'paused_checkpoint':
+      case 'pending':
+      default:
+        return const Color(0xFFF59E0B);
+    }
+  }
+
+  String _runStatusLabel(String status) {
+    switch (status) {
+      case 'pending':
+        return DesktopI18n.tr('Ожидает', 'Pending');
+      case 'running':
+        return DesktopI18n.tr('Выполняется', 'Running');
+      case 'cancel_requested':
+        return DesktopI18n.tr('Запрошена отмена', 'Cancel requested');
+      case 'waiting_approval':
+        return DesktopI18n.tr('Ожидает подтверждения', 'Waiting approval');
+      case 'paused_checkpoint':
+        return DesktopI18n.tr('На паузе', 'Paused');
+      case 'completed':
+        return DesktopI18n.tr('Завершён', 'Completed');
+      case 'failed':
+        return DesktopI18n.tr('Ошибка', 'Failed');
+      case 'cancelled':
+        return DesktopI18n.tr('Отменён', 'Cancelled');
+      default:
+        return status;
+    }
+  }
+
+  String _truncateForInspector(String text, {int max = 600}) {
+    final trimmed = text.trim();
+    if (trimmed.length <= max) return trimmed;
+    return '${trimmed.substring(0, max)}…';
   }
 
   void _showCreateSopDialog() {

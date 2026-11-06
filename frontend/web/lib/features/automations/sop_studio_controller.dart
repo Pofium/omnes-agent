@@ -14,6 +14,12 @@ class SopStudioController extends GetxController {
   final sopRuns = <Map<String, dynamic>>[].obs;
   final activeRunId = RxnString();
 
+  /// Run overlay for the run selected in the step inspector: per-node states
+  /// and recorded tool calls, projected from `sops/{name}/runs/{id}/overlay`.
+  final runOverlay = Rxn<Map<String, dynamic>>();
+  final overlayRunId = RxnString();
+  final overlayLoading = false.obs;
+
   @override
   void onInit() {
     super.onInit();
@@ -394,6 +400,42 @@ class SopStudioController extends GetxController {
         sopRuns.assignAll(runs);
       }
     } catch (_) {}
+  }
+
+  /// Loads the step-execution overlay for one run and shows it in the
+  /// inspector panel. [sopName] defaults to the currently selected SOP; the
+  /// run's own `sop_name` (from the runs list) is preferred when provided.
+  Future<void> loadRunOverlay(String runId, {String? sopName}) async {
+    final name = (sopName != null && sopName.isNotEmpty)
+        ? sopName
+        : selectedSopName.value;
+    if (name == null || name.isEmpty) {
+      Get.snackbar('Инспектор шагов', 'Не удалось определить SOP для этого запуска');
+      return;
+    }
+
+    overlayRunId.value = runId;
+    overlayLoading.value = true;
+    runOverlay.value = null;
+    try {
+      final overlay = await httpClient.sopRunOverlay(name, runId);
+      runOverlay.value = overlay;
+      if (overlay == null) {
+        Get.snackbar(
+          'Инспектор шагов',
+          'Не удалось загрузить состояние запуска $runId',
+          snackPosition: SnackPosition.BOTTOM,
+        );
+      }
+    } finally {
+      overlayLoading.value = false;
+    }
+  }
+
+  /// Closes the step inspector panel.
+  void clearRunOverlay() {
+    runOverlay.value = null;
+    overlayRunId.value = null;
   }
 
   @override
