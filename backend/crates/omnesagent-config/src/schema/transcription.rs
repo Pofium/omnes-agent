@@ -3,9 +3,8 @@
 //! local).
 //!
 //! Extracted from the `schema` module; re-exported with `pub use` so
-//! `crate::schema::TranscriptionConfig` is unchanged. The `default_*_stt_*`
-//! helpers are `pub(super)` because the per-provider STT configs that use
-//! them stay in `schema`.
+//! `crate::schema::TranscriptionConfig` is unchanged. The per-provider STT
+//! configs it nests live in the sibling `stt_providers` module.
 
 use super::*;
 
@@ -21,18 +20,6 @@ fn default_transcription_model() -> String {
 
 fn default_transcription_max_duration_secs() -> u64 {
     120
-}
-
-pub(super) fn default_openai_stt_model() -> String {
-    "whisper-1".into()
-}
-
-pub(super) fn default_deepgram_stt_model() -> String {
-    "nova-2".into()
-}
-
-pub(super) fn default_google_stt_language_code() -> String {
-    "en-US".into()
 }
 
 /// Voice transcription configuration with multi-provider support.
