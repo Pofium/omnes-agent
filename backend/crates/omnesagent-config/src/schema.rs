@@ -170,6 +170,36 @@ pub use secrets::*;
 mod browser;
 pub use browser::*;
 
+// HTTP request tool config (the `[http_request]` section) lives in its own
+// module; re-exported here so `crate::schema::HttpRequestConfig` is
+// unchanged.
+mod http_request;
+pub use http_request::*;
+
+// Web fetch tool config (`[web_fetch]` + nested `[web_fetch.firecrawl]`)
+// lives in its own module; re-exported here so
+// `crate::schema::{WebFetchConfig, FirecrawlConfig, FirecrawlMode}` is
+// unchanged.
+mod web_fetch;
+pub use web_fetch::*;
+
+// Link enricher config (the `[link_enricher]` section) lives in its own
+// module; re-exported here so `crate::schema::LinkEnricherConfig` is
+// unchanged.
+mod link_enricher;
+pub use link_enricher::*;
+
+// Text browser tool config (the `[text_browser]` section) lives in its own
+// module; re-exported here so `crate::schema::TextBrowserConfig` is
+// unchanged.
+mod text_browser;
+pub use text_browser::*;
+
+// Shell tool config (the `[shell_tool]` section) lives in its own module;
+// re-exported here so `crate::schema::ShellToolConfig` is unchanged.
+mod shell_tool;
+pub use shell_tool::*;
+
 // Used by `Config::validate` and its tests, which live outside the security
 // module; kept as a schema-level helper rather than moving with the section.
 fn default_otp_gated_actions() -> Vec<String> {
@@ -4022,336 +4052,6 @@ impl Default for PeripheralBoardConfig {
             transport: default_peripheral_transport(),
             path: None,
             baud: default_peripheral_baud(),
-        }
-    }
-}
-
-// ── HTTP request tool ───────────────────────────────────────────
-
-/// HTTP request tool configuration (`[http_request]` section).
-///
-/// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
-/// for all public hosts, which is the default). If `allowed_domains` is empty, all
-/// requests are rejected. Requests use direct transport so locally validated DNS
-/// answers remain pinned: an enabled `environment` proxy scope or runtime proxy
-/// that applies to `tool.http_request` is rejected. A process environment proxy
-/// outside that managed scope is warned and ignored; connection failures name
-/// the ignored variable.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "http_request"]
-pub struct HttpRequestConfig {
-    /// Enable `http_request` tool for API interactions
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Allowed domains for HTTP requests (exact or subdomain match)
-    #[serde(default = "default_allowed_domains_star")]
-    pub allowed_domains: Vec<String>,
-    /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
-    #[serde(default = "default_http_max_response_size")]
-    pub max_response_size: usize,
-    /// Request timeout in seconds (default: 30)
-    #[serde(default = "default_http_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Allow requests to private/LAN hosts (RFC 1918, loopback, `.local`).
-    /// Default: false (deny private hosts for SSRF protection). Regardless of
-    /// this setting, all of `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba
-    /// `100.100.100.200`, AWS `fd00:ec2::/64`, GCP `fd20:ce::254`, and their
-    /// recognized IPv4-embedded forms remain blocked.
-    #[serde(default)]
-    pub allow_private_hosts: bool,
-    /// Private/internal hosts explicitly allowed to relax the public-address check.
-    /// Exact and subdomain matches are supported; `*` permits private/local hosts
-    /// except the unconditional metadata/platform exclusions: `169.254.0.0/16`,
-    /// `168.63.129.16`, `100.100.100.200`, `fd00:ec2::/64`, `fd20:ce::254`, and
-    /// their recognized IPv4-embedded forms.
-    #[serde(default)]
-    pub allowed_private_hosts: Vec<String>,
-    /// Named authorization secrets for `auth_secret` requests.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub secrets: HashMap<String, String>,
-}
-
-impl Default for HttpRequestConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            allowed_domains: vec!["*".into()],
-            max_response_size: default_http_max_response_size(),
-            timeout_secs: default_http_timeout_secs(),
-            allow_private_hosts: false,
-            allowed_private_hosts: vec![],
-            secrets: HashMap::new(),
-        }
-    }
-}
-
-fn default_http_max_response_size() -> usize {
-    1_000_000 // 1MB
-}
-
-fn default_http_timeout_secs() -> u64 {
-    30
-}
-
-fn default_allowed_domains_star() -> Vec<String> {
-    vec!["*".into()]
-}
-
-// ── Web fetch ────────────────────────────────────────────────────
-
-/// Web fetch tool configuration (`[web_fetch]` section).
-///
-/// Fetches web pages and converts HTML to plain text for LLM consumption.
-/// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
-/// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
-/// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
-/// Same-host redirects are followed; cross-host redirects are rejected so the
-/// validated DNS answers remain pinned to the request transport.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "web_fetch"]
-pub struct WebFetchConfig {
-    /// Enable `web_fetch` tool for fetching web page content
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
-    #[serde(default = "default_web_fetch_allowed_domains")]
-    pub allowed_domains: Vec<String>,
-    /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
-    #[serde(default)]
-    pub blocked_domains: Vec<String>,
-    /// Private/internal hosts allowed to relax the public-address SSRF check
-    /// (e.g. `["192.168.1.10", "internal.local"]`). Exact and subdomain matches
-    /// are supported. Every target still resolves locally, and known cloud
-    /// metadata/platform addresses remain blocked. A *literal* private/local host
-    /// (IP literal, localhost, .local) listed here also bypasses `allowed_domains`.
-    /// The `*` wildcard permits any literal private/local host and lets a name
-    /// already in `allowed_domains` resolve to a private IP, but it does NOT widen
-    /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
-    /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
-    /// The standard `web_fetch` request requires direct transport for DNS pinning:
-    /// environment proxy discovery is disabled, and an enabled `environment` scope
-    /// or runtime proxy applying to the tool is rejected. A process environment proxy
-    /// outside that managed scope is warned and ignored for the standard request.
-    /// The optional Firecrawl API fallback uses normal environment proxy discovery
-    /// because that separate API request has no locally validated DNS pin. Use
-    /// `proxy.scope = "services"` without `tool.*` to proxy other traffic.
-    #[serde(default)]
-    pub allowed_private_hosts: Vec<String>,
-    /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
-    #[serde(default = "default_web_fetch_max_response_size")]
-    pub max_response_size: usize,
-    /// Request timeout in seconds (default: 30)
-    #[serde(default = "default_web_fetch_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Firecrawl fallback configuration (`[web_fetch.firecrawl]`)
-    #[serde(default)]
-    #[nested]
-    pub firecrawl: FirecrawlConfig,
-}
-
-/// Firecrawl fallback mode: scrape a single page or crawl linked pages.
-#[derive(
-    Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, omnesagent_macros::ConfigEnum,
-)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum FirecrawlMode {
-    #[default]
-    Scrape,
-    /// Reserved for future multi-page crawl support. Accepted in config
-    /// deserialization to avoid breaking existing files, but not yet
-    /// implemented — `fetch_via_firecrawl` always uses the `/scrape` endpoint.
-    Crawl,
-}
-
-/// Firecrawl fallback configuration for JS-heavy and bot-blocked sites.
-///
-/// When enabled, if the standard web fetch fails (HTTP error, empty body, or
-/// body shorter than 100 characters suggesting a JS-only page), the tool
-/// falls back to the Firecrawl API for stealth content extraction.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "web_fetch.firecrawl"]
-pub struct FirecrawlConfig {
-    /// Enable Firecrawl fallback
-    #[serde(default)]
-    pub enabled: bool,
-    /// Environment variable name for the Firecrawl API key
-    #[serde(default = "default_firecrawl_api_key_env")]
-    #[credential_class = "legacy_env_path"]
-    pub api_key_env: String,
-    /// Firecrawl API base URL
-    #[serde(default = "default_firecrawl_api_url")]
-    pub api_url: String,
-    /// Firecrawl extraction mode
-    #[serde(default)]
-    pub mode: FirecrawlMode,
-}
-
-fn default_firecrawl_api_key_env() -> String {
-    "FIRECRAWL_API_KEY".into()
-}
-
-fn default_firecrawl_api_url() -> String {
-    "https://api.firecrawl.dev/v1".into()
-}
-
-impl Default for FirecrawlConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key_env: default_firecrawl_api_key_env(),
-            api_url: default_firecrawl_api_url(),
-            mode: FirecrawlMode::default(),
-        }
-    }
-}
-
-fn default_web_fetch_max_response_size() -> usize {
-    500_000 // 500KB
-}
-
-fn default_web_fetch_timeout_secs() -> u64 {
-    30
-}
-
-fn default_web_fetch_allowed_domains() -> Vec<String> {
-    vec!["*".into()]
-}
-
-impl Default for WebFetchConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            allowed_domains: vec!["*".into()],
-            blocked_domains: vec![],
-            allowed_private_hosts: vec![],
-            max_response_size: default_web_fetch_max_response_size(),
-            timeout_secs: default_web_fetch_timeout_secs(),
-            firecrawl: FirecrawlConfig::default(),
-        }
-    }
-}
-
-// ── Link enricher ─────────────────────────────────────────────────
-
-/// Automatic link understanding for inbound channel messages (`[link_enricher]`).
-///
-/// When enabled, URLs in incoming messages are automatically fetched and
-/// summarised. The summary is prepended to the message before the agent
-/// processes it, giving the LLM context about linked pages without an
-/// explicit tool call.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "link_enricher"]
-pub struct LinkEnricherConfig {
-    /// Enable the link enricher pipeline stage (default: false)
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum number of links to fetch per message (default: 3)
-    #[serde(default = "default_link_enricher_max_links")]
-    pub max_links: usize,
-    /// Per-link fetch timeout in seconds (default: 10)
-    #[serde(default = "default_link_enricher_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-fn default_link_enricher_max_links() -> usize {
-    3
-}
-
-fn default_link_enricher_timeout_secs() -> u64 {
-    10
-}
-
-impl Default for LinkEnricherConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_links: default_link_enricher_max_links(),
-            timeout_secs: default_link_enricher_timeout_secs(),
-        }
-    }
-}
-
-// ── Text browser ─────────────────────────────────────────────────
-
-/// Text browser tool configuration (`[text_browser]` section).
-///
-/// Uses text-based browsers (lynx, links, w3m) to render web pages as plain
-/// text. Designed for headless/SSH environments without graphical browsers.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "text_browser"]
-pub struct TextBrowserConfig {
-    /// Enable `text_browser` tool
-    #[serde(default)]
-    pub enabled: bool,
-    /// Preferred text browser ("lynx", "links", or "w3m"). If unset, auto-detects.
-    #[serde(default)]
-    pub preferred_browser: Option<String>,
-    /// Request timeout in seconds (default: 30)
-    #[serde(default = "default_text_browser_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Private/internal hosts allowed to relax the public-address SSRF check.
-    /// Exact and subdomain matches are supported; `["*"]` permits private/local
-    /// hosts (RFC 1918, loopback, `.local`). Default: empty (deny). All of
-    /// `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba `100.100.100.200`, AWS
-    /// `fd00:ec2::/64`, GCP `fd20:ce::254`, and their recognized IPv4-embedded
-    /// forms remain blocked after resolution regardless of this opt-in.
-    /// The external browser re-resolves DNS and follows redirects without
-    /// revalidation, so these checks are not a DNS-rebinding or redirect boundary.
-    /// Local preflight resolution still applies under this opt-in, which may reject
-    /// names available only through a browser or proxy. Prefer `web_fetch` when
-    /// URLs or DNS are attacker-controlled.
-    #[serde(default)]
-    pub allowed_private_hosts: Vec<String>,
-}
-
-fn default_text_browser_timeout_secs() -> u64 {
-    30
-}
-
-impl Default for TextBrowserConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            preferred_browser: None,
-            timeout_secs: default_text_browser_timeout_secs(),
-            allowed_private_hosts: vec![],
-        }
-    }
-}
-
-// ── Shell tool ───────────────────────────────────────────────────
-
-/// Shell tool configuration (`[shell_tool]` section).
-///
-/// Controls the behaviour of the `shell` execution tool. The main
-/// tunable is `timeout_secs` — the maximum wall-clock time a single
-/// shell command may run before it is killed.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "shell_tool"]
-pub struct ShellToolConfig {
-    /// Maximum shell command execution time in seconds (default: 60).
-    #[serde(default = "default_shell_tool_timeout_secs")]
-    pub timeout_secs: u64,
-}
-
-fn default_shell_tool_timeout_secs() -> u64 {
-    60
-}
-
-impl Default for ShellToolConfig {
-    fn default() -> Self {
-        Self {
-            timeout_secs: default_shell_tool_timeout_secs(),
         }
     }
 }
