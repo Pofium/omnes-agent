@@ -358,6 +358,23 @@ pub use verifiable_intent::*;
 mod tool_receipts;
 pub use tool_receipts::*;
 
+// Pacing controls (the `[pacing]` section: per-step timeouts, loop detection)
+// live in their own module; re-exported here so `crate::schema::PacingConfig`
+// is unchanged.
+mod pacing;
+pub use pacing::*;
+
+// Pipeline meta-tool config (the `[pipeline]` section) lives in its own module;
+// re-exported here so `crate::schema::PipelineConfig` is unchanged.
+mod pipeline;
+pub use pipeline::*;
+
+// Multimodal (image) handling config (the `[multimodal]` section) lives in its
+// own module; re-exported here so `crate::schema::MultimodalConfig` is
+// unchanged.
+mod multimodal;
+pub use multimodal::*;
+
 // Used by `Config::validate` and its tests, which live outside the security
 // module; kept as a schema-level helper rather than moving with the section.
 fn default_otp_gated_actions() -> Vec<String> {
@@ -2900,225 +2917,6 @@ fn default_agent_tool_dispatcher() -> String {
 
 fn default_max_system_prompt_chars() -> usize {
     0
-}
-
-// ── Pacing ────────────────────────────────────────────────────────
-
-/// Pacing controls for slow/local LLM workloads (`[pacing]` section).
-///
-/// All fields are optional and default to values that preserve existing
-/// behavior. When set, they extend — not replace — the existing timeout
-/// and loop-detection subsystems.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "pacing"]
-pub struct PacingConfig {
-    /// Per-step timeout in seconds: the maximum time allowed for a single
-    /// LLM inference turn, independent of the total message budget.
-    /// `None` means no per-step timeout (existing behavior).
-    #[serde(default)]
-    pub step_timeout_secs: Option<u64>,
-
-    /// Minimum elapsed seconds before loop detection activates.
-    /// Tasks completing under this threshold get aggressive loop protection;
-    /// longer-running tasks receive a grace period before the detector starts
-    /// counting. `None` means loop detection is always active (existing behavior).
-    #[serde(default)]
-    pub loop_detection_min_elapsed_secs: Option<u64>,
-
-    /// Tool names excluded from identical-output / alternating-pattern loop
-    /// detection. Useful for browser workflows where `browser_screenshot`
-    /// structurally resembles a loop even when making progress.
-    #[serde(default)]
-    pub loop_ignore_tools: Vec<String>,
-
-    /// Override for the hardcoded timeout scaling cap (default: 4).
-    /// The channel message timeout budget is computed as:
-    ///   `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)`
-    /// Raising this value lets long multi-step tasks with slow local models
-    /// receive a proportionally larger budget without inflating the base timeout.
-    #[serde(default)]
-    pub message_timeout_scale_max: Option<u64>,
-
-    /// Enable pattern-based loop detection (exact repeat, ping-pong,
-    /// no-progress). Defaults to `true`.
-    #[serde(default = "default_loop_detection_enabled")]
-    pub loop_detection_enabled: bool,
-
-    /// Sliding window size for the pattern-based loop detector.
-    /// Defaults to 20.
-    #[serde(default = "default_loop_detection_window_size")]
-    pub loop_detection_window_size: usize,
-
-    /// Number of consecutive identical tool+args calls before the first
-    /// escalation (Warning). Defaults to 3.
-    #[serde(default = "default_loop_detection_max_repeats")]
-    pub loop_detection_max_repeats: usize,
-}
-
-fn default_loop_detection_enabled() -> bool {
-    true
-}
-
-fn default_loop_detection_window_size() -> usize {
-    20
-}
-
-fn default_loop_detection_max_repeats() -> usize {
-    3
-}
-
-impl Default for PacingConfig {
-    fn default() -> Self {
-        Self {
-            step_timeout_secs: None,
-            loop_detection_min_elapsed_secs: None,
-            loop_ignore_tools: Vec::new(),
-            message_timeout_scale_max: None,
-            loop_detection_enabled: default_loop_detection_enabled(),
-            loop_detection_window_size: default_loop_detection_window_size(),
-            loop_detection_max_repeats: default_loop_detection_max_repeats(),
-        }
-    }
-}
-
-/// Pipeline tool configuration (`[pipeline]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "pipeline"]
-pub struct PipelineConfig {
-    /// Enable the `execute_pipeline` meta-tool.
-    /// Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Maximum number of steps allowed in a single pipeline invocation.
-    /// Default: `20`.
-    #[serde(default = "default_pipeline_max_steps")]
-    pub max_steps: usize,
-    /// Tools allowed in pipeline steps. Steps referencing tools not on this
-    /// list are rejected before execution.
-    #[serde(default)]
-    pub allowed_tools: Vec<String>,
-}
-
-fn default_pipeline_max_steps() -> usize {
-    20
-}
-
-impl Default for PipelineConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_steps: 20,
-            allowed_tools: Vec::new(),
-        }
-    }
-}
-
-/// Multimodal (image) handling configuration (`[multimodal]` section).
-///
-/// # Privacy and cost note
-///
-/// Tool results that print real local image paths (e.g. shell tools doing
-/// `ls /pictures` or `find . -name '*.png'`) are canonicalized into
-/// `[IMAGE:...]` markers and base64-inlined into the next provider request.
-/// This means image bytes that previously stayed local will be uploaded to
-/// the configured provider when surfaced by a tool.
-///
-/// `max_images` (and the `trim_old_images` LRU policy) bounds the per-request
-/// image budget, but operators running shell-style tools over directories of
-/// personal or sensitive images should be aware of the upload semantics. See
-/// `docs/book/src/contributing/privacy.md` for the project's privacy stance.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "multimodal"]
-pub struct MultimodalConfig {
-    /// Maximum number of image attachments accepted per request.
-    ///
-    /// Caps the total number of `[IMAGE:...]` markers that survive into the
-    /// provider request after multimodal preprocessing. Older images are
-    /// dropped first when the cumulative count exceeds this limit. Acts as
-    /// the upper bound on per-turn upload cost when tool outputs surface
-    /// local image paths.
-    #[serde(default = "default_multimodal_max_images")]
-    pub max_images: usize,
-    /// Maximum image payload size in MiB before base64 encoding.
-    ///
-    /// Measured on decoded bytes, so the encoded request payload is about a
-    /// third larger. Applies to every image entering the pipeline: channel
-    /// attachments, tool outputs that surface local image paths, and the web
-    /// dashboard upload. Defaults to the 20 MiB ceiling that
-    /// [`MultimodalConfig::effective_limits`] clamps to, so an ordinary photo
-    /// is accepted without configuration; lower it to bound per-turn upload
-    /// cost or gateway buffering.
-    ///
-    /// Providers apply their own limits on top of this one. Anthropic refuses a
-    /// single image over 10 MB base64-encoded (about 7.5 MiB decoded), enforced
-    /// by its provider client independently of this setting.
-    #[serde(default = "default_multimodal_max_image_size_mb")]
-    pub max_image_size_mb: usize,
-    /// Maximum age of images in conversation turns.
-    ///
-    /// When non-zero, images in user messages that are more than this many
-    /// turns back from the end of history are stripped before the request is
-    /// sent to the provider. This prevents a single screenshot from being
-    /// re-encoded and re-uploaded on every subsequent turn indefinitely.
-    /// Tool-result images are already managed by the stale-tool-result
-    /// mechanism and are not affected by this setting.
-    ///
-    /// `0` (the default) disables age-based trimming entirely — images are
-    /// only evicted by the `max_images` count cap.
-    #[serde(default)]
-    pub max_image_turns: usize,
-    /// Allow fetching remote image URLs (http/https). Disabled by default.
-    #[serde(default)]
-    pub allow_remote_fetch: bool,
-    /// ModelProvider name to use for vision/image messages (e.g. `"ollama"`).
-    /// When set, messages containing `[IMAGE:]` markers are routed to this
-    /// model_provider instead of the default text model_provider.
-    #[serde(default)]
-    pub vision_model_provider: Option<String>,
-    /// Model to use when routing to the vision model_provider (e.g. `"llava:7b"`).
-    /// Only used when `vision_model_provider` is set.
-    #[serde(default)]
-    pub vision_model: Option<String>,
-}
-
-fn default_multimodal_max_images() -> usize {
-    4
-}
-
-fn default_multimodal_max_image_size_mb() -> usize {
-    20
-}
-
-impl MultimodalConfig {
-    /// Clamp configured values to safe runtime bounds.
-    ///
-    /// The 20 MiB image ceiling is the lowest common per-image or per-request
-    /// bound across the supported vision APIs (OpenAI accepts about 20 MB per
-    /// image, Gemini 20 MB for an inline request, Anthropic 32 MB per request
-    /// with a tighter per-image limit its own client enforces). Images are
-    /// buffered whole and grow by about a third under base64, so the ceiling
-    /// also bounds gateway memory per upload.
-    pub fn effective_limits(&self) -> (usize, usize) {
-        let max_images = self.max_images.clamp(1, 16);
-        let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
-        (max_images, max_image_size_mb)
-    }
-}
-
-impl Default for MultimodalConfig {
-    fn default() -> Self {
-        Self {
-            max_images: default_multimodal_max_images(),
-            max_image_size_mb: default_multimodal_max_image_size_mb(),
-            max_image_turns: 0,
-            allow_remote_fetch: false,
-            vision_model_provider: None,
-            vision_model: None,
-        }
-    }
 }
 
 // ── LinkedIn ────────────────────────────────────────────────────
@@ -26320,3 +26118,4 @@ model_provider = \"ollama.default\"
         assert!(agent.is_dispatchable());
     }
 }
+
