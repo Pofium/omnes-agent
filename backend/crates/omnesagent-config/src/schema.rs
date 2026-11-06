@@ -346,6 +346,18 @@ pub use tool_filter::*;
 mod mcp;
 pub use mcp::*;
 
+// Verifiable Intent (VI) credential config (the `[verifiable_intent]` section)
+// lives in its own module; re-exported here so
+// `crate::schema::VerifiableIntentConfig` is unchanged.
+mod verifiable_intent;
+pub use verifiable_intent::*;
+
+// HMAC tool execution receipt config (`[agents.<alias>.tool_receipts]`) lives in
+// its own module; re-exported here so `crate::schema::ToolReceiptsConfig` is
+// unchanged.
+mod tool_receipts;
+pub use tool_receipts::*;
+
 // Used by `Config::validate` and its tests, which live outside the security
 // module; kept as a schema-level helper rather than moving with the section.
 fn default_otp_gated_actions() -> Vec<String> {
@@ -2872,94 +2884,6 @@ where
 {
     let value: Option<String> = Option::deserialize(deserializer)?;
     Ok(value.filter(|s| !s.trim().is_empty()))
-}
-
-/// Verifiable Intent (VI) credential issuance and constraint checking
-/// (`[verifiable_intent]` section).
-///
-/// OmnesAgent implements issuance, crypto, types and constraint checking, but not
-/// a credential chain verifier. Until one exists the `vi_verify` tool is
-/// withheld from the model-visible registry, so neither key below enables
-/// verification of a credential. The library paths are unaffected.
-///
-/// Enabling the section reports that gap two ways. The runtime traces it at
-/// each config application, which needs log persistence to be on to reach a
-/// sink. `omnesagent doctor` and the config API also report it as the
-/// `verifiable_intent_tool_withheld` validation warning, which stays available
-/// when persistence is off.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "verifiable_intent"]
-pub struct VerifiableIntentConfig {
-    /// Opt in to the VI section (default: false).
-    ///
-    /// While the tool is withheld this does not enable credential verification
-    /// on commerce tool calls. It currently causes a warning naming that gap,
-    /// emitted once per config application: at process startup, and again when
-    /// a daemon reload re-reads config from disk.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Intended strictness mode for constraint evaluation.
-    ///
-    /// Accepts `"strict"` or `"permissive"`, and defaults to `"strict"`. No
-    /// production code reads it while the tool is withheld.
-    #[serde(default = "default_vi_strictness")]
-    pub strictness: String,
-}
-
-fn default_vi_strictness() -> String {
-    "strict".to_owned()
-}
-
-impl Default for VerifiableIntentConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            strictness: default_vi_strictness(),
-        }
-    }
-}
-
-/// HMAC tool execution receipt configuration, per agent
-/// (`[agents.<alias>.tool_receipts]`).
-///
-/// Receipts are short HMAC-SHA256 tags appended to tool results so the model
-/// cannot claim it ran a tool that never actually executed. See
-/// `docs/book/src/security/tool-receipts.md`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "delegate_agent.tool_receipts"]
-pub struct ToolReceiptsConfig {
-    /// Generate HMAC receipts on every tool execution. Default: `false`.
-    /// When false, the entire receipt subsystem is inert (no key, no
-    /// generation, no append, no system-prompt addendum).
-    #[serde(default)]
-    pub enabled: bool,
-    /// Append a trailing `Tool receipts:` block to user-visible replies so
-    /// receipts are auditable from the channel surface, not just the
-    /// internal history. Default: `false`.
-    #[serde(default)]
-    pub show_in_response: bool,
-    /// Inject the receipt-echo instruction into the system prompt so the
-    /// model carries receipts verbatim into its response. Default: `true`.
-    /// No effect when `enabled = false`.
-    #[serde(default = "default_inject_system_prompt")]
-    pub inject_system_prompt: bool,
-}
-
-fn default_inject_system_prompt() -> bool {
-    true
-}
-
-impl Default for ToolReceiptsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            show_in_response: false,
-            inject_system_prompt: default_inject_system_prompt(),
-        }
-    }
 }
 
 fn default_max_tool_result_chars() -> usize {
