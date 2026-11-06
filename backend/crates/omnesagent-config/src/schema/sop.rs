@@ -178,7 +178,15 @@ fn default_sop_execution_mode() -> String {
 /// is a serde enum rather than free text (mirrors `SandboxBackend` /
 /// `ObservabilityBackend` in this file); unknown values are rejected at parse time.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, omnesagent_macros::ConfigEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    omnesagent_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -193,7 +201,15 @@ pub enum SopRunStoreBackend {
 /// WHO may clear a SOP approval gate. Layered with execution_mode / priority /
 /// requires_confirmation (all of which still apply). Closed set => serde enum.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, omnesagent_macros::ConfigEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    omnesagent_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -211,7 +227,15 @@ pub enum ApprovalMode {
 /// What happens to a SOP approval gate when it times out. Default is fail-closed:
 /// the gate never self-approves. Closed set => serde enum.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, omnesagent_macros::ConfigEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    omnesagent_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -404,4 +428,3 @@ impl HasPropKind for serde_json::Value {
     // `config.toml`.
     const PROP_KIND: PropKind = PropKind::String;
 }
-

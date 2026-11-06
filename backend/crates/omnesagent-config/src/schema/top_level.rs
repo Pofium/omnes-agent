@@ -718,7 +718,15 @@ impl WireApi {
 
 /// Policy for image markers embedded in native tool-result content.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, omnesagent_macros::ConfigEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    omnesagent_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -738,7 +746,15 @@ fn is_default_tool_result_image_policy(value: &ToolResultImagePolicy) -> bool {
 /// (e.g. Qwen, Minimax can use API key OR OAuth). Families that only support a
 /// single auth flow simply omit this field from their config struct.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, omnesagent_macros::ConfigEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    omnesagent_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -763,7 +779,15 @@ pub enum AuthMode {
 /// JSON) sits outside that guarantee and must order 1h before 5m when
 /// mixing lifetimes in one request.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, omnesagent_macros::ConfigEnum,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Default,
+    omnesagent_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum CacheTtl {
@@ -999,4 +1023,3 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
 }
-

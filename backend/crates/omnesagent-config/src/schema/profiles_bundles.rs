@@ -328,8 +328,6 @@ pub struct McpBundleConfig {
     pub exclude: Vec<String>,
 }
 
-
-
 /// DingTalk configuration for Stream Mode messaging
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1355,4 +1353,3 @@ fn default_cloud_ops_cost_threshold() -> f64 {
 fn default_cloud_ops_waf() -> Vec<String> {
     vec!["aws-waf".into()]
 }
-

@@ -1322,7 +1322,9 @@ where
         .transpose()
 }
 
-pub(crate) fn deserialize_enum_lenient<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+pub(crate) fn deserialize_enum_lenient<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
@@ -1570,7 +1572,11 @@ pub(crate) fn validate_http_base_url(field: &str, url: &str) -> Result<()> {
 /// once the alias is enabled (Telegram, Discord). `field_path` must be the
 /// `channels.<type>.<alias>.bot_token` leaf; the enabled-state message
 /// derives the sibling `.enabled` path from it.
-pub(crate) fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> Result<()> {
+pub(crate) fn validate_required_bot_token(
+    field_path: &str,
+    enabled: bool,
+    token: &str,
+) -> Result<()> {
     if token.trim() == crate::traits::UNSET_DISPLAY {
         validation_bail!(
             RequiredFieldEmpty,
@@ -1776,7 +1782,8 @@ fn runtime_proxy_current_generation() -> u64 {
     }
 }
 
-pub(crate) fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, RuntimeProxyCachedClient>> {
+pub(crate) fn runtime_proxy_client_cache()
+-> &'static RwLock<HashMap<String, RuntimeProxyCachedClient>> {
     RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -1823,7 +1830,11 @@ pub(crate) fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Cl
     }
 }
 
-pub(crate) fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+pub(crate) fn set_runtime_proxy_cached_client(
+    cache_key: String,
+    generation: u64,
+    client: reqwest::Client,
+) {
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -2074,4 +2085,3 @@ fn apply_explicit_proxy_to_builder(
     }
     builder
 }
-

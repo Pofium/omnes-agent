@@ -523,6 +523,8 @@ use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
 use directories::UserDirs;
+use omnesagent_api::runtime_status::RuntimeConfigKind;
+use omnesagent_macros::Configurable;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -533,8 +535,6 @@ use std::sync::{OnceLock, RwLock};
 use tokio::fs::File;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use omnesagent_api::runtime_status::RuntimeConfigKind;
-use omnesagent_macros::Configurable;
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.anthropic",
@@ -963,7 +963,11 @@ async fn resolve_runtime_config_dirs(
             }
             let omnesagent_dir = expand_tilde_path(custom_config_dir);
             let data_dir = install_data_dir(&omnesagent_dir);
-            return Ok((omnesagent_dir, data_dir, ConfigResolutionSource::EnvConfigDir));
+            return Ok((
+                omnesagent_dir,
+                data_dir,
+                ConfigResolutionSource::EnvConfigDir,
+            ));
         }
     }
 
@@ -1027,7 +1031,6 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
-
 #[cfg(test)]
 mod tests {
     #[::core::prelude::v1::test]
@@ -1070,7 +1073,6 @@ mod tests {
             "cache_ttl is a closed enum; unknown lifetimes must not parse into a silent default"
         );
     }
-
 
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //
@@ -5288,8 +5290,10 @@ default_temperature = 0.7
         // tiny config.toml — only `schema_version` and any operator-
         // touched fields. The hundreds of all-default blocks
         // (LinkedIn, memory, observability, etc.) must not appear.
-        let dir =
-            std::env::temp_dir().join(format!("omnesagent_save_prune_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "omnesagent_save_prune_test_{}",
+            uuid::Uuid::new_v4()
+        ));
         fs::create_dir_all(&dir).await.unwrap();
         let config = Config {
             config_path: dir.join("config.toml"),
@@ -5330,8 +5334,10 @@ default_temperature = 0.7
 
     #[tokio::test]
     async fn config_save_keeps_operator_set_non_default_fields() {
-        let dir =
-            std::env::temp_dir().join(format!("omnesagent_save_keep_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "omnesagent_save_keep_test_{}",
+            uuid::Uuid::new_v4()
+        ));
         fs::create_dir_all(&dir).await.unwrap();
         let mut config = Config {
             config_path: dir.join("config.toml"),
@@ -8028,7 +8034,11 @@ wire_api = "ws"
         let _workspace_guard = EnvValueGuard::remove("OMNESAGENT_WORKSPACE");
 
         let mut failures = Vec::new();
-        for layout in ["default ~/.omnesagent", "container", "explicit --config-dir"] {
+        for layout in [
+            "default ~/.omnesagent",
+            "container",
+            "explicit --config-dir",
+        ] {
             let temp = TempDir::new().unwrap();
             let home = temp.path();
             let (install, config_dir_env, data_dir_env) = match layout {
@@ -20277,7 +20287,3 @@ model_provider = \"ollama.default\"
         assert!(agent.is_dispatchable());
     }
 }
-
-
-
-

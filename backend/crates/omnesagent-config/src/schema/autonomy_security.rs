@@ -115,4 +115,3 @@ pub(crate) fn is_valid_env_var_name(name: &str) -> bool {
     }
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
-
