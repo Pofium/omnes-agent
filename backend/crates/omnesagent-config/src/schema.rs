@@ -283,6 +283,23 @@ pub use file_download::*;
 mod proxy;
 pub use proxy::*;
 
+// Automatic media understanding pipeline (the `[media_pipeline]` section) lives
+// in its own module; re-exported here so
+// `crate::schema::MediaPipelineConfig` is unchanged.
+mod media_pipeline;
+pub use media_pipeline::*;
+
+// Identity format config (the `[identity]` section) lives in its own module;
+// re-exported here so `crate::schema::IdentityConfig` is unchanged.
+mod identity;
+pub use identity::*;
+
+// Peripheral board integration (the `[peripherals]` section) lives in its own
+// module; re-exported here so `crate::schema::{PeripheralsConfig,
+// PeripheralBoardConfig}` are unchanged.
+mod peripherals;
+pub use peripherals::*;
+
 // Used by `Config::validate` and its tests, which live outside the security
 // module; kept as a schema-level helper rather than moving with the section.
 fn default_otp_gated_actions() -> Vec<String> {
@@ -4004,137 +4021,6 @@ impl Default for MultimodalConfig {
             allow_remote_fetch: false,
             vision_model_provider: None,
             vision_model: None,
-        }
-    }
-}
-
-// ── Media Pipeline ──────────────────────────────────────────────
-
-/// Automatic media understanding pipeline configuration (`[media_pipeline]`).
-///
-/// When enabled, inbound channel messages with media attachments are
-/// pre-processed before reaching the agent: audio is transcribed, images are
-/// annotated, and videos are summarised.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "media_pipeline"]
-pub struct MediaPipelineConfig {
-    /// Master toggle for the media pipeline (default: false).
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Transcribe audio attachments using the configured transcription model_provider.
-    #[serde(default = "default_true")]
-    pub transcribe_audio: bool,
-
-    /// Add image descriptions when a vision-capable model is active.
-    #[serde(default = "default_true")]
-    pub describe_images: bool,
-
-    /// Summarize video attachments (placeholder — requires external API).
-    #[serde(default = "default_true")]
-    pub summarize_video: bool,
-}
-
-impl Default for MediaPipelineConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            transcribe_audio: true,
-            describe_images: true,
-            summarize_video: true,
-        }
-    }
-}
-
-// ── Identity (AIEOS / OpenClaw format) ──────────────────────────
-
-/// Identity format configuration (`[identity]` section).
-///
-/// Supports `"openclaw"` (default) or `"aieos"` identity documents.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "identity"]
-pub struct IdentityConfig {
-    /// Identity format: "openclaw" (default) or "aieos"
-    #[serde(default = "default_identity_format")]
-    pub format: String,
-    /// Path to AIEOS JSON file (relative to workspace)
-    #[serde(default)]
-    pub aieos_path: Option<String>,
-    /// Inline AIEOS JSON (alternative to file path)
-    #[serde(default)]
-    pub aieos_inline: Option<String>,
-}
-
-fn default_identity_format() -> String {
-    "openclaw".into()
-}
-
-impl Default for IdentityConfig {
-    fn default() -> Self {
-        Self {
-            format: default_identity_format(),
-            aieos_path: None,
-            aieos_inline: None,
-        }
-    }
-}
-
-// ── Peripherals (hardware: STM32, RPi GPIO, etc.) ────────────────────────
-
-/// Peripheral board integration configuration (`[peripherals]` section).
-///
-/// Boards become agent tools when enabled.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "peripherals"]
-pub struct PeripheralsConfig {
-    /// Enable peripheral support (boards become agent tools)
-    #[serde(default)]
-    pub enabled: bool,
-    /// Board configurations (nucleo-f401re, rpi-gpio, etc.)
-    #[serde(default)]
-    pub boards: Vec<PeripheralBoardConfig>,
-    /// Path to datasheet docs (relative to workspace) for RAG retrieval.
-    /// Place .md/.txt files named by board (e.g. nucleo-f401re.md, rpi-gpio.md).
-    #[serde(default)]
-    pub datasheet_dir: Option<String>,
-}
-
-/// Configuration for a single peripheral board (e.g. STM32, RPi GPIO).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-pub struct PeripheralBoardConfig {
-    /// Board type: "nucleo-f401re", "rpi-gpio", "esp32", etc.
-    pub board: String,
-    /// Transport: "serial", "native", "websocket"
-    #[serde(default = "default_peripheral_transport")]
-    pub transport: String,
-    /// Path for serial: "/dev/ttyACM0", "/dev/ttyUSB0"
-    #[serde(default)]
-    pub path: Option<String>,
-    /// Baud rate for serial (default: 115200)
-    #[serde(default = "default_peripheral_baud")]
-    pub baud: u32,
-}
-
-fn default_peripheral_transport() -> String {
-    "serial".into()
-}
-
-fn default_peripheral_baud() -> u32 {
-    115_200
-}
-
-impl Default for PeripheralBoardConfig {
-    fn default() -> Self {
-        Self {
-            board: String::new(),
-            transport: default_peripheral_transport(),
-            path: None,
-            baud: default_peripheral_baud(),
         }
     }
 }
