@@ -400,10 +400,11 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 
 > **Оценка:** P0+P1+P2-обязательное ≈ небольшой этап; P3 — крупные, отдельно.
 
-### 11.5 Статус порта (обновлено 2026-11-07)
+### 11.5 Статус порта (обновлено 2026-11-08)
 
 | Пункт | PR | Вердикт | Что сделано |
 | ----- | -- | ------- | ----------- |
+| 11.2.10–11.2.16 | плагинный кластер | **DONE** | Полный синк `omnesagent-plugins` к v0.8.7 — коммит `8d12cd466`; config-часть #11520 — коммит `2f7049962` (см. §11.6) |
 | 11.2.4 | #11385 | **ALREADY** | Найдено в дереве: `tools/model_switch.rs` уже несёт новую `note` и тест |
 | 11.2.5 | #11148 | **DONE** | `agent/loop_.rs`: `_utf8_erase_guard = cli_input::ensure_terminal_utf8_erase()` в REPL |
 | 11.2.1 | #11900 | **DONE** | `infra/session_sqlite.rs` (busy_timeout + retry WAL + IMMEDIATE-tx + тест) и `runtime/daemon/mod.rs` (`open_rpc_session_backend` + 2 теста) |
@@ -429,13 +430,13 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 | 11.2.6 | #11431 (gateway ws) | **DEFER** | 414 строк, ADAPT; ws-архитектура форка иная |
 | 11.2.8 | #11328 | **N/A** | Файла `model_picker_delivery.rs` в форке нет |
 | 11.2.9 | #11851 | **DONE (ADAPT)** | Портировано ранее (см. таблицу выше) |
-| 11.2.10–11.2.16 | #11814/#11808/#11809/#11811/#11812/#11848/#11807 | **BLOCKED** | Всё это — часть подсистемы плагинов v0.8.6 (egress/sockets/component_websocket/host-split/catalog/event/signature). Наш `omnesagent-plugins` = база `v0.8.5+34`; напр. `#11814` правит `egress.rs`, который у нас на 1 406 строк позади v0.8.7. `#11848` требует `sender_is_authorized` (нет в базе). Портируемо только вместе с v0.8.6-подсистемой |
+| 11.2.10–11.2.16 | #11814/#11808/#11809/#11811/#11812/#11848/#11807 | **DONE** | Синк крейта `omnesagent-plugins` к v0.8.7 (коммит `8d12cd466`, 72 файла). Отдельным коммитом `2f7049962` портирована config-часть #11520 (`schema.rs`-хелперы `legacy_plugin_dirs_with_entries`/`legacy_root_overlaps_workspace`/`legacy_lexical_absolute_path`, запись `("plugins", V2WorkspaceDest::DataDir)` в `schema/v2.rs`, тесты `legacy_plugin_recovery.rs` + `legacy_plugin_migrate.rs`) — все тесты зелёные |
 | 11.2.18 | #11925 (образы) | **PENDING** | У форка своя контейнерная раскладка (`dev/ci/container-base-images.toml`, `docker-tags.toml`); нужна отдельная адаптация + smoke-сборка |
 | 11.2.19 | #11903 | **N/A** | До #8289 секции нет |
 | 11.2.20 | #11610 | **DONE (ADAPT)** | См. таблицу выше |
 | 11.2.21–11.2.22 | #11438/#11352 | **DEFER** | Крупные архитектурные (бэклог §6) |
 
-> **Вывод:** из дельты v0.8.7 осталось два класса работ. (1) Мелкое и безопасное — сделано (#11610) + опционально #11925. (2) Всё остальное — портируемо **только вместе с подсистемой v0.8.6** (плагины, SOP, типизированные ошибки контекста), т.е. это уже не «небольшая дельта», а отдельный этап синка `v0.8.5+34 → v0.8.7`.
+> **Вывод (обновлено 2026-11-08):** подсистема плагинов v0.8.6/0.8.7 **портирована целиком** (крейт `omnesagent-plugins` = v0.8.7 + config-часть #11520), закрыв весь кластер 11.2.10–11.2.16. Осталось: (1) #11925 (образы, `PENDING`); (2) архитектурные `DEFER` — SOP (#11861, раскладка иная) и gateway-ws (#11431), а также P3 (#11438/#11352) — в бэклог §6 (решение владельца).
 
 > Проверено ранее: `cargo check` по `omnesagent-infra`/`omnesagent-runtime`/`omnesagent-tools`/`omnesagent-channels`/`omnesagent-plugins`/`omnesagent-config` — без новых ошибок; новые тесты проходят (`concurrent_first_openers_of_a_fresh_store_all_succeed`, `rpc_session_store_open_*`, `mcp_capability_tool_names_are_reserved_before_plugins_load`).
 > Рабочий процесс порта описан в скилле `.claude/skills/zeroclaw-update/SKILL.md`.
