@@ -349,7 +349,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 | - | ------ | -- | --- | --------- | ------- |
 | 11.2.1 | `7820b366e` | #11900 | session-store: конкурентный первый open `sessions.db` (оба ждут друг друга, лог+retry) | `omnesagent-infra` (`session_store.rs`/`session_sqlite.rs`) | PORT-CLEAN |
 | 11.2.2 | `850f1c7b4` | #11861 | SOP: устаревшая копия run не должна воскрешать/перезаписывать завершённый run | `omnesagent-sop-graph` | PORT-ADAPT |
-| 11.2.3 | `b1888e1fe` | #11578 | runtime: лог «что заняло окно» при не помещающемся запросе | `omnesagent-runtime` | PORT-CLEAN |
+| 11.2.3 | `b1888e1fe` | #11578 | runtime: лог «что заняло окно» при не помещающемся запросе | `omnesagent-runtime`, `omnesagent-channels` | PORT-ADAPT |
 | 11.2.4 | `e8d2e5fc8` | #11385 | `model_switch`: сказать модели довести задачу в том же ответе | `omnesagent-tools` | PORT-CLEAN |
 | 11.2.5 | `5b7ed49d4` | #11148 | CLI: UTF-8 erase mode в REPL (Backspace удаляет multibyte целиком) — **Windows/кириллица** | `backend/src/main.rs` | PORT-CLEAN |
 | 11.2.6 | `f63f00f6d` | #11431 | gateway: закрывать chat-сокеты retired-инстанса после reload (dashboard reconnect) | `omnesagent-gateway/ws.rs` | ADAPT (архитектура ws иная) |
@@ -425,7 +425,7 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 | Пункт | PR | Вердикт (уточнён) | Причина |
 | ----- | -- | ----------------- | ------- |
 | 11.2.2 | #11861 (SOP) | **DEFER** | Апстрим правит `runtime/src/sop/{engine,store/*}` (2 269 строк); в форке SOP вынесен в `omnesagent-sop-graph` (только `lib.rs`) — раскладка иная |
-| 11.2.3 | #11578 | **BLOCKED** | Требует типизированный `ContextWindowExceeded` (введён в v0.8.6); в форке ошибка — `providers::ReliableProviderTerminalFailureKind::ContextWindow` |
+| 11.2.3 | #11578 | **DONE (ADAPT)** | Типизированный `ContextWindowExceeded` внесён адаптацией (нет предусловия #11067): `turn/outcome.rs` несёт тип + `breakdown()`; `turn/mod.rs` фабрика `context_window_exceeded_error` + обёртка Err после in-loop recovery; orchestrator строковый детектор `is_context_window_overflow_error` короткозамыкается на typed-причине, а журнал берёт `breakdown()` в `else`-ветке. `max_iter.rs`/`loop_.rs`/scheduler-тесты апстрима — N/A (в форке этих точек/тестов нет) |
 | 11.2.6 | #11431 (gateway ws) | **DEFER** | 414 строк, ADAPT; ws-архитектура форка иная |
 | 11.2.8 | #11328 | **N/A** | Файла `model_picker_delivery.rs` в форке нет |
 | 11.2.9 | #11851 | **DONE (ADAPT)** | Портировано ранее (см. таблицу выше) |

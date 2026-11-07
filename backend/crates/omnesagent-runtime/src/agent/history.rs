@@ -329,6 +329,22 @@ pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Estimate the token cost of the native tool schemas a request carries: the
+/// ~4 chars/token heuristic plus ~4 framing tokens per spec. Charges the name,
+/// the description, and the serialized parameter schema, because a provider
+/// serializes all three into the request prefix. `0` when the request carries
+/// no native tools.
+pub fn estimate_tool_schema_tokens(specs: &[crate::tools::ToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(|spec| {
+            let parameters_len =
+                serde_json::to_string(&*spec.parameters).map_or(0, |serialized| serialized.len());
+            (spec.name.len() + spec.description.len() + parameters_len).div_ceil(4) + 4
+        })
+        .sum()
+}
+
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
     // System content is always dispatched verbatim, so the floor always uses
     // the literal-text formula.

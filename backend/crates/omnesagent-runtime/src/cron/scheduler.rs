@@ -961,7 +961,14 @@ async fn run_agent_job(
                     let _ = mem.purge_session(&mem_session_key).await;
                 }
             }
-            (false, format!("agent job failed: {e}"))
+            // A capacity refusal carries the shares that filled the window;
+            // record those instead of the bare provider text so the run result
+            // says what could not fit.
+            let message = crate::agent::context_window_exceeded_from_error(&e)
+                .map_or_else(|| format!("agent job failed: {e}"), |exceeded| {
+                    format!("agent job failed: {}", exceeded.breakdown())
+                });
+            (false, message)
         }
     }
 }

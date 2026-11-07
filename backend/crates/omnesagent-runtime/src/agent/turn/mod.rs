@@ -45,8 +45,8 @@ pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::{ReportedRequestUsage, SteeringPending, StreamCancelledAfterOutput};
 pub use outcome::{
-    ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
-    is_tool_loop_cancelled,
+    ContextWindowExceeded, ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled,
+    context_window_exceeded_from_error, is_model_switch_requested, is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 pub use outcome::{
@@ -194,6 +194,53 @@ fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool
             |remaining| remaining.checked_sub(1),
         )
         .is_ok()
+}
+
+/// The uncalibrated estimate of a request and its shares, carried into the
+/// capacity refusal so the operator can see what filled the window:
+/// `(raw_estimated_tokens, system_tokens, tool_schema_tokens)`. All three are
+/// in raw-estimate units.
+type RequestShares = (usize, usize, usize);
+
+/// Refuse a request the active model's own capacity cannot hold, carrying the
+/// estimate and its shares so the operator log can say what filled the window
+/// instead of a bare refusal.
+fn context_window_exceeded_error(
+    (provider_name, model): (&str, &str),
+    model_context_window: usize,
+    estimated_tokens: usize,
+    (raw_estimated_tokens, system_tokens, tool_schema_tokens): RequestShares,
+) -> anyhow::Error {
+    let span = ::omnesagent_log::info_span!(
+        target: "omnesagent_log_internal_scope",
+        "omnesagent_scope",
+        model = %model,
+        model_provider = %provider_name,
+    );
+    let _guard = span.entered();
+    ::omnesagent_log::record!(
+        WARN,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+            .with_category(::omnesagent_log::EventCategory::Agent)
+            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "estimated_tokens": estimated_tokens,
+                "model_context_window": model_context_window,
+                "raw_estimated_tokens": raw_estimated_tokens,
+                "system_tokens": system_tokens,
+                "tool_schema_tokens": tool_schema_tokens,
+                "error_key": "context_window_exceeded",
+            })),
+        "Provider-facing request exceeds the active model context window"
+    );
+    outcome::ContextWindowExceeded {
+        estimated_tokens,
+        model_context_window,
+        raw_estimated_tokens,
+        system_tokens,
+        tool_schema_tokens,
+    }
+    .into()
 }
 
 pub struct ToolLoop<'a> {
@@ -469,6 +516,14 @@ async fn run_tool_call_loop_impl<'a>(
         receipt_generator,
         knobs,
     } = exec;
+
+    // The active model's context window, resolved on demand from provider
+    // config rather than duplicated into this bundle; configless paths fall
+    // back to the documented unconfigured default.
+    let model_context_window = config.map_or(
+        omnesagent_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+        |cfg| cfg.effective_model_context_window(agent_alias.unwrap_or_default()),
+    );
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
@@ -1192,6 +1247,38 @@ async fn run_tool_call_loop_impl<'a>(
                         crate::i18n::get_required_cli_string("turn-interrupted-by-user")
                     ));
                     turn_state.push_dual(msg);
+                }
+                // The provider refused the request over the active model's own
+                // capacity and in-loop recovery could not make it fit. Attach
+                // the typed refusal so the operator journal can say what filled
+                // the window; the provider's own text stays the outer message
+                // for transports that only read the top-level string.
+                if omnesagent_providers::reliable::is_context_window_exceeded(&e) {
+                    let tool_schema_tokens = if use_native_tools {
+                        crate::agent::history::estimate_tool_schema_tokens(tool_specs)
+                    } else {
+                        0
+                    };
+                    let raw_estimated_tokens =
+                        crate::agent::history::estimate_history_tokens(&provider_request_messages)
+                            .saturating_add(tool_schema_tokens);
+                    // The provider confirmed the request does not fit; never
+                    // report an estimate that appears to fit.
+                    let estimated_tokens =
+                        raw_estimated_tokens.max(model_context_window.saturating_add(1));
+                    return Err(context_window_exceeded_error(
+                        (active_model_provider_name, provider_request_model),
+                        model_context_window,
+                        estimated_tokens,
+                        (
+                            raw_estimated_tokens,
+                            crate::agent::history::estimate_system_floor_tokens(
+                                &provider_request_messages,
+                            ),
+                            tool_schema_tokens,
+                        ),
+                    )
+                    .context(format!("{e:#}")));
                 }
                 return Err(e);
             }
