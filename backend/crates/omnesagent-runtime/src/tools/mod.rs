@@ -1908,9 +1908,7 @@ pub fn all_tools_with_runtime(
                         .iter()
                         .map(|tool| tool.name().to_string())
                         .collect();
-                    if root_config.pipeline.enabled {
-                        registered_names.insert(PipelineTool::NAME.to_string());
-                    }
+                    reserve_deferred_host_names(root_config, &mut registered_names);
                     let plugin_limits = omnesagent_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1983,6 +1981,23 @@ pub fn all_tools_with_runtime(
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
     }
+}
+
+/// Reserve the names of host tools that are minted during assembly, *after*
+/// the plugin (guest) tools register, so the plugin loader cannot see them.
+/// Reserving them up front stops a plugin from registering a tool that shadows
+/// one. The generic MCP capability tools ([`build_mcp_capability_tools`]) are
+/// minted during assembly and are always reserved; `execute_pipeline` is
+/// reserved when `[pipeline] enabled = true`.
+#[cfg(feature = "plugins-wasm")]
+fn reserve_deferred_host_names(
+    config: &Config,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+) {
+    if config.pipeline.enabled {
+        reserved_host_names.insert(PipelineTool::NAME.to_string());
+    }
+    reserved_host_names.extend(["mcp_resources", "mcp_prompts"].map(String::from));
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2351,6 +2366,28 @@ mod tests {
         let names: Vec<_> = one.iter().map(|t| t.name().to_string()).collect();
         assert!(names.contains(&"mcp_resources".to_string()));
         assert!(!names.contains(&"mcp_prompts".to_string()));
+    }
+
+    /// The MCP capability tools register during assembly, after plugin tools,
+    /// so their names are reserved up front for the plugin loader.
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn mcp_capability_tool_names_are_reserved_before_plugins_load() {
+        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let mut reserved = std::collections::HashSet::new();
+        reserve_deferred_host_names(&Config::default(), &mut reserved);
+
+        let built: Vec<String> = build_mcp_capability_tools(&registry, None)
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let mut names = built.clone();
+        names.sort();
+        assert_eq!(names, ["mcp_prompts", "mcp_resources"]);
+        // Every capability tool, including one added later, must be reserved.
+        for name in &built {
+            assert!(reserved.contains(name), "{name}");
+        }
     }
 
     fn test_config(tmp: &TempDir) -> Config {

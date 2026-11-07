@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use omnesagent_api::attribution::{Role, ToolKind};
 use omnesagent_api::runtime_traits::RuntimeAdapter;
 use omnesagent_config::policy::SecurityPolicy;
 use omnesagent_config::schema::Config;
@@ -190,6 +191,13 @@ fn tool_allowed_in_context(name: &str, exclude_memory: bool, acp_delivery: bool)
         && (acp_delivery || name != "deliver_file")
 }
 
+/// Whether a tool comes from a WASM plugin guest rather than the host. Only a
+/// guest can be dropped by the assembly-time name reservation below; a host
+/// tool always keeps its name.
+fn is_guest(tool: &dyn Tool) -> bool {
+    matches!(tool.role(), Role::Tool(ToolKind::WasmPlugin))
+}
+
 impl ScopedToolRegistry {
     /// Mint a scoped, gated registry from already-built eager tools. The single seam
     /// every construction path goes through.
@@ -219,7 +227,7 @@ impl ScopedToolRegistry {
             poll_handle,
             escalate_handle,
             channel_room_handle,
-            unfiltered_tool_arcs,
+            mut unfiltered_tool_arcs,
             // Test-only capture of the concrete delegate instance; `assemble`
             // has no use for it and must keep destructuring exhaustively so a
             // new field cannot be silently dropped here.
@@ -231,6 +239,7 @@ impl ScopedToolRegistry {
         //    real devices), so this is gated: execution surfaces pass
         //    `connect_peripherals: true`; listing-only surfaces pass `false` and
         //    enumerate without holding devices.
+        let mut late_host_names: HashSet<String> = HashSet::new();
         if connect_peripherals {
             let peripheral_tools = load_peripheral_tools(config.peripherals.clone()).await;
             if emit_assembly_logs && !peripheral_tools.is_empty() {
@@ -242,7 +251,44 @@ impl ScopedToolRegistry {
                     "Peripheral tools added"
                 );
             }
+            late_host_names.extend(peripheral_tools.iter().map(|tool| tool.name().to_string()));
             tools_registry.extend(peripheral_tools);
+        }
+        // Peripheral and skill tools register after the plugin (guest) tools, so
+        // the loader could not reserve their names. A skill tool's composed name
+        // loses its `__` separator when it is shortened, so the MCP-namespace
+        // refusal does not always cover it.
+        late_host_names.extend(skills.iter().flat_map(|skill| {
+            skill
+                .tools
+                .iter()
+                .map(|tool| tools::skill_tool::composed_tool_name(&skill.name, &tool.name))
+        }));
+        // A plugin tool that declares one of these late names would shadow the
+        // host tool; drop the guest and let the host tool keep the name.
+        if !late_host_names.is_empty() {
+            tools_registry.retain(|tool| {
+                let shadowed = is_guest(tool.as_ref()) && late_host_names.contains(tool.name());
+                if shadowed && emit_assembly_logs {
+                    ::omnesagent_log::record!(
+                        WARN,
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Load
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "tool": tool.name(),
+                            "error_key": "plugin_tool_name_conflict",
+                        })),
+                        "Plugin tool conflicts with a host tool"
+                    );
+                }
+                !shadowed
+            });
+            unfiltered_tool_arcs.retain(|tool| {
+                !(is_guest(tool.as_ref()) && late_host_names.contains(tool.name()))
+            });
         }
 
         // Mint the pipeline only after the effective caller policy is known. The
