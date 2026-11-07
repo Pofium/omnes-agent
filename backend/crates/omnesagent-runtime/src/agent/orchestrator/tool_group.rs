@@ -172,11 +172,20 @@ pub fn is_read_only_tool(name: &str) -> bool {
         || lower.contains("status")
         || lower.contains("log")
         || lower.contains("diff")
-        || lower.starts_with("ob2h:project_scan")
-        || lower.starts_with("ob2h:project_context")
-        || lower.starts_with("ob2h:project_report")
-        || lower.starts_with("ob2h:graph_search")
-        || lower.starts_with("ob2h:memory_search")
+        // ob2h MCP tools arrive namespaced as `<server>__<tool>` (double
+        // underscore, see mcp_client.rs), so the read-only allowlist must use
+        // `ob2h__` — a single-colon prefix never matched a real tool name.
+        || lower.starts_with("ob2h__project_scan")
+        || lower.starts_with("ob2h__project_context")
+        || lower.starts_with("ob2h__project_report")
+        || lower.starts_with("ob2h__project_impact")
+        || lower.starts_with("ob2h__graph_search")
+        || lower.starts_with("ob2h__graph_reason")
+        || lower.starts_with("ob2h__graph_stats")
+        || lower.starts_with("ob2h__memory_search")
+        || lower.starts_with("ob2h__memory_context")
+        || lower.starts_with("ob2h__omnes_stats")
+        || lower.starts_with("ob2h__secrets_status")
         || lower.starts_with("codegraph_")
         || lower.starts_with("searxng_")
         || lower == "web_search"
@@ -213,6 +222,59 @@ mod tests {
         let filtered = filter_tools_for_intent(&tools, AgentIntent::CodeExploration);
         let names: Vec<_> = filtered.into_iter().map(|t| t.name).collect();
         assert_eq!(names, vec!["read_file", "grep_search"]);
+    }
+
+    #[test]
+    fn test_ob2h_read_only_uses_real_double_underscore_prefix() {
+        // Regression: the read-only allowlist once used `ob2h:` (single colon),
+        // which never matched the `<server>__<tool>` names the MCP client emits,
+        // so ob2h read tools survived only via the generic `__` rule and write
+        // tools were never explicitly excluded.
+        let read_only = [
+            "ob2h__project_scan",
+            "ob2h__project_context",
+            "ob2h__project_report",
+            "ob2h__project_impact",
+            "ob2h__graph_search",
+            "ob2h__graph_reason",
+            "ob2h__graph_stats",
+            "ob2h__memory_search",
+            "ob2h__memory_context",
+            "ob2h__omnes_stats",
+            "ob2h__secrets_status",
+        ];
+        for name in read_only {
+            assert!(is_read_only_tool(name), "{name} should be read-only");
+        }
+
+        let mutating = [
+            "ob2h__memory_save",
+            "ob2h__memory_forget",
+            "ob2h__secrets_set",
+            "ob2h__secrets_delete",
+            "ob2h__workspace_write",
+            "ob2h__project_init",
+            "ob2h__knowledge_extract",
+            "ob2h__dream_run",
+            "ob2h__session_ingest",
+            "ob2h__omnes_backup",
+        ];
+        for name in mutating {
+            assert!(!is_read_only_tool(name), "{name} must not be read-only");
+        }
+    }
+
+    #[test]
+    fn test_code_exploration_excludes_ob2h_write_tools() {
+        let tools = vec![
+            dummy_tool("ob2h__memory_search"),
+            dummy_tool("ob2h__graph_reason"),
+            dummy_tool("ob2h__memory_save"),
+            dummy_tool("ob2h__secrets_set"),
+        ];
+        let filtered = filter_tools_for_intent(&tools, AgentIntent::CodeExploration);
+        let names: Vec<_> = filtered.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["ob2h__memory_search", "ob2h__graph_reason"]);
     }
 
     #[test]
