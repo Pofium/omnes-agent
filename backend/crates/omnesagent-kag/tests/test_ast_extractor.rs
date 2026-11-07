@@ -1,7 +1,134 @@
 //! Тесты AST-парсера кода (Rust, Python, TS/JS, SQL, PHP, Dart, Java, C#, C/C++, Kotlin,
 //! Swift, Ruby, Vue/Svelte, Scala, Lua, Elixir, Shell) — зеркало tests ob2h.
 
-use omnesagent_kag::ast::{AstCodeExtractor, AstScanResult};
+use omnesagent_kag::ast::{AstCodeExtractor, AstEdge, AstScanResult, resolve_imports};
+
+/// Вспомогательная функция: сканируемый файл проекта + его хеш.
+fn seed_file(scan: &mut AstScanResult, rel_path: &str) {
+    scan.file_hashes
+        .insert(rel_path.to_string(), "hash".to_string());
+}
+
+/// Вспомогательная функция: IMPORTS-ребро `file:<src> → module:<target>`.
+fn import_edge(src: &str, module: &str) -> AstEdge {
+    AstEdge {
+        source_node_id: format!("file:{}", src),
+        target_node_id: format!("module:{}", module),
+        label: "IMPORTS".to_string(),
+        weight: 1.0,
+        context: String::new(),
+        provenance: "EXTRACTED".to_string(),
+    }
+}
+
+#[test]
+fn test_resolve_imports_rust_crate_and_super() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "src/main.rs");
+    seed_file(&mut scan, "src/db.rs"); // crate::db
+    seed_file(&mut scan, "src/handlers.rs"); // super::handlers (из crate::api)
+    seed_file(&mut scan, "src/api/mod.rs");
+
+    // crate::db::Database → src/db.rs
+    scan.edges.push(import_edge("src/main.rs", "crate::db::Database"));
+    // super::handlers из src/api/mod.rs (модуль crate::api) → crate::handlers → src/handlers.rs
+    scan.edges.push(import_edge("src/api/mod.rs", "super::handlers"));
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 2, "оба внутренних импорта должны резолвиться");
+    let targets: Vec<String> = scan
+        .edges
+        .iter()
+        .filter(|e| e.label == "IMPORTS")
+        .map(|e| e.target_node_id.clone())
+        .collect();
+    assert!(targets.contains(&"file:src/db.rs".to_string()));
+    assert!(targets.contains(&"file:src/handlers.rs".to_string()));
+}
+
+#[test]
+fn test_resolve_imports_ts_relative_and_alias() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "frontend/src/app.ts");
+    seed_file(&mut scan, "frontend/src/util/format.ts");
+    seed_file(&mut scan, "frontend/src/components/Button.tsx");
+
+    // относительный `./util/format` → frontend/src/util/format.ts
+    scan.edges
+        .push(import_edge("frontend/src/app.ts", "./util/format"));
+    // Vite-алиас `@/components/Button` → frontend/src/components/Button.tsx
+    scan.edges
+        .push(import_edge("frontend/src/app.ts", "@/components/Button"));
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 2);
+    let targets: Vec<String> = scan
+        .edges
+        .iter()
+        .filter(|e| e.label == "IMPORTS")
+        .map(|e| e.target_node_id.clone())
+        .collect();
+    assert!(targets.contains(&"file:frontend/src/util/format.ts".to_string()));
+    assert!(targets.contains(&"file:frontend/src/components/Button.tsx".to_string()));
+}
+
+#[test]
+fn test_resolve_imports_python_and_external_stays() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "app/vector.py");
+    seed_file(&mut scan, "backend/app/services/email.py");
+
+    // `import json, os as system, app.services.email` в одном стейтменте (Python):
+    // внешние json/os остаются module:, внутренний app.services.email → файл проекта.
+    scan.edges.push(import_edge(
+        "app/vector.py",
+        "json, os as system, app.services.email",
+    ));
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 1, "только app.services.email — внутренний модуль");
+    let targets: Vec<String> = scan
+        .edges
+        .iter()
+        .filter(|e| e.label == "IMPORTS")
+        .map(|e| e.target_node_id.clone())
+        .collect();
+    assert!(targets.contains(&"file:backend/app/services/email.py".to_string()));
+    assert!(targets.contains(&"module:json".to_string()));
+    assert!(targets.contains(&"module:os".to_string()));
+    assert!(
+        scan.edges
+            .iter()
+            .filter(|e| e.target_node_id == "file:backend/app/services/email.py")
+            .all(|e| e.context == "import app.services.email"),
+        "контекст ребра должен фиксировать импортируемый модуль"
+    );
+}
+
+#[test]
+fn test_resolve_imports_leaves_non_module_targets() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "src/main.rs");
+
+    // Не-IMPORTS-ребро и уже резолвнутый импорт не должны меняться.
+    scan.edges.push(AstEdge {
+        source_node_id: "file:src/main.rs".to_string(),
+        target_node_id: "file:src/db.rs".to_string(),
+        label: "CALLS".to_string(),
+        weight: 1.0,
+        context: "typepass:import:src/db.rs".to_string(),
+        provenance: "RESOLVED".to_string(),
+    });
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 0);
+    assert_eq!(scan.edges.len(), 1);
+    assert_eq!(scan.edges[0].target_node_id, "file:src/db.rs");
+}
 
 #[test]
 fn test_parse_rust_code() {

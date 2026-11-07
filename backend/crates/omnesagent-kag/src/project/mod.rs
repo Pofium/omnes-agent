@@ -423,7 +423,13 @@ impl ProjectService {
             Vec::new()
         };
 
-        // Type-pass: резолв простых вызовов (Rust/Python) по импортам и same-file
+        // Type-pass, шаг 1: резолв импортов `file: → module:` в реальные файлы проекта
+        let resolved_imports = crate::ast::resolve_imports(&mut scan_res);
+        if resolved_imports > 0 {
+            info!("Type-pass: резолвлено {resolved_imports} импортов (IMPORTS, provenance=RESOLVED)");
+        }
+
+        // Type-pass, шаг 2: резолв простых вызовов (Rust/Python) по импортам и same-file
         let resolved_calls = crate::ast::resolve_calls(&mut scan_res);
         if resolved_calls > 0 {
             info!("Type-pass: резолвлено {resolved_calls} вызовов (CALLS, provenance=RESOLVED)");
