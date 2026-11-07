@@ -3,7 +3,7 @@
 #[cfg(target_family = "wasm")]
 mod component {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     wit_bindgen::generate!({
         path: "../../../../../wit/v0",
@@ -13,11 +13,12 @@ mod component {
 
     use exports::omnesagent::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection, WebhookRequest, WebhookResponse,
     };
     use exports::omnesagent::plugin::plugin_info::Guest as PluginInfo;
     use omnesagent::plugin::config::{ConfigError, get as config_get};
     use omnesagent::plugin::secrets::{SecretError, get as secret_get};
+    use omnesagent::plugin::state::{StateError, get as state_get, put as state_put};
 
     struct FixtureChannel;
     static SEND_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -25,6 +26,48 @@ mod component {
     /// host tests can observe which config generation an instance was
     /// configured with (reconstruction must replay the constructor snapshot).
     static CONFIGURED_HANDLE: Mutex<Option<String>> = Mutex::new(None);
+    /// Guest-held health, flipped by host-enqueued `health:down` and
+    /// `health:up` messages the way a real plugin's connection state changes
+    /// during its polls. A rebuilt instance starts healthy again.
+    static HEALTHY: AtomicBool = AtomicBool::new(true);
+    /// `health-check` calls this instance has answered, reported by a
+    /// host-enqueued `health:count` message so host tests can bound how often
+    /// the host asks.
+    static HEALTH_CHECKS: AtomicU32 = AtomicU32::new(0);
+    /// Set by a host-enqueued `health:trap` message: the next `health-check`
+    /// traps, as a buggy plugin's would.
+    static TRAP_HEALTH_CHECK: AtomicBool = AtomicBool::new(false);
+    /// Host-held state key set by a host-enqueued `health:trap-always`
+    /// message. It outlives a rebuilt instance, so every later `health-check`
+    /// traps.
+    const ALWAYS_TRAP_HEALTH_CHECK: &str = "health-trap";
+    /// Host-held state key set by a host-enqueued `health:trap-alternate`
+    /// message. Its revision counts later `health-check` calls across rebuilt
+    /// instances, and every other one traps, starting with the first.
+    const ALTERNATE_TRAP_HEALTH_CHECK: &str = "health-trap-alternate";
+
+    /// Whether this `health-check` is one that `health:trap-alternate` makes
+    /// trap. The count is recorded before the trap, so it survives it.
+    fn alternate_health_check_traps() -> bool {
+        let Ok(Some(entry)) = state_get(ALTERNATE_TRAP_HEALTH_CHECK) else {
+            return false;
+        };
+        state_put(ALTERNATE_TRAP_HEALTH_CHECK, b"on", Some(entry.revision))
+            .expect("fixture counts the health check")
+            % 2
+            == 0
+    }
+
+    /// How many times `configure` has run for this binding. Each run advances
+    /// the host-held `channel-session` revision, which outlives a rebuilt
+    /// instance, so host tests can count rebuilds. A `send` after a credential
+    /// rotation advances it too.
+    fn configure_count() -> u64 {
+        state_get("channel-session")
+            .ok()
+            .flatten()
+            .map_or(0, |entry| entry.revision)
+    }
 
     fn current_public_config() -> Result<serde_json::Value, String> {
         let config = config_get().map_err(|_| "expected point-of-use public config".to_string())?;
@@ -83,6 +126,14 @@ mod component {
             if token.is_empty() {
                 return Err("expected non-empty api_token secret".to_string());
             }
+            let current = state_get("channel-session")
+                .map_err(|_| "expected scoped channel state".to_string())?;
+            let expected = current.as_ref().map(|entry| entry.revision);
+            let revision = state_put("channel-session", token.as_bytes(), expected)
+                .map_err(|_| "expected scoped channel state write".to_string())?;
+            if revision != expected.unwrap_or(0) + 1 {
+                return Err("unexpected channel state revision".to_string());
+            }
 
             Ok(())
         }
@@ -105,6 +156,11 @@ mod component {
                     value = std::hint::black_box(value.wrapping_add(1));
                 }
             }
+            // A trap in an export that also has an error result of its own,
+            // which the host must tell apart from a returned error string.
+            if message.content == "send:trap" {
+                panic!("fixture send traps on request");
+            }
             // Scoped-secret path (this PR): the message must have been composed
             // from one current config+secret revision resolved at point of use.
             let config = current_public_config()?;
@@ -117,6 +173,17 @@ mod component {
             }
             let token = secret_get("api_token")
                 .map_err(|_| "expected api_token during channel operation".to_string())?;
+            let state = state_get("channel-session")
+                .map_err(|_| "expected channel state during operation".to_string())?
+                .ok_or_else(|| "expected configured channel state".to_string())?;
+            if state.value != token.as_bytes() {
+                let next_revision =
+                    state_put("channel-session", token.as_bytes(), Some(state.revision))
+                        .map_err(|_| "expected CAS update after credential rotation".to_string())?;
+                if next_revision != state.revision + 1 {
+                    return Err("unexpected rotated channel state revision".to_string());
+                }
+            }
             if message.content != format!("{epoch}:{token}") {
                 return Err("message did not use one current config revision".to_string());
             }
@@ -135,11 +202,37 @@ mod component {
                     value = std::hint::black_box(value.wrapping_add(1));
                 }
             }
+            let content = match message.content.as_str() {
+                "health:down" | "health:up" => {
+                    HEALTHY.store(message.content == "health:up", Ordering::SeqCst);
+                    return None;
+                }
+                "health:trap" => {
+                    TRAP_HEALTH_CHECK.store(true, Ordering::SeqCst);
+                    return None;
+                }
+                "health:trap-always" | "health:trap-alternate" => {
+                    let key = if message.content == "health:trap-always" {
+                        ALWAYS_TRAP_HEALTH_CHECK
+                    } else {
+                        ALTERNATE_TRAP_HEALTH_CHECK
+                    };
+                    let current = state_get(key).ok().flatten().map(|entry| entry.revision);
+                    state_put(key, b"on", current).expect("fixture records the health-check trap");
+                    return None;
+                }
+                "health:count" => format!("health-checks:{}", HEALTH_CHECKS.load(Ordering::SeqCst)),
+                // Traps after the message left the host queue, so the trap
+                // consumes it, as an interrupted poll does.
+                "poll:trap" => panic!("fixture poll-message traps on request"),
+                "configure:count" => format!("configures:{}", configure_count()),
+                _ => message.content,
+            };
             Some(InboundMessage {
                 id: message.id,
                 sender: message.sender,
                 reply_target: message.reply_target,
-                content: message.content,
+                content,
                 // Deliberately untrusted: the host must replace both values
                 // with its admitted logical endpoint.
                 channel: "guest-channel".to_string(),
@@ -155,15 +248,27 @@ mod component {
         fn get_channel_capabilities() -> ChannelCapabilities {
             if matches!(config_get(), Err(ConfigError::Unavailable))
                 && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable))
             {
-                ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SELF_HANDLE
+                ChannelCapabilities::HEALTH_CHECK
+                    | ChannelCapabilities::SELF_HANDLE
+                    | ChannelCapabilities::WEBHOOK_INGRESS
+                    | ChannelCapabilities::REQUEST_CHOICE
             } else {
                 ChannelCapabilities::empty()
             }
         }
 
         fn health_check() -> bool {
-            true
+            HEALTH_CHECKS.fetch_add(1, Ordering::SeqCst);
+            let alternate_traps = alternate_health_check_traps();
+            assert!(
+                !TRAP_HEALTH_CHECK.load(Ordering::SeqCst)
+                    && !matches!(state_get(ALWAYS_TRAP_HEALTH_CHECK), Ok(Some(_)))
+                    && !alternate_traps,
+                "fixture health-check traps on request"
+            );
+            HEALTHY.load(Ordering::SeqCst)
         }
 
         fn self_handle() -> Option<String> {
@@ -173,7 +278,8 @@ mod component {
             // `configure` is replayed so the reconstruction metadata check sees
             // a stable value across a rebuilt instance.
             (matches!(config_get(), Err(ConfigError::Unavailable))
-                && matches!(secret_get("api_token"), Err(SecretError::Unavailable)))
+                && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
+                && matches!(state_get("channel-session"), Err(StateError::Unavailable)))
             .then(|| {
                 CONFIGURED_HANDLE
                     .lock()
@@ -283,15 +389,94 @@ mod component {
         }
 
         fn request_choice(
-            _question: String,
+            question: String,
             _choices: Vec<String>,
             _timeout_secs: u64,
         ) -> Result<Option<String>, String> {
+            // Stands in for a person who takes longer to answer than the
+            // host deadline allows.
+            if question.starts_with("spin") {
+                let mut value = 0_u64;
+                loop {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
+            }
             Ok(None)
         }
 
         fn supports_free_form_ask() -> bool {
             true
+        }
+
+        fn webhook_path() -> Option<String> {
+            Some("fixture".to_string())
+        }
+
+        fn parse_webhook(request: WebhookRequest) -> Result<WebhookResponse, WebhookRejection> {
+            let WebhookRequest {
+                method,
+                query,
+                headers,
+                body,
+            } = request;
+            if body == b"spin" {
+                let mut value = 0_u64;
+                loop {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
+            }
+
+            let token = secret_get("api_token").map_err(|_| {
+                WebhookRejection::Unauthorized("scoped webhook secret unavailable".to_string())
+            })?;
+            let supplied = headers
+                .iter()
+                .find(|(name, _)| name == "x-fixture-secret")
+                .map(|(_, value)| value.as_str());
+            if supplied != Some(token.as_str()) {
+                return Err(WebhookRejection::Unauthorized(
+                    "private signature mismatch diagnostic".to_string(),
+                ));
+            }
+
+            if method == "GET" {
+                return Ok(WebhookResponse::Reply(query));
+            }
+            let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+                WebhookRejection::BadRequest(format!("private parser detail: {error}"))
+            })?;
+            if let Some(challenge) = payload.get("challenge").and_then(serde_json::Value::as_str) {
+                return Ok(WebhookResponse::Reply(challenge.to_string()));
+            }
+            let field = |name: &str| {
+                payload
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        WebhookRejection::BadRequest(format!(
+                            "private parser detail: missing {name}"
+                        ))
+                    })
+            };
+            Ok(WebhookResponse::Messages(vec![InboundMessage {
+                id: field("id")?,
+                sender: field("sender")?,
+                reply_target: field("reply_target")?,
+                content: field("content")?,
+                channel: payload
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("spoofed-channel")
+                    .to_string(),
+                channel_alias: Some("spoofed-alias".to_string()),
+                timestamp: 7,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: Vec::new(),
+                subject: None,
+            }]))
         }
     }
 

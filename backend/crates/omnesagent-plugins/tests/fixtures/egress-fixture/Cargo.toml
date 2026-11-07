@@ -13,7 +13,7 @@ test = false
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wit-bindgen = "0.51"
-# Guest-side `wasi:http` bindings. The OmnesAgent WIT worlds declare only
-# OmnesAgent interfaces; `wasi:http` reaches the guest through the wasip2 target,
+# Guest-side `wasi:http` bindings. The omnesagent WIT worlds declare only
+# omnesagent interfaces; `wasi:http` reaches the guest through the wasip2 target,
 # and the host links it only for stores built from an `HttpClient` grant.
 wasi = "0.14"

@@ -2,9 +2,9 @@
 
 ## What this crate is
 
-WASM plugin host for OmnesAgent. Handles plugin discovery, manifest parsing,
+WASM plugin host for omnesagent. Handles plugin discovery, manifest parsing,
 Ed25519 signature verification, and the WIT / direct `wasmtime` execution
-bridge. Bridges plugin-exported functions into OmnesAgent's `Tool` and
+bridge. Bridges plugin-exported functions into omnesagent's `Tool` and
 `Channel` traits so plugins appear as native capabilities to the agent runtime.
 
 ## What this crate is allowed to depend on
@@ -13,6 +13,10 @@ bridge. Bridges plugin-exported functions into OmnesAgent's `Tool` and
 - `wasmtime` (Component Model host)
 - `wasmtime-wasi` and `wasmtime-wasi-http` (WASI Preview 2 host support)
 - `ring` (Ed25519 signatures)
+- `cap-std` (directory handles that install, recovery and admission work through)
+- `same-file` (file identity for the recovery checks, and for the non-Unix payload checks)
+- `windows`, `winx` (Windows only: handle paths, and package moves that never replace an existing entry)
+- `rustix` (Unix only: handle-relative, no-follow opens when admitting a component, and package moves that refuse an existing destination where the platform can)
 - `serde`, `serde_json`, `toml`, `toml_edit` (serialization)
 - `jsonschema` (manifest-owned plugin config-contract validation; network resolvers disabled)
 - `tokio` (async bridging via `spawn_blocking`)

@@ -39,6 +39,8 @@ omnesagent-macros = { path = "crates/omnesagent-macros", version = "0.8.4" }
 omnesagent-compression = { path = "crates/omnesagent-compression", version = "0.8.4" }
 omnesagent-s1 = { path = "crates/omnesagent-s1", version = "0.8.4", default-features = false }
 omnescode = { path = "apps/omnescode", version = "0.8.4" }
+# Secret material wiped on drop (plugin host secrets, TLS PKCS#8 keys).
+zeroize = "1.8"
 directories = "6.0"
 sys-locale = "0.3"
 
