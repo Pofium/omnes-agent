@@ -305,3 +305,137 @@ N/A-кластеры (переписаны у нас): delegate/agents-bundle/ev
 2. Порт-цепочки (promt-cache, reliable, opencode, #8289) — только целиком, порядок внутри цепочки обязателен.
 3. Любое расхождение с нашими подсистемами (Triage Router, compression, stream_guard, editor) — PORT-ADAPT с описанием адаптации в теле коммита.
 4. После каждого этапа: полный покрейтовый прогон + `flutter analyze` + обновление этого плана чекбоксами.
+
+---
+
+## 11. Синк v0.8.6 → v0.8.7 (проверка релиза 2026-10-27)
+
+> **Источник:** <https://github.com/zeroclaw-labs/zeroclaw/releases/tag/v0.8.7> (2026-10-27, «Latest»).
+> **Объём:** `git log v0.8.6..v0.8.7` = **83 коммита** (release-notes называют 81 + 2 релизных), 19 контрибьюторов. Тег присутствует в апстрим-клоне (`v0.8.7` = `99bd353c7`, 2026-10-27; v0.8.6 = `c47322131`, 2026-10-18).
+> **Характер:** security/maintenance follow-up к v0.8.6 — новых крупных фич нет, кроме одного канального feat (#11438).
+> **Важно:** ~⅔ содержания v0.8.7 **уже захвачено** предыдущими этапами (аудит шёл до #11927 и включал v0.8.7-коммиты). Ниже — только дельта: что новое к порту (§11.2), что уже сделано (§11.1), что не берём (§11.3).
+
+### 11.1 Уже покрыто планом (НЕ дублировать)
+
+| PR | Раздел | Наш коммит |
+| -- | ------ | ---------- |
+| #11924 (wasmtime 48.0.7 / Pulley / Cranelift) | §3.1.3 | `889e97dda` |
+| #12010 / #11998 (tokio 1.53.3, ctutils 0.4.5) | §3.1.5 | `05e92fafd` |
+| #11656 (`firejail_args` молча игнорировался) | §3.1.11 | `602c2f6c3` |
+| #11801 (wall-clock дата из промптов) | §4 | `eeaaeb76b` |
+| #11650 (Telegram 429 `retry_after`) | §4 | `20026f6b4` |
+| **#11669 (Lark flat `post`-контент)** | §4 | `8f373cb27` |
+| #11144 (memory FP credential-regex) | §4 | `26e7d3618` |
+| #11258 (transcription `initial_prompt`) | §4 | `6ce697b6c` |
+| #11400 (doctor `models_cache` при открытом reader) | §4 | `420786e33` |
+| #11398 (JSONL session при открытом reader) | §4 | `703933983` |
+| #11804 (open-skills sync без git-промпта) | §4 | `ec4e6d873` |
+| #11616 (статические map-key пути в schema) | §4 | `4621ba990` |
+| #11599 (`native_tools` для compat-семейств) | §4 | `6dc0973f2` |
+| #11659 (snake_case `context_length_exceeded`) | §4 | `7a0c0c20c` |
+| #11350 (cost tracker по ledger path) | §4 | `648185b15` |
+| #11557 (torn ledger records) | §4 | `82c0eba97` |
+| #10034 (probe очевидного alias после model-routing) | §5 (волна 5) | `2be2482e2` |
+| #11143 (qdrant time bounds) | §4 | **SKIP** (Qdrant удалён) |
+| #11726 / #11531 (tailscale serve) | §5.3 | **SKIP** |
+| #11901 (gateway drain) | §5.3 → §6 | НЕ НАЧАТО |
+| #11803 (lifecycle lock в `data/.lifecycle`) | §6.2 (live-revisions) | НЕ НАЧАТО |
+
+### 11.2 НОВОЕ из v0.8.7 — к порту (не покрыто предыдущими этапами)
+
+**P0 — багфиксы с нашей кодовой базой (PORT-CLEAN/ADAPT):**
+
+| # | Коммит | PR | Что | Наш крейт | Вердикт |
+| - | ------ | -- | --- | --------- | ------- |
+| 11.2.1 | `7820b366e` | #11900 | session-store: конкурентный первый open `sessions.db` (оба ждут друг друга, лог+retry) | `omnesagent-infra` (`session_store.rs`/`session_sqlite.rs`) | PORT-CLEAN |
+| 11.2.2 | `850f1c7b4` | #11861 | SOP: устаревшая копия run не должна воскрешать/перезаписывать завершённый run | `omnesagent-sop-graph` | PORT-ADAPT |
+| 11.2.3 | `b1888e1fe` | #11578 | runtime: лог «что заняло окно» при не помещающемся запросе | `omnesagent-runtime` | PORT-CLEAN |
+| 11.2.4 | `e8d2e5fc8` | #11385 | `model_switch`: сказать модели довести задачу в том же ответе | `omnesagent-tools` | PORT-CLEAN |
+| 11.2.5 | `5b7ed49d4` | #11148 | CLI: UTF-8 erase mode в REPL (Backspace удаляет multibyte целиком) — **Windows/кириллица** | `backend/src/main.rs` | PORT-CLEAN |
+| 11.2.6 | `f63f00f6d` | #11431 | gateway: закрывать chat-сокеты retired-инстанса после reload (dashboard reconnect) | `omnesagent-gateway/ws.rs` | ADAPT (архитектура ws иная) |
+| 11.2.7 | `7d64426fc` | #11106 | tools: валидация AnySearch-ответов + Fluent | `omnesagent-tools` | PORT (если AnySearch есть) |
+| 11.2.8 | `bbaf837f7` | #11328 | channels: clippy-clean при выключенном Telegram | `omnesagent-channels` | PORT (chore) |
+
+**P1 — кластер плагинов (у нас есть `omnesagent-plugins` + `api_plugins.rs`, wasmtime 48.0.7):**
+
+| # | Коммит | PR | Что |
+| - | ------ | -- | --- |
+| 11.2.9 | `65672a33a` | #11851 | резервировать peripheral/skill/MCP-имена (`mcp_resources`/`mcp_prompts`) до регистрации plugin-инструментов (иначе плагин перехватывает вызовы) — **security** |
+| 11.2.10 | `f91b9f2c3` | #11814 | egress-dial: чередовать resolved-адреса, следующий через 250 мс; дефолтный connect-timeout 10 с вместо 600 с |
+| 11.2.11 | `ab836a854` | #11808 | egress для `websocket_client`/`socket_client` пакетов сидируется и диагностируется, как для HTTP |
+| 11.2.12 | `02bb07526` | #11809 | `plugin remove` удаляет загруженный плагин из его фактической директории |
+| 11.2.13 | `3c18211b9` | #11811 | `plugin info`/`list --verify` сообщают отказ рантайма по конфигу как «не грузится» |
+| 11.2.14 | `3037ae5e8` | #11812 | `config set` берёт не-секретную настройку как есть (маскированный промпт только для `x-secret`) |
+| 11.2.15 | `842c71e71` | #11848 | имена отправителя в `plugin_channel_sender_denied` |
+| 11.2.16 | `1fded6b06` | #11807 | package lock / transaction lease — owner-only (`0600`) на Unix (частично N/A на Windows) |
+
+**P2 — безопасность/зависимости, проверить покрытие:**
+
+| # | Коммит | PR | Что | Замечание |
+| - | ------ | -- | --- | --------- |
+| 11.2.17 | `ece3b744e` | #11924 | TLS: `rustls-webpki` 0.103.16 / `webpki-roots` **1.0.10** / `webpki-root-certs` 1.0.10 (RUSTSEC-2026-0381/0382/0383, distrusted emSign) | У нас `webpki-roots = "1.0.6"` — **проверить и поднять** |
+| 11.2.18 | `028c50f5e` | #11925 | Контейнеры: пересборка с обновлёнными CA-бандлами (без emSign) | Проверить наши Dockerfile'ы |
+| 11.2.19 | `eea20ebf1` | #11903 | Один общий fetch JWKS на конкурентные проверки `oidc.<alias>` | N/A до #8289 (секции нет) |
+| 11.2.20 | `f2902113c` | #11610 | lint-guard: запрет `std::env::set_current_dir` по workspace | Низкий риск, полезно |
+
+**P3 — архитектурные/крупные (оценить, вероятно в §6-класс решений):**
+
+| # | Коммит | PR | Что |
+| - | ------ | -- | --- |
+| 11.2.21 | `89bd18484` | #11438 | feat(channels): conversation binding port + channel conversation owner (RFC #6954, шаг 2a/3) — новый seam |
+| 11.2.22 | `f3f8bf435` | #11352 | refactor(rpc): config-writer gate из context authority — только вместе с live-revisions (§6.2) |
+
+### 11.3 Не берём (N/A / infra-only)
+
+- **CI/release/docs/tests-only** (не портируем): #11941, #11833, #11967, #11854, #11832, #11838, #11863, #11141, #11140, #11154, #11155, #11157, #11312, #11337, #11595, #11683, #11688, #11080, #10729, #93077ec62, #504b71069, #7606d92c2, #11929, #b882455d7 (#11927), #f66ba320a, #7f2fe028a, #448b9584c, #8f03c962d, #885854129, #133dc0467, #6a99c3dee, #c2f6b3f4c, #20edcf51f (#11840 docs), #2223b38c1 (#11852 quickstart), #40935ae50 (#11841 docs), #ee2f5f58f (#11329 docs), #9cb75f7d6 (#11591 docs).
+- **Frontend апстрима (ZeroCode/desktop/Tauri), которого у нас нет:** #5162ca01b (#11802 Tauri tray), #d441e307d (#11399 zerocode sidebar), #c332fbbcf (#11775), #8faf3a89f (#11407), #8821e3cd5 (#11508), #3051b8ad3 (#11513), #7007365f4 (#11692 UI-часть — наша закрыта §8.1.1).
+- **Уже `N/A` по §11.1.**
+
+### 11.4 Порядок порта v0.8.7
+
+1. **P0:** 11.2.1 → 11.2.2 → 11.2.3 → 11.2.4 → 11.2.5 (Windows) → 11.2.6 → 11.2.7 → 11.2.8.
+2. **P1:** плагины 11.2.9 (security) → 11.2.10 → 11.2.11 → 11.2.12 → 11.2.13 → 11.2.14 → 11.2.15 → 11.2.16.
+3. **P2:** 11.2.17 (TLS-бумп — обязательно) → 11.2.20; 11.2.18 (образы), 11.2.19 (N/A до #8289).
+4. **P3:** 11.2.21/#11438 и 11.2.22/#11352 — в бэклог §6 (решение владельца).
+
+> **Оценка:** P0+P1+P2-обязательное ≈ небольшой этап; P3 — крупные, отдельно.
+
+### 11.5 Статус порта (обновлено 2026-11-07)
+
+| Пункт | PR | Вердикт | Что сделано |
+| ----- | -- | ------- | ----------- |
+| 11.2.4 | #11385 | **ALREADY** | Найдено в дереве: `tools/model_switch.rs` уже несёт новую `note` и тест |
+| 11.2.5 | #11148 | **DONE** | `agent/loop_.rs`: `_utf8_erase_guard = cli_input::ensure_terminal_utf8_erase()` в REPL |
+| 11.2.1 | #11900 | **DONE** | `infra/session_sqlite.rs` (busy_timeout + retry WAL + IMMEDIATE-tx + тест) и `runtime/daemon/mod.rs` (`open_rpc_session_backend` + 2 теста) |
+| 11.2.7 | #11106 | **N/A** | Подсистемы AnySearch в форке нет — портировать нечего |
+| 11.2.9 | #11851 | **DONE (ADAPT)** | `runtime/tools/mod.rs` (`reserve_deferred_host_names`) + `scoped.rs` (отбрасывание guest-инструментов с зарезервированными именами). Адаптация: у нас плагины грузятся в `all_tools_with_runtime`, фича `plugins-wasm` |
+| 11.2.17 | #11924 (TLS) | **DONE** | MQTT/TLS-часть уже была (`rustls-webpki 0.103.16`, `rumqttc-v4-next 0.34`); осталось поднять `webpki-roots` 1.0.7→1.0.10 (5 манифестов + lock) |
+| 11.2.20 | #11610 | **DONE (ADAPT)** | `backend/clippy.toml`: добавлен `std::env::set_current_dir` в `disallowed-methods`. Халф `xtask/src/cmd/mdbook/seo.rs` — N/A: `xtask` в форке нет. Нарушений в форке не найдено (grep `set_current_dir` = 0). Проверено `cargo clippy -p omnesagent-log --all-targets -- -D warnings` → OK |
+
+### 11.6 Уточнение базы форка (проверено 2026-11-07)
+
+> **Реальность:** кодовая база форка ≈ апстрим **`v0.8.5-34-gc18478e6f`** (HEAD аудит-клона, ДО v0.8.6), а не v0.8.6/0.8.7. Отдельные фиксы в форк бэкпортированы вручную (см. §11.1), но **подсистемы v0.8.6 целиком нет**.
+>
+> **Метод проверки:** rename-нормализованный дифф (`zeroclaw`→`omnesagent`) наших файлов против `HEAD` апстрим-клона.
+> - `omnesagent-plugins/src/{egress.rs,host.rs,wasm_channel.rs}` — **побайтово совпадают** с `v0.8.5+34` (совпадение подтверждено). При этом `HEAD..v0.8.7` по этому крейту = **+20 286 / −1 725** строк.
+> - `omnesagent-runtime/src/agent/turn/outcome.rs` — нет типа `ContextWindowExceeded` (введён в v0.8.6). `runtime/src/sop/` в форке отсутствует (SOP живёт в `omnesagent-sop-graph`).
+
+**Уточнённые вердикты по §11.2:**
+
+| Пункт | PR | Вердикт (уточнён) | Причина |
+| ----- | -- | ----------------- | ------- |
+| 11.2.2 | #11861 (SOP) | **DEFER** | Апстрим правит `runtime/src/sop/{engine,store/*}` (2 269 строк); в форке SOP вынесен в `omnesagent-sop-graph` (только `lib.rs`) — раскладка иная |
+| 11.2.3 | #11578 | **BLOCKED** | Требует типизированный `ContextWindowExceeded` (введён в v0.8.6); в форке ошибка — `providers::ReliableProviderTerminalFailureKind::ContextWindow` |
+| 11.2.6 | #11431 (gateway ws) | **DEFER** | 414 строк, ADAPT; ws-архитектура форка иная |
+| 11.2.8 | #11328 | **N/A** | Файла `model_picker_delivery.rs` в форке нет |
+| 11.2.9 | #11851 | **DONE (ADAPT)** | Портировано ранее (см. таблицу выше) |
+| 11.2.10–11.2.16 | #11814/#11808/#11809/#11811/#11812/#11848/#11807 | **BLOCKED** | Всё это — часть подсистемы плагинов v0.8.6 (egress/sockets/component_websocket/host-split/catalog/event/signature). Наш `omnesagent-plugins` = база `v0.8.5+34`; напр. `#11814` правит `egress.rs`, который у нас на 1 406 строк позади v0.8.7. `#11848` требует `sender_is_authorized` (нет в базе). Портируемо только вместе с v0.8.6-подсистемой |
+| 11.2.18 | #11925 (образы) | **PENDING** | У форка своя контейнерная раскладка (`dev/ci/container-base-images.toml`, `docker-tags.toml`); нужна отдельная адаптация + smoke-сборка |
+| 11.2.19 | #11903 | **N/A** | До #8289 секции нет |
+| 11.2.20 | #11610 | **DONE (ADAPT)** | См. таблицу выше |
+| 11.2.21–11.2.22 | #11438/#11352 | **DEFER** | Крупные архитектурные (бэклог §6) |
+
+> **Вывод:** из дельты v0.8.7 осталось два класса работ. (1) Мелкое и безопасное — сделано (#11610) + опционально #11925. (2) Всё остальное — портируемо **только вместе с подсистемой v0.8.6** (плагины, SOP, типизированные ошибки контекста), т.е. это уже не «небольшая дельта», а отдельный этап синка `v0.8.5+34 → v0.8.7`.
+
+> Проверено ранее: `cargo check` по `omnesagent-infra`/`omnesagent-runtime`/`omnesagent-tools`/`omnesagent-channels`/`omnesagent-plugins`/`omnesagent-config` — без новых ошибок; новые тесты проходят (`concurrent_first_openers_of_a_fresh_store_all_succeed`, `rpc_session_store_open_*`, `mcp_capability_tool_names_are_reserved_before_plugins_load`).
+> Рабочий процесс порта описан в скилле `.claude/skills/zeroclaw-update/SKILL.md`.
