@@ -46,7 +46,7 @@ toml = "1.0"
 toml_edit = "0.25"
 url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

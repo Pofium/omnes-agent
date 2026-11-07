@@ -96,7 +96,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = [
     "ring",
     "tls12",
 ] }
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.10"
 
 # `O_NONBLOCK` for the MCP custom-CA loader, so a special file substituted at a
 # configured `tls_ca_cert_path` cannot block MCP registry startup.
