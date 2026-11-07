@@ -1047,6 +1047,7 @@ impl AstCodeExtractor {
                     .unwrap_or("");
                 if !fn_name.is_empty() {
                     let node_id = format!("fn:{}:{}", rel_path, fn_name);
+                    let line_end = ts_body_end(&lines, i) + 1 + line_offset;
                     out.nodes.push(AstNode {
                         node_id: node_id.clone(),
                         label: fn_name.to_string(),
@@ -1054,7 +1055,7 @@ impl AstCodeExtractor {
                         description: format!("Функция `{}` в {}", fn_name, rel_path),
                         file_path: rel_path.to_string(),
                         line_start: i + 1 + line_offset,
-                        line_end: i + 1,
+                        line_end: line_end.max(i + 1 + line_offset),
                     });
                     out.edges.push(AstEdge {
                         source_node_id: file_node_id.to_string(),
@@ -3091,6 +3092,111 @@ fn first_existing(base: &str, exts: &[&str], files: &HashSet<String>) -> Option<
         }
     }
     None
+}
+
+/// Ф42 (issue 3.4): конец тела TS/JS-блока по балансу фигурных скобок.
+/// Возвращает 0-based индекс строки закрывающей `}` (или `;` для expression-body
+/// стрелок). `start` — 0-based строка объявления.
+///
+/// ponytail: не полноценный парсер — template-литералы `${}` и inline-типы
+/// возврата (`: { ok: boolean }`) могут дать пару строк погрешности; для графа и
+/// impact этого достаточно, точность — только через tree-sitter. (Порт ob2h `a646d38`.)
+fn ts_body_end(lines: &[&str], start: usize) -> usize {
+    let joined = lines.get(start..).map(|s| s.join("\n")).unwrap_or_default();
+    let ch: Vec<char> = joined.chars().collect();
+    let mut line = start;
+    let mut paren = 0i32;
+    let mut depth = 0i32;
+    let mut opened = false;
+    let mut i = 0usize;
+    let mut in_str: Option<char> = None;
+    let mut esc = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while i < ch.len() {
+        let c = ch[i];
+        if c == '\n' {
+            line += 1;
+            line_comment = false;
+            i += 1;
+            continue;
+        }
+        if line_comment {
+            i += 1;
+            continue;
+        }
+        if block_comment {
+            if c == '*' && i + 1 < ch.len() && ch[i + 1] == '/' {
+                block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '/' if i + 1 < ch.len() && ch[i + 1] == '/' => {
+                line_comment = true;
+                i += 2;
+            }
+            '/' if i + 1 < ch.len() && ch[i + 1] == '*' => {
+                block_comment = true;
+                i += 2;
+            }
+            '"' | '\'' | '`' => {
+                in_str = Some(c);
+                i += 1;
+            }
+            '(' | '[' => {
+                paren += 1;
+                i += 1;
+            }
+            ')' | ']' => {
+                paren -= 1;
+                i += 1;
+            }
+            '{' if !opened => {
+                if paren <= 0 {
+                    opened = true;
+                    depth = 1;
+                }
+                i += 1;
+            }
+            '{' => {
+                depth += 1;
+                i += 1;
+            }
+            '}' if opened => {
+                depth -= 1;
+                if depth == 0 {
+                    return line;
+                }
+                i += 1;
+            }
+            // expression-body стрелки закончилось на закрытии внешнего блока
+            '}' if !opened && paren <= 0 => {
+                return line.saturating_sub(1).max(start);
+            }
+            ';' if !opened && paren <= 0 => {
+                return line;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    line
 }
 
 /// Ф39.1: собрать места вызовов `name(` — без `.`-методов (receiver-типы

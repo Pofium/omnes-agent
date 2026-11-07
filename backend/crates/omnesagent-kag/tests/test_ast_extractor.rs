@@ -131,6 +131,42 @@ fn test_resolve_imports_leaves_non_module_targets() {
 }
 
 #[test]
+fn test_ts_function_body_bounds_multi_line() {
+    let extractor = AstCodeExtractor::new();
+    let ts_code = r#"export function outer(): number {
+    const inner = () => {
+        return 1;
+    };
+    return inner();
+}
+
+export const arrow = (x: number) => x + 1;
+"#;
+
+    let mut res = AstScanResult::default();
+    extractor.parse_file("src/util.ts", ts_code, &mut res);
+
+    let outer = res
+        .nodes
+        .iter()
+        .find(|n| n.label == "outer")
+        .expect("функция outer должна быть найдена");
+    assert_eq!(outer.line_start, 1);
+    assert_eq!(
+        outer.line_end, 6,
+        "тело outer должно заканчиваться на закрывающей `}}` (6 строка)"
+    );
+
+    // expression-body стрелка: конец тела — не выдумываем, минимум = строка объявления
+    let arrow = res
+        .nodes
+        .iter()
+        .find(|n| n.label == "arrow")
+        .expect("стрелка arrow должна быть найдена");
+    assert!(arrow.line_end >= arrow.line_start);
+}
+
+#[test]
 fn test_parse_rust_code() {
     let extractor = AstCodeExtractor::new();
     let rust_code = r#"
