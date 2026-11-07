@@ -38,3 +38,5 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:to
 
 [dev-dependencies]
 tempfile = "3.26"
+rusqlite = { version = "0.37", features = ["bundled", "hooks", "chrono"] }
+parking_lot = "0.12"

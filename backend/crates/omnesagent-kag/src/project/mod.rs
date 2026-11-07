@@ -423,6 +423,85 @@ impl ProjectService {
             Vec::new()
         };
 
+        // Для инкрементального скана подгружаем существующие символы и ast_refs
+        // неизменённых файлов: иначе type-pass не видит их и теряет межфайловые
+        // CALLS/IMPORTS при правке одного файла (порт ob2h `0c79b95`).
+        if incremental && (!scan_res.file_meta.is_empty() || !deleted_files.is_empty()) {
+            let conn = self.conn.lock();
+            let prefix = format!("{project_id}:");
+
+            // Узлы неизменённых файлов (node_id в БД хранится со scoped-префиксом).
+            let mut stmt = conn.prepare(
+                "SELECT node_id, label, node_type, description, file_path, line_start, line_end \
+                 FROM graph_nodes WHERE project_id = ?1 AND provenance = 'ast'",
+            )?;
+            let rows = stmt.query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)? as usize,
+                    r.get::<_, i64>(6)? as usize,
+                ))
+            })?;
+            for (node_id, label, node_type, description, file_path, line_start, line_end) in
+                rows.flatten()
+            {
+                let Some(file_path) = file_path else { continue };
+                if scan_res.file_meta.contains_key(&file_path) || deleted_files.contains(&file_path)
+                {
+                    continue;
+                }
+                scan_res.nodes.push(crate::ast::AstNode {
+                    node_id: node_id.strip_prefix(&prefix).unwrap_or(&node_id).to_string(),
+                    label,
+                    node_type,
+                    description: description.unwrap_or_default(),
+                    file_path,
+                    line_start,
+                    line_end,
+                });
+            }
+
+            // Сохранённые места вызовов и импорты неизменённых файлов.
+            let mut stmt_refs = conn.prepare(
+                "SELECT rel_path, line, kind, name, module, item, alias \
+                 FROM ast_refs WHERE project_id = ?1",
+            )?;
+            let ref_rows = stmt_refs.query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+            for (rel_path, line, kind, name, module, item, alias) in ref_rows.flatten() {
+                if scan_res.file_meta.contains_key(&rel_path) || deleted_files.contains(&rel_path) {
+                    continue;
+                }
+                if kind == "call" {
+                    scan_res.call_sites.push(crate::ast::CallSite {
+                        rel_path,
+                        line,
+                        name,
+                    });
+                } else if kind == "import" {
+                    scan_res.imports.push(crate::ast::ImportRef {
+                        rel_path,
+                        module: module.unwrap_or_default(),
+                        item,
+                        alias,
+                    });
+                }
+            }
+        }
+
         // Type-pass, шаг 1: резолв импортов `file: → module:` в реальные файлы проекта
         let resolved_imports = crate::ast::resolve_imports(&mut scan_res);
         if resolved_imports > 0 {
@@ -565,6 +644,67 @@ impl ProjectService {
                         prov,
                         now
                     ]);
+                }
+            }
+        }
+
+        // Сохраняем ast_refs (вызовы/импорты) для перерезолва на следующем
+        // инкрементальном скане (порт ob2h `0c79b95`).
+        if !incremental {
+            tx.execute(
+                "DELETE FROM ast_refs WHERE project_id = ?1",
+                params![project_id],
+            )?;
+        } else {
+            for del_rel in &deleted_files {
+                tx.execute(
+                    "DELETE FROM ast_refs WHERE project_id = ?1 AND rel_path = ?2",
+                    params![project_id, del_rel],
+                )?;
+            }
+            for rel_path in scan_res.file_meta.keys() {
+                tx.execute(
+                    "DELETE FROM ast_refs WHERE project_id = ?1 AND rel_path = ?2",
+                    params![project_id, rel_path],
+                )?;
+            }
+        }
+
+        {
+            let mut insert_ref = tx.prepare(
+                r#"
+                INSERT INTO ast_refs (project_id, rel_path, line, kind, name, module, item, alias, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )?;
+            for site in &scan_res.call_sites {
+                if !incremental || scan_res.file_meta.contains_key(&site.rel_path) {
+                    insert_ref.execute(params![
+                        project_id,
+                        site.rel_path,
+                        site.line as i64,
+                        "call",
+                        site.name,
+                        None::<String>,
+                        None::<String>,
+                        None::<String>,
+                        now
+                    ])?;
+                }
+            }
+            for imp in &scan_res.imports {
+                if !incremental || scan_res.file_meta.contains_key(&imp.rel_path) {
+                    insert_ref.execute(params![
+                        project_id,
+                        imp.rel_path,
+                        0i64,
+                        "import",
+                        imp.item.as_deref().unwrap_or(&imp.module),
+                        Some(&imp.module),
+                        imp.item.as_deref(),
+                        imp.alias.as_deref(),
+                        now
+                    ])?;
                 }
             }
         }

@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, Result, params};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const MIGRATION_BASE: &str = r#"
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -30,6 +30,21 @@ CREATE TABLE IF NOT EXISTS project_files (
   PRIMARY KEY (project_id, rel_path)
 );
 CREATE INDEX IF NOT EXISTS idx_project_files_project ON project_files(project_id);
+
+CREATE TABLE IF NOT EXISTS ast_refs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  rel_path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  module TEXT,
+  item TEXT,
+  alias TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ast_refs_proj_path ON ast_refs(project_id, rel_path);
+CREATE INDEX IF NOT EXISTS idx_ast_refs_target_name ON ast_refs(project_id, name);
 
 CREATE TABLE IF NOT EXISTS memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -404,6 +419,7 @@ mod tests {
             "kv",
             "projects",
             "project_files",
+            "ast_refs",
             "memories",
             "memory_relations",
             "documents",
