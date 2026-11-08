@@ -107,6 +107,10 @@ impl Tool for ProjectCodeTool {
                     "type": "boolean",
                     "description": "Include high-importance project memories in repo_map (default: true)"
                 },
+                "full": {
+                    "type": "boolean",
+                    "description": "Force a full rescan for project_scan, ignoring the incremental file cache (default: false)"
+                },
                 "depth": {
                     "type": "integer",
                     "description": "Max traversal depth for impact calculation or call path (default: 3)"
@@ -155,6 +159,9 @@ impl Tool for ProjectCodeTool {
                     .ok_or_else(|| anyhow::anyhow!("project_scan requires 'project_id'"))?;
                 let custom_path = args.get("path").and_then(|v| v.as_str());
                 let incremental = args.get("incremental").and_then(|v| v.as_bool()).unwrap_or(true);
+                // `full=true` заставляет полный рескан (эквивалент ob2h `project scan --full`).
+                let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+                let incremental = incremental && !full;
 
                 let stats = self.project_service.scan_project(project_id, custom_path, incremental)?;
 

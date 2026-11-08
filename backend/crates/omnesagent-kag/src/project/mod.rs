@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use chrono::Utc;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -16,6 +16,11 @@ pub use codegraph_bridge::{sync_codegraph_db, CodeGraphSyncResult};
 use crate::ast::{AstCodeExtractor, AstScanResult};
 use crate::models::ProjectRecord;
 use crate::vector::similarity::top_k;
+
+/// Версия AST-экстрактора. При изменении алгоритмов извлечения узлов/рёбер
+/// инкрементальные данные устаревают — gate в `scan_project` форсит полный
+/// рескан. Порт ob2h `AST_EXTRACTOR_VERSION` (`2ad9027`).
+pub const AST_EXTRACTOR_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectStats {
@@ -392,6 +397,7 @@ impl ProjectService {
 
     /// Сканирует кодовую базу проекта через AST и обновляет граф знаний.
     pub fn scan_project(&self, project_id: &str, custom_path: Option<&str>, incremental: bool) -> anyhow::Result<AstScanResult> {
+        let mut incremental = incremental;
         let project = self.get_project(project_id)?
             .ok_or_else(|| anyhow::anyhow!("Проект с ID '{}' не найден", project_id))?;
 
@@ -403,6 +409,28 @@ impl ProjectService {
         }
 
         info!("Начало AST-сканирования проекта '{}' (incremental={}) по пути: {}", project_id, incremental, scan_path);
+
+        // Смена версии экстрактора делает инкрементальные узлы устаревшими →
+        // один раз принудительно пересканируем проект целиком. (Порт ob2h `2ad9027`.)
+        let version_key = format!("ast_extractor_version:{project_id}");
+        if incremental {
+            let stored: Option<String> = {
+                let conn = self.conn.lock();
+                conn.query_row(
+                    "SELECT value FROM kv WHERE key = ?1",
+                    params![version_key],
+                    |row| row.get(0),
+                )
+                .optional()?
+            };
+            if stored.as_deref() != Some(AST_EXTRACTOR_VERSION) {
+                info!(
+                    "Версия AST-экстрактора изменилась ({:?} → {}); полный рескан проекта '{}'",
+                    stored, AST_EXTRACTOR_VERSION, project_id
+                );
+                incremental = false;
+            }
+        }
 
         let known_hashes = if incremental {
             self.get_known_files(project_id)?
@@ -708,6 +736,16 @@ impl ProjectService {
                 }
             }
         }
+
+        // Фиксируем версию экстрактора вместе с результатами скана (атомарно),
+        // чтобы при следующем инкрементале не переиспользовать устаревшие узлы.
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+            params![
+                format!("ast_extractor_version:{project_id}"),
+                AST_EXTRACTOR_VERSION
+            ],
+        )?;
 
         // Обновляем время сканирования
         tx.execute(

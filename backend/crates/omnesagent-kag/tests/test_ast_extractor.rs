@@ -1,7 +1,7 @@
 //! Тесты AST-парсера кода (Rust, Python, TS/JS, SQL, PHP, Dart, Java, C#, C/C++, Kotlin,
 //! Swift, Ruby, Vue/Svelte, Scala, Lua, Elixir, Shell) — зеркало tests ob2h.
 
-use omnesagent_kag::ast::{AstCodeExtractor, AstEdge, AstScanResult, resolve_imports};
+use omnesagent_kag::ast::{AstCodeExtractor, AstEdge, AstScanResult, resolve_calls, resolve_imports};
 
 /// Вспомогательная функция: сканируемый файл проекта + его хеш.
 fn seed_file(scan: &mut AstScanResult, rel_path: &str) {
@@ -226,6 +226,90 @@ fn test_parse_python_code() {
     let edge_labels: Vec<String> = res.edges.iter().map(|e| e.label.clone()).collect();
     assert!(edge_labels.contains(&"IMPORTS".to_string()));
     assert!(edge_labels.contains(&"INHERITS".to_string()));
+}
+
+/// Ф43 (порт ob2h `2ad9027`): многострочные `def` и многострочные route-декораторы.
+#[test]
+fn test_python_multiline_signature_and_route() {
+    let extractor = AstCodeExtractor::new();
+    let code = r#"from fastapi import APIRouter
+router = APIRouter()
+
+@router.post(
+    "/ask",
+    status_code=200,
+)
+async def ask_kag(
+    self,
+    query: str,
+    limit: int = 5,
+) -> dict:
+    result = self._run(query)
+    return result
+
+def helper(
+    a: int,
+) -> int:
+    return a
+"#;
+
+    let mut res = AstScanResult::default();
+    extractor.parse_file("app/api/chat.py", code, &mut res);
+
+    let find = |label: &str| {
+        res.nodes
+            .iter()
+            .find(|n| n.label == label)
+            .unwrap_or_else(|| panic!("нет узла {label}"))
+    };
+
+    let ask = find("ask_kag");
+    assert_eq!(
+        (ask.line_start, ask.line_end),
+        (8, 14),
+        "границы тела при многострочной сигнатуре"
+    );
+    let help = find("helper");
+    assert_eq!(
+        (help.line_start, help.line_end),
+        (16, 19),
+        "тело после многострочной сигнатуры"
+    );
+
+    let route = res
+        .edges
+        .iter()
+        .find(|e| e.label == "ROUTE")
+        .expect("ROUTE для многострочного декоратора");
+    assert_eq!(route.source_node_id, "fn:app/api/chat.py:ask_kag");
+    assert_eq!(route.target_node_id, "route:POST /ask");
+}
+
+/// Ф43 (порт ob2h `2ad9027`): `self.method()` / `cls.method()` резолвятся в метод
+/// того же файла, произвольный receiver остаётся AMBIGUOUS.
+#[test]
+fn test_self_method_call_resolved() {
+    let extractor = AstCodeExtractor::new();
+    let code = "class Store:\n    def run(self):\n        self.helper()\n\n    def helper(self):\n        return 1\n";
+
+    let mut res = AstScanResult::default();
+    extractor.parse_file("app/store.py", code, &mut res);
+
+    let added = resolve_calls(&mut res);
+    assert!(
+        added >= 1,
+        "self.helper() должен резолвиться в same-file метод helper"
+    );
+    let calls: Vec<String> = res
+        .edges
+        .iter()
+        .filter(|e| e.label == "CALLS" && e.provenance == "RESOLVED")
+        .map(|e| format!("{} -> {}", e.source_node_id, e.target_node_id))
+        .collect();
+    assert!(
+        calls.iter().any(|c| c.ends_with("helper")),
+        "ожидалось CALLS-ребро на helper, получено: {calls:?}"
+    );
 }
 
 #[test]
