@@ -542,6 +542,12 @@ impl ProjectService {
             info!("Type-pass: резолвлено {resolved_calls} вызовов (CALLS, provenance=RESOLVED)");
         }
 
+        // Ф51.3 (порт ob2h): слияние внешних импортов с pkg:-узлами
+        let merged = crate::ast::consolidate_external_imports(&mut scan_res);
+        if merged > 0 {
+            info!("Manifests: слито {merged} внешних импортов в pkg:-узлы");
+        }
+
         if incremental && scan_res.files_scanned == 0 && deleted_files.is_empty() {
             info!("Инкрементальный скан: изменений не обнаружено для проекта '{}'", project_id);
             return Ok(scan_res);
@@ -643,7 +649,9 @@ impl ProjectService {
             }
         }
 
-        // Вставка рёбер
+        // Вставка рёбер. Цели рёбер, которых нет среди узлов скана (внешние
+        // модули, `pkg:`-пакеты, `route:`-заглушки), авто-создаются по префиксу
+        // node_id (порт ob2h, ADR-AST-6) — иначе ребро теряется.
         {
             let mut insert_edge_stmt = tx.prepare(
                 r#"
@@ -657,22 +665,71 @@ impl ProjectService {
                     updated_at = excluded.updated_at
                 "#,
             )?;
+            let mut select_node_stmt =
+                tx.prepare("SELECT id FROM graph_nodes WHERE node_id = ?1")?;
+            let mut insert_node_stmt = tx.prepare(
+                r#"
+                INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, provenance, confidence, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'ast', 1.0, ?6, ?6)
+                ON CONFLICT(node_id) DO NOTHING
+                "#,
+            )?;
 
             for e in &scan_res.edges {
-                if let (Some(&src_pk), Some(&dst_pk)) = (node_id_to_pk.get(&e.source_node_id), node_id_to_pk.get(&e.target_node_id)) {
-                    let ctx_json = serde_json::to_string(&vec![e.context.clone()]).unwrap_or_default();
-                    let prov = if e.provenance.is_empty() { "ast" } else { &e.provenance };
-                    let _ = insert_edge_stmt.execute(params![
-                        src_pk,
-                        dst_pk,
-                        e.label,
-                        e.weight,
-                        ctx_json,
-                        project_id,
-                        prov,
-                        now
-                    ]);
-                }
+                // Источник — уже сохранённый узел (текущего скана или прошлых).
+                let src_pk = match node_id_to_pk.get(&e.source_node_id) {
+                    Some(&pk) => pk,
+                    None => {
+                        let scoped = format!("{}:{}", project_id, e.source_node_id);
+                        match select_node_stmt
+                            .query_row(params![scoped], |r| r.get::<_, i64>(0))
+                            .optional()?
+                        {
+                            Some(pk) => pk,
+                            None => continue,
+                        }
+                    }
+                };
+                // Цель — узел скана, существующий узел или авто-созданная заглушка.
+                let dst_pk = match node_id_to_pk.get(&e.target_node_id) {
+                    Some(&pk) => pk,
+                    None => {
+                        let scoped = format!("{}:{}", project_id, e.target_node_id);
+                        match select_node_stmt
+                            .query_row(params![scoped], |r| r.get::<_, i64>(0))
+                            .optional()?
+                        {
+                            Some(pk) => pk,
+                            None => {
+                                let (auto_type, auto_label) =
+                                    crate::ast::node_type_for_prefix(&e.target_node_id)
+                                        .unwrap_or(("ExternalModule", e.target_node_id.clone()));
+                                insert_node_stmt.execute(params![
+                                    scoped,
+                                    auto_label,
+                                    auto_type,
+                                    format!("Внешний модуль/зависимость: {}", e.target_node_id),
+                                    project_id,
+                                    now,
+                                ])?;
+                                select_node_stmt.query_row(params![scoped], |r| r.get::<_, i64>(0))?
+                            }
+                        }
+                    }
+                };
+
+                let ctx_json = serde_json::to_string(&vec![e.context.clone()]).unwrap_or_default();
+                let prov = if e.provenance.is_empty() { "ast" } else { &e.provenance };
+                let _ = insert_edge_stmt.execute(params![
+                    src_pk,
+                    dst_pk,
+                    e.label,
+                    e.weight,
+                    ctx_json,
+                    project_id,
+                    prov,
+                    now
+                ]);
             }
         }
 

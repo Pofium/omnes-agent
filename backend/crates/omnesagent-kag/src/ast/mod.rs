@@ -2890,8 +2890,8 @@ fn module_to_paths(module: &str, from_file: &str) -> Vec<String> {
         }
         return out;
     }
-    if m.starts_with('.') || m.contains('.') {
-        // Python
+    if m.starts_with('.') {
+        // Python относительный импорт
         let dots = m.chars().take_while(|&c| c == '.').count();
         let rest = &m[dots..];
         let mut base = parent(from_file);
@@ -2910,8 +2910,158 @@ fn module_to_paths(module: &str, from_file: &str) -> Vec<String> {
             out.push(format!("{prefix}{rel}.py"));
             out.push(format!("{prefix}{rel}/__init__.py"));
         }
+    } else if !m.contains('/') && !m.contains(' ') {
+        // Абсолютный Python-модуль (`app.services.x`) или top-level пакет
+        // (`app`, `kag`), доступный через sys.path на services/. (Порт ob2h `2ad9027`.)
+        let rel = m.replace('.', "/");
+        for pre in [
+            "backend/app/services/",
+            "backend/app/",
+            "backend/",
+            "app/",
+            "",
+        ] {
+            out.push(format!("{pre}{rel}.py"));
+            out.push(format!("{pre}{rel}/__init__.py"));
+        }
     }
     out
+}
+
+/// Ф47.3 (порт ob2h, ADR-AST-6): тип узла для авто-создания цели ребра в
+/// scan_project по префиксу node_id. Единая таблица вместо if/else.
+pub const NODE_TYPE_BY_PREFIX: &[(&str, &str)] = &[
+    ("route:", "Route"),
+    ("table:", "Table"),
+    ("file:", "File"),
+    ("css:", "Stylesheet"),
+    ("service:", "Service"),
+    ("svc:", "Service"),
+    ("endpoint:", "Endpoint"),
+    ("contract:", "Contract"),
+    ("schema:", "Schema"),
+    ("pkg:", "ExternalPackage"),
+    ("cssclass:", "CssClass"),
+    ("cssid:", "CssId"),
+    ("cssvar:", "CssVar"),
+    ("resource:", "Resource"),
+    ("k8s:", "K8sResource"),
+    ("image:", "BaseImage"),
+    ("el:", "Element"),
+];
+
+/// Тип и метка авто-создаваемого узла-цели по node_id (None → ExternalModule).
+pub fn node_type_for_prefix(node_id: &str) -> Option<(&'static str, String)> {
+    NODE_TYPE_BY_PREFIX
+        .iter()
+        .find_map(|(p, t)| node_id.strip_prefix(p).map(|rest| (*t, rest.to_string())))
+}
+
+/// Ф51.3 (порт ob2h): нормализация внешнего модуля импорта в id пакета
+/// (`pkg:<eco>:<name>`). Внутренние/относительные пути → None (остаются
+/// module:-узлами).
+pub fn package_of_module(lang: &str, module: &str) -> Option<String> {
+    let m = module.trim();
+    if m.is_empty() {
+        return None;
+    }
+    match lang {
+        "rust" => {
+            if m.starts_with("crate::") || m.starts_with("self::") || m.starts_with("super::") {
+                return None;
+            }
+            let first = m.split("::").next()?;
+            Some(format!("pkg:rust:{}", first))
+        }
+        "python" => {
+            if m.starts_with('.') {
+                return None;
+            }
+            let first = m.split('.').next()?;
+            Some(format!("pkg:pypi:{}", first))
+        }
+        "ts-js" | "sfc" => {
+            if m.starts_with('.') || m.starts_with('/') {
+                return None;
+            }
+            if let Some(rest) = m.strip_prefix('@') {
+                // scope сохраняется: @scope/pkg → pkg:npm:@scope
+                let (scope, _) = rest.split_once('/')?;
+                Some(format!("pkg:npm:@{}", scope))
+            } else {
+                let first = m.split('/').next()?;
+                Some(format!("pkg:npm:{}", first))
+            }
+        }
+        "go" => {
+            if m.contains("://") {
+                None
+            } else {
+                Some(format!("pkg:go:{}", m.trim_matches('"')))
+            }
+        }
+        "php" => {
+            let parts: Vec<&str> = m.split('\\').filter(|p| !p.is_empty()).collect();
+            if parts.len() < 2 {
+                return None; // vendor\package минимум
+            }
+            Some(format!(
+                "pkg:composer:{}/{}",
+                parts[0].to_lowercase(),
+                parts[1].to_lowercase()
+            ))
+        }
+        "dart" => {
+            let rest = m.strip_prefix("package:")?;
+            let first = rest.split('/').next()?;
+            Some(format!("pkg:pub:{}", first))
+        }
+        _ => None,
+    }
+}
+
+/// Языковая экосистема файла (для `package_of_module`).
+fn ecosystem_for_path(rel_path: &str) -> Option<&'static str> {
+    let ext = Path::new(rel_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "rs" => Some("rust"),
+        "py" | "ipynb" => Some("python"),
+        "ts" | "tsx" | "js" | "jsx" => Some("ts-js"),
+        "vue" | "svelte" => Some("sfc"),
+        "go" => Some("go"),
+        "php" => Some("php"),
+        "dart" => Some("dart"),
+        _ => None,
+    }
+}
+
+/// Ф51.3 (порт ob2h): IMPORTS-рёбра `file: → module:X` переписываются в
+/// `file: → pkg:<eco>:X` по нормализации [`package_of_module`]; внутренние
+/// (уже `file:`) модули не трогаются. Возвращает число переписанных рёбер.
+pub fn consolidate_external_imports(scan: &mut AstScanResult) -> usize {
+    let mut rewritten = 0usize;
+    for edge in scan.edges.iter_mut() {
+        if edge.label != "IMPORTS" || !edge.source_node_id.starts_with("file:") {
+            continue;
+        }
+        if !edge.target_node_id.starts_with("module:") {
+            continue;
+        }
+        let module = edge.target_node_id.strip_prefix("module:").unwrap_or("");
+        let rel_path = edge.source_node_id.strip_prefix("file:").unwrap_or("");
+        let Some(lang) = ecosystem_for_path(rel_path) else {
+            continue;
+        };
+        if let Some(pkg_id) = package_of_module(lang, module) {
+            edge.target_node_id = pkg_id;
+            rewritten += 1;
+        }
+    }
+    rewritten
 }
 
 /// Резолв импортов: IMPORTS-рёбра `file: → module:<сырое имя>` переписываются на
@@ -3402,10 +3552,17 @@ pub fn resolve_calls(scan: &mut AstScanResult) -> usize {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for site in &scan.call_sites {
         // вызывающий — последний символ файла, чей line_start <= строке вызова
+        // Python: вызов вне тела функции не должен приписываться предыдущей
+        // функции. (Порт ob2h `2ad9027`.)
+        let is_python = site.rel_path.ends_with(".py") || site.rel_path.ends_with(".ipynb");
         let Some(ci) = syms_by_file.get(site.rel_path.as_str()).and_then(|idxs| {
             let mut caller = None;
             for &i in idxs {
-                if scan.nodes[i].line_start <= site.line {
+                let node = &scan.nodes[i];
+                if node.line_start <= site.line {
+                    if is_python && (node.node_type != "Function" || site.line > node.line_end) {
+                        continue;
+                    }
                     caller = Some(i);
                 } else {
                     break;

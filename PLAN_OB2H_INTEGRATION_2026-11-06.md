@@ -272,9 +272,28 @@ read-only; прибрать БД ob2h и рабочее дерево.
 
 Задачи:
 
-- [ ] **1.1** Верификационный dual-scan golden-набор: скан `C:\Projects\Omnes-agent`
+- [x] **1.1** Верификационный dual-scan golden-набор: скан `C:\Projects\Omnes-agent`
       внешним ob2h (`ob2h project scan --id omnes-agent`) и встроенным kag-сканером;
       дифф по символам/рёбрам; зафиксировать baseline в `backend/crates/omnesagent-kag/tests/golden/`.
+      **Done:** harness `tests/test_golden_dual_scan.rs` (symbol F1 / call F1 против
+      baseline), эталон `tests/golden/ob2h-1.9.2.expected.json`, перегонка
+      `tests/golden/regenerate.ps1` + `export_ob2h.py` (изолированный `OB2H_DATA_DIR`,
+      реальные данные ob2h не затрагиваются).
+      **Решение по дизайну (отличие от буквы плана):** baseline фиксируется на **маленьком
+      неизменяемом корпусе** `tests/golden/corpus/` (Rust/Python/TS/Go/SQL + skip-проба
+      `*_pb2.py`), а не на всём репозитории: только так F1 детерминирован и осмыслен
+      (полный репо-скан даёт шум от постоянно меняющихся исходников). Зафиксировать в
+      `docs/kag_sync.md` (§1.9).
+      **Порты паритета (3 расхождения, выявленные difff'ом), все в `omnesagent-kag`:**
+      (а) `ast::module_to_paths` — абсолютный Python-модуль (`app.models`) больше не
+      трактуется как относительный; отдельная ветка `sys.path`-корней (порт `2ad9027`);
+      (б) `ast::resolve_calls` — Python-специфичное приписывание вызывающего
+      (`is_python` → только `Function` и в пределах `line_end`); (в)
+      `ast::NODE_TYPE_BY_PREFIX`/`node_type_for_prefix` + авто-создание висячих целей
+      рёбер в `ProjectService::scan_project` (route:/pkg:/table: заглушки, ADR-AST-6) и
+      `ast::package_of_module`/`consolidate_external_imports` (IMPORTS `module:` → `pkg:<eco>:`).
+      **Результат:** `symbol P=R=F1=1.000`, `call P=R=F1=1.000` (оба выше DoD-порогов);
+      `cargo test -p omnesagent-kag` — все наборы зелёные.
 - [x] **1.2** Резолв Rust `crate::/super::` импортов + точные границы тел функций
       (порт `a646d38` из ob2h) в `omnesagent-kag/src/ast/`.
       **Done:** `ast::resolve_imports` + `resolve_module_file` + `first_existing` портированы
