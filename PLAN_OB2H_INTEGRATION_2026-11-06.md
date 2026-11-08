@@ -345,8 +345,14 @@ read-only; прибрать БД ob2h и рабочее дерево.
       близнеца (`omnesagent-kag/src/schema.rs`, миграция по образцу ob2h M10).
 - [ ] **1.5** FTS5-индекс графа (порт Ф62.1) в `omnesagent-kag/src/graph/service.rs`
       + гибридная выдача в `project_graph_search`-эквиваленте.
-- [ ] **1.6** Perf-паттерн `RETURNING id` + `prepare_cached` (порт `208fd94`) в горячих
+- [x] **1.6** Perf-паттерн `RETURNING id` + `prepare_cached` (порт `208fd94`) в горячих
       вставках узлов/рёбер.
+      **Done:** `RETURNING id` уже был (заменяет двухшаговый INSERT+SELECT вставкой узла);
+      горячие per-loop statements переведены `tx.prepare` → `tx.prepare_cached`
+      (кэш компиляции SQL живёт на `Connection`, переиспользуется между сканами):
+      `scan_project` — вставка узлов, вставка рёбер, авто-создание узлов-целей,
+      `SELECT id …node_id`, вставка `ast_refs`; `codegraph_bridge::sync_codegraph_db` —
+      вставка узлов и рёбер. `cargo test -p omnesagent-kag` — все наборы зелёные.
 - [ ] **1.7** LRU-кэш эмбеддингов (порт Ф62.2) в `omnesagent-kag/src/embedding/` и
       семантика `superseded_among` (Ф62.4) в `omnesagent-memory/src/dedup.rs`/`conflict.rs`.
 - [x] **1.8** Сверить направление `import-codegraph` (ob2h `678afe0`) с

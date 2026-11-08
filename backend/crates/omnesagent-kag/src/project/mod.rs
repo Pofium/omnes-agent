@@ -611,7 +611,7 @@ impl ProjectService {
         let mut node_id_to_pk = std::collections::HashMap::new();
 
         {
-            let mut insert_stmt = tx.prepare(
+            let mut insert_stmt = tx.prepare_cached(
                 r#"
                 INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, file_path, line_start, line_end, provenance, confidence, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ast', 1.0, ?9, ?9)
@@ -653,7 +653,7 @@ impl ProjectService {
         // модули, `pkg:`-пакеты, `route:`-заглушки), авто-создаются по префиксу
         // node_id (порт ob2h, ADR-AST-6) — иначе ребро теряется.
         {
-            let mut insert_edge_stmt = tx.prepare(
+            let mut insert_edge_stmt = tx.prepare_cached(
                 r#"
                 INSERT INTO graph_edges (source_id, target_id, label, weight, contexts, project_id, provenance, confidence, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?8)
@@ -666,8 +666,8 @@ impl ProjectService {
                 "#,
             )?;
             let mut select_node_stmt =
-                tx.prepare("SELECT id FROM graph_nodes WHERE node_id = ?1")?;
-            let mut insert_node_stmt = tx.prepare(
+                tx.prepare_cached("SELECT id FROM graph_nodes WHERE node_id = ?1")?;
+            let mut insert_node_stmt = tx.prepare_cached(
                 r#"
                 INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, provenance, confidence, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, 'ast', 1.0, ?6, ?6)
@@ -756,7 +756,7 @@ impl ProjectService {
         }
 
         {
-            let mut insert_ref = tx.prepare(
+            let mut insert_ref = tx.prepare_cached(
                 r#"
                 INSERT INTO ast_refs (project_id, rel_path, line, kind, name, module, item, alias, created_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
