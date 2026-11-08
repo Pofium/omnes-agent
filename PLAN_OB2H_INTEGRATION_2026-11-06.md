@@ -349,10 +349,22 @@ read-only; прибрать БД ob2h и рабочее дерево.
       вставках узлов/рёбер.
 - [ ] **1.7** LRU-кэш эмбеддингов (порт Ф62.2) в `omnesagent-kag/src/embedding/` и
       семантика `superseded_among` (Ф62.4) в `omnesagent-memory/src/dedup.rs`/`conflict.rs`.
-- [ ] **1.8** Сверить направление `import-codegraph` (ob2h `678afe0`) с
+- [x] **1.8** Сверить направление `import-codegraph` (ob2h `678afe0`) с
       `omnesagent-kag/src/project/codegraph_bridge.rs`; задокументировать в `docs/kag_sync.md`.
-- [ ] **1.9** Регламент синка: `docs/kag_sync.md` — чеклист переноса алгоритмов из ob2h
+      **Done:** направление **совпадает** — внешняя БД `.codegraph/codegraph.db` →
+      встроенный граф (`provenance='codegraph'`), реверс отсутствует в обоих движках.
+      Отличия форка (не нарушают паритет): scoped `node_id` `{project}:cg:{id}`,
+      слияние `signature\ndocstring`, контекст ребра = JSON `metadata`/`{"line":N}`,
+      `READ_ONLY` + fail-open (у ob2h — ручная CLI-команда `import-codegraph`, ошибка наружу).
+      Вывод: доработок не требует. Секция «Ревизия направления» в `docs/kag_sync.md` (§6).
+- [x] **1.9** Регламент синка: `docs/kag_sync.md` — чеклист переноса алгоритмов из ob2h
       (прецедент: `2ea87333a`), правила golden-перегонки, владелец-гейт.
+      **Done:** создан `docs/kag_sync.md`: §1 границы (ADR-O2 алгоритм-паритет),
+      §2 чеклист переноса (upstream-hash → порт → тесты → golden → 1 пункт = 1 коммит),
+      §3 правила golden-перегонки (`regenerate.ps1`, изолированный `OB2H_DATA_DIR`,
+      пороги DoD), §4 осознанные расхождения (scoped `node_id`, авто-синк CodeGraph),
+      §5 bench-гейт, §6 ревизия CodeGraph↔граф (Ф1.8). Закрывает пункт DoD Ф1
+      «`docs/kag_sync.md` существует».
 
 **DoD Ф1:** dual-scan: symbol F1 >= 95%, call F1 >= 90% (пороги фазы 71.7 ob2h v2.0);
 `cargo test -p omnesagent-kag` (включая `test_ast_extractor` 16 + `test_phase6_parsers` 12)
