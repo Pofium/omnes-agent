@@ -343,8 +343,19 @@ read-only; прибрать БД ob2h и рабочее дерево.
       ранее путь не покрывался тестами.
 - [ ] **1.4** Типизированные рёбра AST (CALLS/IMPORTS/IMPLEMENTS/DEPENDS_ON) в схеме
       близнеца (`omnesagent-kag/src/schema.rs`, миграция по образцу ob2h M10).
-- [ ] **1.5** FTS5-индекс графа (порт Ф62.1) в `omnesagent-kag/src/graph/service.rs`
+- [x] **1.5** FTS5-индекс графа (порт Ф62.1) в `omnesagent-kag/src/graph/service.rs`
       + гибридная выдача в `project_graph_search`-эквиваленте.
+      **Done:** в `omnesagent-kag/src/schema.rs` поднята `SCHEMA_VERSION` 7→8 и добавлена
+      внешне-контентная FTS5-таблица `graph_nodes_fts(label, description, content='graph_nodes',
+      tokenize='trigram')` с триггерами `ai/ad/au` и backfill существующих узлов
+      (порт ob2h `MIGRATION_V10`, креейт обновляет индекс автоматически — триггеры
+      срабатывают и на вставках из `scan_project`/`codegraph_bridge`). В
+      `GraphService::search` лексический скоринг переведён с полного перебора
+      `SELECT … FROM graph_nodes` на кандидатов из `graph_nodes_fts MATCH` (OR по словам),
+      за скорингом label/desc прежняя формула; при недоступности/битом FTS5 — fallback
+      на прежний полный перебор (без регресса). Гибридная выдача (лексика FTS5 +
+      векторный RRF) сохранена. Тесты: миграция/идемпотентность/триггеры
+      `graph_nodes_fts` + `cargo test -p omnesagent-kag` все наборы зелёные.
 - [x] **1.6** Perf-паттерн `RETURNING id` + `prepare_cached` (порт `208fd94`) в горячих
       вставках узлов/рёбер.
       **Done:** `RETURNING id` уже был (заменяет двухшаговый INSERT+SELECT вставкой узла);

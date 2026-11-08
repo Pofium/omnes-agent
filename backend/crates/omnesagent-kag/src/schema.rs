@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, Result, params};
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const MIGRATION_BASE: &str = r#"
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -387,6 +387,46 @@ END;
         )?;
     }
 
+    // Ф1.5: FTS5-индекс графа `graph_nodes(label, description)` для быстрого
+    // лексического поиска (BM25 через trigram) вместо Full Scan `LIKE %query%`.
+    // Внешний контент (content='graph_nodes') — дублирования данных нет;
+    // триггеры синхронизируют индекс; backfill индексирует существующие узлы.
+    // Порт ob2h MIGRATION_V10 (Ф62.1).
+    let has_graph_nodes_fts: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='graph_nodes_fts'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+
+    if !has_graph_nodes_fts {
+        conn.execute_batch(
+            r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS graph_nodes_fts USING fts5(
+  label, description, content='graph_nodes', content_rowid='id', tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_ai AFTER INSERT ON graph_nodes BEGIN
+  INSERT INTO graph_nodes_fts (rowid, label, description)
+    VALUES (new.id, new.label, new.description);
+END;
+CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_ad AFTER DELETE ON graph_nodes BEGIN
+  INSERT INTO graph_nodes_fts (graph_nodes_fts, rowid, label, description)
+    VALUES ('delete', old.id, old.label, old.description);
+END;
+CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_au AFTER UPDATE ON graph_nodes BEGIN
+  INSERT INTO graph_nodes_fts (graph_nodes_fts, rowid, label, description)
+    VALUES ('delete', old.id, old.label, old.description);
+  INSERT INTO graph_nodes_fts (rowid, label, description)
+    VALUES (new.id, new.label, new.description);
+END;
+INSERT INTO graph_nodes_fts (rowid, label, description)
+  SELECT id, label, description FROM graph_nodes;
+"#,
+        )?;
+    }
+
     conn.execute(
         "INSERT OR REPLACE INTO kv (key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -429,6 +469,7 @@ mod tests {
             "dream_runs",
             "memories_fts",
             "chunks_fts",
+            "graph_nodes_fts",
         ] {
             assert!(
                 tables.iter().any(|t| t == expected),
@@ -484,6 +525,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 0, "delete trigger must unindex the content");
+    }
+
+    #[test]
+    fn graph_nodes_fts_triggers_keep_the_index_in_sync() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO graph_nodes (node_id, label, node_type, description, created_at, updated_at)
+             VALUES ('fn:alpha', 'alpha_quantum_lift', 'Function', 'обработчик лифта', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM graph_nodes_fts WHERE graph_nodes_fts MATCH 'quantum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "insert trigger must index label/description");
+
+        conn.execute("DELETE FROM graph_nodes WHERE node_id = 'fn:alpha'", [])
+            .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM graph_nodes_fts WHERE graph_nodes_fts MATCH 'quantum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "delete trigger must unindex the node");
     }
 
     #[test]
