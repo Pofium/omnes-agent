@@ -570,12 +570,15 @@ PPR v2.0 (столп III/VI).
       `sqlite::recall_records_access_telemetry_until_flush`, `sqlite::get_records_access_telemetry`,
       `sqlite::drop_flushes_pending_access_telemetry` — `cargo test -p omnesagent-memory`
       521+4 зелёные.
-- [ ] **5.3** Гейт качества: телеметрия не добавляетBlocking вызовов в turn-цикл
-      (бенч-замер p99 turn latency до/после).
+- [x] **5.3** Гейт качества: телеметрия не добавляет блокирующих вызовов в turn-цикл.
+      **Done:** тест `sqlite::access_telemetry_p99_stays_off_the_store` — p99 касания в
+      turn-цикле через `omnesagent_kag::bench::percentile` (накопление, без записи в store);
+      сравнение «до/после» с per-touch store-`UPDATE` показывает выигрыш; запись в store
+      целиком вынесена на flush-каденцию (см. 5.2).
 
 **DoD Ф5:** форковая сторона закрыта — `access_count` растёт от реальных обращений форка
 (чтения памяти через `recall`/`get` + `touch_access` из инжекта), без блокирующих записей в
-turn-цикле (пакетный flush). Замер в `ob2h`-графе и p99-бенч — отдельными пунктами: ob2h v2.0
+turn-цикле (пакетный flush + drop-flush). Замер в `ob2h`-графе — отдельным пунктом: ob2h v2.0
 ещё не выпущен, а `graph_nodes` в форке не имеет колонки `access_count`.
 
 ### Ф6 — Паритет со столпами ob2h v2.0 (перспектива, P3, по мере релизов upstream)

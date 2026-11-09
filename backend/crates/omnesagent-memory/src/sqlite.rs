@@ -2782,6 +2782,61 @@ mod tests {
         );
     }
 
+    /// Ф5.3 latency gate: the access-telemetry write stays off the turn path.
+    /// "До" is a per-touch store `UPDATE` on the calling thread; "после" is the
+    /// batched accumulator. The accumulator must be non-blocking (p99 well
+    /// under a store round-trip).
+    #[tokio::test]
+    async fn access_telemetry_p99_stays_off_the_store() {
+        use std::time::Instant;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let key = "k".to_string();
+        const N: usize = 500;
+
+        // "До": one awaited store write per touch (pre-ADR-O6 behaviour).
+        let mut before = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start = Instant::now();
+            {
+                let conn = mem.connection();
+                let conn = conn.lock();
+                conn.execute(
+                    "UPDATE memories SET access_count = COALESCE(access_count, 0) + 1 \
+                     WHERE key = ?1",
+                    params!["k"],
+                )
+                .unwrap();
+            }
+            before.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+
+        // "После": accumulate in memory; the write is deferred to the flush.
+        for _ in 0..50 {
+            mem.touch_access(std::slice::from_ref(&key)).await.unwrap();
+        }
+        let mut after = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start = Instant::now();
+            mem.touch_access(std::slice::from_ref(&key)).await.unwrap();
+            after.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+
+        let before_p99 = omnesagent_kag::bench::percentile(&mut before, 99.0);
+        let after_p99 = omnesagent_kag::bench::percentile(&mut after, 99.0);
+        assert!(
+            after_p99 < 10.0,
+            "turn-path telemetry p99 = {after_p99:.3} ms; must be non-blocking",
+        );
+        assert!(
+            after_p99 < before_p99,
+            "batched p99 {after_p99:.3} ms must beat per-touch store p99 {before_p99:.3} ms",
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_recall_keyword() {
         let (_tmp, mem) = temp_sqlite();
