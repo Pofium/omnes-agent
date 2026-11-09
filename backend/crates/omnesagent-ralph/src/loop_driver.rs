@@ -3,19 +3,25 @@
 //! Conforms to §7.2, §7.3, §7.5, FR-A3 of specification.
 
 use crate::approval::{GateAction, GateManager};
+use crate::ast::{all_labels, changed_labels, diff_snapshots, snapshot_paths, SymbolChange};
 use crate::bridge::Ob2hBridge;
 use crate::debt::DebtLedger;
 use crate::events::RalphEvent;
 use crate::executor::{Executor, TaskContext};
 use crate::git::GitRepo;
-use crate::journal::{ExecutionResult, IterationRecord, Journal, JournalEntry, TestsSummary};
+use crate::journal::{
+    stale_findings, ExecutionResult, FindingRecord, IterationRecord, Journal, JournalEntry,
+    JournalError, TestsSummary,
+};
 use crate::knowledge::RalphKnowledgeService;
 use crate::openspec::OpenSpecWorkspace;
 use crate::plateau::{compute_failure_fingerprint, is_plateau};
 use crate::state::{FailureFingerprint, GateDecision, RalphPhase, RalphState};
 use crate::tasks::TaskList;
+use crate::verdict::auto_verdict;
 use chrono::Utc;
 use omnesagent_config::ralph::{Ob2hBridgeConfig, RalphConfig};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -103,6 +109,47 @@ pub async fn run_test_command(cmd_str: &str, working_dir: &Path) -> TestsSummary
         failed_tests,
         fingerprint: fp,
         exit_code,
+    }
+}
+
+/// Mark findings invalidated by an iteration's symbol changes as `stale` (Ф3.3).
+///
+/// Runs *before* the current iteration's own finding is recorded, so a finding
+/// that legitimately references a symbol this very iteration touches is not
+/// immediately invalidated by the change that produced it. Only modified and
+/// removed symbols invalidate prior findings — newly added symbols cannot.
+fn apply_staleness_pass(journal_path: &Path, changes: &[SymbolChange]) -> Result<(), JournalError> {
+    let changed = changed_labels(changes);
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let existing = Journal::read_findings(journal_path)?;
+    for finding in stale_findings(&existing, &changed) {
+        Journal::append_finding(journal_path, &finding)?;
+    }
+    Ok(())
+}
+
+/// Build the architectural finding that summarises one iteration (Ф3.3).
+///
+/// `symbols` are the symbols the iteration touched (added, modified, removed);
+/// a later iteration that modifies or removes any of them invalidates this
+/// finding via [`apply_staleness_pass`].
+fn iteration_finding(
+    slug: &str,
+    task: &str,
+    n: usize,
+    content: &str,
+    verdict: &str,
+    symbols: BTreeSet<String>,
+) -> FindingRecord {
+    FindingRecord {
+        finding_id: format!("{slug}:{task}:i{n}"),
+        task: task.to_string(),
+        content: content.to_string(),
+        verdict: verdict.to_string(),
+        symbols: symbols.into_iter().collect(),
+        at: Utc::now(),
     }
 }
 
@@ -217,6 +264,9 @@ pub async fn drive_loop(
     let task_list = TaskList::parse(&tasks_md)?;
 
     let mut total_iterations = 0usize;
+    // Debt harvested per committed iteration (Ф3.1). The final working-tree diff
+    // is empty once every iteration is committed, so debt is accumulated here.
+    let mut debt_ledger = DebtLedger::default();
 
     // Apply loop (§7.2)
     while state.phase == RalphPhase::Applying {
@@ -286,6 +336,9 @@ pub async fn drive_loop(
         let git_before = git.rev_parse_head().ok();
         let start_time = Instant::now();
 
+        // Symbol snapshot before the executor mutates the working tree (Ф3.2).
+        let snapshot_before = snapshot_paths(&repo_root, &next_task.paths_scope);
+
         // Run executor with configured timeout (§5.2, FR-A14)
         let answer = match executor.run_task(&task_ctx).await {
             Ok(ans) => ans,
@@ -302,6 +355,7 @@ pub async fn drive_loop(
                     ),
                     exit_code: 1,
                 };
+                let verdict = auto_verdict(&summary);
                 let it = IterationRecord {
                     task: next_task.id.clone(),
                     n,
@@ -313,9 +367,11 @@ pub async fn drive_loop(
                         self_assessment: "failed".to_string(),
                     },
                     tests_summary: summary,
-                    verdict: "failed".to_string(),
+                    verdict: verdict.label.to_string(),
+                    verdict_source: verdict.source.to_string(),
                     ladder_rung: "none".to_string(),
                     markers: vec![],
+                    ast_changes: vec![],
                     git_before: git_before.clone(),
                     git_after: None,
                     tokens_used: 0,
@@ -330,6 +386,14 @@ pub async fn drive_loop(
         // Check paths scope compliance (§5.4)
         if let Err(e) = git.check_paths_scope(&next_task.paths_scope) {
             let _ = git.revert_working_copy();
+            let summary = TestsSummary {
+                passed: 0,
+                failed: 1,
+                failed_tests: vec!["paths_scope_violation".to_string()],
+                fingerprint: compute_failure_fingerprint(&["paths_scope_violation".to_string()], 1),
+                exit_code: 1,
+            };
+            let verdict = auto_verdict(&summary);
             let it = IterationRecord {
                 task: next_task.id.clone(),
                 n,
@@ -340,16 +404,12 @@ pub async fn drive_loop(
                     errors: vec![e.to_string()],
                     self_assessment: "failed".to_string(),
                 },
-                tests_summary: TestsSummary {
-                    passed: 0,
-                    failed: 1,
-                    failed_tests: vec!["paths_scope_violation".to_string()],
-                    fingerprint: compute_failure_fingerprint(&["paths_scope_violation".to_string()], 1),
-                    exit_code: 1,
-                },
-                verdict: "failed".to_string(),
+                tests_summary: summary,
+                verdict: verdict.label.to_string(),
+                verdict_source: verdict.source.to_string(),
                 ladder_rung: answer.ladder_rung,
                 markers: vec![],
+                ast_changes: vec![],
                 git_before,
                 git_after: None,
                 tokens_used: 0,
@@ -368,7 +428,8 @@ pub async fn drive_loop(
 
         let mut tests = run_test_command(test_cmd, &repo_root).await;
         let is_green = tests.exit_code == 0;
-        let verdict = if is_green { "verified" } else { "failed" };
+        // Objective verdict only — the executor's self_assessment is ignored (ADR-K4).
+        let verdict = auto_verdict(&tests);
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
         state.fingerprints.push(FailureFingerprint {
@@ -411,6 +472,17 @@ pub async fn drive_loop(
                 }
             }
 
+            // Harvest ponytail debt from this iteration's diff before it is
+            // committed (Ф3.1). Once committed the working-tree diff is empty,
+            // so harvesting here is the only place the marker text is visible.
+            if config.debt_harvest {
+                if let Ok(iter_diff) = git.diff(None) {
+                    debt_ledger
+                        .items
+                        .extend(DebtLedger::harvest_from_diff(&iter_diff).items);
+                }
+            }
+
             // Commit iteration
             let commit_hash = git.commit_iteration(
                 &next_task.id,
@@ -423,6 +495,15 @@ pub async fn drive_loop(
             state.mark_done(&next_task.id);
             state.write_atomic(&state_path)?;
 
+            // Symbol-level delta for this iteration (Ф3.2). Computed after the
+            // minimality review so removed boilerplate is not reported as added.
+            let snapshot_after = snapshot_paths(&repo_root, &next_task.paths_scope);
+            let changes = diff_snapshots(&snapshot_before, &snapshot_after);
+
+            // Invalidate prior findings whose symbols this iteration changed
+            // (Ф3.3) — before this iteration's own finding is recorded.
+            apply_staleness_pass(&journal_path, &changes)?;
+
             let it = IterationRecord {
                 task: next_task.id.clone(),
                 n,
@@ -430,9 +511,11 @@ pub async fn drive_loop(
                 plan: answer.plan,
                 result: answer.result,
                 tests_summary: tests,
-                verdict: verdict.to_string(),
+                verdict: verdict.label.to_string(),
+                verdict_source: verdict.source.to_string(),
                 ladder_rung: answer.ladder_rung.clone(),
                 markers: answer.markers,
+                ast_changes: changes.clone(),
                 git_before,
                 git_after: Some(commit_hash),
                 tokens_used: 0,
@@ -443,17 +526,34 @@ pub async fn drive_loop(
             Journal::append(&journal_path, &JournalEntry::Iteration(it.clone()))?;
             knowledge.record_iteration(&it).await;
 
+            // Record the iteration's architectural finding (Ф3.3).
+            let finding = iteration_finding(
+                &slug,
+                &next_task.id,
+                n,
+                &it.result.what_done,
+                &it.verdict,
+                all_labels(&changes),
+            );
+            Journal::append_finding(&journal_path, &finding)?;
+
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(RalphEvent::IterationCompleted {
                     task: next_task.id.clone(),
                     n,
-                    verdict: verdict.to_string(),
+                    verdict: verdict.label.to_string(),
                     ladder_rung: answer.ladder_rung,
                     duration_ms,
                 });
             }
         } else {
             // Test failed: record iteration and check for plateau (§7.2, §7.5)
+            // Symbol deltas are still recorded from a red iteration, so signature
+            // edits invalidate prior findings even without a green test run (Ф3.2).
+            let snapshot_after = snapshot_paths(&repo_root, &next_task.paths_scope);
+            let changes = diff_snapshots(&snapshot_before, &snapshot_after);
+            apply_staleness_pass(&journal_path, &changes)?;
+
             let it = IterationRecord {
                 task: next_task.id.clone(),
                 n,
@@ -461,9 +561,11 @@ pub async fn drive_loop(
                 plan: answer.plan,
                 result: answer.result,
                 tests_summary: tests.clone(),
-                verdict: verdict.to_string(),
+                verdict: verdict.label.to_string(),
+                verdict_source: verdict.source.to_string(),
                 ladder_rung: answer.ladder_rung,
                 markers: answer.markers,
+                ast_changes: changes,
                 git_before,
                 git_after: None,
                 tokens_used: 0,
@@ -513,16 +615,15 @@ pub async fn drive_loop(
 
     // Phase: Verifying (§7.3)
     if state.phase == RalphPhase::Verifying {
-        // Debt harvesting if enabled
+        // Report the debt harvested across the cycle (Ф3.1). The ledger was
+        // accumulated per-iteration before each commit, so the final working-tree
+        // diff — now empty — is not a valid source.
         if config.debt_harvest {
-            if let Ok(cycle_diff) = git.diff(None) {
-                let ledger = DebtLedger::harvest_from_diff(&cycle_diff);
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(RalphEvent::DebtHarvested {
-                        count: ledger.items.len(),
-                        no_trigger_count: ledger.no_trigger_count(),
-                    });
-                }
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(RalphEvent::DebtHarvested {
+                    count: debt_ledger.items.len(),
+                    no_trigger_count: debt_ledger.no_trigger_count(),
+                });
             }
         }
 
@@ -566,8 +667,9 @@ pub async fn drive_loop(
         state.transition_to(RalphPhase::Archived)?;
         state.write_atomic(&state_path)?;
 
-        // ob2h bridge (Ф2.2): publish archived findings, fail-open. A disabled or
-        // unreachable ob2h must never abort the just-completed Ralph cycle.
+        // ob2h bridge (Ф2.2/Ф3.1): publish archived findings and export the debt
+        // ledger, fail-open. A disabled or unreachable ob2h must never abort the
+        // just-completed Ralph cycle.
         if bridge.enabled && bridge.auto_push_after_archive {
             let publisher = Ob2hBridge::from_config(bridge.clone());
             match publisher.publish_after_archive(&repo_root, &slug).await {
@@ -579,8 +681,91 @@ pub async fn drive_loop(
                     "ob2h bridge: publication skipped, Ralph cycle continues: {err}"
                 ),
             }
+
+            // Ф3.1: export the fork's harvested debt into ob2h's Ralph Knowledge
+            // Layer so `ob2h ralph debt` surfaces the same deferred markers.
+            if config.debt_harvest {
+                match publisher
+                    .publish_debt(&debt_ledger, &slug, &state.run_id, &slug)
+                    .await
+                {
+                    Ok(report) => eprintln!(
+                        "ob2h bridge: exported {} debt item(s) (skipped {}, failed {})",
+                        report.published, report.skipped, report.failed
+                    ),
+                    Err(err) => eprintln!(
+                        "ob2h bridge: debt export skipped, Ralph cycle continues: {err}"
+                    ),
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Seed a prior verified finding referencing `symbols` in the journal.
+    fn seed_finding(journal: &Path, id: &str, symbols: &[&str]) {
+        Journal::append_finding(
+            journal,
+            &FindingRecord {
+                finding_id: id.to_string(),
+                task: "T-001".to_string(),
+                content: format!("observation {id}"),
+                verdict: "verified".to_string(),
+                symbols: symbols.iter().map(|s| s.to_string()).collect(),
+                at: Utc::now(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn staleness_pass_marks_findings_for_modified_signature() {
+        let dir = tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn alpha(x: i32) -> i32 { x }\n").unwrap();
+
+        seed_finding(&journal, "f1", &["fn:alpha"]);
+
+        let before = snapshot_paths(dir.path(), &["src".to_string()]);
+        std::fs::write(src.join("lib.rs"), "pub fn alpha(x: i64) -> i64 { x }\n").unwrap();
+        let after = snapshot_paths(dir.path(), &["src".to_string()]);
+        let changes = diff_snapshots(&before, &after);
+
+        apply_staleness_pass(&journal, &changes).unwrap();
+
+        let findings = Journal::read_findings(&journal).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].verdict, "stale");
+    }
+
+    #[test]
+    fn staleness_pass_ignores_added_symbols() {
+        let dir = tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+        seed_finding(&journal, "f1", &["alpha"]);
+
+        let before = snapshot_paths(dir.path(), &["src".to_string()]);
+        std::fs::write(src.join("lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+        let after = snapshot_paths(dir.path(), &["src".to_string()]);
+        let changes = diff_snapshots(&before, &after);
+
+        apply_staleness_pass(&journal, &changes).unwrap();
+
+        // A newly added symbol cannot invalidate a finding that references it.
+        let findings = Journal::read_findings(&journal).unwrap();
+        assert_eq!(findings[0].verdict, "verified");
+    }
 }

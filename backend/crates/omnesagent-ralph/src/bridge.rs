@@ -7,6 +7,7 @@
 //! config (`enabled`, `push_scope`, `projects`, `auto_push_after_archive`) and by a
 //! credential guard that never forwards secret-classified content (Ф2.5, ADR-O5).
 
+use crate::debt::DebtLedger;
 use crate::journal::{FindingRecord, Journal, JournalError};
 use crate::openspec::OpenSpecWorkspace;
 use async_trait::async_trait;
@@ -400,6 +401,107 @@ impl Ob2hBridge {
         Ok(report)
     }
 
+    /// Export the fork's harvested debt ledger into ob2h's Ralph Knowledge Layer
+    /// (Ф3.1) so that `ob2h ralph debt` surfaces the same deferred markers.
+    ///
+    /// ob2h has no standalone "add finding" tool, so the bridge opens a run
+    /// (`ralph_start`) and records the debt items as a single `deferred`
+    /// iteration (`ralph_iteration`). The feature slug is suffixed with the fork
+    /// run id, which keeps repeated archives from colliding with ob2h's
+    /// "one active run per (project, feature)" guard. A disabled bridge or an
+    /// empty project list is a no-op; individual failures are counted, never
+    /// propagated (fail-open, ADR-O3).
+    pub async fn publish_debt(
+        &self,
+        ledger: &DebtLedger,
+        slug: &str,
+        run_id: &str,
+        goal: &str,
+    ) -> Result<BridgeReport, BridgeError> {
+        if !self.config.enabled || self.config.projects.is_empty() {
+            return Ok(BridgeReport {
+                skipped: ledger.items.len(),
+                ..BridgeReport::default()
+            });
+        }
+
+        // Credential guard (ADR-O5): never forward secret-classified debt text.
+        let items: Vec<&crate::debt::DebtItem> = ledger
+            .items
+            .iter()
+            .filter(|item| {
+                !carries_credential_class(&item.raw_marker)
+                    && !carries_credential_class(&item.ceiling)
+            })
+            .collect();
+
+        let mut report = BridgeReport {
+            skipped: ledger.items.len() - items.len(),
+            ..BridgeReport::default()
+        };
+        if items.is_empty() {
+            return Ok(report);
+        }
+
+        let findings: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                json!({
+                    "kind": "deferred",
+                    "content": item.raw_marker,
+                    "meta": {
+                        "ceiling": item.ceiling,
+                        "upgrade_trigger": item.upgrade_trigger,
+                        "file": item.file,
+                        "line": item.line,
+                        "no_trigger": item.tags.iter().any(|t| t == "no-trigger"),
+                    },
+                })
+            })
+            .collect();
+
+        let feature_slug = format!("{slug}@{run_id}");
+
+        let mut transport = (self.factory)();
+        self.round_trip(transport.initialize()).await?;
+
+        for project in &self.config.projects {
+            let start = self
+                .round_trip(transport.call_tool(
+                    "ralph_start",
+                    json!({
+                        "project_id": project,
+                        "feature_slug": feature_slug,
+                        "goal": goal,
+                    }),
+                ))
+                .await;
+            let Some(ob2h_run_id) = start.ok().as_deref().and_then(parse_run_id) else {
+                report.failed += 1;
+                continue;
+            };
+
+            match self
+                .round_trip(transport.call_tool(
+                    "ralph_iteration",
+                    json!({
+                        "run_id": ob2h_run_id,
+                        "task_id": "debt",
+                        "n": 1,
+                        "findings": findings,
+                    }),
+                ))
+                .await
+            {
+                Ok(_) => report.published += items.len(),
+                Err(_) => report.failed += 1,
+            }
+        }
+
+        transport.shutdown().await;
+        Ok(report)
+    }
+
     /// Bound a single transport operation by `request_timeout`.
     async fn round_trip<F, T>(&self, future: F) -> Result<T, BridgeError>
     where
@@ -409,6 +511,17 @@ impl Ob2hBridge {
             Ok(result) => result,
             Err(_) => Err(BridgeError::Timeout(self.request_timeout)),
         }
+    }
+}
+
+/// Extract the `run_id=...` token from an ob2h `ralph_start` reply.
+fn parse_run_id(reply: &str) -> Option<String> {
+    let rest = reply.split("run_id=").nth(1)?;
+    let id = rest.split_whitespace().next()?;
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
     }
 }
 
@@ -464,11 +577,14 @@ mod tests {
             Ok(())
         }
 
-        async fn call_tool(&mut self, _tool: &str, arguments: Value) -> Result<String, BridgeError> {
+        async fn call_tool(&mut self, tool: &str, arguments: Value) -> Result<String, BridgeError> {
             if self.hang {
                 return std::future::pending().await;
             }
             self.saved.lock().unwrap().push(arguments);
+            if tool == "ralph_start" {
+                return Ok("run_id=rrun_test status=applying".to_string());
+            }
             Ok("saved".to_string())
         }
 
@@ -603,5 +719,97 @@ mod tests {
             &finding("f2", "failed", "whatever"),
             BridgePushScope::Verified
         ));
+    }
+
+    fn debt_item(marker: &str) -> crate::debt::DebtItem {
+        crate::debt::DebtItem {
+            file: "src/cache.rs".to_string(),
+            line: 12,
+            raw_marker: marker.to_string(),
+            ceiling: "in-memory buffer up to 100".to_string(),
+            upgrade_trigger: Some("migrate to sqlite".to_string()),
+            tags: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publishes_debt_as_deferred_findings() {
+        let (saved, mock) = MockTransport::recording();
+        let config = Ob2hBridgeConfig {
+            enabled: true,
+            projects: vec!["omnes-agent".to_string()],
+            ..Ob2hBridgeConfig::default()
+        };
+        let bridge = Ob2hBridge::with_factory(config, Duration::from_secs(1), factory_for(mock));
+
+        let ledger = DebtLedger {
+            items: vec![debt_item("ponytail: in-memory buffer up to 100, migrate to sqlite")],
+        };
+        let report = bridge
+            .publish_debt(&ledger, "test-feature", "run_1", "ship it")
+            .await
+            .unwrap();
+
+        assert_eq!(report.published, 1);
+        assert_eq!(report.failed, 0);
+
+        let saved = saved.lock().unwrap();
+        assert_eq!(saved.len(), 2, "expected ralph_start + ralph_iteration");
+
+        let start = saved.iter().find(|a| a.get("feature_slug").is_some()).unwrap();
+        assert_eq!(start["project_id"], "omnes-agent");
+        assert_eq!(start["feature_slug"], "test-feature@run_1");
+
+        let iteration = saved
+            .iter()
+            .find(|a| a.get("findings").is_some())
+            .unwrap();
+        assert_eq!(iteration["run_id"], "rrun_test");
+        assert_eq!(iteration["findings"][0]["kind"], "deferred");
+        assert_eq!(
+            iteration["findings"][0]["meta"]["upgrade_trigger"],
+            "migrate to sqlite"
+        );
+    }
+
+    #[tokio::test]
+    async fn debt_with_credentials_is_skipped() {
+        let (saved, mock) = MockTransport::recording();
+        let config = Ob2hBridgeConfig {
+            enabled: true,
+            projects: vec!["omnes-agent".to_string()],
+            ..Ob2hBridgeConfig::default()
+        };
+        let bridge = Ob2hBridge::with_factory(config, Duration::from_secs(1), factory_for(mock));
+
+        let ledger = DebtLedger {
+            items: vec![debt_item("ponytail: pin stored as encrypted_secret, rotate later")],
+        };
+        let report = bridge
+            .publish_debt(&ledger, "test-feature", "run_1", "ship it")
+            .await
+            .unwrap();
+
+        assert_eq!(report.published, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(saved.lock().unwrap().is_empty(), "nothing may reach ob2h");
+    }
+
+    #[tokio::test]
+    async fn disabled_bridge_skips_debt_export() {
+        let bridge = Ob2hBridge::from_config(Ob2hBridgeConfig::default());
+        let ledger = DebtLedger {
+            items: vec![debt_item("ponytail: temporary shim, revisit after v2")],
+        };
+        let report = bridge
+            .publish_debt(&ledger, "test-feature", "run_1", "ship it")
+            .await
+            .unwrap();
+
+        assert_eq!(report, BridgeReport {
+            published: 0,
+            skipped: 1,
+            failed: 0,
+        });
     }
 }

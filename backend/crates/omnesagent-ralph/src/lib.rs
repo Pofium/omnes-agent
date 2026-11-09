@@ -4,6 +4,7 @@
 //! Conforms to specification `Ralph Orchestrator (Omnes Agent).md` (v2.1).
 
 pub mod approval;
+pub mod ast;
 pub mod bridge;
 pub mod debt;
 pub mod events;
@@ -17,6 +18,7 @@ pub mod openspec;
 pub mod plateau;
 pub mod state;
 pub mod tasks;
+pub mod verdict;
 
 use approval::GateManager;
 use events::RalphEvent;
