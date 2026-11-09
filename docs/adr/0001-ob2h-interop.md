@@ -59,13 +59,44 @@ MCP (`ob2h serve` → `initialize` → `notifications/initialized` → `tools/ca
 ### 5. Секреты: ob2h Vault — межагентный сейф, форк — конфиг-секреты (ADR-O5)
 
 - Доступ агентов к `secrets_*` ob2h разрешён; PIN вводится только GUI/CLI ob2h и
-  никогда не проходит через чат/LLM/MCP-аргументы.
+  никогда не проходит через чат/LLM/MCP-аргументы (ADR-18).
 - Форковые конфиг-секреты (`#[credential_class]`-поля: `encrypted_secret`,
   `external_auth_store` и т. п.) остаются в форке.
 - **Граница публикации:** контент, несущий `#[credential_class]`-классификацию, в ob2h
   не публикуется. Мост `[ob2h_bridge]` отбрасывает такие находки до `memory_save`
   (см. `omnesagent-ralph::bridge`). Изоляция проверяется негативными тестами
   (непопадание секретов в память/RAG/граф/логи).
+
+**Когда сейф ob2h, а когда форковый конфиг (правило выбора):**
+
+| Критерий | ob2h Vault (`secrets_*`) | Форковый конфиг-секрет (`#[credential_class]`) |
+|---|---|---|
+| Область | Межагентная, кросс-продуктовая | Конфигурация конкретного сервера/канала форка |
+| Примеры | Токены LLM-провайдеров, общие API-ключи | `McpServerConfig.env`, `access_token` каналов, `api_key` провайдеров |
+| Запись | GUI/CLI ob2h (PIN); `secrets_set` из EngineeringTask/SystemAdmin | `#[secret]`-поле в TOML/схеме форка |
+| Чтение агентом | `secrets_get` — только под Engineering/SystemAdmin; `secrets_status` — read-класс | Значение распаковывается харнесом при инициализации подсистемы, агенту не отдаётся |
+| В чате/MCP-аргументах | Никогда | Никогда |
+| В памяти/RAG/графе/логах | Никогда | Никогда |
+
+Правило выбора: **межагентное и переиспользуемое — в сейф ob2h; привязанное к
+конфигурации конкретного сервера форка — в конфиг форка.** Копирование секретов между
+слоями (в любую сторону) запрещено.
+
+**Изоляция (Ф4.3):** гарантии и их покрытие тестами:
+
+- (а) значения сейфа, попадающие в текст MCP-ответов, скрабируются
+  (`omnesagent-tools::mcp_context`, тест `resource_wrapper_redacts_secrets`);
+- (б) `McpServerConfig.env`/`headers` классифицированы как `EncryptedSecret` и
+  шифруются на сохранении; значения не раскрываются при интроспекции конфига
+  (`omnesagent-config::schema`, тесты `empty_secret_map_emits_container_row`,
+  `secret_map_entries_add_list_and_remove_without_leaking_values`) — каждый
+  stdio-сервер получает только собственный `env` (`mcp_transport::spawn`);
+- (в) write-инструменты сейфа недоступны в CodeExploration — контроль на стороне
+  агента `filter_tools_for_intent` (только `secrets_status` в read-only-группе,
+  тест `test_ob2h_vault_tools_are_engineering_only`);
+- (г) `#[credential_class]`-контент не публикуется мостом
+  (`omnesagent-ralph::bridge`, тесты `credential_class_content_is_never_published`,
+  `debt_with_credentials_is_skipped`).
 
 ## Последствия
 

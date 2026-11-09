@@ -20,3 +20,19 @@ All AI coding assistants and subagents MUST always use the `ob2h` MCP server too
 3. **Knowledge Graph**:
    - Resolve entity relationships, dependencies, and imports via `ob2h:graph_search` and `ob2h:graph_reason`.
    - Calculate blast radius before refactorings using `ob2h:project_impact`.
+
+4. **Vault & Secrets (ADR-O5)**:
+   - The ob2h vault (`secrets_*`) is the *inter-agent* secret store: LLM-provider
+     tokens shared across agents. Fork config secrets (`#[credential_class]` fields
+     such as `McpServerConfig.env`) stay in the fork and are never copied into ob2h.
+   - PIN entry and vault unlock happen **only** through the ob2h GUI/CLI. A PIN,
+     passphrase, or any chat-pasted secret is **never** passed as an MCP argument and
+     is never written to `memory_save` (ADR-18).
+   - Call `secrets_get` **only** to read a value the agent legitimately needs at
+     runtime (e.g. a provider token). Never call it to echo back a value the user
+     typed into the chat.
+   - `secrets_get/set/delete/lock` are EngineeringTask/SystemAdmin-only; only the
+     read-class `secrets_status` is exposed in CodeExploration (see
+     `filter_tools_for_intent`).
+   - Vault values must never be persisted into memory, RAG chunks, the knowledge
+     graph, or tool logs.

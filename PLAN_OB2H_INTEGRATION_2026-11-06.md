@@ -477,19 +477,39 @@ AST-дельты, stale-инвалидация).
 
 Задачи:
 
-- [ ] **3.1** Debt-леджер: экспорт форкового `omnesagent-ralph::debt` в `ob2h ralph debt`
+- [x] **3.1** Debt-леджер: экспорт форкового `omnesagent-ralph::debt` в `ob2h ralph debt`
       (Ф60.3) при архивации run (через мост Ф2).
-- [ ] **3.2** AST-дельты в валидацию: `loop_driver` использует `ast_diff`/`ast_history`
+      **Done:** `Ob2hBridge::publish_debt` (`bridge.rs`) открывает run (`ralph_start`,
+      feature_slug = `<slug>@<run_id>` — обход «one active run per (project,feature)») и
+      записывает debt-пункты одной `deferred`-итерацией (`ralph_iteration`); credential-guard
+      (Ф2.5) фильтрует секрет-класс. `loop_driver` накапливает `DebtLedger` по каждой
+      закоммиченной итерации (до `commit_iteration`) и экспортирует его при архивации,
+      fail-open. Тесты: `publishes_debt_as_deferred_findings`,
+      `debt_with_credentials_is_skipped`, `disabled_bridge_skips_debt_export`.
+- [x] **3.2** AST-дельты в валидацию: `loop_driver` использует `ast_diff`/`ast_history`
       (MCP ob2h или kag-эквиваленты Ф1) для символьного диффа итераций вместо сырого git-диффа.
-- [ ] **3.3** Stale-инвалидация (столп VI v2.0): при изменении сигнатур/рёбер AST помечать
+      **Done:** kag-эквивалент Ф1 в `ast.rs` (`snapshot_paths` → `diff_snapshots` через
+      `omnesagent_kag::AstCodeExtractor`); `loop_driver` снимает снапшот до/после executor'а,
+      пишет `ast_changes` в `IterationRecord` (7 unit-тестов ast).
+- [x] **3.3** Stale-инвалидация (столп VI v2.0): при изменении сигнатур/рёбер AST помечать
       связанные findings форка `stale`; объединить с `omnesagent-ralph::journal`.
-- [ ] **3.4** Вердикты: автоматические вердикты итераций форка — только по объективным
+      **Done:** `journal::stale_findings` + `Journal::append_finding`/`read_findings`
+      (latest-per-id); `loop_driver::apply_staleness_pass` помечает findings `stale` до записи
+      собственного finding итерации (идемпотентно; added-символы не инвалидируют). Тесты в
+      `journal.rs` и `loop_driver.rs` (`staleness_pass_marks_findings_for_modified_signature`,
+      `staleness_pass_ignores_added_symbols`).
+- [x] **3.4** Вердикты: автоматические вердикты итераций форка — только по объективным
       тестовым сигналам (соответствие ADR-K4 ob2h); человек/дрим могут переопределить.
+      **Done:** модуль `verdict.rs` (`auto_verdict` по `TestsSummary`, `self_assessment` не
+      читается, `verdict_source = "auto_tests"`); `loop_driver` заполняет `verdict`/
+      `verdict_source` во всех ветках записи `IterationRecord`. 4 unit-теста.
 - [ ] **3.5** Опционально (отдельным решением): интеграция `omnesagent-ralph` в Triage Router
       (Tier 2 из `PLAN.md`) — вне обязательного объёма этой фазы.
 
-**DoD Ф3:** archive run форка создаёт debt-записи в ob2h; после правки сигнатуры
-зависимые findings помечены stale в журнале; вердикт-логика покрыта тестами.
+**DoD Ф3:** `[x] archive run форка создаёт debt-записи в ob2h; после правки сигнатуры
+зависимые findings помечены stale в журнале; вердикт-логика покрыта тестами.`
+Проверено: `cargo test -p omnesagent-ralph` — 39 unit + 3 e2e зелёные;
+`cargo clippy -p omnesagent-ralph --all-targets` и `cargo check --workspace` без ошибок.
 
 ### Ф4 — Secrets Vault мост (1–2 дня, P2)
 
@@ -497,17 +517,36 @@ AST-дельты, stale-инвалидация).
 
 Задачи:
 
-- [ ] **4.1** Разрешить read-класс `ob2h__secrets_status` в read-only-группе (сделано в Ф0.4);
+- [x] **4.1** Разрешить read-класс `ob2h__secrets_status` в read-only-группе (сделано в Ф0.4);
       `secrets_get/set/delete` — только EngineeringTask/SystemAdmin-интенции (не CodeExploration).
-- [ ] **4.2** Правило в системном промпте/скилле: PIN и разблокировка — только GUI/CLI ob2h;
+      **Done:** allowlist `secrets_status` в `is_read_only_tool` (Ф0.4); `secrets_get/lock`
+      добавлены в список write-класса; новый тест `test_ob2h_vault_tools_are_engineering_only`
+      (`omnesagent-runtime::orchestrator::tool_group`) — в CodeExploration остаётся только
+      `secrets_status`, Engineering/SystemAdmin сохраняют все.
+- [x] **4.2** Правило в системном промпте/скилле: PIN и разблокировка — только GUI/CLI ob2h;
       инструмент `secrets_get` не вызывать для значений, вводимых пользователем в чат (ADR-18).
-- [ ] **4.3** Тесты изоляции: содержимое `secrets_get` не попадает в записи памяти (оба слоя),
+      **Done:** раздел «Vault & Secrets (ADR-O5)» в `.agents/rules/ob2h.md` (системное правило
+      монорепо) и раздел «🔐 Сейф (Vault) и секреты (ADR-O5, ADR-18)» в
+      `.agents/skills/ob2h/SKILL.md`.
+- [x] **4.3** Тесты изоляции: содержимое `secrets_get` не попадает в записи памяти (оба слоя),
       RAG-чанки, граф, tool-логи форка; секреты `McpServerConfig.env` не видны ob2h.
-- [ ] **4.4** Документ: когда использовать сейф ob2h (межагентные токены LLM-провайдеров),
+      **Done:** покрытие негативными тестами по четырём границам — (а) скраб текста MCP-ответов
+      (`mcp_context::resource_wrapper_redacts_secrets`); (б) `McpServerConfig.env`/`headers` =
+      `EncryptedSecret` без раскрытия при интроспекции (`schema::empty_secret_map_emits_container_row`,
+      `secret_map_entries_add_list_and_remove_without_leaking_values`), per-server `env` в
+      `mcp_transport::spawn`; (в) write-сейф-инструменты вне CodeExploration (тест 4.1);
+      (г) `#[credential_class]`-контент не публикуется мостом (`bridge::credential_class_content_is_never_published`,
+      `debt_with_credentials_is_skipped`).
+- [x] **4.4** Документ: когда использовать сейф ob2h (межагентные токены LLM-провайдеров),
       когда форковые config-secrets (конфиг серверов) — в ADR Ф2.
+      **Done:** ADR-O5 в `docs/adr/0001-ob2h-interop.md` расширен правилом выбора
+      (таблица «критерий → ob2h Vault vs форковый конфиг-секрет») и картой покрытия изоляции.
 
-**DoD Ф4:** негативные тесты изоляции зелёные; правила задокументированы; утечки в
+**DoD Ф4:** [x] негативные тесты изоляции зелёные; правила задокументированы; утечки в
 `omnes_stats`/логах не обнаружены прогоном.
+Проверено: `cargo test -p omnesagent-runtime tool_group` — 7/7 зелёные; существующие тесты
+изоляции конфига/моста/скраба зелёные (`cargo test -p omnesagent-config`,
+`-p omnesagent-ralph`, `-p omnesagent-tools`).
 
 ### Ф5 — Access Telemetry Parity (2 дня, P2)
 

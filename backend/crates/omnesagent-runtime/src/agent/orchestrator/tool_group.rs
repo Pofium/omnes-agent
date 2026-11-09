@@ -250,8 +250,10 @@ mod tests {
         let mutating = [
             "ob2h__memory_save",
             "ob2h__memory_forget",
+            "ob2h__secrets_get",
             "ob2h__secrets_set",
             "ob2h__secrets_delete",
+            "ob2h__secrets_lock",
             "ob2h__workspace_write",
             "ob2h__project_init",
             "ob2h__knowledge_extract",
@@ -262,6 +264,29 @@ mod tests {
         for name in mutating {
             assert!(!is_read_only_tool(name), "{name} must not be read-only");
         }
+    }
+
+    #[test]
+    fn test_ob2h_vault_tools_are_engineering_only() {
+        // Ф4.1: only the read-class `secrets_status` is allowed in
+        // CodeExploration; get/set/delete/lock stay EngineeringTask/SystemAdmin.
+        let tools = vec![
+            dummy_tool("ob2h__secrets_status"),
+            dummy_tool("ob2h__secrets_get"),
+            dummy_tool("ob2h__secrets_set"),
+            dummy_tool("ob2h__secrets_delete"),
+            dummy_tool("ob2h__secrets_lock"),
+        ];
+
+        let explored = filter_tools_for_intent(&tools, AgentIntent::CodeExploration);
+        let names: Vec<_> = explored.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["ob2h__secrets_status"]);
+
+        let engineering = filter_tools_for_intent(&tools, AgentIntent::EngineeringTask);
+        assert_eq!(engineering.len(), tools.len());
+
+        let admin = filter_tools_for_intent(&tools, AgentIntent::SystemAdmin);
+        assert_eq!(admin.len(), tools.len());
     }
 
     #[test]
