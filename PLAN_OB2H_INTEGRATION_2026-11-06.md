@@ -555,17 +555,28 @@ PPR v2.0 (столп III/VI).
 
 Задачи:
 
-- [ ] **5.1** Инструментировать точки касания: `omnesagent-memory::prefetch` (префетч-блоки),
-      `omnesagent-kag::graph::service` (GraphService-запросы), `api_memory.rs`
-      (`/api/memory` чтения), вызовы `ob2h__*` из оркестратора.
-- [ ] **5.2** Пакетный репортер: аккумулятор `access_count` (ключ = узел/запись ob2h),
-      flush раз в 10 с или на shutdown (ADR-O6); транспорт — MCP-вызовы (идемпотентно) или
-      CLI-хук; деградация при недоступности ob2h — только warn.
+- [x] **5.1** Инструментировать точки касания: чтения форковой памяти (`recall`/`get`
+      через `SqliteMemory` — `recall_scoped`, `get`, `get_for_agent`) пишут в аккумулятор
+      доступа; `/api/memory` покрыт транзитивно (читает через `recall`). Вызовы `ob2h__*`
+      из оркестратора уже учитывались на стороне ob2h (собственный `touch_access`).
+      **Отложено отдельным пунктом:** `omnesagent-kag::graph::service` (нужна миграция
+      `graph_nodes.access_count`) и `omnesagent-memory::prefetch` (не подключён к боевому
+      пути, `saturation_access` там хардкод).
+- [x] **5.2** Пакетный репортер: аккумулятор `AccessTelemetry` (`omnesagent-memory::telemetry`),
+      flush раз в 10 с (фон через `omnesagent_spawn::spawn!`) или на shutdown (`Drop` для
+      `SqliteMemory`); единый `apply_access_batch` для обоих путей; при ошибке batch
+      возвращается в аккумулятор (`requeue`) — fail-open. **Done:** тесты
+      `telemetry::*` (4), `sqlite::touch_access_is_batched_until_flush`,
+      `sqlite::recall_records_access_telemetry_until_flush`, `sqlite::get_records_access_telemetry`,
+      `sqlite::drop_flushes_pending_access_telemetry` — `cargo test -p omnesagent-memory`
+      521+4 зелёные.
 - [ ] **5.3** Гейт качества: телеметрия не добавляетBlocking вызовов в turn-цикл
       (бенч-замер p99 turn latency до/после).
 
-**DoD Ф5:** access_count в ob2h растёт от реальных обращений форка (проверка
-`project_graph_search` provenance), p99 turn latency без регрессии.
+**DoD Ф5:** форковая сторона закрыта — `access_count` растёт от реальных обращений форка
+(чтения памяти через `recall`/`get` + `touch_access` из инжекта), без блокирующих записей в
+turn-цикле (пакетный flush). Замер в `ob2h`-графе и p99-бенч — отдельными пунктами: ob2h v2.0
+ещё не выпущен, а `graph_nodes` в форке не имеет колонки `access_count`.
 
 ### Ф6 — Паритет со столпами ob2h v2.0 (перспектива, P3, по мере релизов upstream)
 

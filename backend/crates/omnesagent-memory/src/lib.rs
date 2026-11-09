@@ -41,6 +41,7 @@ pub mod scanned;
 pub mod snapshot;
 pub mod sqlite;
 mod sqlite_permissions;
+pub mod telemetry;
 pub mod threat;
 pub mod traits;
 pub mod vector;
