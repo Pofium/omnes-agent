@@ -1,6 +1,7 @@
 //! Conflict resolution for memory entries.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use std::collections::HashSet;
 
 /// Check for conflicting memories and mark old ones as superseded.
 /// Returns the list of entry IDs that were superseded.
@@ -56,6 +57,29 @@ pub fn mark_superseded(
     }
 
     Ok(())
+}
+
+/// Ф62.4 (порт ob2h `superseded_among`): id записей, подавленных как устаревшие,
+/// но ТОЛЬКО если запись-замена (`superseded_by`) тоже присутствует в выборке
+/// `entries`. Если замена недоступна здесь же — запись не подавляем, иначе
+/// знание было бы потеряно, а не обновлено.
+///
+/// В модели форка связь «старое → новое» хранится в колонке `memories.superseded_by`
+/// (id записи-замены), поэтому алгоритм ob2h (рёбра `supersedes` между живыми
+/// записями) выражается напрямую через поле `MemoryEntry::superseded_by`.
+pub fn superseded_among(entries: &[MemoryEntry]) -> HashSet<String> {
+    if entries.len() < 2 {
+        return HashSet::new();
+    }
+    let present: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let successor = entry.superseded_by.as_deref()?;
+            // Подавляем, лишь когда замена доступна в этой же выборке.
+            present.contains(successor).then(|| entry.id.clone())
+        })
+        .collect()
 }
 
 /// Simple text-based conflict detection without embeddings.
@@ -225,5 +249,53 @@ mod tests {
         // An identical new_content is an update, not a conflict.
         let none = find_text_conflicts(&entries, "User prefers Rust for systems work", 0.3);
         assert!(none.is_empty());
+    }
+
+    fn marker_entry(id: &str, superseded_by: Option<&str>) -> MemoryEntry {
+        MemoryEntry {
+            id: id.into(),
+            key: id.into(),
+            content: id.into(),
+            category: MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.7),
+            superseded_by: superseded_by.map(str::to_string),
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+            trust: None,
+            last_feedback_at: None,
+        }
+    }
+
+    #[test]
+    fn superseded_among_suppresses_only_when_successor_present() {
+        // Замена "new" присутствует -> "old" подавляется.
+        let both = vec![
+            marker_entry("old", Some("new")),
+            marker_entry("new", None),
+        ];
+        let suppressed = superseded_among(&both);
+        assert_eq!(suppressed.len(), 1);
+        assert!(suppressed.contains("old"));
+
+        // Замена отсутствует -> запись НЕ подавляем (знание не теряется).
+        let lonely = vec![marker_entry("old", Some("new"))];
+        assert!(superseded_among(&lonely).is_empty());
+    }
+
+    #[test]
+    fn superseded_among_ignores_entries_without_marker() {
+        let entries = vec![
+            marker_entry("a", None),
+            marker_entry("b", None),
+            marker_entry("c", Some("missing")),
+        ];
+        assert!(superseded_among(&entries).is_empty());
     }
 }

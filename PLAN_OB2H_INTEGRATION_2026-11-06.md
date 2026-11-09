@@ -341,8 +341,16 @@ read-only; прибрать БД ob2h и рабочее дерево.
       Побочно устранён унаследованный самодеадлок `parking_lot::Mutex` в `scan_project`
       (guard транзакции не снимался перед повторным `self.conn.lock()` на codegraph-синке) —
       ранее путь не покрывался тестами.
-- [ ] **1.4** Типизированные рёбра AST (CALLS/IMPORTS/IMPLEMENTS/DEPENDS_ON) в схеме
+- [x] **1.4** Типизированные рёбра AST (CALLS/IMPORTS/IMPLEMENTS/DEPENDS_ON) в схеме
       близнеца (`omnesagent-kag/src/schema.rs`, миграция по образцу ob2h M10).
+      **Done:** паритет уже достигнут — тип ребра хранится в `graph_edges.label TEXT`
+      (та же модель, что у ob2h «простой» `graph_edges`), UNIQUE(source_id,target_id,label).
+      Все четыре типа генерируются AST-сканером: `CALLS` — `resolve_calls`
+      (`ast/mod.rs:3639`, provenance=RESOLVED); `IMPORTS` — `languages.rs`/`iac.rs`/`schemas.rs`;
+      `IMPLEMENTS` — `ast/mod.rs` (1248/1453/…, интерфейсы/трейты, включая TS);
+      `DEPENDS_ON` — `manifests.rs`/`iac.rs`. Константа `USAGE_EDGE_LABELS`
+      (`graph/callpath.rs:12`) фиксирует канонический набор. Golden dual-scan
+      (Ф1.1) подтверждает совпадение по CALLS/IMPORTS с ob2h. Доработок не требует.
 - [x] **1.5** FTS5-индекс графа (порт Ф62.1) в `omnesagent-kag/src/graph/service.rs`
       + гибридная выдача в `project_graph_search`-эквиваленте.
       **Done:** в `omnesagent-kag/src/schema.rs` поднята `SCHEMA_VERSION` 7→8 и добавлена
@@ -364,8 +372,22 @@ read-only; прибрать БД ob2h и рабочее дерево.
       `scan_project` — вставка узлов, вставка рёбер, авто-создание узлов-целей,
       `SELECT id …node_id`, вставка `ast_refs`; `codegraph_bridge::sync_codegraph_db` —
       вставка узлов и рёбер. `cargo test -p omnesagent-kag` — все наборы зелёные.
-- [ ] **1.7** LRU-кэш эмбеддингов (порт Ф62.2) в `omnesagent-kag/src/embedding/` и
+- [x] **1.7** LRU-кэш эмбеддингов (порт Ф62.2) в `omnesagent-kag/src/embedding/` и
       семантика `superseded_among` (Ф62.4) в `omnesagent-memory/src/dedup.rs`/`conflict.rs`.
+      **Done:** (Ф62.2) в `omnesagent-kag/src/embedding/mod.rs` добавлен
+      `CachedEmbeddingProvider` — потокобезопасный `LruCache` (`parking_lot::Mutex`,
+      ёмкость по умолчанию 1000) поверх любого бэкенда, ключ = `trim()+lowercase`,
+      батч с частичными попаданиями эмбеддит только промахи, есть `stats()`/`cache_len()`;
+      `default_embedding_provider()` оборачивает бэкенд в кэш; зависимость `lru = "0.18.2"`.
+      (Ф62.4) в `omnesagent-memory/src/conflict.rs` добавлен `superseded_among(&[MemoryEntry])` —
+      запись подавляется как устаревшая ТОЛЬКО если её замена (`superseded_by`) присутствует
+      в той же выборке (иначе знание терялось бы); подключён в `dedup::core_candidates`
+      (аналог consolidation-сайта ob2h `service.rs:1492`). Тесты: кэш (hit/miss/нормализация/
+      частичный батч/эвикция LRU/dim/пустой вход) + `superseded_among`/`core_candidates`.
+      Расхождение с ob2h (осознанное): модель форка хранит связь в колонке
+      `memories.superseded_by` (а не в рёбрах `memory_links.kind='supersedes'`), а подавление
+      на чтении выполняется SQL-фильтром `superseded_by IS NULL`; хелпер централизует
+      семантику Ф62.4 на слое чистой логики. `cargo test -p omnesagent-memory -p omnesagent-kag` зелёные.
 - [x] **1.8** Сверить направление `import-codegraph` (ob2h `678afe0`) с
       `omnesagent-kag/src/project/codegraph_bridge.rs`; задокументировать в `docs/kag_sync.md`.
       **Done:** направление **совпадает** — внешняя БД `.codegraph/codegraph.db` →

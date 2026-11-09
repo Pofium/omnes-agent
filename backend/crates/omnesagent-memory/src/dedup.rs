@@ -40,10 +40,13 @@ pub fn dedup_gate(candidates: &[MemoryEntry], incoming: &str, cfg: &MemoryConfig
 }
 
 pub fn core_candidates(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+    // Ф62.4: подавляем устаревшую запись только если её замена присутствует в
+    // этой же выборке (порт ob2h `superseded_among`); иначе знание терялось бы.
+    let superseded = conflict::superseded_among(&entries);
     entries
         .into_iter()
         .filter(|entry| {
-            matches!(entry.category, MemoryCategory::Core) && entry.superseded_by.is_none()
+            matches!(entry.category, MemoryCategory::Core) && !superseded.contains(&entry.id)
         })
         .collect()
 }
@@ -186,5 +189,18 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "live");
+    }
+
+    #[test]
+    fn core_candidates_keeps_orphan_superseded_entry() {
+        // Ф62.4: замена отсутствует в выборке -> устаревшая запись сохраняется,
+        // иначе знание было бы потеряно, а не обновлено.
+        let mut orphan = entry("old", "value superseded elsewhere");
+        orphan.superseded_by = Some("absent".into());
+
+        let filtered = core_candidates(vec![orphan]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "old");
     }
 }
