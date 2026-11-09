@@ -4,6 +4,7 @@
 //! Conforms to specification `Ralph Orchestrator (Omnes Agent).md` (v2.1).
 
 pub mod approval;
+pub mod bridge;
 pub mod debt;
 pub mod events;
 pub mod executor;
@@ -21,7 +22,7 @@ use approval::GateManager;
 use events::RalphEvent;
 use executor::{Executor, SubprocessCliExecutor};
 use knowledge::RalphKnowledgeService;
-use omnesagent_config::ralph::RalphConfig;
+use omnesagent_config::ralph::{Ob2hBridgeConfig, RalphConfig};
 use openspec::OpenSpecWorkspace;
 use state::{RalphPhase, RalphState, StateError};
 use std::collections::HashMap;
@@ -62,6 +63,8 @@ pub struct RalphOrchestrator {
     pub repo_root: PathBuf,
     pub config: RalphConfig,
     pub knowledge: RalphKnowledgeService,
+    /// ob2h bridge configuration (`[ob2h_bridge]`), consumed by `drive_loop`.
+    pub ob2h_bridge: Ob2hBridgeConfig,
     pub gate_mgr: Arc<GateManager>,
     pub runs: Arc<RwLock<HashMap<String, RunHandle>>>,
     pub event_tx: Sender<RalphEvent>,
@@ -72,12 +75,14 @@ impl RalphOrchestrator {
         repo_root: PathBuf,
         config: RalphConfig,
         knowledge: RalphKnowledgeService,
+        ob2h_bridge: Ob2hBridgeConfig,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             repo_root,
             config,
             knowledge,
+            ob2h_bridge,
             gate_mgr: Arc::new(GateManager::new()),
             runs: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
@@ -140,6 +145,7 @@ impl RalphOrchestrator {
         let repo_root = self.repo_root.clone();
         let slug_clone = slug.to_string();
         let config = self.config.clone();
+        let ob2h_bridge = self.ob2h_bridge.clone();
         let knowledge = self.knowledge.clone();
         let gate_mgr = self.gate_mgr.clone();
         let event_tx = Some(self.event_tx.clone());
@@ -151,6 +157,7 @@ impl RalphOrchestrator {
                 repo_root,
                 slug_clone.clone(),
                 config,
+                ob2h_bridge,
                 executor,
                 knowledge,
                 gate_mgr,

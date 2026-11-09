@@ -3,6 +3,7 @@
 //! Conforms to §7.2, §7.3, §7.5, FR-A3 of specification.
 
 use crate::approval::{GateAction, GateManager};
+use crate::bridge::Ob2hBridge;
 use crate::debt::DebtLedger;
 use crate::events::RalphEvent;
 use crate::executor::{Executor, TaskContext};
@@ -14,7 +15,7 @@ use crate::plateau::{compute_failure_fingerprint, is_plateau};
 use crate::state::{FailureFingerprint, GateDecision, RalphPhase, RalphState};
 use crate::tasks::TaskList;
 use chrono::Utc;
-use omnesagent_config::ralph::RalphConfig;
+use omnesagent_config::ralph::{Ob2hBridgeConfig, RalphConfig};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -110,6 +111,7 @@ pub async fn drive_loop(
     repo_root: PathBuf,
     slug: String,
     config: RalphConfig,
+    bridge: Ob2hBridgeConfig,
     executor: Arc<dyn Executor>,
     knowledge: RalphKnowledgeService,
     gate_mgr: Arc<GateManager>,
@@ -563,6 +565,21 @@ pub async fn drive_loop(
 
         state.transition_to(RalphPhase::Archived)?;
         state.write_atomic(&state_path)?;
+
+        // ob2h bridge (Ф2.2): publish archived findings, fail-open. A disabled or
+        // unreachable ob2h must never abort the just-completed Ralph cycle.
+        if bridge.enabled && bridge.auto_push_after_archive {
+            let publisher = Ob2hBridge::from_config(bridge.clone());
+            match publisher.publish_after_archive(&repo_root, &slug).await {
+                Ok(report) => eprintln!(
+                    "ob2h bridge: published {} finding(s) (skipped {}, failed {})",
+                    report.published, report.skipped, report.failed
+                ),
+                Err(err) => eprintln!(
+                    "ob2h bridge: publication skipped, Ralph cycle continues: {err}"
+                ),
+            }
+        }
     }
 
     Ok(())

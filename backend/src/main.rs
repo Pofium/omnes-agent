@@ -4101,7 +4101,12 @@ async fn handle_ralph_command(
 
             println!("Starting Ralph Orchestrator for slug: {slug}");
             let knowledge = omnesagent_ralph::knowledge::RalphKnowledgeService::new(None, None);
-            let orchestrator = omnesagent_ralph::RalphOrchestrator::new(repo_root.clone(), ralph_cfg, knowledge);
+            let orchestrator = omnesagent_ralph::RalphOrchestrator::new(
+                repo_root.clone(),
+                ralph_cfg,
+                knowledge,
+                config.ob2h_bridge.clone(),
+            );
             let mut rx = orchestrator.subscribe();
             let run_id = orchestrator.start_run(&slug, None).await
                 .map_err(|e| anyhow::anyhow!("Failed to start Ralph run: {e}"))?;
