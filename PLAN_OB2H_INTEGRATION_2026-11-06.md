@@ -417,20 +417,54 @@ read-only; прибрать БД ob2h и рабочее дерево.
 
 Задачи:
 
-- [ ] **2.1** ADR-документ в `backend/docs/adr/` (или соглашённое место): роли двух
+- [x] **2.1** ADR-документ в `backend/docs/adr/` (или соглашённое место): роли двух
       памятей, запрет автосинка данных, границы секретов (текст ADR-O1/O3).
-- [ ] **2.2** Реализовать потребителя `[ob2h_bridge]` в `omnesagent-ralph` (сейчас конфиг
+      **Done:** создан `docs/adr/0001-ob2h-interop.md` (соглашённое место — рядом с
+      `docs/kag_sync.md`; каталога `backend/docs/` не существует). Зафиксированы:
+      роли двух памятей (ADR-O1), алгоритм-паритет без дата-паритета (ADR-O2),
+      интероп только по политике владельца / без автосинка (ADR-O3), штатный MCP-механизм
+      (ADR-O4), границы секретов и запрет публикации `#[credential_class]`-контента (ADR-O5),
+      fail-open семантика моста.
+- [x] **2.2** Реализовать потребителя `[ob2h_bridge]` в `omnesagent-ralph` (сейчас конфиг
       без потребителя): публикация архивированных runs/verified findings в ob2h через
       CLI-вызов (`ob2h_command`/`ob2h_args` + `projects`), `push_scope = verified|all`,
       `auto_push_after_archive`; fail-open с журналом (не ронять Ralph-цикл при
       недоступности ob2h).
-- [ ] **2.3** Политика публикации памяти: агентские методы (системный промпт/скилл форка)
+      **Done:** новый модуль `omnesagent-ralph/src/bridge.rs`: `Ob2hBridge` +
+      `McpStdioClient` — MCP-stdio клиент по контракту `ob2h serve`
+      (newline-delimited JSON-RPC 2.0: `initialize` → `notifications/initialized` →
+      `tools/call memory_save` с `content/key/category/importance/source/project_id`).
+      Публикация в `loop_driver.rs` после `state.transition_to(RalphPhase::Archived)`
+      при `enabled && auto_push_after_archive`: чтение findings из `journal.jsonl`,
+      фильтр по `push_scope` (`verified|all`), `memory_save` на каждую находку × каждый
+      `projects`-таргет, стабильный `key = finding_id` (идемпотентность). Транспорт
+      абстрагирован трейтом `Ob2hTransport`; таймаут на MCP-раунд — `round_trip`.
+      **Fail-open:** ошибка спавна/таймаут/ошибка инструмента логируется (`eprintln!`) и
+      не прерывает цикл. Проводка: `RalphOrchestrator::new(..., ob2h_bridge)` →
+      `drive_loop(..., bridge)`; `backend/src/main.rs` передаёт `config.ob2h_bridge.clone()`.
+- [x] **2.3** Политика публикации памяти: агентские методы (системный промпт/скилл форка)
       предписывают: решения владельца и архитектурные факты -> `ob2h__memory_save`
       (`project_id = "omnes-agent"`); операционный контекст сессии -> встроенная память.
-- [ ] **2.4** Дедупликация на границе: перед `memory_save` в ob2h — обязательный
+      **Done:** секция «Политика публикации памяти (ADR-O1/O3)» в
+      `.agents/skills/ob2h/SKILL.md` и расширенный п.2 «Long-Term Memory» в
+      `.agents/rules/ob2h.md`: решения владельца/архитектурные факты → `memory_save`
+      с `project_id = "omnes-agent"` и стабильным `key`; операционный контекст сессии →
+      встроенная память харнеса; запрет автосинка.
+- [x] **2.4** Дедупликация на границе: перед `memory_save` в ob2h — обязательный
       `memory_search` (правило уже в скилле); повторить в системном промпте форка.
-- [ ] **2.5** Тесты: mock-обёртка CLI-моста (успех/таймаут/отсутствие бинарника);
+      **Done:** в `.agents/skills/ob2h/SKILL.md` (п.2 политики) и `.agents/rules/ob2h.md`
+      закреплено: перед каждым `memory_save` — `memory_search` по тому же `key`/смыслу,
+      при совпадении `memory_update` вместо дубля. Мост со своей стороны использует
+      стабильный `key = finding_id` (`memory_save` идемпотентен по ключу).
+- [x] **2.5** Тесты: mock-обёртка CLI-моста (успех/таймаут/отсутствие бинарника);
       не публиковать записи с `#[credential_class]`-контентом.
+      **Done:** в `bridge.rs` (mod tests) — mock-транспорт `Ob2hTransport`:
+      успех (`publishes_only_verified_findings_under_verified_scope`,
+      `all_scope_publishes_every_finding`), таймаут (`times_out_when_ob2h_never_answers`),
+      отсутствие бинарника (`reports_missing_ob2h_binary`, реальный спавн), no-op при
+      disabled (`disabled_bridge_is_a_noop`), credential-guard
+      (`credential_class_content_is_never_published`, `plain_content_is_publishable`).
+      `cargo test -p omnesagent-ralph` — 20 unit + 3 e2e зелёные.
 
 **DoD Ф2:** `[ob2h_bridge]` при `enabled = true` публикует verified-findings выбранного
 проекта; при `enabled = false` и при падении ob2h Ralph-цикл жив; ADR-документ принят
