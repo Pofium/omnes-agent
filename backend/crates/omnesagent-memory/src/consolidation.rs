@@ -219,6 +219,7 @@ pub async fn consolidate_turn(
             &mem_key,
             update,
             &MemoryCategory::Core,
+            &conflict::ConflictScope::default(),
             memory_config.conflict_threshold,
         )
         .await
@@ -352,6 +353,7 @@ async fn store_typed_facts(
             &mem_key,
             fact,
             &MemoryCategory::Core,
+            &conflict::ConflictScope::default(),
             memory_config.conflict_threshold,
         )
         .await

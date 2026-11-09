@@ -3,6 +3,45 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use std::collections::HashSet;
 
+/// Контекст входящей записи для разрешения конфликтов (семантика ob2h v2.0
+/// «Contextual Coexistence»): подавлять можно только кандидатов в том же
+/// пространстве имён и тенанте. Иная область — факты сосуществуют, а не конкурируют.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConflictScope {
+    /// Пространство имён входящей записи (`None` → `"default"`).
+    pub namespace: Option<String>,
+    /// Тенант входящей записи (`None` → отсутствует).
+    pub tenant_id: Option<String>,
+}
+
+impl ConflictScope {
+    /// Совпадает ли кандидат с областью входящей записи.
+    pub fn matches(&self, entry: &MemoryEntry) -> bool {
+        let namespace = self.namespace.as_deref().unwrap_or("default");
+        namespace == entry.namespace && self.tenant_id == entry.tenant_id
+    }
+}
+
+/// Решение по одному кандидату: подавлять ли его как устаревший.
+///
+/// Учитывает семантику ob2h v2.0: контекст (`ConflictScope`), HITL для
+/// защищённых записей (`pinned` — аналог SOUL/USER/SYSTEM) и порог схожести.
+/// Идентичная по содержанию или та же самая запись (`key`) — обновление, не конфликт.
+pub fn supersede_candidate(
+    candidate: &MemoryEntry,
+    key: &str,
+    content: &str,
+    scope: &ConflictScope,
+    threshold: f64,
+) -> bool {
+    candidate.key != key
+        && matches!(candidate.category, MemoryCategory::Core)
+        && !candidate.pinned
+        && scope.matches(candidate)
+        && candidate.content != content
+        && candidate.score.is_some_and(|score| score > threshold)
+}
+
 /// Check for conflicting memories and mark old ones as superseded.
 /// Returns the list of entry IDs that were superseded.
 pub async fn check_and_resolve_conflicts(
@@ -10,6 +49,7 @@ pub async fn check_and_resolve_conflicts(
     key: &str,
     content: &str,
     category: &MemoryCategory,
+    scope: &ConflictScope,
     threshold: f64,
 ) -> anyhow::Result<Vec<String>> {
     // Only check conflicts for Core memories
@@ -22,16 +62,7 @@ pub async fn check_and_resolve_conflicts(
 
     let mut superseded = Vec::new();
     for candidate in &candidates {
-        if candidate.key == key {
-            continue; // Same key = update, not conflict
-        }
-        if !matches!(candidate.category, MemoryCategory::Core) {
-            continue;
-        }
-        if let Some(score) = candidate.score
-            && score > threshold
-            && candidate.content != content
-        {
+        if supersede_candidate(candidate, key, content, scope, threshold) {
             superseded.push(candidate.id.clone());
         }
     }
@@ -297,5 +328,156 @@ mod tests {
             marker_entry("c", Some("missing")),
         ];
         assert!(superseded_among(&entries).is_empty());
+    }
+
+    /// Build a Core candidate with an explicit context (namespace/tenant),
+    /// similarity score and pin state for `supersede_candidate` tests.
+    fn core_candidate(
+        key: &str,
+        content: &str,
+        namespace: &str,
+        tenant_id: Option<&str>,
+        pinned: bool,
+        score: Option<f64>,
+    ) -> MemoryEntry {
+        MemoryEntry {
+            id: key.into(),
+            key: key.into(),
+            content: content.into(),
+            category: MemoryCategory::Core,
+            timestamp: "now".into(),
+            session_id: None,
+            score,
+            namespace: namespace.into(),
+            importance: Some(0.7),
+            superseded_by: None,
+            kind: None,
+            pinned,
+            tenant_id: tenant_id.map(str::to_string),
+            agent_alias: None,
+            agent_id: None,
+            trust: None,
+            last_feedback_at: None,
+        }
+    }
+
+    #[test]
+    fn conflict_scope_matches_namespace_and_tenant() {
+        let scope = ConflictScope::default();
+        // Default scope = namespace "default", no tenant.
+        assert!(scope.matches(&core_candidate("a", "x", "default", None, false, None)));
+        assert!(!scope.matches(&core_candidate("a", "x", "other", None, false, None)));
+        assert!(!scope.matches(&core_candidate("a", "x", "default", Some("t1"), false, None)));
+
+        let scoped = ConflictScope {
+            namespace: Some("alpha".into()),
+            tenant_id: Some("t1".into()),
+        };
+        assert!(scoped.matches(&core_candidate("a", "x", "alpha", Some("t1"), false, None)));
+        assert!(!scoped.matches(&core_candidate("a", "x", "alpha", Some("t2"), false, None)));
+        assert!(!scoped.matches(&core_candidate("a", "x", "beta", Some("t1"), false, None)));
+    }
+
+    #[test]
+    fn supersede_candidate_suppresses_same_context_above_threshold() {
+        let scope = ConflictScope::default();
+        let candidate = core_candidate(
+            "old",
+            "User prefers Rust for systems work",
+            "default",
+            None,
+            false,
+            Some(0.9),
+        );
+        assert!(supersede_candidate(
+            &candidate,
+            "new",
+            "User now prefers Go for systems work",
+            &scope,
+            0.3,
+        ));
+    }
+
+    #[test]
+    fn supersede_candidate_coexists_across_contexts() {
+        // Contextual Coexistence: different namespace/tenant → not suppressed.
+        let scope = ConflictScope::default();
+        let candidate = core_candidate(
+            "old",
+            "User prefers Rust for systems work",
+            "other_ns",
+            None,
+            false,
+            Some(0.9),
+        );
+        assert!(!supersede_candidate(
+            &candidate,
+            "new",
+            "User now prefers Go for systems work",
+            &scope,
+            0.3,
+        ));
+
+        let other_tenant = core_candidate(
+            "old",
+            "User prefers Rust for systems work",
+            "default",
+            Some("t9"),
+            false,
+            Some(0.9),
+        );
+        assert!(!supersede_candidate(
+            &other_tenant,
+            "new",
+            "User now prefers Go for systems work",
+            &scope,
+            0.3,
+        ));
+    }
+
+    #[test]
+    fn supersede_candidate_respects_hitl_pin() {
+        // Pinned (SOUL/USER/SYSTEM surrogate) → no auto-supersede (HITL).
+        let scope = ConflictScope::default();
+        let candidate = core_candidate(
+            "old",
+            "User prefers Rust for systems work",
+            "default",
+            None,
+            true,
+            Some(0.9),
+        );
+        assert!(!supersede_candidate(
+            &candidate,
+            "new",
+            "User now prefers Go for systems work",
+            &scope,
+            0.3,
+        ));
+    }
+
+    #[test]
+    fn supersede_candidate_ignores_self_identical_and_low_score() {
+        let scope = ConflictScope::default();
+        // Same key → update, not conflict.
+        let same_key = core_candidate("new", "User prefers X", "default", None, false, Some(0.9));
+        assert!(!supersede_candidate(
+            &same_key, "new", "User prefers Y", &scope, 0.3
+        ));
+        // Identical content → no conflict.
+        let identical = core_candidate("old", "User prefers X", "default", None, false, Some(0.9));
+        assert!(!supersede_candidate(
+            &identical, "new", "User prefers X", &scope, 0.3
+        ));
+        // Below threshold → not suppressed.
+        let low = core_candidate("old", "User prefers X", "default", None, false, Some(0.2));
+        assert!(!supersede_candidate(
+            &low, "new", "User prefers Y", &scope, 0.3
+        ));
+        // Missing score → not suppressed.
+        let no_score = core_candidate("old", "User prefers X", "default", None, false, None);
+        assert!(!supersede_candidate(
+            &no_score, "new", "User prefers Y", &scope, 0.3
+        ));
     }
 }

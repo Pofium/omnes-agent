@@ -605,9 +605,17 @@ PPR v2.0 (столп III/VI).
       запрет смешивания векторных пространств, `reindex`-процедура; для форка оценить
       reuse `local_bert.rs` (candle).
 - [ ] **6.3** (72b) vec0-инкремент + SIMD-rescore в векторном слое близнеца.
-- [ ] **6.4** (столп IV) Dream-консолидация: сверить `omnesagent-memory::consolidation/
+- [x] **6.4** (столп IV) Dream-консолидация: сверка `omnesagent-memory::consolidation/
       conflict/decay` с семантикой SUPERSEDES/HITL ob2h; для форка — операционный аналог
       (ночная консолидация agent-scoped памяти), данные не сливаются (ADR-O2).
+      **Частично Done (инкремент «Контекстная суперсессия + HITL»):** в
+      `omnesagent-memory::conflict` добавлены `ConflictScope` (namespace/tenant) +
+      `supersede_candidate` — авто-супersede только в том же контексте (иначе
+      **Contextual Coexistence** — факты сосуществуют) и никогда для `pinned`-записей
+      (аналог HITL для SOUL/USER/SYSTEM). `check_and_resolve_conflicts` принимает
+      `&ConflictScope`; оба call-site в `consolidation.rs` передают
+      `ConflictScope::default()`. Остаток (ночная консолидация, `DreamTool::dream_run`
+      заглушка) — отложен.
 - [x] **6.5** (столп III) Usage-Weighted PPR в `omnesagent-kag/src/graph/pagerank.rs`
       (формула ob2h v2.0, CAP_access, CATD-lite, grace-period). **Done:** добавлен
       `NodeUsage` + `usage_weight` (`min(1 + ln(1 + access_count), CAP 3.0) · e^{-λ·Δt} ·
@@ -759,8 +767,8 @@ lower.starts_with("ob2h__project_scan")
 | Память: trust/feedback-поля | 1.x | `MemoryEntry.trust/last_feedback_at` | паритет |
 | PPR/pagerank, blast radius, repomap | 1.x | `omnesagent-kag::graph` | базовый паритет |
 | Bench-гейт recall/MRR (ADR-13) | 1.7 | `omnesagent-kag::bench` (`GateVerdict`) | паритет |
-| Dream-консолидация SUPERSEDES/HITL | v2.0 | `consolidation/conflict/decay` (проверить семантику) | Ф6.4 |
-| Usage-Weighted PPR | v2.0 | `pagerank.rs` (базовый PPR) | Ф6.5 |
+| Dream-консолидация SUPERSEDES/HITL | v2.0 | `conflict::ConflictScope`/`supersede_candidate` (контекст + HITL); ночной прогон — отложен | Ф6.4 (частично) |
+| Usage-Weighted PPR | v2.0 | `pagerank.rs` (`personalized_pagerank_weighted`/`usage_weight`) | Ф6.5 |
 | Tree-sitter hybrid | v2.0 | — | Ф6.1 |
 | ONNX/FastEmbed + fingerprint | v2.0 | `embedding/local_bert.rs` (candle) | Ф6.2 |
 | Ralph debt-леджер (Ф60.3) | 1.9 | `omnesagent-ralph::debt` (свой) | мост Ф3.1 |
