@@ -559,17 +559,26 @@ PPR v2.0 (столп III/VI).
       через `SqliteMemory` — `recall_scoped`, `get`, `get_for_agent`) пишут в аккумулятор
       доступа; `/api/memory` покрыт транзитивно (читает через `recall`). Вызовы `ob2h__*`
       из оркестратора уже учитывались на стороне ob2h (собственный `touch_access`).
-      **Отложено отдельным пунктом:** `omnesagent-kag::graph::service` (нужна миграция
-      `graph_nodes.access_count`) и `omnesagent-memory::prefetch` (не подключён к боевому
-      пути, `saturation_access` там хардкод).
-- [x] **5.2** Пакетный репортер: аккумулятор `AccessTelemetry` (`omnesagent-memory::telemetry`),
-      flush раз в 10 с (фон через `omnesagent_spawn::spawn!`) или на shutdown (`Drop` для
-      `SqliteMemory`); единый `apply_access_batch` для обоих путей; при ошибке batch
-      возвращается в аккумулятор (`requeue`) — fail-open. **Done:** тесты
-      `telemetry::*` (4), `sqlite::touch_access_is_batched_until_flush`,
+      **Остаток закрыт:** `omnesagent-kag::graph::service` инструментирован (см. ниже) —
+      `search` учитывает прочитанные узлы (включая 1-hop соседей), flush пишет
+      `graph_nodes.access_count`/`last_accessed`. Остаётся отложенным только
+      `omnesagent-memory::prefetch` (не подключён к боевому пути, `saturation_access`
+      там хардкод).
+- [x] **5.2** Пакетный репортер: аккумулятор `AccessTelemetry` перенесён в общий
+      `omnesagent-kag::telemetry` (kag не зависит от memory — единый тип для обоих
+      хранилищ; memory ре-экспортирует через `omnesagent_kag::telemetry`), flush раз в 10 с
+      (фон через `omnesagent_spawn::spawn!` в memory; синхронный bounded-flush в
+      `GraphService`, у kag нет зависимости на `omnesagent-spawn`) или на shutdown (`Drop`
+      для `SqliteMemory`/`GraphService`); `apply_access_batch`/`apply_graph_access_batch` для
+      обоих путей; при ошибке batch возвращается в аккумулятор (`requeue`) — fail-open.
+      **Done:** тесты `telemetry::*` (4), `sqlite::touch_access_is_batched_until_flush`,
       `sqlite::recall_records_access_telemetry_until_flush`, `sqlite::get_records_access_telemetry`,
-      `sqlite::drop_flushes_pending_access_telemetry` — `cargo test -p omnesagent-memory`
-      521+4 зелёные.
+      `sqlite::drop_flushes_pending_access_telemetry` (memory, 518 зелёных),
+      `graph::service::search_records_access_telemetry_until_flush`,
+      `graph::service::search_counts_expanded_neighbors_as_reads`,
+      `schema::migrate_adds_access_columns_to_legacy_graph_nodes`,
+      `schema::graph_nodes_fts_update_trigger_is_scoped_to_indexed_columns`
+      (kag, 67 зелёных).
 - [x] **5.3** Гейт качества: телеметрия не добавляет блокирующих вызовов в turn-цикл.
       **Done:** тест `sqlite::access_telemetry_p99_stays_off_the_store` — p99 касания в
       turn-цикле через `omnesagent_kag::bench::percentile` (накопление, без записи в store);
@@ -577,9 +586,12 @@ PPR v2.0 (столп III/VI).
       целиком вынесена на flush-каденцию (см. 5.2).
 
 **DoD Ф5:** форковая сторона закрыта — `access_count` растёт от реальных обращений форка
-(чтения памяти через `recall`/`get` + `touch_access` из инжекта), без блокирующих записей в
-turn-цикле (пакетный flush + drop-flush). Замер в `ob2h`-графе — отдельным пунктом: ob2h v2.0
-ещё не выпущен, а `graph_nodes` в форке не имеет колонки `access_count`.
+(чтения памяти через `recall`/`get` + `touch_access` из инжекта; чтения графа через
+`graph::service::search`), без блокирующих записей в turn-цикле (пакетный flush + drop-flush).
+`graph_nodes` в форке теперь имеет колонки `access_count`/`last_accessed` (миграция схемы,
+`SCHEMA_VERSION` 9; FTS-триггер UPDATE скоупирован на `label, description`, чтобы flush
+телеметрии не переиндексировал FTS). Замер в `ob2h`-графе — отдельным пунктом (ob2h v2.0
+ещё не выпущен); usage-весовой PPR на базе `access_count` — Ф6.5.
 
 ### Ф6 — Паритет со столпами ob2h v2.0 (перспектива, P3, по мере релизов upstream)
 

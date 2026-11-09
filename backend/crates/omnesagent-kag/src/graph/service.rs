@@ -1,5 +1,6 @@
 //! Сервис графа знаний: дедупликация, поиск и KAG-рассуждение.
 
+use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::embedding::EmbeddingProvider;
+use crate::telemetry::AccessTelemetry;
 use crate::vector::top_k;
 
 pub const REASON_SYSTEM_PROMPT: &str = "\
@@ -86,15 +88,83 @@ pub struct GraphStats {
     pub god_nodes: i64,
 }
 
+/// Apply one accumulated `(node_id, count)` access batch to `graph_nodes` in a
+/// single transaction (ADR-O6). Only the telemetry columns are written, so the
+/// label/description-scoped FTS trigger stays quiet on the access path.
+fn apply_graph_access_batch(
+    conn: &Connection,
+    batch: &[(String, i64)],
+    now: &str,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for (node_id, count) in batch {
+        tx.execute(
+            "UPDATE graph_nodes SET access_count = COALESCE(access_count, 0) + ?1, \
+             last_accessed = ?2 WHERE node_id = ?3",
+            params![count, now, node_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct GraphService {
     conn: Arc<Mutex<Connection>>,
     embedder: Arc<dyn EmbeddingProvider>,
+    /// Batched `graph_nodes.access_count` telemetry (ADR-O6). Shared across
+    /// clones so every read funnels into one flush.
+    access: Arc<AccessTelemetry>,
 }
 
 impl GraphService {
     pub fn new(conn: Arc<Mutex<Connection>>, embedder: Arc<dyn EmbeddingProvider>) -> Self {
-        Self { conn, embedder }
+        Self {
+            conn,
+            embedder,
+            access: Arc::new(AccessTelemetry::new()),
+        }
+    }
+
+    /// Flush accumulated node-access counts to `graph_nodes` in one batch
+    /// (ADR-O6). Returns the number of distinct nodes written. On error the
+    /// drained batch is requeued so the next cadence retries it (fail-open:
+    /// telemetry loss on a transient store error is avoided). Safe to call from
+    /// a shutdown path.
+    pub fn flush_access_telemetry(&self) -> anyhow::Result<usize> {
+        let batch = self.access.drain();
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let applied = batch.len();
+        let conn = self.conn.lock();
+        let now = Local::now().to_rfc3339();
+        match apply_graph_access_batch(&conn, &batch, &now) {
+            Ok(()) => {
+                self.access.mark_flushed();
+                Ok(applied)
+            }
+            Err(error) => {
+                self.access.requeue(batch);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Record read nodes into the batched access accumulator (ADR-O6). The read
+    /// funnel (`search`) calls this so every real fork access grows
+    /// `graph_nodes.access_count` — ob2h's Access Telemetry Parity (pillar
+    /// III/VI). Only a short accumulator mutex is taken; the store write is
+    /// deferred to the flush cadence, so the read path never pays per node.
+    fn note_reads(&self, node_ids: &[String]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        self.access.record_many(node_ids);
+        if self.access.flush_due() {
+            // Fail-open: a failed flush requeues the batch for the next cadence.
+            self.flush_access_telemetry().ok();
+        }
     }
 
     /// Быстрый поиск по графу знаний (лексический + векторный RRF)
@@ -349,6 +419,11 @@ impl GraphService {
             }
         }
 
+        // Access telemetry (ADR-O6): every node surfaced to the caller counts as
+        // read. Recorded into the batch accumulator, not written per node.
+        let read_ids: Vec<String> = nodes_map.values().map(|n| n.node_id.clone()).collect();
+        self.note_reads(&read_ids);
+
         Ok(GraphSearchResult {
             nodes: nodes_map.into_values().collect(),
             edges,
@@ -434,6 +509,21 @@ impl GraphService {
             chunks,
             god_nodes,
         })
+    }
+}
+
+impl Drop for GraphService {
+    /// Best-effort flush of telemetry still pending when the service is
+    /// released — the "on shutdown" arm of ADR-O6. Synchronous and panic-free: a
+    /// failure while unwinding must never abort the process.
+    fn drop(&mut self) {
+        let batch = self.access.drain();
+        if batch.is_empty() {
+            return;
+        }
+        let conn = self.conn.lock();
+        let now = Local::now().to_rfc3339();
+        let _ = apply_graph_access_batch(&conn, &batch, &now);
     }
 }
 
@@ -643,7 +733,61 @@ mod tests {
         assert!(context.contains("нет данных"));
     }
 
+    #[tokio::test]
+    async fn search_records_access_telemetry_until_flush() {
+        let service = seeded_service();
+
+        let hit = service.search("schema.rs", 10, false, None).await.unwrap();
+        assert!(hit.nodes.iter().any(|n| n.label == "schema.rs"));
+
+        // Batched (ADR-O6): the read is accumulated, not written per node yet.
+        assert_eq!(
+            access_count(&service, "aaa"),
+            0,
+            "access_count must not be written before the flush"
+        );
+
+        let written = service.flush_access_telemetry().unwrap();
+        assert!(written >= 1, "flush must persist the batched nodes");
+        assert_eq!(access_count(&service, "aaa"), 1);
+
+        let last: Option<String> = {
+            let conn = service.conn.lock();
+            conn.query_row(
+                "SELECT last_accessed FROM graph_nodes WHERE node_id = 'aaa'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(last.is_some(), "last_accessed must be stamped on flush");
+    }
+
+    #[tokio::test]
+    async fn search_counts_expanded_neighbors_as_reads() {
+        let service = seeded_service();
+
+        let expanded = service.search("schema.rs", 10, true, None).await.unwrap();
+        assert!(labels_of(&expanded).contains(&"runtime loop".to_string()));
+
+        service.flush_access_telemetry().unwrap();
+        assert!(
+            access_count(&service, "bbb") >= 1,
+            "a 1-hop neighbor surfaced to the caller counts as a read"
+        );
+    }
+
     // -- helpers ---------------------------------------------------------
+
+    fn access_count(service: &GraphService, node_id: &str) -> i64 {
+        let conn = service.conn.lock();
+        conn.query_row(
+            "SELECT access_count FROM graph_nodes WHERE node_id = ?1",
+            params![node_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
 
     fn labels_of(result: &GraphSearchResult) -> Vec<String> {
         result.nodes.iter().map(|n| n.label.clone()).collect()

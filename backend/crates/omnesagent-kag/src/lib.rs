@@ -7,6 +7,7 @@ pub mod graph;
 pub mod models;
 pub mod project;
 pub mod schema;
+pub mod telemetry;
 pub mod vector;
 
 pub use ast::{AstCodeExtractor, AstEdge, AstNode, AstScanResult};
@@ -33,4 +34,5 @@ pub use project::{
     ScoredProjectNode,
 };
 pub use schema::{migrate, SCHEMA_VERSION};
+pub use telemetry::{AccessTelemetry, ACCESS_FLUSH_INTERVAL};
 pub use vector::{cosine, deserialize, normalize, rrf_merge, serialize, top_k, RankedItem};

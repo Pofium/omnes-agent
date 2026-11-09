@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, Result, params};
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub const MIGRATION_BASE: &str = r#"
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -123,7 +123,9 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
   origin TEXT NOT NULL DEFAULT '',
   deleted_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  last_accessed TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_label ON graph_nodes (label);
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes (node_type);
@@ -356,6 +358,30 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         let _ = conn.execute("ALTER TABLE memory_relations ADD COLUMN deleted_at TEXT", []);
     }
 
+    // Ф5 (остаток): колонки телеметрии доступа к узлам графа. Добавляются в
+    // существующие базы (созданные до v9) до MIGRATION_BASE, чтобы `CREATE TABLE
+    // IF NOT EXISTS` не перетёр уже живущую таблицу; на свежей базе их создаёт
+    // сам `CREATE TABLE` ниже.
+    let graph_nodes_exists: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='graph_nodes'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if graph_nodes_exists {
+        if !table_has_column(conn, "graph_nodes", "access_count") {
+            let _ = conn.execute(
+                "ALTER TABLE graph_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+        }
+        if !table_has_column(conn, "graph_nodes", "last_accessed") {
+            let _ = conn.execute("ALTER TABLE graph_nodes ADD COLUMN last_accessed TEXT", []);
+        }
+    }
+
     conn.execute_batch(MIGRATION_BASE)?;
 
     let has_memories_fts: bool = conn
@@ -415,17 +441,28 @@ CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_ad AFTER DELETE ON graph_nodes BEGI
   INSERT INTO graph_nodes_fts (graph_nodes_fts, rowid, label, description)
     VALUES ('delete', old.id, old.label, old.description);
 END;
-CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_au AFTER UPDATE ON graph_nodes BEGIN
-  INSERT INTO graph_nodes_fts (graph_nodes_fts, rowid, label, description)
-    VALUES ('delete', old.id, old.label, old.description);
-  INSERT INTO graph_nodes_fts (rowid, label, description)
-    VALUES (new.id, new.label, new.description);
-END;
 INSERT INTO graph_nodes_fts (rowid, label, description)
   SELECT id, label, description FROM graph_nodes;
 "#,
         )?;
     }
+
+    // Ф5 (остаток): триггер UPDATE скоупится на индексируемые колонки. Прежний
+    // `AFTER UPDATE` срабатывал на любом UPDATE `graph_nodes` — в том числе на
+    // пакетном флаше телеметрии доступа (`access_count`/`last_accessed`), зря
+    // переиндексируя FTS. Идемпотентно (drop + create) перекрывает и базы со
+    // старым определением.
+    conn.execute_batch(
+        r#"
+DROP TRIGGER IF EXISTS graph_nodes_fts_au;
+CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_au AFTER UPDATE OF label, description ON graph_nodes BEGIN
+  INSERT INTO graph_nodes_fts (graph_nodes_fts, rowid, label, description)
+    VALUES ('delete', old.id, old.label, old.description);
+  INSERT INTO graph_nodes_fts (rowid, label, description)
+    VALUES (new.id, new.label, new.description);
+END;
+"#,
+    )?;
 
     conn.execute(
         "INSERT OR REPLACE INTO kv (key, value) VALUES ('schema_version', ?1)",
@@ -606,6 +643,68 @@ mod tests {
         assert_eq!(origin, "");
         assert_eq!(namespace, "default");
         assert_eq!(access_count, 0);
+    }
+
+    #[test]
+    fn migrate_adds_access_columns_to_legacy_graph_nodes() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-v9 graph_nodes: everything except the access-telemetry columns.
+        conn.execute_batch(
+            "CREATE TABLE graph_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT UNIQUE NOT NULL,
+                label TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                description TEXT,
+                val INTEGER NOT NULL DEFAULT 1,
+                embedding BLOB,
+                project_id TEXT,
+                file_path TEXT,
+                line_start INTEGER,
+                line_end INTEGER,
+                provenance TEXT NOT NULL DEFAULT 'manual',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                is_god_node INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT '',
+                deleted_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO graph_nodes (node_id, label, node_type, created_at, updated_at)
+            VALUES ('n1', 'legacy node', 'File', 't0', 't0');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn), SCHEMA_VERSION);
+        assert!(table_has_column(&conn, "graph_nodes", "access_count"));
+        assert!(table_has_column(&conn, "graph_nodes", "last_accessed"));
+        let (label, access_count): (String, i64) = conn
+            .query_row(
+                "SELECT label, access_count FROM graph_nodes WHERE node_id = 'n1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(label, "legacy node");
+        assert_eq!(access_count, 0, "existing rows default to zero accesses");
+    }
+
+    #[test]
+    fn graph_nodes_fts_update_trigger_is_scoped_to_indexed_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='graph_nodes_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("UPDATE OF label, description"),
+            "access-only updates must not churn the FTS index: {sql}"
+        );
     }
 
     #[test]

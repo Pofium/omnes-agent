@@ -1,11 +1,12 @@
-//! Batched access telemetry for the SQLite memory backend (ob2h pillar III/VI
-//! parity — Access Telemetry Parity, ADR-O6).
+//! Batched access telemetry shared by the memory and knowledge-graph stores
+//! (ob2h pillar III/VI parity — Access Telemetry Parity, ADR-O6).
 //!
-//! Every touch of a memory record (`Memory::touch_access`) used to run its own
-//! `UPDATE memories …` against the shared `Mutex<Connection>`. On a busy turn
-//! loop that is a per-turn blocking write. Here touches are accumulated in
-//! memory and applied to the store in one batch every [`ACCESS_FLUSH_INTERVAL`]
-//! (or on shutdown), so the agent turn loop never pays for an individual write.
+//! Every real read of a stored record (`memories` via `omnesagent-memory`,
+//! `graph_nodes` via [`crate::graph::GraphService`]) used to run its own
+//! `UPDATE …` against the shared `Mutex<Connection>`. On a busy turn loop that
+//! is a per-read blocking write. Here reads are accumulated in memory and
+//! applied to the store in one batch every [`ACCESS_FLUSH_INTERVAL`] (or on
+//! shutdown), so the agent turn loop never pays for an individual write.
 //!
 //! Flag-free accumulator: [`AccessTelemetry::try_begin_flush`] hands the flush
 //! right to exactly one caller per cadence, so background flushes never overlap.

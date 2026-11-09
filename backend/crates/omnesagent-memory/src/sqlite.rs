@@ -4,7 +4,7 @@ use super::traits::{
     is_recent_recall_query,
 };
 use super::vector;
-use crate::telemetry::AccessTelemetry;
+use omnesagent_kag::telemetry::AccessTelemetry;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
