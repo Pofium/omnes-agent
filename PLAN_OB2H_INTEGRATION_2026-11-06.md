@@ -608,8 +608,15 @@ PPR v2.0 (столп III/VI).
 - [ ] **6.4** (столп IV) Dream-консолидация: сверить `omnesagent-memory::consolidation/
       conflict/decay` с семантикой SUPERSEDES/HITL ob2h; для форка — операционный аналог
       (ночная консолидация agent-scoped памяти), данные не сливаются (ADR-O2).
-- [ ] **6.5** (столп III) Usage-Weighted PPR в `omnesagent-kag/src/graph/pagerank.rs`
-      (формула ob2h v2.0, CAP_access, CATD-lite, grace-period) — после Ф5.
+- [x] **6.5** (столп III) Usage-Weighted PPR в `omnesagent-kag/src/graph/pagerank.rs`
+      (формула ob2h v2.0, CAP_access, CATD-lite, grace-period). **Done:** добавлен
+      `NodeUsage` + `usage_weight` (`min(1 + ln(1 + access_count), CAP 3.0) · e^{-λ·Δt} ·
+      (0.1 + 0.9·trust)`, `λ = ln2 / PPR_RECENCY_HALF_LIFE_SECS`, grace-period
+      `PPR_GRACE_ACCESSES = 4`); `personalized_pagerank_weighted` взвешивает входящие рёбра
+      узла (`w · node_weights[to]`) с degree-normalization по взвешенной сумме (hub-защита
+      сохранена); базовый `personalized_pagerank` делегирует с пустыми весами (bit-identical).
+      Тесты: `usage_weight_*` (grace/cap/recency/trust), `weighted_pagerank_*` — 6 новых,
+      kag 73 зелёных.
 - [ ] **6.6** (Laya/System One) Переиспользовать `LocalMiniLLM`-опыт ob2h (Qwen3-0.6B,
       candle 0.9) в `omnesagent-s1` (`laya.rs`): локальный инференс Choice/Score/Noul
       421M ModernBERT-модели; связь с утверждённым ТЗ System One. Отдельный трек — здесь

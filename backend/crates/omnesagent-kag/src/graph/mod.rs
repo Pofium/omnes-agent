@@ -19,8 +19,9 @@ pub use callpath::{
 };
 pub use communities::{detect_zones, format_zones, mentioned_symbols, Zone, ZonesReport};
 pub use pagerank::{
-    normalize_entity, parse_ppr_weights, personalized_pagerank, weight_for, PprEdge, PprGraph,
-    PprWeights, DEFAULT_PPR_WEIGHTS, PPR_UNKNOWN_WEIGHT,
+    normalize_entity, parse_ppr_weights, personalized_pagerank, personalized_pagerank_weighted,
+    usage_weight, weight_for, NodeUsage, PprEdge, PprGraph, PprWeights, DEFAULT_PPR_WEIGHTS,
+    PPR_ACCESS_CAP, PPR_GRACE_ACCESSES, PPR_RECENCY_HALF_LIFE_SECS, PPR_UNKNOWN_WEIGHT,
 };
 pub use repomap::build_repo_map;
 pub use service::{

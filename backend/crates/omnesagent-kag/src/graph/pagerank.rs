@@ -12,6 +12,9 @@
 //!   hub-защита, иначе PPR «залипает» на записи-хабе со 100+ рёбрами;
 //! * висячие узлы (без исходящих рёбер) не теряют массу — она возвращается в
 //!   персонализацию (teleport), как в стандартном PPR;
+//! * **usage-weighting** (столп III ob2h v2.0, [`personalized_pagerank_weighted`]):
+//!   входящие рёбра узла взвешиваются [`usage_weight`] (`access_count`, recency-decay,
+//!   trust, grace-period) — фундамент usage-weighted выдачи;
 //! * никаких новых зависимостей — только `std` и `serde_json` для разбора весов.
 
 use std::collections::HashMap;
@@ -32,6 +35,19 @@ pub const DEFAULT_PPR_WEIGHTS: &str =
 
 /// Вес ребра неизвестного типа.
 pub const PPR_UNKNOWN_WEIGHT: f64 = 0.5;
+
+/// Usage-Weighted PPR (столп III ob2h v2.0): верхняя граница access-boost,
+/// `min(1 + ln(1 + access_count), CAP)`.
+pub const PPR_ACCESS_CAP: f64 = 3.0;
+
+/// Usage-Weighted PPR: grace-period — пока обращений меньше этого числа, узел
+/// считается «нейтральным» (множитель `1.0`), чтобы свежие/редко читаемые записи
+/// не искажали ранжирование.
+pub const PPR_GRACE_ACCESSES: i64 = 4;
+
+/// Usage-Weighted PPR / CATD-lite: за [`PPR_RECENCY_HALF_LIFE_SECS`] recency-множитель
+/// `e^{-λ·Δt}` падает вдвое (≈ месяц — типовая давность знания в личном агенте).
+pub const PPR_RECENCY_HALF_LIFE_SECS: f64 = 30.0 * 86_400.0;
 
 /// Веса рёбер по типу: `kind → weight`.
 pub type PprWeights = HashMap<String, f64>;
@@ -90,8 +106,45 @@ impl PprGraph {
     }
 }
 
-/// Персонализированный PageRank. Возвращает `(узел, score)`, отсортированные по
-/// убыванию score (узлы с нулевой массой не попадают в результат).
+/// Статистика обращений к узлу для Usage-Weighted PPR (столп III ob2h v2.0).
+///
+/// Значения берутся из хранилища-источника: граф — `graph_nodes.access_count`/
+/// `last_accessed`/`confidence`; память — `memories.access_count`/`last_accessed`/
+/// `trust`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeUsage {
+    /// Число реальных обращений к узлу.
+    pub access_count: i64,
+    /// Возраст последнего обращения в секундах (`None` — обращений не было).
+    pub since_last_access_secs: Option<f64>,
+    /// Доверие `0..=1` (память — `trust`; граф — `confidence`).
+    pub trust: f64,
+}
+
+/// Множитель Usage-Weighted PPR (столп III ob2h v2.0):
+/// `min(1 + ln(1 + access_count), CAP) · e^{-λ·Δt} · (0.1 + 0.9·trust)`, где
+/// `λ = ln 2 / PPR_RECENCY_HALF_LIFE_SECS` (CATD-lite — экспоненциальный recency-decay).
+///
+/// Grace-period: пока `access_count < `[`PPR_GRACE_ACCESSES`], узел считается
+/// нейтральным (`1.0`) — свежие и редко читаемые записи не искажают ранжирование.
+pub fn usage_weight(u: NodeUsage) -> f64 {
+    if u.access_count < PPR_GRACE_ACCESSES {
+        return 1.0;
+    }
+    let accesses = u.access_count.max(0) as f64;
+    let access_factor = (1.0 + (1.0 + accesses).ln()).min(PPR_ACCESS_CAP);
+    let recency_factor = match u.since_last_access_secs {
+        Some(dt) if dt.is_finite() && dt > 0.0 => {
+            (-std::f64::consts::LN_2 * dt / PPR_RECENCY_HALF_LIFE_SECS).exp()
+        }
+        _ => 1.0,
+    };
+    let trust = u.trust.clamp(0.0, 1.0);
+    access_factor * recency_factor * (0.1 + 0.9 * trust)
+}
+
+/// Персонализированный PageRank (без usage-весов). Возвращает `(узел, score)`,
+/// отсортированные по убыванию score (узлы с нулевой массой не попадают в результат).
 ///
 /// * `seeds` — персонализация: пары `(узел, вес)`, нормализуются в распределение.
 /// * `damping` — клампится в [`DAMPING_MIN`]..=[`DAMPING_MAX`].
@@ -100,6 +153,24 @@ impl PprGraph {
 pub fn personalized_pagerank(
     graph: &PprGraph,
     seeds: &[(usize, f64)],
+    damping: f64,
+    max_iter: usize,
+    tol: f64,
+) -> Vec<(usize, f64)> {
+    personalized_pagerank_weighted(graph, seeds, &[], damping, max_iter, tol)
+}
+
+/// Usage-Weighted Personalized PageRank (столп III ob2h v2.0).
+///
+/// `node_weights[v]` — множитель входящих в узел `v` рёбер (обычно [`usage_weight`]);
+/// пустой срез — эквивалент [`personalized_pagerank`]. Эффективный вес ребра —
+/// `w · node_weights[to]`, degree-normalization считается по взвешенной сумме
+/// исходящих рёбер: часто читаемые узлы получают больше массы, но hub-защита не
+/// даёт выдача «залипнуть». Невалидные множители (не-конечные/неположительные) → `1.0`.
+pub fn personalized_pagerank_weighted(
+    graph: &PprGraph,
+    seeds: &[(usize, f64)],
+    node_weights: &[f64],
     damping: f64,
     max_iter: usize,
     tol: f64,
@@ -125,6 +196,21 @@ pub fn personalized_pagerank(
         *s /= total;
     }
 
+    // Usage-множитель узла (1.0 — если не задан или невалиден).
+    let node_factor = |v: usize| -> f64 {
+        node_weights
+            .get(v)
+            .copied()
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or(1.0)
+    };
+    // Взвешенная сумма исходящих рёбер — знаменатель degree-normalization.
+    // При пустых `node_weights` совпадает с `PprGraph::out_weight`.
+    let mut wdeg = vec![0.0f64; n];
+    for (u, deg) in wdeg.iter_mut().enumerate() {
+        *deg = graph.out[u].iter().map(|&(v, w)| w * node_factor(v)).sum();
+    }
+
     let d = damping.clamp(DAMPING_MIN, DAMPING_MAX);
     let iters = max_iter.clamp(1, MAX_ITER);
     let tol = if tol > 0.0 { tol } else { DEFAULT_TOL };
@@ -137,7 +223,7 @@ pub fn personalized_pagerank(
             if pu == 0.0 {
                 continue;
             }
-            let deg = graph.out_weight[u];
+            let deg = wdeg[u];
             if deg <= 0.0 {
                 // Висячий узел: масса уходит в персонализацию (как в стандартном PPR).
                 dangling += pu;
@@ -146,7 +232,7 @@ pub fn personalized_pagerank(
             // degree-normalization: hub со 100+ рёбрами отдаёт каждому соседу долю,
             // а не полную массу — иначе выдача «залипает» на хабе.
             for &(v, w) in &graph.out[u] {
-                next[v] += d * pu * (w / deg);
+                next[v] += d * pu * (w * node_factor(v) / deg);
             }
         }
         let teleport = (1.0 - d) + d * dangling;
@@ -374,5 +460,95 @@ mod tests {
         assert_eq!(normalize_entity("Ёлка"), "елка");
         assert_eq!(normalize_entity("ООО «Ромашка»"), "ооо ромашка");
         assert_eq!(normalize_entity("кое-что"), "коечто");
+    }
+
+    fn usage(access_count: i64, since: Option<f64>, trust: f64) -> NodeUsage {
+        NodeUsage {
+            access_count,
+            since_last_access_secs: since,
+            trust,
+        }
+    }
+
+    #[test]
+    fn usage_weight_applies_grace_period() {
+        // До grace-порога множитель нейтрален, даже при высоком trust.
+        assert!((usage_weight(usage(0, None, 1.0)) - 1.0).abs() < 1e-12);
+        assert!((usage_weight(usage(3, Some(1.0), 1.0)) - 1.0).abs() < 1e-12);
+        // На пороге и выше — буст включается.
+        assert!(usage_weight(usage(PPR_GRACE_ACCESSES, None, 1.0)) > 1.0);
+    }
+
+    #[test]
+    fn usage_weight_grows_with_access_and_caps() {
+        let at_grace = usage_weight(usage(4, None, 1.0));
+        let expected = 1.0 + 5.0f64.ln();
+        assert!((at_grace - expected).abs() < 1e-9, "got {at_grace}");
+        // Дальше растёт, но не превышает cap.
+        assert!(usage_weight(usage(10, None, 1.0)) > at_grace);
+        assert!((usage_weight(usage(1000, None, 1.0)) - PPR_ACCESS_CAP).abs() < 1e-12);
+    }
+
+    #[test]
+    fn usage_weight_decays_with_recency() {
+        let fresh = usage_weight(usage(10, Some(0.0), 1.0));
+        let half = usage_weight(usage(10, Some(PPR_RECENCY_HALF_LIFE_SECS), 1.0));
+        let late = usage_weight(usage(10, Some(2.0 * PPR_RECENCY_HALF_LIFE_SECS), 1.0));
+        assert!(fresh > half && half > late, "{fresh} {half} {late}");
+        assert!((half / fresh - 0.5).abs() < 1e-9, "half-life должен давать 1/2");
+        // Отсутствие данных о давности — нейтрально (без штрафа).
+        assert!((usage_weight(usage(10, None, 1.0)) - fresh).abs() < 1e-12);
+    }
+
+    #[test]
+    fn usage_weight_scales_with_trust() {
+        let high = usage_weight(usage(10, None, 1.0));
+        let mid = usage_weight(usage(10, None, 0.5));
+        let low = usage_weight(usage(10, None, 0.0));
+        assert!(high > mid && mid > low, "{high} {mid} {low}");
+        // trust=1.0 → множитель 1.0, trust=0.0 → 0.1.
+        assert!((low / high - 0.1).abs() < 1e-9);
+        // trust вне [0,1] клампится, а не искажает.
+        assert!((usage_weight(usage(10, None, 5.0)) - high).abs() < 1e-12);
+    }
+
+    #[test]
+    fn weighted_pagerank_with_empty_weights_matches_base() {
+        let g = PprGraph::new(3, &[edge(0, 1, 1.0), edge(1, 2, 1.0)]);
+        let base = personalized_pagerank(&g, &[(0, 1.0)], 0.85, MAX_ITER, DEFAULT_TOL);
+        let weighted =
+            personalized_pagerank_weighted(&g, &[(0, 1.0)], &[], 0.85, MAX_ITER, DEFAULT_TOL);
+        assert_eq!(base, weighted);
+    }
+
+    #[test]
+    fn weighted_pagerank_boosts_hot_target() {
+        // 0=seed, 1=cold A, 2=hot B (равные базовые веса рёбер).
+        let g = PprGraph::new(3, &[edge(0, 1, 1.0), edge(0, 2, 1.0)]);
+        let score = |r: &[(usize, f64)], n: usize| {
+            r.iter()
+                .find(|(i, _)| *i == n)
+                .map(|(_, s)| *s)
+                .unwrap_or(0.0)
+        };
+
+        let base = personalized_pagerank(&g, &[(0, 1.0)], 0.85, MAX_ITER, DEFAULT_TOL);
+        assert!(
+            (score(&base, 1) - score(&base, 2)).abs() < 1e-9,
+            "без usage-весов симметричные узлы равны"
+        );
+
+        let weighted = personalized_pagerank_weighted(
+            &g,
+            &[(0, 1.0)],
+            &[1.0, 1.0, 3.0],
+            0.85,
+            MAX_ITER,
+            DEFAULT_TOL,
+        );
+        assert!(
+            score(&weighted, 2) > score(&weighted, 1),
+            "hot-узел B обязан обойти cold-узел A: {weighted:?}"
+        );
     }
 }
