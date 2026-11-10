@@ -662,10 +662,21 @@ PPR v2.0 (столп III/VI).
       сохранена); базовый `personalized_pagerank` делегирует с пустыми весами (bit-identical).
       Тесты: `usage_weight_*` (grace/cap/recency/trust), `weighted_pagerank_*` — 6 новых,
       kag 73 зелёных.
-- [ ] **6.6** (Laya/System One) Переиспользовать `LocalMiniLLM`-опыт ob2h (Qwen3-0.6B,
+- [x] **6.6** (Laya/System One) Переиспользовать `LocalMiniLLM`-опыт ob2h (Qwen3-0.6B,
       candle 0.9) в `omnesagent-s1` (`laya.rs`): локальный инференс Choice/Score/Noul
       421M ModernBERT-модели; связь с утверждённым ТЗ System One. Отдельный трек — здесь
       только фиксация переиспользования стека candle.
+      **Done (фиксация переиспользования стека, без нового кода):** `omnesagent-s1` —
+      равноправный член воркспейса (фича `candle` включена по умолчанию) уже содержит
+      провайдер локального инференса Laya: `laya.rs` → `CandleLayaProvider` на `ModernBert`
+      (`candle-transformers`) + `tokenizers` + `hf-hub`, вопросы Choice/Score/Noul с
+      бюджетом 150 мс через `spawn_blocking` (решающая голова — эвристическая, псевдо-логиты
+      из pooled-эмбеддинга; полноценная обученная Laya-голова — в отдельном треке). Стек
+      candle **тот же**, что и в близнеце (`omnesagent-kag/src/embedding/local_bert.rs`):
+      `candle-core`/`candle-nn`/`candle-transformers` 0.8, `tokenizers` 0.21, `hf-hub` 0.4 —
+      отдельного стека/форка нет. Трек об2h «System One / Qwen3-0.6B LocalMiniLLM»
+      (план v1.6 ob2h) развивается вне этой спеки. Проверено:
+      `cargo check -p omnesagent-s1 --features candle` — чисто (13.9 с).
 
 **DoD Ф6 (по каждому пункту):** golden-перегонка Ф1 проходит на новых алгоритмах;
 паритет-матрица (Приложение B) обновляется после каждого релиза ob2h.
@@ -813,6 +824,7 @@ lower.starts_with("ob2h__project_scan")
 | Tree-sitter hybrid | v2.0 | `ast/treesitter.rs` под фичей `treesitter` (грамматики из `inkjet`) | Ф6.1 (частично) |
 | vec0 KNN + SIMD-rescore | v2.0 | `vector/vec0.rs` + `vector/simd.rs` под фичей `vec0` (vendored `sqlite-vec`) | Ф6.3 |
 | ONNX/FastEmbed + fingerprint | v2.0 | `embedding/fingerprint.rs` (`EmbeddingFingerprint`/`check`/`reindex`) на candle-бэкенде; ONNX не принят | Ф6.2 |
+| System One / Laya (Choice/Score/Noul, локальный инференс) | 1.6 | `omnesagent-s1` (`laya.rs`, candle + ModernBERT) | Ф6.6 (стек candle переиспользован) |
 | Ralph debt-леджер (Ф60.3) | 1.9 | `omnesagent-ralph::debt` (свой) | мост Ф3.1 |
 | Access Telemetry Parity | v2.0 | — | Ф5 |
 | Secrets Vault (`secrets_*`) | 1.9 | config-secrets форка | мост Ф4 (ADR-O5) |
