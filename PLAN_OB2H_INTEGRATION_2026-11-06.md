@@ -598,9 +598,19 @@ PPR v2.0 (столп III/VI).
 Привязать к фазам `PLAN_v2.0.md`; каждый пункт — отдельным решением после выхода
 соответствующего релиза ob2h:
 
-- [ ] **6.1** (Ф70–71 ob2h) tree-sitter в `omnesagent-kag` под фичей `treesitter`:
+- [x] **6.1** (Ф70–71 ob2h) tree-sitter в `omnesagent-kag` под фичей `treesitter`:
       Rust/TS/JS/Py/Go, provenance-поля рёбер, fallback на regex при >10% `ERROR`-узлов,
-      бюджет грамматик <= 8 МБ.
+      бюджет грамматик <= 8 МБ. **Done (скелет + извлечение):** фича `treesitter`
+      (`src/ast/treesitter.rs`); грамматики переиспользуются из `inkjet` (одна версия
+      tree-sitter в воркспейсе, новых crate-грамматик нет — бюджет удержан без
+      отдельных грамматик). `TsLanguage::from_path` покрывает rs/py/ts/tsx/js/jsx/go;
+      `extract` эмитит определения (`Function`/`Struct`/`Class`/`Interface`/`Trait`/
+      `Module`) и `IMPORTS`-рёбра с провенансом `SYNTAX`/`RESOLVED`/`HEURISTIC`
+      (для нового пути — `SYNTAX`; legacy regex оставлен на `EXTRACTED`/`INFERRED`
+      без ломания golden-паритета). Fallback: `missing_error_ratio > 10%` →
+      `extract` возвращает `None`, `parse_file` отступает на regex. Хук в `parse_file`
+      под `#[cfg(feature = "treesitter")]`; дефолтная сборка (и golden-тесты) не затронуты.
+      Остаток (CALLS/type-resolve через tree-sitter, расширение языков) — отложен.
 - [ ] **6.2** (Ф72) ONNX/FastEmbed + `embedding_fingerprint` в `omnesagent-kag/src/embedding/`:
       запрет смешивания векторных пространств, `reindex`-процедура; для форка оценить
       reuse `local_bert.rs` (candle).
@@ -769,7 +779,7 @@ lower.starts_with("ob2h__project_scan")
 | Bench-гейт recall/MRR (ADR-13) | 1.7 | `omnesagent-kag::bench` (`GateVerdict`) | паритет |
 | Dream-консолидация SUPERSEDES/HITL | v2.0 | `conflict::ConflictScope`/`supersede_candidate` (контекст + HITL); ночной прогон — отложен | Ф6.4 (частично) |
 | Usage-Weighted PPR | v2.0 | `pagerank.rs` (`personalized_pagerank_weighted`/`usage_weight`) | Ф6.5 |
-| Tree-sitter hybrid | v2.0 | — | Ф6.1 |
+| Tree-sitter hybrid | v2.0 | `ast/treesitter.rs` под фичей `treesitter` (грамматики из `inkjet`) | Ф6.1 (частично) |
 | ONNX/FastEmbed + fingerprint | v2.0 | `embedding/local_bert.rs` (candle) | Ф6.2 |
 | Ralph debt-леджер (Ф60.3) | 1.9 | `omnesagent-ralph::debt` (свой) | мост Ф3.1 |
 | Access Telemetry Parity | v2.0 | — | Ф5 |

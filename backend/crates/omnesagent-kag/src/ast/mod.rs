@@ -7,6 +7,8 @@ pub mod iac;
 pub mod languages;
 pub mod manifests;
 pub mod schemas;
+#[cfg(feature = "treesitter")]
+pub mod treesitter;
 pub mod web;
 
 use regex::Regex;
@@ -574,6 +576,17 @@ impl AstCodeExtractor {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_lowercase();
+
+        // Ф6.1: tree-sitter гибрид — пробуем разобрать целевые языки; при плохом
+        // качестве разбора (>10% ERROR-узлов) отступаем на regex-экстрактор ниже.
+        #[cfg(feature = "treesitter")]
+        if treesitter::supports(rel_path) {
+            if let Some(extraction) = treesitter::extract(rel_path, content) {
+                out.nodes.extend(extraction.nodes);
+                out.edges.extend(extraction.edges);
+                return;
+            }
+        }
 
         match ext.as_str() {
             "rs" => self.parse_rust(rel_path, &file_node_id, content, out),

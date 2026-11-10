@@ -33,9 +33,19 @@ candle-transformers = { version = "0.8", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
 hf-hub = { version = "0.4", optional = true }
 
+# Ф6.1 (ob2h v2.0): tree-sitter hybrid AST. Grammars are reused from `inkjet`
+# (already vendored for `omnesagent-editor`), which keeps a single tree-sitter
+# version workspace-wide and avoids pulling extra grammar crates.
+tree-sitter = { version = "0.23", optional = true }
+inkjet = { version = "0.11", default-features = false, features = [
+    "language-rust", "language-python", "language-typescript",
+    "language-tsx", "language-javascript", "language-jsx", "language-go",
+], optional = true }
+
 [features]
 default = ["candle"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+treesitter = ["dep:tree-sitter", "dep:inkjet"]
 
 [dev-dependencies]
 tempfile = "3.26"

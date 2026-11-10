@@ -7087,6 +7087,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "ignore",
+ "inkjet",
  "lru 0.18.2",
  "notify",
  "notify-debouncer-mini",
@@ -7102,6 +7103,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "tree-sitter",
 ]
 
 [[package]]
