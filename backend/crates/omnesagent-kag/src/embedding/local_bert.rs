@@ -28,6 +28,8 @@ pub struct LocalBertEmbedding {
     tokenizer: Tokenizer,
     device: Device,
     dim: usize,
+    /// Ф6.2: HF repo id загруженной модели — часть отпечатка пространства.
+    model_id: String,
 }
 
 #[cfg(feature = "candle")]
@@ -66,6 +68,7 @@ impl LocalBertEmbedding {
             tokenizer,
             device,
             dim,
+            model_id: repo_id.to_string(),
         })
     }
 }
@@ -112,5 +115,9 @@ impl EmbeddingProvider for LocalBertEmbedding {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
     }
 }

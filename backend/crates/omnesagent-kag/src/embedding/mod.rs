@@ -1,6 +1,7 @@
 //! Провайдеры векторных представлений (Embeddings).
 
 pub mod fake;
+pub mod fingerprint;
 #[cfg(feature = "candle")]
 pub mod local_bert;
 
@@ -22,6 +23,13 @@ pub trait EmbeddingProvider: Send + Sync {
 
     /// Размерность вектора.
     fn dim(&self) -> usize;
+
+    /// Ф6.2: стабильный идентификатор модели — часть отпечатка векторного
+    /// пространства. Провайдеры, сравнивающие эмбеддинги между собой, обязаны
+    /// возвращать его, чтобы исключить смешивание разных пространств.
+    fn model_id(&self) -> &str {
+        "unknown"
+    }
 }
 
 /// Ф62.2: нормализация текста в ключ кэша (trim + lower-case).
@@ -122,6 +130,10 @@ impl EmbeddingProvider for CachedEmbeddingProvider {
 
     fn dim(&self) -> usize {
         self.inner.dim()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
     }
 }
 

@@ -103,25 +103,76 @@ impl ProjectService {
         Ok(crate::graph::GraphAnalytics::generate_project_report(&conn, project_id)?)
     }
 
-    /// Векторизация узлов графа проекта без эмбеддингов
+    /// Векторизация узлов графа проекта без эмбеддингов.
+    ///
+    /// Ф6.2: при несовпадении отпечатка векторного пространства (смена модели)
+    /// запись запрещена — возвращается ошибка, требуется
+    /// [`Self::reindex_project_embeddings`].
     pub async fn embed_unembedded_nodes(&self, project_id: &str) -> anyhow::Result<usize> {
+        self.embed_project_nodes(project_id, true).await
+    }
+
+    /// Ф6.2: полная переиндексация эмбеддингов узлов проекта — пересчитывает
+    /// векторы всех живых узлов активным провайдером и фиксирует его отпечаток.
+    /// Применяется после смены модели, когда [`Self::embed_unembedded_nodes`]
+    /// отклоняет запись из-за несовпадения пространства.
+    pub async fn reindex_project_embeddings(&self, project_id: &str) -> anyhow::Result<usize> {
+        self.embed_project_nodes(project_id, false).await
+    }
+
+    /// Общая реализация векторизации узлов проекта.
+    /// `only_missing = true` — только узлы без эмбеддинга (обычный путь);
+    /// `false` — переиндексация всех живых узлов (reindex).
+    async fn embed_project_nodes(
+        &self,
+        project_id: &str,
+        only_missing: bool,
+    ) -> anyhow::Result<usize> {
         let embedder = match &self.embedder {
             Some(e) => e.clone(),
             None => return Ok(0),
         };
 
+        // Ф6.2: отпечаток активного пространства. Обычная запись запрещена при
+        // смене модели (Mismatch) — это исключает смешивание пространств;
+        // переиндексация его допускает и перезапишет отпечаток.
+        let current = crate::embedding::fingerprint::EmbeddingFingerprint::of(embedder.as_ref());
+        if only_missing {
+            let status = {
+                let conn = self.conn.lock();
+                crate::embedding::fingerprint::check(&conn, &current)?
+            };
+            if let crate::embedding::fingerprint::FingerprintStatus::Mismatch { stored } = &status {
+                anyhow::bail!(
+                    "смена модели эмбеддингов: сохранён отпечаток {} ({}), активен {} ({}); \
+                     выполните reindex_project_embeddings",
+                    stored.key(),
+                    stored.model_id,
+                    current.key(),
+                    current.model_id
+                );
+            }
+        }
+
         let nodes: Vec<RawNodeTuple> = {
             let conn = self.conn.lock();
-            let mut stmt = conn.prepare(
+            // Обычный путь ограничен батчем 500 (повторные вызовы дочерпывают);
+            // переиндексация охватывает все живые узлы проекта.
+            let (missing_clause, limit_clause) = if only_missing {
+                ("AND embedding IS NULL", "LIMIT 500")
+            } else {
+                ("", "")
+            };
+            let mut stmt = conn.prepare(&format!(
                 r#"
                 SELECT id, node_type, label, file_path, description
                 FROM graph_nodes
                 WHERE project_id = ?1
-                  AND embedding IS NULL
+                  {missing_clause}
                   AND (deleted_at IS NULL OR deleted_at = '')
-                LIMIT 500
+                {limit_clause}
                 "#,
-            )?;
+            ))?;
             let rows = stmt.query_map(params![project_id], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -174,6 +225,12 @@ impl ProjectService {
                 tx.commit()?;
             }
             total_embedded += chunk.len();
+        }
+
+        // Ф6.2: фиксируем отпечаток пространства после успешной записи.
+        {
+            let conn = self.conn.lock();
+            crate::embedding::fingerprint::store(&conn, &current)?;
         }
 
         if total_embedded > 0 {
@@ -1266,4 +1323,89 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
         }
 
     (name, tech_stack, description)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedding::FakeEmbedding;
+    use crate::embedding::fingerprint::{self, EmbeddingFingerprint};
+    use crate::schema::migrate;
+
+    fn setup() -> ProjectService {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        migrate(&conn.lock()).unwrap();
+        let svc = ProjectService::new_with_embedder(conn, Some(Arc::new(FakeEmbedding::new(384))));
+        svc.register_project("p1", "Proj", "C:/tmp/proj", None, None)
+            .unwrap();
+        svc
+    }
+
+    fn insert_node(svc: &ProjectService, node_id: &str) {
+        let conn = svc.conn.lock();
+        conn.execute(
+            "INSERT INTO graph_nodes (node_id, label, node_type, project_id, created_at, updated_at) \
+             VALUES (?1, ?1, 'Function', 'p1', 't', 't')",
+            params![node_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn embed_tracks_fingerprint_and_reindex_recovers_from_model_change() {
+        let svc = setup();
+        insert_node(&svc, "fn:a");
+
+        // Первый прогон: отпечатка нет -> запись проходит и фиксируется.
+        assert_eq!(svc.embed_unembedded_nodes("p1").await.unwrap(), 1);
+        let stored = {
+            let conn = svc.conn.lock();
+            fingerprint::load(&conn).expect("fingerprint stored after embed")
+        };
+        assert_eq!(stored, EmbeddingFingerprint::new("fake", 384));
+
+        // Смена модели (другой отпечаток): обычная запись запрещена — смешивание
+        // пространств не допускается.
+        {
+            let conn = svc.conn.lock();
+            fingerprint::store(&conn, &EmbeddingFingerprint::new("other-model", 384)).unwrap();
+        }
+        let err = svc
+            .embed_unembedded_nodes("p1")
+            .await
+            .expect_err("mismatch must forbid writes");
+        assert!(
+            err.to_string().contains("reindex_project_embeddings"),
+            "error must point to the reindex procedure: {err}"
+        );
+
+        // Переиндексация разрешает и перезаписывает отпечаток.
+        assert_eq!(
+            svc.reindex_project_embeddings("p1").await.unwrap(),
+            1,
+            "reindex re-embeds all live nodes"
+        );
+        let conn = svc.conn.lock();
+        assert_eq!(
+            fingerprint::load(&conn),
+            Some(EmbeddingFingerprint::new("fake", 384))
+        );
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM graph_nodes WHERE node_id = 'fn:a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(blob.is_some_and(|b| !b.is_empty()), "node re-embedded");
+    }
+
+    #[tokio::test]
+    async fn embed_without_embedder_is_a_noop() {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        migrate(&conn.lock()).unwrap();
+        let svc = ProjectService::new(conn);
+        assert_eq!(svc.embed_unembedded_nodes("p1").await.unwrap(), 0);
+        assert_eq!(svc.reindex_project_embeddings("p1").await.unwrap(), 0);
+    }
 }

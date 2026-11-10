@@ -45,6 +45,12 @@ impl EmbeddingProvider for FakeEmbedding {
     fn dim(&self) -> usize {
         self.dim
     }
+
+    /// Ф6.2: детерминированный псевдо-эмбеддер всегда занимает своё
+    /// пространство `fake`, изолированное от модельных (candle) векторов.
+    fn model_id(&self) -> &str {
+        "fake"
+    }
 }
 
 #[cfg(test)]

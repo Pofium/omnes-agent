@@ -611,9 +611,20 @@ PPR v2.0 (столп III/VI).
       `extract` возвращает `None`, `parse_file` отступает на regex. Хук в `parse_file`
       под `#[cfg(feature = "treesitter")]`; дефолтная сборка (и golden-тесты) не затронуты.
       Остаток (CALLS/type-resolve через tree-sitter, расширение языков) — отложен.
-- [ ] **6.2** (Ф72) ONNX/FastEmbed + `embedding_fingerprint` в `omnesagent-kag/src/embedding/`:
+- [x] **6.2** (Ф72) ONNX/FastEmbed + `embedding_fingerprint` в `omnesagent-kag/src/embedding/`:
       запрет смешивания векторных пространств, `reindex`-процедура; для форка оценить
       reuse `local_bert.rs` (candle).
+      **Done (candle-first, без ONNX — см. открытый вопрос №5):** новый модуль
+      `embedding/fingerprint.rs` — `EmbeddingFingerprint { model_id, dim }` (короткий
+      sha256-ключ), хранение в `kv['embedding_fingerprint']`, `check` → `Fresh`/`Matched`/
+      `Mismatch{stored}` и `allows_write`. В трейт `EmbeddingProvider` добавлен
+      `model_id()` (default `"unknown"`; `FakeEmbedding` → `"fake"`, `LocalBertEmbedding` →
+      HF repo id, `CachedEmbeddingProvider` делегирует). `ProjectService`:
+      `embed_unembedded_nodes` при `Mismatch` **отклоняет** запись (запрет смешивания
+      пространств) и фиксирует отпечаток после успешной записи;
+      `reindex_project_embeddings` пересчитывает эмбеддинги всех живых узлов и
+      перезаписывает отпечаток. Тесты: `fingerprint` (4) + `ProjectService` (2); kag 83
+      зелёных (87 под `--features vec0`).
 - [x] **6.3** (72b) vec0-инкремент + SIMD-rescore в векторном слое близнеца.
       **Done:** амальгамация `sqlite-vec` вендорена в
       `backend/crates/omnesagent-kag/vendor/sqlite-vec/` и компилируется `build.rs`
@@ -712,6 +723,10 @@ PPR v2.0 (столп III/VI).
    сохранить ли текущее правило скилла (решения + пользовательские инструкции)?
 4. Нужен ли форку доступ к `ob2h sync` (PC<->VPS) или синк остаётся вне форка (ADR-K6)?
 5. Ф6.2: форк остаётся на candle-first (zero C-deps, как ADR-1..8 ob2h) или принимает ONNX?
+   **Решено (10.11):** candle-first. ONNX/FastEmbed не добавляется — внешний тяжёлый
+   C/ONNX-runtime противоречит правилу backend/AGENTS.md «no heavy deps» и линии форка;
+   реализована несущая, framework-независимая часть — `embedding_fingerprint` + запрет
+   смешивания пространств + `reindex` (см. Ф6.2). Смена бэкенда — отдельным решением.
 
 ## 12. Правила выполнения
 
@@ -797,7 +812,7 @@ lower.starts_with("ob2h__project_scan")
 | Usage-Weighted PPR | v2.0 | `pagerank.rs` (`personalized_pagerank_weighted`/`usage_weight`) | Ф6.5 |
 | Tree-sitter hybrid | v2.0 | `ast/treesitter.rs` под фичей `treesitter` (грамматики из `inkjet`) | Ф6.1 (частично) |
 | vec0 KNN + SIMD-rescore | v2.0 | `vector/vec0.rs` + `vector/simd.rs` под фичей `vec0` (vendored `sqlite-vec`) | Ф6.3 |
-| ONNX/FastEmbed + fingerprint | v2.0 | `embedding/local_bert.rs` (candle) | Ф6.2 |
+| ONNX/FastEmbed + fingerprint | v2.0 | `embedding/fingerprint.rs` (`EmbeddingFingerprint`/`check`/`reindex`) на candle-бэкенде; ONNX не принят | Ф6.2 |
 | Ralph debt-леджер (Ф60.3) | 1.9 | `omnesagent-ralph::debt` (свой) | мост Ф3.1 |
 | Access Telemetry Parity | v2.0 | — | Ф5 |
 | Secrets Vault (`secrets_*`) | 1.9 | config-secrets форка | мост Ф4 (ADR-O5) |
