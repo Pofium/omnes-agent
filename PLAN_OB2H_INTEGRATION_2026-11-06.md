@@ -614,7 +614,23 @@ PPR v2.0 (столп III/VI).
 - [ ] **6.2** (Ф72) ONNX/FastEmbed + `embedding_fingerprint` в `omnesagent-kag/src/embedding/`:
       запрет смешивания векторных пространств, `reindex`-процедура; для форка оценить
       reuse `local_bert.rs` (candle).
-- [ ] **6.3** (72b) vec0-инкремент + SIMD-rescore в векторном слое близнеца.
+- [x] **6.3** (72b) vec0-инкремент + SIMD-rescore в векторном слое близнеца.
+      **Done:** амальгамация `sqlite-vec` вендорена в
+      `backend/crates/omnesagent-kag/vendor/sqlite-vec/` и компилируется `build.rs`
+      (`cc`) под фичей `vec0` со `SQLITE_CORE` (статическая линковка с bundled SQLite
+      из `rusqlite`, внешних `.dll` нет); DISKANN/RESCORE/IVF отключены. Новый модуль
+      `src/vector/vec0.rs`: `register` (`sqlite3_vec_init`), `ensure_schema`
+      (`CREATE VIRTUAL TABLE vec_graph_nodes USING vec0(node_rowid INTEGER PRIMARY KEY,
+      embedding float[384] distance_metric=cosine)` + разовый backfill легаси-f32),
+      `sync_node`/`delete_node`, `knn` (MATCH + `k`), `knn_rescore` (over-fetch ×4,
+      фильтр `deleted_at`/`project_id`, точный cosine). Точный rescore — SIMD-ядро
+      `src/vector/simd.rs` (AVX2+FMA через `std::arch`, рантайм-детекция
+      `is_x86_feature_detected!`, скалярный fallback); `similarity::cosine` делегирует
+      в него (контракт сохранён). Интеграция: `schema::migrate` → best-effort `vec0::init`;
+      запись эмбеддингов (`project/mod.rs`) синхронит индекс; `graph/service.rs` —
+      vec0-KNN+rescore с откатом на прежний полный `top_k` при отсутствии таблицы/
+      несовпадении размерности. Тесты: `simd` (4) + `vec0` (4); kag 81 зелёный под
+      `--features vec0` (77 дефолт). Лицензии вендора — `vendor/sqlite-vec/README.md`.
 - [x] **6.4** (столп IV) Dream-консолидация: сверка `omnesagent-memory::consolidation/
       conflict/decay` с семантикой SUPERSEDES/HITL ob2h; для форка — операционный аналог
       (ночная консолидация agent-scoped памяти), данные не сливаются (ADR-O2).
@@ -780,6 +796,7 @@ lower.starts_with("ob2h__project_scan")
 | Dream-консолидация SUPERSEDES/HITL | v2.0 | `conflict::ConflictScope`/`supersede_candidate` (контекст + HITL); ночной прогон — отложен | Ф6.4 (частично) |
 | Usage-Weighted PPR | v2.0 | `pagerank.rs` (`personalized_pagerank_weighted`/`usage_weight`) | Ф6.5 |
 | Tree-sitter hybrid | v2.0 | `ast/treesitter.rs` под фичей `treesitter` (грамматики из `inkjet`) | Ф6.1 (частично) |
+| vec0 KNN + SIMD-rescore | v2.0 | `vector/vec0.rs` + `vector/simd.rs` под фичей `vec0` (vendored `sqlite-vec`) | Ф6.3 |
 | ONNX/FastEmbed + fingerprint | v2.0 | `embedding/local_bert.rs` (candle) | Ф6.2 |
 | Ralph debt-леджер (Ф60.3) | 1.9 | `omnesagent-ralph::debt` (свой) | мост Ф3.1 |
 | Access Telemetry Parity | v2.0 | — | Ф5 |

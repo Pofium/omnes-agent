@@ -464,6 +464,15 @@ END;
 "#,
     )?;
 
+    // Ф6.3 (ob2h v2.0 / Ф72b): vec0-индекс графовых эмбеддингов. Best-effort:
+    // регистрирует статически слинкованное расширение sqlite-vec на этом
+    // соединении и создаёт `vec_graph_nodes` (+ разовый backfill). При
+    // недоступности расширения миграция не падает — поиск остаётся на переборе.
+    #[cfg(feature = "vec0")]
+    {
+        let _ = crate::vector::vec0::init(conn);
+    }
+
     conn.execute(
         "INSERT OR REPLACE INTO kv (key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],

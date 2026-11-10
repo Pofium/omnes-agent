@@ -262,39 +262,60 @@ impl GraphService {
             }
         }
 
-        // 2. Векторный скоринг
+        // 2. Векторный скоринг. Ф6.3: при активном vec0-индексе и совпадении
+        //    размерности — KNN + точный SIMD-rescore шортлиста; иначе прежний
+        //    полный перебор по всем блобам (тот же результат, без индекса).
         if let Ok(q_embs) = self.embedder.embed(&[query.to_string()]).await
             && let Some(q_vec) = q_embs.first()
         {
-            let candidates = {
-                let conn = self.conn.lock();
-                let mut stmt = conn.prepare(
-                    r#"
+            let vec0_hits: Vec<(i64, f32)> = {
+                #[cfg(feature = "vec0")]
+                {
+                    let conn = self.conn.lock();
+                    crate::vector::vec0::knn_rescore(&conn, q_vec, limit, project_id_filter)
+                        .unwrap_or_default()
+                }
+                #[cfg(not(feature = "vec0"))]
+                {
+                    Vec::new()
+                }
+            };
+
+            let vector_hits = if vec0_hits.is_empty() {
+                let candidates = {
+                    let conn = self.conn.lock();
+                    let mut stmt = conn.prepare(
+                        r#"
                         SELECT id, embedding 
                         FROM graph_nodes 
                         WHERE embedding IS NOT NULL 
                           AND (deleted_at IS NULL OR deleted_at = '')
                           AND (?1 IS NULL OR project_id = ?1)
                         "#,
-                )?;
-                let rows = stmt.query_map(params![project_id_filter], |row| {
-                    let id: i64 = row.get(0)?;
-                    let blob: Vec<u8> = row.get(1)?;
-                    Ok((id, blob))
-                })?;
-                let mut list = Vec::new();
-                for r in rows.flatten() {
-                    list.push(r);
-                }
-                list
+                    )?;
+                    let rows = stmt.query_map(params![project_id_filter], |row| {
+                        let id: i64 = row.get(0)?;
+                        let blob: Vec<u8> = row.get(1)?;
+                        Ok((id, blob))
+                    })?;
+                    let mut list = Vec::new();
+                    for r in rows.flatten() {
+                        list.push(r);
+                    }
+                    list
+                };
+
+                let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
+                    .iter()
+                    .map(|(id, b)| (*id, Some(b.as_slice())))
+                    .collect();
+
+                top_k(q_vec, &cand_refs, limit, 0.0)
+            } else {
+                vec0_hits
             };
 
-            let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
-                .iter()
-                .map(|(id, b)| (*id, Some(b.as_slice())))
-                .collect();
-
-            for (nid, vscore) in top_k(q_vec, &cand_refs, limit, 0.0) {
+            for (nid, vscore) in vector_hits {
                 let entry = scored.entry(nid).or_insert(0.0);
                 *entry += (vscore as f64) * 10.0;
             }

@@ -42,10 +42,21 @@ inkjet = { version = "0.11", default-features = false, features = [
     "language-tsx", "language-javascript", "language-jsx", "language-go",
 ], optional = true }
 
+# Ф6.3 (ob2h v2.0 / Ф72b): vec0-инкремент. Амальгамация `sqlite-vec` вендорена
+# в `vendor/sqlite-vec/` и компилируется `build.rs` со `SQLITE_CORE` (статическая
+# линковка с bundled SQLite из rusqlite); внешнего `.dll` в рантайме не нужно.
+# DISKANN/RESCORE/IVF-подсистемы отключены — их исходники не входят в набор, а
+# точный rescore выполняется в Rust SIMD-ядром.
+
 [features]
 default = ["candle"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
 treesitter = ["dep:tree-sitter", "dep:inkjet"]
+# KNN-индекс графовых эмбеддингов (vec0) + точный SIMD-rescore.
+vec0 = []
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 tempfile = "3.26"

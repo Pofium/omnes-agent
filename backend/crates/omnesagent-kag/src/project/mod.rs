@@ -167,6 +167,9 @@ impl ProjectService {
                         "UPDATE graph_nodes SET embedding = ?1 WHERE id = ?2",
                         params![blob, pk],
                     )?;
+                    // Ф6.3: держим vec0-KNN-индекс в согласии с эмбеддингами.
+                    #[cfg(feature = "vec0")]
+                    crate::vector::vec0::sync_node(&tx, *pk, &blob)?;
                 }
                 tx.commit()?;
             }
