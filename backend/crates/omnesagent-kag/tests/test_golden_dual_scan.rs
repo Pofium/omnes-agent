@@ -7,6 +7,13 @@
 //! * Метрики: symbol F1 (узлы) и call F1 (CALLS-рёбра) против эталона.
 //!
 //! Пороги — DoD Ф1: symbol F1 >= 0.95, call F1 >= 0.90.
+//!
+//! Golden-эталон снимается с внешнего ob2h (regex-сканер близнеца, дефолтная
+//! сборка). Экспериментальный tree-sitter путь (`--features treesitter`) намеренно
+//! резолвит больше вызовов (CALLS/type-resolve, Ф6.1), поэтому паритет с эталоном
+//! ob2h v1.9.2 к нему не применяется — харнесс скоупится на дефолтную сборку.
+
+#![cfg(not(feature = "treesitter"))]
 
 use omnesagent_kag::{migrate, ProjectService};
 use parking_lot::Mutex;

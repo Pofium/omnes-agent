@@ -40,6 +40,9 @@ tree-sitter = { version = "0.23", optional = true }
 inkjet = { version = "0.11", default-features = false, features = [
     "language-rust", "language-python", "language-typescript",
     "language-tsx", "language-javascript", "language-jsx", "language-go",
+    "language-java", "language-kotlin", "language-c-sharp",
+    "language-c", "language-cpp", "language-php", "language-ruby",
+    "language-swift", "language-scala", "language-lua", "language-dart",
 ], optional = true }
 
 # Ф6.3 (ob2h v2.0 / Ф72b): vec0-инкремент. Амальгамация `sqlite-vec` вендорена

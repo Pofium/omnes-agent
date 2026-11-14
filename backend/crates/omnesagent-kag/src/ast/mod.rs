@@ -584,6 +584,8 @@ impl AstCodeExtractor {
             if let Some(extraction) = treesitter::extract(rel_path, content) {
                 out.nodes.extend(extraction.nodes);
                 out.edges.extend(extraction.edges);
+                out.call_sites.extend(extraction.call_sites);
+                out.imports.extend(extraction.imports);
                 return;
             }
         }
@@ -2854,6 +2856,21 @@ fn split_rust_use(s: &str) -> Option<(String, Option<String>, Option<String>)> {
     Some((module, Some(item), alias))
 }
 
+/// Ф6.1: нормализация относительного пути (`web/./x`, `web/../x` → без `.`/`..`).
+fn normalize_rel_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
 /// Ф39.1: кандидаты-файлы, которые может обозначать модуль импорта.
 /// Rust: `crate::a::b` → src/a.rs, src/a/b.rs, src/a/b/mod.rs, a.rs…;
 /// `super::x`/`self::x` — относительно файла.
@@ -2904,8 +2921,24 @@ fn module_to_paths(module: &str, from_file: &str) -> Vec<String> {
         return out;
     }
     if m.starts_with('.') {
-        // Python относительный импорт
+        // Ф6.1: TS/JS относительный импорт (`./x`, `../x`) — точки, за
+        // которыми следует `/`. Разрешаем относительно родителя файла с
+        // расширениями и директориями-index. Python-relative (`.mod`, `..pkg`)
+        // — точки БЕЗ следующего `/` — обрабатывается ниже.
         let dots = m.chars().take_while(|&c| c == '.').count();
+        if m[dots..].starts_with('/') {
+            let base = parent(from_file);
+            let combined = format!("{base}/{m}");
+            let norm = normalize_rel_path(&combined);
+            for ext in [".ts", ".tsx", ".js", ".jsx"] {
+                out.push(format!("{norm}{ext}"));
+            }
+            for ext in ["ts", "tsx", "js", "jsx"] {
+                out.push(format!("{norm}/index.{ext}"));
+            }
+            return out;
+        }
+        // Python относительный импорт
         let rest = &m[dots..];
         let mut base = parent(from_file);
         for _ in 1..dots {

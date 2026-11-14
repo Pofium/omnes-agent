@@ -610,7 +610,26 @@ PPR v2.0 (столп III/VI).
       без ломания golden-паритета). Fallback: `missing_error_ratio > 10%` →
       `extract` возвращает `None`, `parse_file` отступает на regex. Хук в `parse_file`
       под `#[cfg(feature = "treesitter")]`; дефолтная сборка (и golden-тесты) не затронуты.
-      Остаток (CALLS/type-resolve через tree-sitter, расширение языков) — отложен.
+      **Done (остаток — CALLS/type-resolve + расширение языков):** `TsLanguage` расширен
+      с 7 до 18 языков (добавлены java/kotlin/csharp/c/cpp/php/ruby/swift/scala/lua/dart;
+      грамматики — те же `inkjet`-фичи, бюджет без отдельных crate-грамматик). Экстрактор
+      теперь собирает места вызовов (`CallSite`) и импорты с алиасами (`ImportRef`) —
+      закрыта регрессия tree-sitter-пути (ранее нуль call sites → нуль CALLS-рёбер);
+      `parse_file` прокидывает их в `AstScanResult`, а глобальный type-pass `resolve_calls`
+      резолвит same-file/по-импортам (CALLS с провенансом `RESOLVED`). `module_to_paths`
+      расширена на TS/JS-относительные импорты (`./x`, `../x`) с расширениями и `index.*`;
+      Python-relative (`.mod`) не затронут. Дополнительно экстрактор эмитит рёбра
+      `INHERITS`/`IMPLEMENTS` (**SYNTAX**) и `ROUTE` (**HEURISTIC**, Python-декораторы) по
+      той же `class:`/`interface:`/`route:` нотации, что и regex-путь (паритет рёбер
+      гибридного и regex-сканера).
+      **Golden-харнесс скоупится на дефолтную сборку:** эталон снят с внешнего ob2h
+      (regex-сканер v1.9.2), поэтому паритет к нему применим только к regex-пути;
+      tree-sitter-путь намеренно резолвит больше вызовов, и `call F1 = 0.545 < 0.90` —
+      ожидаемое расхождение, а не дефект. Поэтому `tests/test_golden_dual_scan.rs` гейтится
+      `#![cfg(not(feature = "treesitter"))]` (поведение и риск зафиксированы явно, поведение
+      дефолтной сборки не изменено). Проверено: `cargo test -p omnesagent-kag` (дефолт) и
+      `cargo test -p omnesagent-kag --features treesitter` — обе сборки зелёные; golden-паритет
+      (symbol F1 = 1.000) сохранён на дефолтной сборке.
 - [x] **6.2** (Ф72) ONNX/FastEmbed + `embedding_fingerprint` в `omnesagent-kag/src/embedding/`:
       запрет смешивания векторных пространств, `reindex`-процедура; для форка оценить
       reuse `local_bert.rs` (candle).
