@@ -8,6 +8,7 @@ pub mod tool_group;
 pub mod heuristic;
 pub mod escalation;
 pub mod auto_continue;
+pub mod dispatch;
 
 #[cfg(test)]
 mod tests;
@@ -24,6 +25,7 @@ pub use tool_group::{
 pub use heuristic::{classify_message, HeuristicDecision};
 pub use escalation::evaluate_escalation;
 pub use auto_continue::{analyze_truncation, continuation_prompt, TruncationAnalysis, MAX_AUTO_CONTINUE_ROUNDS};
+pub use dispatch::{derive_slug, resolve_engine_route, EngineRoute, RalphDispatch};
 
 use omnesagent_api::tool::ToolSpec;
 

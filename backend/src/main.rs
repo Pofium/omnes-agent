@@ -1192,6 +1192,17 @@ enum RalphCliCommands {
         #[arg(long)]
         repo: Option<String>,
     },
+
+    /// Route a natural-language task through the Triage Router and start a
+    /// Ralph run only when the router selects the autonomous engine
+    Dispatch {
+        /// The engineering task to classify and, when routed to Ralph, execute
+        message: String,
+
+        /// Working repository directory (default: current dir)
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -4068,7 +4079,8 @@ async fn handle_ralph_command(
     let repo_root = match &cmd {
         RalphCliCommands::Run { repo, .. }
         | RalphCliCommands::Status { repo, .. }
-        | RalphCliCommands::Debt { repo, .. } => repo
+        | RalphCliCommands::Debt { repo, .. }
+        | RalphCliCommands::Dispatch { repo, .. } => repo
             .as_ref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
@@ -4112,27 +4124,7 @@ async fn handle_ralph_command(
                 .map_err(|e| anyhow::anyhow!("Failed to start Ralph run: {e}"))?;
 
             println!("Run started with id: {run_id}. Subscribing to events...");
-            while let Ok(evt) = rx.recv().await {
-                match evt {
-                    omnesagent_ralph::events::RalphEvent::IterationCompleted { task, n, verdict, ladder_rung, duration_ms } => {
-                        println!("[{task}] iteration {n}: {verdict} (ladder: {ladder_rung}, {duration_ms}ms)");
-                    }
-                    omnesagent_ralph::events::RalphEvent::IterationFailed { task, n, fingerprint, exit_code } => {
-                        println!("[{task}] iteration {n} FAILED (code: {exit_code}, fp: {fingerprint})");
-                    }
-                    omnesagent_ralph::events::RalphEvent::ReviewDeleteList { count, files_affected } => {
-                        println!("Minimality review: deleted {count} items across {files_affected:?}");
-                    }
-                    omnesagent_ralph::events::RalphEvent::DebtHarvested { count, no_trigger_count } => {
-                        println!("Debt harvested: {count} items ({no_trigger_count} without trigger)");
-                    }
-                    omnesagent_ralph::events::RalphEvent::RunStopped { reason, .. } => {
-                        println!("Run STOPPED: {reason}");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            stream_ralph_events(&mut rx).await;
         }
         RalphCliCommands::Status { slug, .. } => {
             let state_path = repo_root.join("openspec").join("changes").join(&slug).join("state.json");
@@ -4166,8 +4158,79 @@ async fn handle_ralph_command(
                 Err(e) => eprintln!("Failed to inspect git diff: {e}"),
             }
         }
+        RalphCliCommands::Dispatch { message, .. } => {
+            let profile = omnesagent_runtime::agent::orchestrator::triage(&message, &[]);
+            let route =
+                omnesagent_runtime::agent::orchestrator::resolve_engine_route(&profile, &message);
+
+            match route {
+                omnesagent_runtime::agent::orchestrator::EngineRoute::Ralph(dispatch) => {
+                    println!(
+                        "Triage Router selected the autonomous engine (intent: {}, mode: {}).",
+                        profile.intent.as_str(),
+                        profile.ui_flags.display_mode
+                    );
+                    println!("Feature slug: {}", dispatch.slug);
+
+                    let knowledge = omnesagent_ralph::knowledge::RalphKnowledgeService::new(None, None);
+                    let orchestrator = omnesagent_ralph::RalphOrchestrator::new(
+                        repo_root.clone(),
+                        config.ralph.clone(),
+                        knowledge,
+                        config.ob2h_bridge.clone(),
+                    );
+                    let mut rx = orchestrator.subscribe();
+                    let run_id = orchestrator
+                        .start_run(&dispatch.slug, None)
+                        .await
+                        .with_context(|| {
+                            format!("failed to start Ralph run for slug '{}'", dispatch.slug)
+                        })?;
+
+                    println!("Run started with id: {run_id}. Subscribing to events...");
+                    stream_ralph_events(&mut rx).await;
+                }
+                omnesagent_runtime::agent::orchestrator::EngineRoute::StandardLoop => {
+                    println!(
+                        "Triage Router selected the standard loop (intent: {}, mode: {}); \
+                         not starting a Ralph run.",
+                        profile.intent.as_str(),
+                        profile.ui_flags.display_mode
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Print a running Ralph orchestrator's phase events until the run stops.
+/// Shared by the explicit `ralph run` and the Triage-Router driven `ralph dispatch`.
+#[cfg(feature = "agent-runtime")]
+async fn stream_ralph_events(
+    rx: &mut tokio::sync::broadcast::Receiver<omnesagent_ralph::events::RalphEvent>,
+) {
+    while let Ok(evt) = rx.recv().await {
+        match evt {
+            omnesagent_ralph::events::RalphEvent::IterationCompleted { task, n, verdict, ladder_rung, duration_ms } => {
+                println!("[{task}] iteration {n}: {verdict} (ladder: {ladder_rung}, {duration_ms}ms)");
+            }
+            omnesagent_ralph::events::RalphEvent::IterationFailed { task, n, fingerprint, exit_code } => {
+                println!("[{task}] iteration {n} FAILED (code: {exit_code}, fp: {fingerprint})");
+            }
+            omnesagent_ralph::events::RalphEvent::ReviewDeleteList { count, files_affected } => {
+                println!("Minimality review: deleted {count} items across {files_affected:?}");
+            }
+            omnesagent_ralph::events::RalphEvent::DebtHarvested { count, no_trigger_count } => {
+                println!("Debt harvested: {count} items ({no_trigger_count} without trigger)");
+            }
+            omnesagent_ralph::events::RalphEvent::RunStopped { reason, .. } => {
+                println!("Run STOPPED: {reason}");
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(not(feature = "agent-runtime"))]
