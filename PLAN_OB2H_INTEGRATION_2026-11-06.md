@@ -503,8 +503,16 @@ AST-дельты, stale-инвалидация).
       **Done:** модуль `verdict.rs` (`auto_verdict` по `TestsSummary`, `self_assessment` не
       читается, `verdict_source = "auto_tests"`); `loop_driver` заполняет `verdict`/
       `verdict_source` во всех ветках записи `IterationRecord`. 4 unit-теста.
-- [ ] **3.5** Опционально (отдельным решением): интеграция `omnesagent-ralph` в Triage Router
-      (Tier 2 из `PLAN.md`) — вне обязательного объёма этой фазы.
+- [x] **3.5** Интеграция `omnesagent-ralph` в Triage Router (Tier 2 из `PLAN.md`).
+      **Done:** в `omnesagent-runtime::agent::orchestrator::dispatch` добавлен типизированный
+      контракт маршрутизации — `EngineRoute` (`StandardLoop` | `Ralph(RalphDispatch{slug,task})`)
+      и `resolve_engine_route(&SessionExecutionProfile, message)`; `derive_slug` строит
+      детерминированный filesystem-safe OpenSpec-slug (ASCII-lowercase + `-`, cap 48;
+      для не-ASCII — стабильный `task-<fnv1a>` fallback). Потребитель в бинарнике: новая
+      CLI-команда `omnesagent ralph dispatch <message>` запускает `triage()`, берёт маршрут и
+      при `EngineRoute::Ralph` реально стартует `RalphOrchestrator::start_run(slug)` с выводом
+      событий (общий хелпер `stream_ralph_events` с `ralph run`); при `StandardLoop` — сообщает,
+      что Ralph не запускается. Тесты: 4 unit в `dispatch.rs`.
 
 **DoD Ф3:** `[x] archive run форка создаёт debt-записи в ob2h; после правки сигнатуры
 зависимые findings помечены stale в журнале; вердикт-логика покрыта тестами.`
@@ -664,14 +672,27 @@ PPR v2.0 (столп III/VI).
 - [x] **6.4** (столп IV) Dream-консолидация: сверка `omnesagent-memory::consolidation/
       conflict/decay` с семантикой SUPERSEDES/HITL ob2h; для форка — операционный аналог
       (ночная консолидация agent-scoped памяти), данные не сливаются (ADR-O2).
-      **Частично Done (инкремент «Контекстная суперсессия + HITL»):** в
-      `omnesagent-memory::conflict` добавлены `ConflictScope` (namespace/tenant) +
+      **Done:** в `omnesagent-memory::conflict` добавлены `ConflictScope` (namespace/tenant) +
       `supersede_candidate` — авто-супersede только в том же контексте (иначе
       **Contextual Coexistence** — факты сосуществуют) и никогда для `pinned`-записей
       (аналог HITL для SOUL/USER/SYSTEM). `check_and_resolve_conflicts` принимает
       `&ConflictScope`; оба call-site в `consolidation.rs` передают
-      `ConflictScope::default()`. Остаток (ночная консолидация, `DreamTool::dream_run`
-      заглушка) — отложен.
+      `ConflictScope::default()`.
+      **Остаток закрыт:** новый модуль `omnesagent-memory::dream` (ночная agent-scoped
+      консолидация) — `run_if_due`/`consolidate_now`; scope-изоляция по
+      `(agent_id, namespace, tenant_id)` (группировка SQL-скана `category='core' AND
+      superseded_by IS NULL AND pinned=0`, внутри scope старые near-duplicate записи
+      помечаются `superseded_by` новейшей; области не сливаются), HITL-защита `pinned`,
+      near-duplicate через `conflict::jaccard_similarity` > `dedup_jaccard_threshold`
+      (+ предфильтр по длине). Каденс 24 ч через state-файл
+      `memory/memory_dream_state.json` (по образцу `hygiene`), opt-in флаг
+      `memory.dream_enabled` (default off, SQLite-only). Интеграция:
+      `create_memory_with_storage_and_routes` (best-effort) и
+      `DefaultMemoryStrategy::run_governance` (фаза 2 после hygiene). `DreamTool::dream_run`
+      переписан с заглушки на реальную консолидацию (`consolidate_now`) с записью реальных
+      `scanned/scopes/superseded` в `dream_runs` (`phase_log`/`stats`). Тесты: 5 в `dream.rs`
+      + 2 в `dream_tool.rs`. Фоновый вызов best-effort: ошибка консолидации не валит старт
+      памяти (лог `"nightly memory consolidation skipped"`).
 - [x] **6.5** (столп III) Usage-Weighted PPR в `omnesagent-kag/src/graph/pagerank.rs`
       (формула ob2h v2.0, CAP_access, CATD-lite, grace-period). **Done:** добавлен
       `NodeUsage` + `usage_weight` (`min(1 + ln(1 + access_count), CAP 3.0) · e^{-λ·Δt} ·
