@@ -17,6 +17,7 @@ pub mod conflict;
 pub mod consolidation;
 pub mod decay;
 pub mod dedup;
+pub mod dream;
 pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
@@ -575,6 +576,18 @@ pub fn create_memory_with_storage_and_routes(
                 .with_outcome(::omnesagent_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
             "memory hygiene skipped"
+        );
+    }
+
+    // Best-effort nightly agent-scoped consolidation (Ф6.4 "Dream" analog),
+    // throttled by its own state file. Opt-in via `memory.dream_enabled`.
+    if let Err(e) = dream::run_if_due(config, workspace_dir) {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "nightly memory consolidation skipped"
         );
     }
 

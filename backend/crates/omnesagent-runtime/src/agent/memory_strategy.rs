@@ -56,10 +56,12 @@ impl MemoryStrategy for DefaultMemoryStrategy {
     }
 
     async fn run_governance(&self) -> anyhow::Result<()> {
-        // Delegate to the existing hygiene routine.
-        // Phase 1: `hygiene::run_if_due` returns `Result<()>`.
-        // A structured report will be wired in a follow-up when hygiene
-        // exposes per-action counters.
-        omnesagent_memory::hygiene::run_if_due(&self.memory_config, &self.workspace_dir)
+        // Phase 1: the periodic hygiene/retention pass.
+        omnesagent_memory::hygiene::run_if_due(&self.memory_config, &self.workspace_dir)?;
+        // Phase 2: the nightly agent-scoped consolidation pass (Ф6.4 "Dream"
+        // analog), throttled by its own cadence state. Opt-in via
+        // `memory.dream_enabled`, so the default path is a no-op.
+        omnesagent_memory::dream::run_if_due(&self.memory_config, &self.workspace_dir)?;
+        Ok(())
     }
 }

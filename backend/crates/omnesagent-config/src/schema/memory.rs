@@ -217,6 +217,13 @@ pub struct MemoryConfig {
     /// Run the periodic hygiene pass that archives stale daily/session files and enforces retention windows. Leave on unless you want to manage cleanup yourself.
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
+    /// Run the nightly agent-scoped memory consolidation pass (the operational
+    /// "Dream" analog): within each `(agent, namespace, tenant)` scope, Core
+    /// entries that are near-duplicates are collapsed by marking the older one
+    /// superseded. Scopes are never merged (data stays partitioned per agent).
+    /// Default off; SQLite-only. Throttled to one run per 24h by a state file.
+    #[serde(default = "default_dream_enabled")]
+    pub dream_enabled: bool,
     /// Also extract atomic durable facts from each consolidated turn and store
     /// them as individual Core memories. Default off; the flip is sequenced in
     /// a later phase. SQLite-only: enabling this requires the sqlite memory
@@ -744,6 +751,11 @@ fn default_auto_save() -> bool {
 fn default_hygiene_enabled() -> bool {
     true
 }
+/// Nightly agent-scoped consolidation is opt-in: it mutates `superseded_by`
+/// and is SQLite-only, so it stays off until the operator enables it.
+fn default_dream_enabled() -> bool {
+    false
+}
 fn default_archive_after_days() -> u32 {
     7
 }
@@ -794,6 +806,7 @@ impl Default for MemoryConfig {
             backend: "sqlite".into(),
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
+            dream_enabled: default_dream_enabled(),
             consolidation_extract_facts: false,
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
