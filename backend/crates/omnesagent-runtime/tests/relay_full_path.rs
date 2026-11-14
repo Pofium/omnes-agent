@@ -1,4 +1,4 @@
-//! Full real-component path on the DESIGNED relay protocol: a zerocode-style
+//! Full real-component path on the DESIGNED relay protocol: a omnescode-style
 //! client -> (outer TLS + WS + `conn_id` mux) relay -> real daemon bridge ->
 //! daemon WSS mTLS listener, with the inner mutual TLS completing end to end.
 //!
@@ -102,7 +102,7 @@ fn relay_outer_acceptor() -> TlsAcceptor {
 }
 
 #[tokio::test]
-async fn zerocode_to_relay_to_daemon_full_path() {
+async fn omnescode_to_relay_to_daemon_full_path() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Daemon mTLS materials + an issued client cert (the inner session).
@@ -350,7 +350,7 @@ async fn enrollment_post_round_trips_through_relay_route() {
     let _ = enroll_task.await;
 }
 
-/// Mirror of zerocode's `dial_through_relay`: outer TLS + WS to the relay, send
+/// Mirror of omnescode's `dial_through_relay`: outer TLS + WS to the relay, send
 /// `Connect`, await `Opened`, then bridge a duplex byte stream to/from the DATA
 /// frames. Retries the full dial until the bridge has registered the node-id.
 async fn dial_relay_with_retry(

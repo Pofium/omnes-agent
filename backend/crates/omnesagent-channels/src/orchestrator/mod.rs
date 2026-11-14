@@ -453,34 +453,92 @@ impl InterruptOnNewMessageConfig {
     }
 }
 
+/// Snapshot whether any alias enables `interrupt_on_new_message` for each
+/// channel type. This preserves the legacy fallback for inbound messages that
+/// do not carry an alias; aliased messages resolve their own live config.
 fn interrupt_on_new_message_config(
     channels: &omnesagent_config::schema::ChannelsConfig,
 ) -> InterruptOnNewMessageConfig {
     InterruptOnNewMessageConfig {
         telegram: channels
             .telegram
-            .get("default")
-            .is_some_and(|tg| tg.interrupt_on_new_message),
+            .values()
+            .any(|tg| tg.interrupt_on_new_message),
         slack: channels
             .slack
-            .get("default")
-            .is_some_and(|sl| sl.interrupt_on_new_message),
+            .values()
+            .any(|sl| sl.interrupt_on_new_message),
         discord: channels
             .discord
-            .get("default")
-            .is_some_and(|dc| dc.interrupt_on_new_message),
+            .values()
+            .any(|dc| dc.interrupt_on_new_message),
         mattermost: channels
             .mattermost
-            .get("default")
-            .is_some_and(|mm| mm.interrupt_on_new_message),
+            .values()
+            .any(|mm| mm.interrupt_on_new_message),
         matrix: channels
             .matrix
-            .get("default")
-            .is_some_and(|mx| mx.interrupt_on_new_message),
+            .values()
+            .any(|mx| mx.interrupt_on_new_message),
         whatsapp: channels
             .whatsapp
-            .get("default")
-            .is_some_and(|wa| wa.interrupt_on_new_message),
+            .values()
+            .any(|wa| wa.interrupt_on_new_message),
+    }
+}
+
+fn interrupt_on_new_message_enabled(
+    ctx: &ChannelRuntimeContext,
+    msg: &omnesagent_api::channel::ChannelMessage,
+) -> bool {
+    let Some(alias) = msg
+        .channel_alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+    else {
+        return ctx
+            .interrupt_on_new_message
+            .enabled_for_channel(msg.channel.as_str());
+    };
+
+    match msg.channel.as_str() {
+        "telegram" => ctx
+            .prompt_config
+            .channels
+            .telegram
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "slack" => ctx
+            .prompt_config
+            .channels
+            .slack
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "discord" => ctx
+            .prompt_config
+            .channels
+            .discord
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "mattermost" => ctx
+            .prompt_config
+            .channels
+            .mattermost
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "matrix" => ctx
+            .prompt_config
+            .channels
+            .matrix
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        "whatsapp" => ctx
+            .prompt_config
+            .channels
+            .whatsapp
+            .get(alias)
+            .is_some_and(|config| config.interrupt_on_new_message),
+        _ => false,
     }
 }
 
@@ -505,6 +563,7 @@ struct ChannelRuntimeContext {
     /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<omnesagent_config::schema::AliasedAgentConfig>,
     prompt_config: Arc<omnesagent_config::schema::Config>,
+    live_config: Arc<RwLock<omnesagent_config::schema::Config>>,
     memory: Arc<dyn Memory>,
     memory_strategy: Arc<dyn MemoryStrategy>,
     tools_registry: Arc<omnesagent_runtime::tools::scoped::ScopedToolRegistry>,
@@ -641,7 +700,11 @@ fn conversation_memory_key(msg: &omnesagent_api::channel::ChannelMessage) -> Str
 /// omnesagent alias when present, so two bots on the same platform (e.g.
 /// `discord.clamps` + `discord.glados`) never share a keyspace.
 fn channel_scope(msg: &omnesagent_api::channel::ChannelMessage) -> String {
-    match &msg.channel_alias {
+    match msg
+        .channel_alias
+        .as_deref()
+        .filter(|alias| !alias.is_empty())
+    {
         Some(alias) => format!("{}.{}", msg.channel, alias),
         None => msg.channel.clone(),
     }
@@ -731,21 +794,32 @@ fn followup_thread_id(msg: &omnesagent_api::channel::ChannelMessage) -> Option<S
     }
 }
 
+/// Encodes the conversation scope tuple canonically using length-prefixed
+/// components to prevent boundary collisions between adjacent components
+/// (e.g., `#room_` + `alice` vs `#room` + `_alice`). Both `Sender` and
+/// `ReplyTarget` variants use the same injective representation.
 fn interruption_scope_key(msg: &omnesagent_api::channel::ChannelMessage) -> String {
-    match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
-        (omnesagent_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
-            sanitize_session_key(&format!("{}_{}", channel_scope(msg), scope))
-        }
-        (omnesagent_api::channel::ChannelConversationScope::ReplyTarget, None) => {
-            sanitize_session_key(&format!("{}_{}", channel_scope(msg), msg.reply_target))
-        }
-        (omnesagent_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, msg.sender, scope
+    let tag = match msg.conversation_scope {
+        omnesagent_api::channel::ChannelConversationScope::Sender => "sender",
+        omnesagent_api::channel::ChannelConversationScope::ReplyTarget => "reply_target",
+    };
+    let ch = channel_scope(msg);
+    let target = &msg.reply_target;
+    let sender = &msg.sender;
+    match msg.interruption_scope_id.as_deref() {
+        Some(scope) => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}:{}:{scope}",
+            ch.len(),
+            target.len(),
+            sender.len(),
+            scope.len()
         ),
-        (omnesagent_api::channel::ChannelConversationScope::Sender, None) => {
-            format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
-        }
+        None => format!(
+            "{tag}:{}:{ch}:{}:{target}:{}:{sender}",
+            ch.len(),
+            target.len(),
+            sender.len()
+        ),
     }
 }
 
@@ -1082,11 +1156,11 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Date refresh stays in the system prompt: the heading is date-only
-    // (no seconds), so within a single day the rendered value is stable and
-    // cache hits; it only changes once per day at midnight. Acceptable for
-    // a 99%+ intra-session cache-hit rate.
-    refresh_channel_prompt_date_section(&mut prompt);
+    // Strip volatile date sections: the per-turn
+    // [turn-context] preamble already carries time/date/weekday/tz, and a
+    // ## Current Date value that changes at midnight busts the prompt cache
+    // for every live channel session.
+    strip_channel_prompt_volatile_date_sections(&mut prompt);
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -1152,29 +1226,74 @@ fn build_channel_system_prompt_for_message_with_signal(
     }
 }
 
-fn current_date_section() -> String {
-    let now = chrono::Local::now();
-    format!(
-        "{CURRENT_DATE_HEADING}{} ({})",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    )
-}
-
-fn refresh_channel_prompt_date_section(prompt: &mut String) {
-    let runtime_start = prompt
-        .find("\n## Runtime")
-        .map(|i| i + 1)
-        .unwrap_or(prompt.len());
-
-    if let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) {
+fn strip_channel_prompt_volatile_date_sections(prompt: &mut String) {
+    // Walk repeatedly so both ## Current Date and ## Current Date & Time
+    // are removed even when both appear. Keep a ## Current Date section
+    // whose body is not a generated date line (e.g. a project note).
+    loop {
+        let runtime_start = prompt
+            .find("\n## Runtime")
+            .map(|i| i + 1)
+            .unwrap_or(prompt.len());
+        let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start)
+        else {
+            break;
+        };
         let content_start = start + heading_len;
         let section_end = prompt[content_start..]
             .find("\n## ")
             .map(|i| content_start + i)
             .unwrap_or(prompt.len());
-        prompt.replace_range(start..section_end, &current_date_section());
+        let body = prompt[content_start..section_end].trim();
+        if !is_generated_date_line(body) {
+            // Non-date body under ## Current Date — leave it alone and stop
+            // scanning older headings so we do not remove project notes.
+            break;
+        }
+        // Remove the section with the newline that ends it, so the next
+        // heading keeps the blank line in front of it. A section at the end
+        // of the prompt takes the newlines before it instead. Only ASCII
+        // '\n' bytes are stepped over, so the range stays on char boundaries.
+        let (from, to) = if section_end < prompt.len() {
+            (start, section_end + 1)
+        } else {
+            let mut from = start;
+            while from > 0 && prompt.as_bytes()[from - 1] == b'\n' {
+                from -= 1;
+            }
+            (from, section_end)
+        };
+        prompt.replace_range(from..to, "");
     }
+}
+
+/// True when `body` is exactly one date line as the prompt builders used to
+/// emit it: `YYYY-MM-DD (+HH:MM)` or the legacy `YYYY-MM-DD HH:MM:SS (TZ)`.
+/// Anything else (e.g. a workspace note that merely starts with a date) is
+/// project context and must survive the strip.
+fn is_generated_date_line(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    if body.contains('\n') || bytes.len() < 10 {
+        return false;
+    }
+    let date_ok = bytes[..10].iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    if !date_ok {
+        return false;
+    }
+    let rest = &body[10..];
+    let Some(open) = rest.find(" (") else {
+        return false;
+    };
+    let time = &rest[..open];
+    let zone = &rest[open + 2..];
+    let time_ok = time.is_empty()
+        || (time.starts_with(' ')
+            && time.len() > 1
+            && time[1..].bytes().all(|b| b.is_ascii_digit() || b == b':'));
+    time_ok && zone.len() > 1 && zone.ends_with(')') && !zone[..zone.len() - 1].contains(['(', ')'])
 }
 
 fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize, usize)> {
@@ -2497,6 +2616,11 @@ fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
+    // The turn engine owns local capacity rejection. Keep its typed terminal
+    // reason even when an outer context includes a provider's overflow text.
+    if omnesagent_runtime::agent::context_window_exceeded_from_error(err).is_some() {
+        return false;
+    }
     let lower = err.to_string().to_lowercase();
     [
         "exceeds the context window",
@@ -4136,15 +4260,15 @@ fn sanitize_channel_response_with_leak_detection(
     )
 }
 
-/// Remove `[media attachment]` placeholders a model echoed from degraded
-/// history. The placeholder is an internal contract token (`strip_media_markers`
-/// rewrites `[IMAGE:...]`/`[AUDIO:...]` markers to it before the request), and
-/// when a non-vision model quotes it verbatim the end user sees a raw internal
-/// artifact. Lines that carried only the placeholder are dropped; surrounding
-/// text keeps its line structure. Content without the placeholder is returned
-/// untouched.
+/// Remove `(media attachment omitted)` placeholders a model echoed from
+/// degraded history. The placeholder is an internal contract token
+/// (`strip_media_markers` rewrites `[IMAGE:...]`/`[AUDIO:...]` markers to it
+/// before the request), and when a non-vision model quotes it verbatim the end
+/// user sees an internal artifact. Lines that carried only the placeholder are
+/// dropped; surrounding text keeps its line structure. Content without the
+/// placeholder is returned untouched.
 fn strip_media_attachment_placeholder_echoes(content: &str) -> String {
-    let placeholder = omnesagent_providers::multimodal::MEDIA_ATTACHMENT_PLACEHOLDER;
+    let placeholder = omnesagent_providers::multimodal::MEDIA_PLACEHOLDER;
     if !content.contains(placeholder) {
         return content.to_string();
     }
@@ -4187,9 +4311,9 @@ fn sanitize_channel_response_for_format_with_leak_detection(
     let trimmed_response = response.trim();
     let trimmed_response = strip_think_tags_inline(trimmed_response).trim().to_string();
     let trimmed_response = trimmed_response.as_str();
-    // Model replies echo the internal `[media attachment]` placeholder that
-    // degraded history carries (issue: the placeholder reaching end users).
-    // Scrub the echo before the rest of the guardrail chain runs.
+    // Model replies echo the internal `(media attachment omitted)` placeholder
+    // that degraded history carries (issue: the placeholder reaching end
+    // users). Scrub the echo before the rest of the guardrail chain runs.
     let trimmed_response = strip_media_attachment_placeholder_echoes(trimmed_response);
     let trimmed_response = trimmed_response.as_str();
     // Final channel guardrail: reuse the parser classifier so channel cleanup
@@ -7292,6 +7416,7 @@ async fn process_channel_message_body(
                 // this turn's.
                 sop_reassembly: Some(omnesagent_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    live_config: Some(Arc::clone(&ctx.live_config)),
                 }),
             }));
             // Scope this turn's routing handle so concurrent same-agent turns,
@@ -7817,6 +7942,54 @@ async fn process_channel_message_body(
                             .await
                         {
                             Ok(()) => true,
+                            Err(e)
+                                if e
+                                    .downcast_ref::<omnesagent_api::channel::FinalizePartialDelivery>(
+                                    )
+                                    .is_some() =>
+                            {
+                                // The channel already posted part of the chunked
+                                // final answer and could not finish. Resending the
+                                // full answer here would duplicate the delivered
+                                // prefix, so accept degraded delivery instead of
+                                // restarting from chunk zero.
+                                let delivered = e
+                                    .downcast_ref::<omnesagent_api::channel::FinalizePartialDelivery>()
+                                    .map(|p| p.delivered)
+                                    .unwrap_or(0);
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Note
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"delivered_chunks": delivered})),
+                                    "Final answer partially delivered; not resending to avoid duplicating the accepted prefix"
+                                );
+                                true
+                            }
+                            Err(e)
+                                if e
+                                    .downcast_ref::<omnesagent_api::channel::FinalizeUndelivered>()
+                                    .is_some() =>
+                            {
+                                // Nothing was delivered and the channel asked us
+                                // not to send again yet (e.g. a flood limit).
+                                // Resending would only extend the penalty, and
+                                // the reply must not be reported as sent.
+                                ::omnesagent_log::record!(
+                                    WARN,
+                                    ::omnesagent_log::Event::new(
+                                        module_path!(),
+                                        ::omnesagent_log::Action::Fail
+                                    )
+                                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Final answer not delivered; not resending"
+                                );
+                                false
+                            }
                             Err(e) => {
                                 ::omnesagent_log::record!(
                                     WARN,
@@ -7936,7 +8109,7 @@ async fn process_channel_message_body(
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
-                    compacted
+                    compacted,
                 );
                 ::omnesagent_log::record!(
                     WARN,
@@ -7963,15 +8136,28 @@ async fn process_channel_message_body(
                         .await;
                 }
             } else {
-                let safe_error = omnesagent_providers::sanitize_api_error(&e.to_string());
+                let context_window_exceeded =
+                    omnesagent_runtime::agent::context_window_exceeded_from_error(&e);
+                let safe_error = if context_window_exceeded.is_some() {
+                    String::new()
+                } else {
+                    omnesagent_providers::sanitize_api_error(&e.to_string())
+                };
+                // `safe_error` is deliberately empty for a capacity failure, so
+                // the journal needs the typed breakdown instead: without it
+                // this line read "LLM error after Nms:" and nothing else.
+                let journal_error = context_window_exceeded
+                    .map_or_else(|| safe_error.clone(), |exceeded| exceeded.breakdown());
                 eprintln!(
-                    "  ❌ LLM error after {}ms: {safe_error}",
+                    "  ❌ LLM error after {}ms: {journal_error}",
                     started_at.elapsed().as_millis(),
                 );
 
                 // Evict cached model_provider on auth errors so the next request
                 // re-creates it with fresh OAuth credentials.
-                if omnesagent_providers::reliable::is_auth_error(&e) {
+                if context_window_exceeded.is_none()
+                    && omnesagent_providers::reliable::is_auth_error(&e)
+                {
                     let cache_key = provider_cache_key(
                         &route.model_provider,
                         route.api_key.as_deref(),
@@ -7992,6 +8178,22 @@ async fn process_channel_message_body(
                         );
                     }
                 }
+                let mut error_attributes = ::serde_json::json!({
+                    "model_provider": route.model_provider,
+                    "model": route.model,
+                    "sender": msg.sender,
+                });
+                if let Some(exceeded) = context_window_exceeded {
+                    error_attributes["error_kind"] = "context_window_exceeded".into();
+                    error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
+                    error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+                    error_attributes["system_tokens"] = exceeded.system_tokens.into();
+                    error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
+                } else {
+                    error_attributes["error_kind"] = "provider_error".into();
+                    error_attributes["error"] = safe_error.clone().into();
+                }
                 ::omnesagent_log::record!(
                     WARN,
                     ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
@@ -7999,15 +8201,11 @@ async fn process_channel_message_body(
                         .with_duration(
                             u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                         )
-                        .with_attrs(::serde_json::json!({
-                            "model_provider": route.model_provider,
-                            "model": route.model,
-                            "sender": msg.sender,
-                            "error": safe_error,
-                        })),
+                        .with_attrs(error_attributes),
                     "channel_message_error"
                 );
-                let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
+                let should_rollback_user_turn =
+                    context_window_exceeded.is_none() && should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
@@ -8110,9 +8308,7 @@ async fn dispatch_worker(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
-    let interrupt_enabled = ctx
-        .interrupt_on_new_message
-        .enabled_for_channel(msg.channel.as_str());
+    let interrupt_enabled = interrupt_on_new_message_enabled(&ctx, &msg);
     let sender_scope_key = interruption_scope_key(&msg);
     let cancellation_token = CancellationToken::new();
     let completion = Arc::new(InFlightTaskCompletion::new());
@@ -13038,6 +13234,7 @@ pub async fn start_channels(
             agent_alias: Arc::new(agent_alias.clone()),
             agent_cfg: Arc::new(agent.clone()),
             prompt_config: Arc::new(config.clone()),
+            live_config: Arc::clone(&config_arc),
             memory: Arc::clone(&mem),
             memory_strategy,
             tools_registry: Arc::clone(&tools_registry),
@@ -13637,6 +13834,7 @@ fn concurrent_persist_lock_serialization() {
         provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
         workspace_dir: Arc::new(std::env::temp_dir()),
         prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
         message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
         non_cli_excluded_tools: Arc::new(Vec::new()),
         autonomy_level: AutonomyLevel::default(),
@@ -13720,6 +13918,26 @@ fn concurrent_persist_lock_serialization() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn should_rollback_failed_user_turn_ignores_stream_idle_timeouts() {
+        // A stream idle timeout is a transport stall, not a client error: the
+        // elapsed-seconds bound in the message must never read as an HTTP
+        // status, or a stalled turn would delete the user's prompt.
+        let idle_error = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout; raise timeout_secs above 480s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !should_rollback_failed_user_turn(&idle_error),
+            "stream idle timeouts must stay retryable so the prompt is preserved"
+        );
+
+        let client_error = anyhow::Error::msg("HTTP 400 Bad Request");
+        assert!(
+            should_rollback_failed_user_turn(&client_error),
+            "genuine 4xx client errors must still roll the failed turn back"
+        );
+    }
     // Production code no longer calls this directly (the ScopedToolRegistry::assemble
     // seam applies it internally now); two tests below still exercise it directly to
     // pin the built-in filter's own behavior.
@@ -15289,6 +15507,7 @@ temperature = 0.3
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -15785,7 +16004,8 @@ temperature = 0.3
 
         let base_ctx = (*router_test_ctx()).clone();
         let ctx = Arc::new(ChannelRuntimeContext {
-            prompt_config: Arc::new(cfg),
+            prompt_config: Arc::new(cfg.clone()),
+            live_config: Arc::new(RwLock::new(cfg)),
             ..base_ctx
         });
 
@@ -16186,6 +16406,19 @@ temperature = 0.3
         let other_err =
             anyhow::Error::msg("OpenAI Codex API error (502 Bad Gateway): error code: 502");
         assert!(!is_context_window_overflow_error(&other_err));
+
+        // A typed capacity refusal stays out of the string detector even when an
+        // outer context carries a provider's overflow text: the turn engine owns
+        // that reason, and the journal reads it from the typed cause instead.
+        let typed_err = anyhow::Error::new(omnesagent_runtime::agent::ContextWindowExceeded {
+            estimated_tokens: 65_537,
+            model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
+        })
+        .context("maximum context length; private provider diagnostics");
+        assert!(!is_context_window_overflow_error(&typed_err));
     }
 
     fn channel_runtime_context_for_defaults_test(
@@ -16249,6 +16482,7 @@ temperature = 0.3
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -16572,10 +16806,14 @@ api_key = "anthropic-key"
 
     #[test]
     fn sanitize_channel_response_strips_echoed_media_attachment_placeholder() {
-        // Degraded history carries `[media attachment]`; a non-vision model
-        // quoting it verbatim must not ship the internal artifact to the user.
-        let reply = "Here is what I can see:\n[media attachment]\n\nLet me know if you want details.";
-        let sanitized = sanitize_channel_response(reply, &[]);
+        // Degraded history carries `(media attachment omitted)`; a non-vision
+        // model quoting it verbatim must not ship the internal artifact to the
+        // user.
+        let reply = format!(
+            "Here is what I can see:\n{}\n\nLet me know if you want details.",
+            omnesagent_providers::multimodal::MEDIA_PLACEHOLDER
+        );
+        let sanitized = sanitize_channel_response(&reply, &[]);
         assert_eq!(
             sanitized,
             "Here is what I can see:\n\nLet me know if you want details."
@@ -16586,7 +16824,8 @@ api_key = "anthropic-key"
     fn sanitize_channel_response_placeholder_only_reply_scrubs_empty_and_plain_text_survives() {
         // A reply that is nothing but the echoed placeholder scrubs to empty;
         // the delivery layer substitutes its nonempty fallback for that.
-        let sanitized = sanitize_channel_response("[media attachment]", &[]);
+        let sanitized =
+            sanitize_channel_response(omnesagent_providers::multimodal::MEDIA_PLACEHOLDER, &[]);
         assert!(sanitized.trim().is_empty());
 
         // Ordinary prose that merely mentions attachments passes through.
@@ -16753,6 +16992,7 @@ api_key = "anthropic-key"
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -16852,6 +17092,7 @@ api_key = "anthropic-key"
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -16969,6 +17210,7 @@ api_key = "anthropic-key"
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -17090,6 +17332,7 @@ api_key = "anthropic-key"
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -18091,7 +18334,8 @@ api_key = "anthropic-key"
             reliability: Arc::new(omnesagent_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: Arc::new(RwLock::new(prompt_config)),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -18197,7 +18441,8 @@ api_key = "anthropic-key"
             reliability: Arc::new(omnesagent_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: Arc::new(RwLock::new(prompt_config)),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -20559,7 +20804,8 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(omnesagent_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config,
+            prompt_config: Arc::clone(&prompt_config),
+            live_config: Arc::new(RwLock::new(prompt_config.as_ref().clone())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -20649,6 +20895,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -20772,6 +21019,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -20890,6 +21138,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -20987,8 +21236,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "receipts block must be prefixed with the documented `---\\nTool receipts:` separator, got {receipts_message}"
         );
         assert!(
-            receipts_message.contains("zc-receipt-"),
-            "receipts block must carry at least one zc-receipt-* HMAC token (proves the generator actually ran), got {receipts_message}"
+            receipts_message.contains("oc-receipt-"),
+            "receipts block must carry at least one oc-receipt-* HMAC token (proves the generator actually ran), got {receipts_message}"
         );
         assert!(
             receipts_message.contains("mock_price"),
@@ -21045,6 +21294,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -21172,6 +21422,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -21246,8 +21497,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "agent must still respond when receipts are disabled"
         );
         assert!(
-            !sent_messages.iter().any(|m| m.contains("zc-receipt-")),
-            "no zc-receipt- token must appear in any sent message when receipts are disabled, got {:?}",
+            !sent_messages.iter().any(|m| m.contains("oc-receipt-")),
+            "no oc-receipt- token must appear in any sent message when receipts are disabled, got {:?}",
             sent_messages.as_slice()
         );
         assert!(
@@ -21321,6 +21572,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -21453,6 +21705,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -21570,6 +21823,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -21704,7 +21958,8 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(omnesagent_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(prompt_config),
+            prompt_config: Arc::new(prompt_config.clone()),
+            live_config: Arc::new(RwLock::new(prompt_config)),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -21864,6 +22119,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -22044,6 +22300,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::clone(&prompt_config),
+            live_config: Arc::new(RwLock::new(prompt_config.as_ref().clone())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -22532,6 +22789,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -22644,6 +22902,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -22766,6 +23025,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -23138,6 +23398,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -23284,6 +23545,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -23445,6 +23707,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -23616,6 +23879,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
             multimodal: omnesagent_config::schema::MultimodalConfig::default(),
@@ -23763,6 +24027,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -23899,6 +24164,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -24385,6 +24651,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -24514,6 +24781,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -24647,6 +24915,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -24772,6 +25041,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -24897,6 +25167,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -25309,6 +25580,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -25398,10 +25670,13 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(prompt.contains("## Current Date"), "missing Date section");
+        assert!(
+            !prompt.contains("## Current Date"),
+            "system prompt must not carry wall-clock date (#11704)"
+        );
         assert!(
             !prompt.contains("## Current Date & Time"),
-            "prompt should use date-only context"
+            "prompt should not use datetime context"
         );
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
     }
@@ -26512,7 +26787,10 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_history_key(&msg),
             "wecom_ws_work_group--room-1"
         );
-        assert_eq!(interruption_scope_key(&msg), "wecom_ws_work_group--room-1");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "reply_target:13:wecom_ws.work:13:group--room-1:14:omnesagent_user:13:group--room-1"
+        );
     }
 
     #[test]
@@ -26729,7 +27007,8 @@ BTC is currently around $65,000 based on latest tool output."#
             "openrouter.default",
             "config-default-model",
         );
-        ctx.prompt_config = Arc::new(prompt_config);
+        ctx.prompt_config = Arc::new(prompt_config.clone());
+        ctx.live_config = Arc::new(RwLock::new(prompt_config));
         ctx
     }
 
@@ -27976,6 +28255,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -28157,6 +28437,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.data_dir.clone()),
             prompt_config: Arc::new(config.clone()),
+            live_config: Arc::new(RwLock::new(config.clone())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -28677,6 +28958,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29166,6 +29448,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -29228,7 +29511,16 @@ BTC is currently around $65,000 based on latest tool output."#
                 interruption_scope_id: None,
                 attachments: vec![omnesagent_api::media::MediaAttachment {
                     file_name: "sticker.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    // A real 1x1 PNG: content validation drops undecodable
+                    // bytes, so a placeholder never survives to the provider.
+                    data: vec![
+                        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+                        0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+                        0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+                        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ],
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -29266,7 +29558,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
         assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("iVBORw0KGgoAAAANSUhEUg"));
     }
 
     #[tokio::test]
@@ -29323,6 +29615,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -31986,7 +32279,9 @@ This is an example JSON object for profile settings."#;
         let vision_server = MockServer::start().await;
         let _vision_mock = Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("data:image/png;base64,AQIDBA=="))
+            .and(body_string_contains(
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [
                     {
@@ -32040,7 +32335,17 @@ This is an example JSON object for profile settings."#;
                 interruption_scope_id: None,
                 attachments: vec![omnesagent_api::media::MediaAttachment {
                     file_name: "route.png".to_string(),
-                    data: vec![1, 2, 3, 4],
+                    // A real 1x1 PNG: content validation rejects bytes that are
+                    // not decodable, so a placeholder would never reach the
+                    // vision route this test exercises.
+                    data: vec![
+                        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+                        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+                        0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+                        0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
+                        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    ],
                     mime_type: Some("image/png".to_string()),
                     marker: None,
                 }],
@@ -32088,7 +32393,7 @@ This is an example JSON object for profile settings."#;
         assert!(
             vision_body
                 .to_string()
-                .contains("data:image/png;base64,AQIDBA=="),
+                .contains("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe"),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
         );
     }
@@ -32475,6 +32780,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32592,6 +32898,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -32756,6 +33063,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33018,6 +33326,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33173,6 +33482,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33320,6 +33630,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33487,6 +33798,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -33932,6 +34244,45 @@ This is an example JSON object for profile settings."#;
         assert!(!cfg.enabled_for_channel("telegram"));
     }
 
+    /// Regression: the alias map is keyed by the operator-chosen section name,
+    /// so `[channels.whatsapp.home]` must opt in exactly like a `default` one.
+    /// This previously resolved to `false` because the lookup hardcoded the
+    /// literal key `"default"`.
+    #[test]
+    fn interrupt_on_new_message_config_reads_non_default_whatsapp_alias() {
+        let mut channels = omnesagent_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            omnesagent_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/omnesagent-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(cfg.enabled_for_channel("whatsapp"));
+    }
+
+    /// A configured alias that leaves the flag off must not opt the channel in.
+    #[test]
+    fn interrupt_on_new_message_config_ignores_non_default_alias_with_flag_off() {
+        let mut channels = omnesagent_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            omnesagent_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/omnesagent-whatsapp-session.db".into()),
+                interrupt_on_new_message: false,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(!cfg.enabled_for_channel("whatsapp"));
+    }
+
     #[test]
     fn interrupt_on_new_message_disabled_for_discord_by_default() {
         let cfg = InterruptOnNewMessageConfig {
@@ -33964,7 +34315,20 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:6:matrix:4:room:5:alice"
+        );
+
+        // Empty alias is treated like no alias by channel_scope.
+        let empty_alias_msg = omnesagent_api::channel::ChannelMessage {
+            channel_alias: Some(String::new()),
+            ..msg
+        };
+        assert_eq!(
+            interruption_scope_key(&empty_alias_msg),
+            "sender:6:matrix:4:room:5:alice"
+        );
     }
 
     #[test]
@@ -33984,7 +34348,10 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:6:matrix:4:room:5:alice:8:$thread1"
+        );
     }
 
     #[test]
@@ -34005,7 +34372,246 @@ This is an example JSON object for profile settings."#;
 
             ..Default::default()
         };
-        assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "sender:5:slack:4:C123:5:alice"
+        );
+    }
+
+    #[test]
+    fn interruption_scope_key_keeps_listeners_apart_when_underscores_collide() {
+        // Without length-prefixed canonical encoding, `slack.work` + `room_x` and `slack.work_room` + `x`
+        // could collide across component boundaries.
+        let scoped = |alias: &str, reply_target: &str| omnesagent_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: reply_target.into(),
+            content: "hi".into(),
+            channel: "slack".into(),
+            channel_alias: Some(alias.into()),
+            timestamp: 0,
+            thread_ts: Some("1234567890.000100".into()),
+            interruption_scope_id: Some("1234567890.000100".into()),
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+
+        let short_alias = interruption_scope_key(&scoped("work", "room_x"));
+        let long_alias = interruption_scope_key(&scoped("work_room", "x"));
+
+        assert_eq!(
+            short_alias,
+            "sender:10:slack.work:6:room_x:5:alice:17:1234567890.000100"
+        );
+        assert_eq!(
+            long_alias,
+            "sender:15:slack.work_room:1:x:5:alice:17:1234567890.000100"
+        );
+        assert_ne!(short_alias, long_alias);
+    }
+
+    #[test]
+    fn interruption_scope_key_prevents_component_boundary_collision() {
+        let irc_msg =
+            |target: &str, sender: &str, scope: omnesagent_api::channel::ChannelConversationScope| {
+                omnesagent_api::channel::ChannelMessage {
+                    id: "1".into(),
+                    sender: sender.into(),
+                    reply_target: target.into(),
+                    content: "hi".into(),
+                    channel: "irc".into(),
+                    channel_alias: Some("default".into()),
+                    timestamp: 0,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    conversation_scope: scope,
+                    attachments: vec![],
+                    subject: None,
+                    ..Default::default()
+                }
+            };
+
+        // Sender scope variants
+        let sender_room_underscore = irc_msg(
+            "#room_",
+            "alice",
+            omnesagent_api::channel::ChannelConversationScope::Sender,
+        );
+        let sender_user_underscore = irc_msg(
+            "#room",
+            "_alice",
+            omnesagent_api::channel::ChannelConversationScope::Sender,
+        );
+        assert_eq!(
+            interruption_scope_key(&sender_room_underscore),
+            "sender:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&sender_user_underscore),
+            "sender:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&sender_user_underscore)
+        );
+
+        // ReplyTarget scope variants
+        let reply_room_underscore = irc_msg(
+            "#room_",
+            "alice",
+            omnesagent_api::channel::ChannelConversationScope::ReplyTarget,
+        );
+        let reply_user_underscore = irc_msg(
+            "#room",
+            "_alice",
+            omnesagent_api::channel::ChannelConversationScope::ReplyTarget,
+        );
+        assert_eq!(
+            interruption_scope_key(&reply_room_underscore),
+            "reply_target:11:irc.default:6:#room_:5:alice"
+        );
+        assert_eq!(
+            interruption_scope_key(&reply_user_underscore),
+            "reply_target:11:irc.default:5:#room:6:_alice"
+        );
+        assert_ne!(
+            interruption_scope_key(&reply_room_underscore),
+            interruption_scope_key(&reply_user_underscore)
+        );
+
+        // Cross-scope: Sender vs ReplyTarget with identical components must never collide
+        assert_ne!(
+            interruption_scope_key(&sender_room_underscore),
+            interruption_scope_key(&reply_room_underscore)
+        );
+
+        // Leading and trailing underscores across all boundaries:
+        // 1. Channel scope boundary
+        let ch_underscore = omnesagent_api::channel::ChannelMessage {
+            channel: "irc_default".into(),
+            channel_alias: None,
+            reply_target: "room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        let target_underscore = omnesagent_api::channel::ChannelMessage {
+            channel: "irc".into(),
+            channel_alias: None,
+            reply_target: "_default_room".into(),
+            sender: "alice".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            interruption_scope_key(&ch_underscore),
+            interruption_scope_key(&target_underscore)
+        );
+
+        // 2. Sender vs scope_id boundary
+        let mut sender_underscore_trailing = sender_room_underscore.clone();
+        sender_underscore_trailing.sender = "alice_".into();
+        sender_underscore_trailing.interruption_scope_id = Some("thread".into());
+
+        let mut scope_underscore_leading = sender_room_underscore.clone();
+        scope_underscore_leading.sender = "alice".into();
+        scope_underscore_leading.interruption_scope_id = Some("_thread".into());
+
+        assert_ne!(
+            interruption_scope_key(&sender_underscore_trailing),
+            interruption_scope_key(&scope_underscore_leading)
+        );
+
+        // 3. None scope_id vs empty string scope_id vs non-empty scope_id
+        let mut msg_none = sender_room_underscore.clone();
+        msg_none.interruption_scope_id = None;
+
+        let mut msg_empty = sender_room_underscore.clone();
+        msg_empty.interruption_scope_id = Some("".into());
+
+        let mut msg_some = sender_room_underscore.clone();
+        msg_some.interruption_scope_id = Some("t".into());
+
+        assert_ne!(
+            interruption_scope_key(&msg_none),
+            interruption_scope_key(&msg_empty)
+        );
+        assert_ne!(
+            interruption_scope_key(&msg_none),
+            interruption_scope_key(&msg_some)
+        );
+        assert_ne!(
+            interruption_scope_key(&msg_empty),
+            interruption_scope_key(&msg_some)
+        );
+    }
+
+    /// Sibling scopes with boundary underscores (e.g. `(telegram.default, room_, alice)`
+    /// vs `(telegram.default, room, _alice)`) must not cancel each other's turn when /stop is sent.
+    #[tokio::test]
+    async fn message_dispatch_boundary_colliding_scopes_do_not_cancel_each_other() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(150),
+            }),
+            omnesagent_config::schema::Config::default(),
+            omnesagent_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<omnesagent_api::channel::ChannelMessage>(8);
+        let send_task = omnesagent_spawn::spawn!(async move {
+            // Scope A: (telegram.default, room_, alice) starts an in-flight turn
+            tx.send(omnesagent_api::channel::ChannelMessage {
+                id: "m1".into(),
+                sender: "alice".into(),
+                reply_target: "room_".into(),
+                content: "please think slowly".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+            // Scope B: (telegram.default, room, _alice) sends /stop while Scope A is in flight.
+            // Delimiter-escaped keys collapsed both to `telegram.default_room___alice`.
+            // Canonical length-prefixed keys keep them distinct so Scope A continues.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(omnesagent_api::channel::ChannelMessage {
+                id: "s1".into(),
+                sender: "_alice".into(),
+                reply_target: "room".into(),
+                content: "/stop".into(),
+                channel: "telegram".into(),
+                channel_alias: Some("default".into()),
+                timestamp: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let stop_no_task =
+            omnesagent_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task");
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("please think slowly")),
+            "Scope A turn must complete despite Scope B /stop: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|m| m.ends_with(&stop_no_task)),
+            "Scope B /stop must resolve to no task of its own: {sent:?}"
+        );
     }
 
     #[tokio::test]
@@ -34054,6 +34660,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: omnesagent_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(omnesagent_config::schema::Config::default()),
+            live_config: Arc::new(RwLock::new(omnesagent_config::schema::Config::default())),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -35559,54 +36166,76 @@ Done."#;
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_legacy_datetime_section_to_date_only() {
+    fn build_channel_system_prompt_strips_legacy_datetime_keeps_project_note() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
             None,
         );
 
-        assert!(prompt.contains("## Current Date\n\n"));
         assert!(prompt.contains("Project note, not generated date context."));
         assert!(!prompt.contains("## Current Date & Time"));
         assert!(!prompt.contains("01:02:03"));
-        let generated_section = prompt
-            .split("## Runtime")
-            .next()
-            .expect("prompt should contain runtime section before generated date assertion");
-        let date_line = generated_section
-            .rsplit("## Current Date\n\n")
-            .next()
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
-        );
         assert!(
-            date_line[10..].starts_with(" ("),
-            "date line should contain only date plus UTC offset: {date_line}"
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_current_date_section() {
+    fn build_channel_system_prompt_strips_date_after_multibyte_text() {
+        let prompt = build_channel_system_prompt(
+            "\u{e9}\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.starts_with('\u{e9}'));
+        assert!(!prompt.contains("## Current Date"));
+        assert!(!prompt.contains("2026-01-01 (+00:00)"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_keeps_dated_project_note() {
+        let prompt = build_channel_system_prompt(
+            "Base.\n\n## Current Date\n\n2026-10-16 is the project launch date.\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.contains("## Current Date\n\n2026-10-16 is the project launch date."));
+    }
+
+    #[test]
+    fn generated_date_line_matches_only_builder_output() {
+        assert!(is_generated_date_line("2026-01-01 (+00:00)"));
+        assert!(is_generated_date_line("2026-01-01 01:02:03 (UTC)"));
+        assert!(!is_generated_date_line(
+            "2026-10-16 is the project launch date."
+        ));
+        assert!(!is_generated_date_line("2026-01-01 (+00:00)\nmore notes"));
+        assert!(!is_generated_date_line(
+            "Project note, not generated date context."
+        ));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_strips_generated_current_date_section() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
             None,
         );
 
-        assert!(prompt.contains("## Current Date\n\n"));
+        assert!(!prompt.contains("## Current Date"));
         assert!(!prompt.contains("2026-01-01 (+00:00)"));
-        let date_line = prompt
-            .split("## Current Date\n\n")
-            .nth(1)
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
+        assert!(
+            prompt.starts_with("Base.\n\n## Runtime\n"),
+            "next heading keeps its blank line: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 

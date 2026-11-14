@@ -9,7 +9,7 @@ const PREFIX: &str = "OMNESAGENT_";
 const SEP: &str = "__";
 
 /// `[todotracker]` was a daemon schema section in v0.8.3 only; TodoWrite
-/// display config now lives in ZeroCode's `zerocode-config.toml`. Removing the
+/// display config now lives in OmnesCode's `omnescode-config.toml`. Removing the
 /// schema section would make these previously valid env vars unresolved, and
 /// an unresolved path is a hard error — so a working deployment would stop
 /// starting after an upgrade. Recognized legacy fields are therefore accepted
@@ -65,14 +65,14 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         // Recognized legacy `[todotracker]` vars are accepted and ignored so an
         // upgrade cannot turn a previously working deployment into a daemon
         // that refuses to start. The value has no effect: TodoWrite display is
-        // now owned by ZeroCode's `zerocode-config.toml`.
+        // now owned by OmnesCode's `omnescode-config.toml`.
         if is_recognized_legacy_todotracker(&tail) {
             ::omnesagent_log::record!(
                 WARN,
                 ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
                     .with_outcome(::omnesagent_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"env_var": env_name})),
-                "ignoring removed [todotracker] env override; move this setting into zerocode-config.toml"
+                "ignoring removed [todotracker] env override; move this setting into omnescode-config.toml"
             );
             continue;
         }
@@ -502,8 +502,8 @@ mod tests {
     }
     // ── Legacy `[todotracker]` compatibility ────────────────────────────────
     //
-    // The section moved out of the daemon schema into ZeroCode's
-    // `zerocode-config.toml`. Recognized legacy env vars must not become
+    // The section moved out of the daemon schema into OmnesCode's
+    // `omnescode-config.toml`. Recognized legacy env vars must not become
     // unresolved paths, because an unresolved path is fatal and would stop a
     // previously working daemon from starting after an upgrade.
 

@@ -8,7 +8,7 @@
 //! The config-derived types this widget is built from
 //! ([`TodoLocation`](crate::config::TodoLocation) and
 //! [`TodoTrackerSettings`](crate::config::TodoTrackerSettings)) live in
-//! [`crate::config`], the single owner of `zerocode-config.toml` parsing.
+//! [`crate::config`], the single owner of `omnescode-config.toml` parsing.
 
 use crate::wire::{PlanEntry, PlanStatus};
 
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn render_obeys_active_theme() {
         // Regression guard: the tracker panel must paint from the active
-        // ZeroCode theme, not ratatui defaults. Pin a known palette and
+        // OmnesCode theme, not ratatui defaults. Pin a known palette and
         // assert entry spans carry that theme's colours (routed through the
         // same colour-depth downgrade the renderer uses, so the assertion
         // is independent of the test terminal's detected depth).

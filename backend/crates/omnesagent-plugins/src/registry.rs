@@ -64,8 +64,13 @@ pub fn registry_cache_path(data_dir: &Path) -> PathBuf {
 
 pub fn read_cached_registry_index(data_dir: &Path) -> Result<Option<PluginRegistryIndex>> {
     let path = registry_cache_path(data_dir);
-    let Ok(registry_json) = std::fs::read_to_string(&path) else {
-        return Ok(None);
+    let registry_json = match std::fs::read_to_string(&path) {
+        Ok(registry_json) => registry_json,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading cached plugin registry {}", path.display()));
+        }
     };
     serde_json::from_str::<PluginRegistryIndex>(&registry_json)
         .map(Some)
@@ -109,7 +114,10 @@ pub fn parse_plugin_spec(source: &str) -> Result<PluginSpec> {
     if source.is_empty() {
         bail!("plugin name must not be empty");
     }
-    let Some((name, version)) = source.rsplit_once('@') else {
+    // A package name cannot contain `@` and a registry version can, so the
+    // name ends at the first one: `name@version` parses back to the entry it
+    // was printed from, whatever the version holds.
+    let Some((name, version)) = source.split_once('@') else {
         return Ok(PluginSpec {
             name: source.to_string(),
             version: None,
@@ -140,6 +148,32 @@ pub fn resolve_entry<'a>(
     matches
         .next_back()
         .ok_or_else(|| anyhow::Error::msg(format!("plugin '{}' not found in registry", spec.name)))
+}
+
+/// Resolve the install-default entry for every distinct registry package.
+///
+/// Version selection delegates to [`resolve_entry`], keeping unpinned install
+/// and catalog views on the same rule: the last matching entry in the index.
+#[must_use]
+pub fn resolved_entries(index: &PluginRegistryIndex) -> Vec<&PluginRegistryEntry> {
+    let mut seen = std::collections::HashSet::new();
+    index
+        .plugins
+        .iter()
+        .filter_map(|entry| {
+            if !seen.insert(entry.name.as_str()) {
+                return None;
+            }
+            resolve_entry(
+                index,
+                &PluginSpec {
+                    name: entry.name.clone(),
+                    version: None,
+                },
+            )
+            .ok()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -193,6 +227,18 @@ mod tests {
     }
 
     #[test]
+    fn resolved_entries_use_unpinned_install_selection() {
+        let index = sample_index();
+
+        let resolved = resolved_entries(&index);
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "team-calendar");
+        assert_eq!(resolved[0].version, "0.2.0");
+        assert_eq!(resolved[1].name, "web-research");
+    }
+
+    #[test]
     fn resolves_pinned_version_or_latest_listed_match() {
         let index = sample_index();
 
@@ -225,6 +271,30 @@ mod tests {
     }
 
     #[test]
+    fn a_version_holding_an_at_sign_parses_back_whole() {
+        let entry = PluginRegistryEntry {
+            name: "team-calendar".to_string(),
+            version: "0.3.0@rc.1".to_string(),
+            description: None,
+            author: None,
+            capabilities: vec!["tool".to_string()],
+            url: "https://example.invalid/team-calendar-0.3.0.zip".to_string(),
+            sha256: None,
+        };
+
+        assert_eq!(
+            parse_plugin_spec(&install_source(&entry)).unwrap(),
+            PluginSpec {
+                name: "team-calendar".to_string(),
+                version: Some("0.3.0@rc.1".to_string()),
+            }
+        );
+        for malformed in ["@0.3.0", "team-calendar@"] {
+            assert!(parse_plugin_spec(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
     fn writes_and_reads_cached_registry_with_origin() {
         let dir = tempfile::tempdir().unwrap();
         let index = sample_index();
@@ -241,5 +311,19 @@ mod tests {
             Some("https://example.invalid/registry.json")
         );
         assert!(registry_cache_path(dir.path()).is_file());
+    }
+
+    #[test]
+    fn cache_absence_is_distinct_from_an_unreadable_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_cached_registry_index(dir.path()).unwrap().is_none());
+
+        let path = registry_cache_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+
+        let error = read_cached_registry_index(dir.path())
+            .expect_err("invalid UTF-8 should be reported as a cache read failure");
+        assert!(error.to_string().contains("reading cached plugin registry"));
     }
 }

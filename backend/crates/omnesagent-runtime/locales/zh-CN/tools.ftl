@@ -62,8 +62,11 @@ tool-file-download-error-move = 将已下载文件移动到位失败：{ $err }
 tool-file-download-success = 已下载 { $written } 字节到 { $dest_path }（{ $status }）
 tool-file-read = 读取带行号的文件内容。支持通过 offset 和 limit 进行部分读取。二进制文件和图像文件会被拒绝（图像请使用 image_info 工具）。设置 encoding="base64" 可以返回经 base64 编码的原始字节（适用于 .pdf/.xlsx/.docx 等二进制文件）；该模式下 offset/limit 被忽略。
 tool-file-write = 将内容写入工作区中的文件
-tool-git-operations = 执行结构化的 Git 操作（status、diff、log、branch、commit、add、checkout、stash）。提供解析后的 JSON 输出，并与安全策略集成以实现自主控制。
+tool-git-operations = 执行结构化的 Git 操作（status、diff、log、branch、commit、add、checkout、stash、worktree）。提供解析后的 JSON 输出，并与安全策略集成以实现自主控制。
 tool-git-operations-error-not-in-repo = 当前路径 '{ $path }' 不在 Git 仓库中。请选择一个 Git 工作树内的路径，通过 'path' 参数指定仓库子目录，或在运行 git_operations 前初始化一个仓库。
+tool-git-operations-error-repository-outside-authorized-roots = 在 '{ $path }' 的允许根目录内没有可访问的 Git 仓库。请选择位于适用允许根目录内的仓库路径，或在运行 git_operations 前初始化仓库。
+tool-git-operations-error-repository-not-authorized = '{ $path }' 的 Git 仓库元数据未获授权执行此操作。请选择位于适用允许根目录内的仓库。
+tool-git-operations-error-path-not-authorized = Git 路径 '{ $path }' 未获授权执行此操作。请选择位于适用允许根目录内的路径。
 tool-git-forge-error-requires-field = { $resource }.{ $action } 需要 '{ $field }'。
 tool-git-forge-error-requires-number = { $resource }.{ $action } 需要 'number'。
 tool-git-forge-error-issue-close-reason = issue.close 的 'reason' 必须为 'completed' 或 'not_planned'。
@@ -96,7 +99,7 @@ tool-project-intel = 项目交付智能：生成状态报告、检测风险、�
 tool-proxy-config = 管理 OmnesAgent 代理设置（范围：environment | omnesagent | services），包括运行时和进程环境变量应用
 tool-pushover = 向你的设备发送 Pushover 通知。需要 .env 文件中的 PUSHOVER_TOKEN 和 PUSHOVER_USER_KEY。
 tool-schedule = 管理仅限 shell 的定时任务。操作：create/add/once/list/get/cancel/remove/pause/resume。警告：此工具创建的 shell 任务输出仅被记录，不会投递到任何频道。要向 Discord/Telegram/Slack/Matrix 发送定时消息，请使用 cron_add 工具，并设置 job_type='agent' 和如 {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"} 的 delivery 配置。
-tool-screenshot = 捕获当前屏幕的截图。返回文件路径和 base64 编码的 PNG 数据。
+tool-screenshot = 捕获当前屏幕的截图。返回已保存文件的路径。
 tool-security-ops = 用于托管网络安全服务的安全运营工具。操作：triage_alert（对告警分类/排序）、run_playbook（执行事件响应步骤）、parse_vulnerability（解析扫描结果）、generate_report（创建安全态势报告）、list_playbooks（列出可用 playbook）、alert_stats（汇总告警指标）。
 tool-shell = 在工作区目录中执行 shell 命令
 tool-sop-advance = 报告当前 SOP 步骤的结果并推进到下一步。提供 run_id、步骤是成功还是失败，以及简要的输出摘要。

@@ -64,7 +64,7 @@ expect_run "runtime then channel" "all" \
     "crates/omnesagent-runtime/src/lib.rs" \
     "crates/omnesagent-channels/src/orchestrator/mod.rs"
 
-expect_skip "ZeroCode-only changes" "apps/zerocode/src/app.rs"
+expect_skip "OmnesCode-only changes" "apps/omnescode/src/app.rs"
 expect_skip "web-only changes" "web/src/pages/AgentChat.tsx"
 expect_skip "docs-only changes" "docs/book/src/contributing/testing.md"
 expect_skip "unrelated crate changes" "crates/omnesagent-providers/src/openai.rs"

@@ -1,6 +1,6 @@
 //! Shared serde projection types for the SOP Blueprint graph. Single source
 //! of the graph wire shape: the runtime builds these, the gateway exports
-//! their JSON Schema, and the zerocode TUI deserializes them off RPC.
+//! their JSON Schema, and the omnescode TUI deserializes them off RPC.
 
 use serde::{Deserialize, Serialize};
 
@@ -176,8 +176,8 @@ pub struct NodePosition {
 
 /// Canonical canvas geometry: the pixel box and inter-slot pitch every
 /// surface renders a node with, plus the seed origin a grid slot maps to.
-/// This is the single registry both the web canvas and the zerocode TUI read
-/// from (the web off `GraphLayout.geometry`, zerocode off [`LayoutGeometry::CANONICAL`])
+/// This is the single registry both the web canvas and the omnescode TUI read
+/// from (the web off `GraphLayout.geometry`, omnescode off [`LayoutGeometry::CANONICAL`])
 /// so neither surface hardcodes its own drifting copy. A slot at
 /// `(col, row)` seeds to `(origin + col*(node_w+col_gap), origin + row*(node_h+row_gap))`,
 /// and a persisted `NodePosition.x`/`y` lives in that same pixel space.

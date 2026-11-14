@@ -236,6 +236,7 @@ pub fn build_repo_map(
     };
 
     let ranked = personalized_pagerank(&graph, &seeds, 0.85, 100, 1e-6);
+    let ranked = apply_elbow_cutoff(&ranked);
 
     // --- Блоки файлов -----------------------------------------------------------
     let mut blocks: Vec<String> = Vec::with_capacity(n);
@@ -264,7 +265,7 @@ pub fn build_repo_map(
         }
     }
 
-    for &(node, score) in &ranked {
+    for &(node, score) in ranked {
         let file = &files[node];
         let syms = load_symbols(conn, project_id, file.id, 12)?;
         if syms.is_empty() {
@@ -320,4 +321,53 @@ fn fit_prefix(blocks: &[String], budget: usize) -> usize {
         }
     }
     lo
+}
+
+/// Применяет отсечение «локтя» (Elbow Cutoff):
+/// отсекает узлы, чей скор < 0.15 S_max или падает более чем на 50% относительно предыдущего (при i >= 3).
+pub fn apply_elbow_cutoff(ranked: &[(usize, f64)]) -> &[(usize, f64)] {
+    if ranked.is_empty() {
+        return ranked;
+    }
+    let s_max = ranked[0].1;
+    let min_score = s_max * 0.15;
+
+    let mut cutoff_len = ranked.len();
+    for (i, &(_, score)) in ranked.iter().enumerate() {
+        if score < min_score {
+            cutoff_len = i;
+            break;
+        }
+        if i >= 3 && score < 0.5 * ranked[i - 1].1 {
+            cutoff_len = i;
+            break;
+        }
+    }
+    &ranked[..cutoff_len.max(1)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elbow_cutoff_truncates_below_threshold_or_on_steep_drop() {
+        let items = vec![
+            (0, 1.0),
+            (1, 0.8),
+            (2, 0.7),
+            (3, 0.2), // > 50% drop from 0.7 at i >= 3
+            (4, 0.1),
+        ];
+        let cut = apply_elbow_cutoff(&items);
+        assert_eq!(cut.len(), 3, "drops at item 3 due to >50% plunge");
+
+        let items2 = vec![
+            (0, 1.0),
+            (1, 0.5),
+            (2, 0.14), // < 0.15 * S_max
+        ];
+        let cut2 = apply_elbow_cutoff(&items2);
+        assert_eq!(cut2.len(), 2, "drops at item 2 due to < 0.15 * S_max");
+    }
 }

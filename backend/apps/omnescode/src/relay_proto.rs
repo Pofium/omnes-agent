@@ -1,6 +1,6 @@
 //! Client-side relay wire frames for `omnesagent.relay.v1`.
 //!
-//! Keep this small and dependency-light: zerocode is an RPC/wire client and must
+//! Keep this small and dependency-light: omnescode is an RPC/wire client and must
 //! not link backend `omnesagent-*` crates. The daemon and relay own their shared
 //! protocol crate; this module mirrors only the frames the client sends or
 //! receives.
@@ -12,7 +12,7 @@ pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 pub const MAX_DATA_PAYLOAD: usize = 64 * 1024;
 /// Largest legal WebSocket message on the relay plane: a `DATA` message is an
 /// 8-byte `conn_id` header plus at most [`MAX_DATA_PAYLOAD`]; control frames are
-/// bounded by [`MAX_CONTROL_FRAME`]. Mirrors `omnesagent-relay-proto`; zerocode
+/// bounded by [`MAX_CONTROL_FRAME`]. Mirrors `omnesagent-relay-proto`; omnescode
 /// cannot depend on `omnesagent-*` crates (RPC-boundary gate), so this module is
 /// a deliberate copy and the two must be changed together.
 pub const MAX_WS_MESSAGE: usize = if MAX_CONTROL_FRAME > MAX_DATA_PAYLOAD + 8 {

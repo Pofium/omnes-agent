@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
+use rumqttc::{AsyncClient, Broker, Event, MqttOptions, Packet, QoS, Transport};
 
 use omnesagent_config::schema::MqttConfig;
 use omnesagent_runtime::sop::audit::SopAuditLogger;
@@ -21,22 +21,10 @@ pub async fn run_mqtt_sop_listener(
     engine: Arc<Mutex<SopEngine>>,
     audit: Arc<SopAuditLogger>,
 ) -> Result<()> {
-    config.validate()?;
-
-    let mut mqtt_options = MqttOptions::new(
-        &config.client_id,
-        broker_host(&config.broker_url),
-        broker_port(&config.broker_url),
-    );
-    mqtt_options.set_keep_alive(std::time::Duration::from_secs(config.keep_alive_secs));
-
-    if let (Some(user), Some(pass)) = (&config.username, &config.password) {
-        mqtt_options.set_credentials(user, pass);
-    }
+    let mqtt_options = mqtt_options(config)?;
 
     // Configure TLS transport when mqtts:// scheme is used
     if config.use_tls {
-        mqtt_options.set_transport(Transport::tls_with_default_config());
         ::omnesagent_log::record!(
             INFO,
             ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
@@ -44,7 +32,9 @@ pub async fn run_mqtt_sop_listener(
         );
     }
 
-    let (client, mut eventloop) = AsyncClient::new(mqtt_options, 64);
+    let (client, mut eventloop) = AsyncClient::builder(mqtt_options)
+        .capacity(64)
+        .try_build()?;
 
     let qos = match config.qos {
         0 => QoS::AtMostOnce,
@@ -68,11 +58,12 @@ pub async fn run_mqtt_sop_listener(
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(msg))) => {
+                let topic = std::str::from_utf8(&msg.topic)?;
                 let payload_raw = String::from_utf8_lossy(&msg.payload);
                 SopIngress::new(Some(&engine), Some(audit.as_ref()))
                     .dispatch(
                         SopTriggerSource::Mqtt,
-                        Some(&msg.topic),
+                        Some(topic),
                         Some(&payload_raw),
                         None,
                         None,
@@ -104,6 +95,29 @@ pub async fn run_mqtt_sop_listener(
         }
     }
 }
+
+fn mqtt_options(config: &MqttConfig) -> Result<MqttOptions> {
+    config.validate()?;
+    let mut options = MqttOptions::new(
+        &config.client_id,
+        Broker::tcp(
+            broker_host(&config.broker_url),
+            broker_port(&config.broker_url),
+        ),
+    );
+    options.set_keep_alive(u16::try_from(config.keep_alive_secs)?);
+    if let (Some(user), Some(pass)) = (&config.username, &config.password) {
+        options.set_credentials(user.as_str(), pass.clone());
+    }
+    if config.use_tls {
+        options.set_transport(Transport::try_tls_with_default_config()?);
+    }
+    Ok(options)
+}
+
+#[cfg(test)]
+#[path = "mqtt/security_tests.rs"]
+mod security_tests;
 
 /// Extract host from broker URL like "mqtt://host:port"
 fn broker_host(url: &str) -> String {

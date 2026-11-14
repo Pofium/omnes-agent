@@ -38,12 +38,16 @@ RUN cargo build --release --bin omnesagent
 FROM debian:bookworm-slim AS runtime
 
 # Install runtime utilities needed by agent tools (git, curl, sqlite3, certificates)
+# The emSign/eMudhra roots were distrusted (DSA-6572-1): fail the build rather
+# than ship an image whose OS trust store still carries them. The bookworm fix
+# version is a lower bound, so it also holds on newer bases.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
     sqlite3 \
     libssl3 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && rm -rf /var/lib/apt/lists/*
 
 # Setup non-root system user and persistent volume mount point

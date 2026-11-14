@@ -164,6 +164,57 @@ api_key = "sk-cc-v2-test"
 }
 
 #[test]
+fn openai_chat_folds_under_openai() {
+    let v3 = migrate_v2(
+        r#"
+[providers.models.openai-chat]
+api_key = "sk-oc-v2-test"
+uri = "http://127.0.0.1:8002/v1"
+model = "coder"
+"#,
+    );
+    let model_providers = lookup_dotted(&v3, "providers.models")
+        .and_then(toml::Value::as_table)
+        .expect("providers.models present after V2→V3");
+    let entry = model_providers
+        .get("openai")
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("default"))
+        .and_then(toml::Value::as_table)
+        .expect("openai-chat folded under providers.models.openai.default");
+    assert_eq!(
+        entry.get("uri").and_then(toml::Value::as_str),
+        Some("http://127.0.0.1:8002/v1")
+    );
+    assert!(
+        !model_providers.contains_key("openai-chat"),
+        "standalone openai-chat provider must not appear in V3"
+    );
+}
+
+#[test]
+fn openai_underscore_chat_folds_under_openai() {
+    let v3 = migrate_v2(
+        r#"
+[providers.models.openai_chat]
+api_key = "sk-ocu-v2-test"
+uri = "http://127.0.0.1:8006/v1"
+"#,
+    );
+    let model_providers = lookup_dotted(&v3, "providers.models")
+        .and_then(toml::Value::as_table)
+        .expect("providers.models present after V2→V3");
+    assert!(
+        model_providers
+            .get("openai")
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("default"))
+            .is_some(),
+        "openai_chat folded under providers.models.openai.default"
+    );
+}
+
+#[test]
 fn v1_model_routes_preserved_at_providers_level() {
     let cfg = v3_config();
     assert!(
@@ -2770,4 +2821,70 @@ api_key = "sk-openai-lead"
             agent.model_provider
         );
     }
+}
+
+
+#[test]
+fn v3_explicit_empty_allowed_tools_stays_unrestricted() {
+    // No schema migration touches `allowed_tools`: V3 files with an explicit
+    // `allowed_tools = []` keep the legacy unrestricted meaning.
+    let raw = r#"
+schema_version = 3
+
+[risk_profiles.default]
+allowed_tools = []
+"#;
+    let cfg = migrate_to_current(raw).expect("V3 empty allowed_tools loads");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("default profile survives");
+    assert!(
+        profile.allowed_tools.is_empty(),
+        "legacy V3 allowed_tools = [] must stay the unrestricted state, got {:?}",
+        profile.allowed_tools
+    );
+    assert!(!profile.deny_all_tools);
+    let policy = omnesagent_config::policy::SecurityPolicy::from_profiles(
+        profile,
+        None,
+        std::path::Path::new("/ws"),
+    );
+    assert!(
+        policy.is_tool_allowed("shell"),
+        "legacy empty array must remain unrestricted"
+    );
+}
+
+#[test]
+fn v3_deny_all_tools_flag_loads_without_migration() {
+    // `deny_all_tools` is a plain additive V3 field: no migration step, it
+    // deserializes directly and maps to deny-all at the policy boundary.
+    let raw = r#"
+schema_version = 3
+
+[risk_profiles.default]
+deny_all_tools = true
+"#;
+    let cfg = migrate_to_current(raw).expect("V3 deny_all_tools loads");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("default profile present");
+    assert!(profile.deny_all_tools);
+    let policy = omnesagent_config::policy::SecurityPolicy::from_profiles(
+        profile,
+        None,
+        std::path::Path::new("/ws"),
+    );
+    assert!(
+        !policy.is_tool_allowed("shell"),
+        "deny_all_tools = true must deny built-ins"
+    );
+    assert!(
+        !policy.is_tool_allowed("filesystem__write_file"),
+        "deny_all_tools = true must deny MCP-shaped names; the __ auto-admit is nonempty-allowlist only"
+    );
 }

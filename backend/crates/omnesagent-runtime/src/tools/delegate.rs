@@ -1025,11 +1025,7 @@ impl DelegateTool {
 
         let profile = self.risk_profiles.get(risk_profile)?;
         Some(SecurityPolicy {
-            allowed_tools: if profile.allowed_tools.is_empty() {
-                None
-            } else {
-                Some(profile.allowed_tools.clone())
-            },
+            allowed_tools: profile.effective_allowed_tools(),
             excluded_tools: if profile.excluded_tools.is_empty() {
                 None
             } else {
@@ -4307,7 +4303,7 @@ mod tests {
                     "--exact",
                     "control_plane::boot::tests::live_owner_process_helper",
                 ])
-                .env("ZEROCLAW_LIVE_OWNER_TEST_HELPER", "1")
+                .env("OMNESAGENT_LIVE_OWNER_TEST_HELPER", "1")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -4333,7 +4329,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let child_started_at = child_started_at.expect("child process should be visible");
-        let child_identity = format!("zc-process-v1:{child_pid}:{child_started_at}:test-owner");
+        let child_identity = format!("oc-process-v1:{child_pid}:{child_started_at}:test-owner");
 
         let temp = TempDir::new().unwrap();
         let data_dir = temp.path().join("data");
@@ -5305,6 +5301,25 @@ mod tests {
 
     fn agentic_risk_profiles(allowed_tools: Vec<String>) -> HashMap<String, RiskProfileConfig> {
         agentic_risk_profiles_with_excluded(allowed_tools, Vec::new())
+    }
+
+    fn agentic_risk_profiles_deny_all() -> HashMap<String, RiskProfileConfig> {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                deny_all_tools: true,
+                ..Default::default()
+            },
+        );
+        profiles
+    }
+
+    fn agentic_risk_profiles_legacy_deny_all() -> HashMap<String, RiskProfileConfig> {
+        agentic_risk_profiles(vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+        ])
     }
 
     fn agentic_risk_profiles_with_excluded(
@@ -6415,6 +6430,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agentic_mode_deny_all_tools_flag_is_deny_all() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_deny_all())
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool),
+                Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
+            ])));
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("policy resolves");
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "echo_tool"),
+            "deny_all_tools must deny built-ins"
+        );
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "server__tool"),
+            "deny_all_tools must deny MCP names; the __ auto-admit is nonempty-allowlist only"
+        );
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &FinalOnlyModelProvider,
+                "test",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("delegate saw tool"));
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_legacy_none_sentinel_is_deny_all() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_legacy_deny_all());
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("policy resolves");
+
+        assert!(!DelegateTool::delegate_admits_with_mcp(
+            &policy,
+            "echo_tool"
+        ));
+        assert!(!DelegateTool::delegate_admits_with_mcp(
+            &policy,
+            "server__tool"
+        ));
+    }
+
+    #[tokio::test]
     async fn agentic_mode_padded_allowed_tool_name_remains_exact_and_runs_without_match() {
         // Tool identifiers are exact names, not forgiving user input. Padding an
         // allowed_tools entry must not accidentally admit a real tool after
@@ -7249,8 +7320,8 @@ mod tests {
             receipts.as_slice()
         );
         assert!(
-            receipts[0].starts_with("echo_tool: zc-receipt-"),
-            "sub-tool receipt must be tagged with the tool name and a zc-receipt- HMAC token, got: {}",
+            receipts[0].starts_with("echo_tool: oc-receipt-"),
+            "sub-tool receipt must be tagged with the tool name and a oc-receipt- HMAC token, got: {}",
             receipts[0]
         );
     }

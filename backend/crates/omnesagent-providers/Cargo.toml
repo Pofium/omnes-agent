@@ -22,6 +22,13 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 chacha20poly1305 = "0.10"
 hex = "0.4"
 hmac = "0.12"
+image = { version = "0.25", default-features = false, features = [
+  "gif",
+  "jpeg",
+  "png",
+  "webp",
+] }
+libc = "0.2"
 parking_lot = "0.12"
 rand = "0.10"
 regex = "1.10"
@@ -35,6 +42,7 @@ tokio = { version = "1.50", default-features = false, features = ["rt-multi-thre
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs", "sync"] }
 tokio-util = { version = "0.7", default-features = false }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["test-util"] }
@@ -49,3 +57,7 @@ nix = { version = "0.30", default-features = false, features = ["process", "sign
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+
+[features]
+default = []
+test-helpers = []

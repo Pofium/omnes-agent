@@ -53,12 +53,12 @@ pub fn run(root: &Path) -> Result<()> {
     let list = render_list(arr)?;
     std::fs::write(book.join("theme/pc-themes.css"), css)?;
     inject_theme_list(&book.join("theme/index.hbs"), &list)?;
-    // Write the zerocode TUI theme-name list to a derived fragment that
+    // Write the omnescode TUI theme-name list to a derived fragment that
     // themes.md `{{#include}}`s at build time. Gitignored, like cli.md/config.md
     // — the names stay sourced from the same registry the TUI build generates
     // its preset table from, and nothing generated lands in the committed doc.
     std::fs::write(
-        root.join("docs/book/src/zerocode/zerocode-theme-list.md"),
+        root.join("docs/book/src/omnescode/omnescode-theme-list.md"),
         render_doc_theme_names(arr)?,
     )?;
     println!(
@@ -92,7 +92,7 @@ fn inject_theme_list(hbs_path: &Path, list: &str) -> Result<()> {
 }
 
 /// Render the dark/light grouped backtick list of snake_case theme names the
-/// TUI exposes. Mirrors `apps/zerocode/build.rs::snake_case`.
+/// TUI exposes. Mirrors `apps/omnescode/build.rs::snake_case`.
 fn render_doc_theme_names(themes: &[Value]) -> Result<String> {
     let names = |want: &str| -> Result<Vec<String>> {
         themes

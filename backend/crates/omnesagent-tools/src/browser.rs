@@ -2072,7 +2072,7 @@ mod native_backend {
 
         if trimmed.starts_with('@') {
             let escaped = css_attr_escape(trimmed);
-            return SelectorKind::Css(format!("[data-zc-ref=\"{escaped}\"]"));
+            return SelectorKind::Css(format!("[data-oc-ref=\"{escaped}\"]"));
         }
 
         SelectorKind::Css(trimmed.to_string())
@@ -2171,7 +2171,7 @@ mod native_backend {
     if (compact && !interactive && !text) return;
 
     const ref = '@e' + (++counter);
-    el.setAttribute('data-zc-ref', ref);
+    el.setAttribute('data-oc-ref', ref);
     nodes.push({{
       ref,
       depth,
@@ -2245,7 +2245,7 @@ mod native_backend {
             let SelectorKind::Css(css) = sel else {
                 panic!("expected Css selector, got XPath");
             };
-            assert_eq!(css, r#"[data-zc-ref="@elem"]"#);
+            assert_eq!(css, r#"[data-oc-ref="@elem"]"#);
         }
 
         #[test]

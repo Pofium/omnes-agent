@@ -1059,7 +1059,7 @@ bot_token = "t"
 
     #[test]
     fn valid_provider_aliases_survive_broken_sibling() {
-        // Repro for the zerocode "all providers vanish after restart" report:
+        // Repro for the omnescode "all providers vanish after restart" report:
         // one malformed provider alias must not take the whole [providers]
         // section (and every other provider) down with it.
         let raw = r#"

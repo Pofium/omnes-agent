@@ -16,9 +16,9 @@ extract:
 	fi
 	podman create --name omnesagent-extract $(IMAGE_NAME):$(IMAGE_TAG)
 	podman cp omnesagent-extract:/usr/bin/omnesagent .
-	podman cp omnesagent-extract:/usr/bin/zerocode .
+	podman cp omnesagent-extract:/usr/bin/omnescode .
 	podman rm omnesagent-extract
-	ls -lh omnesagent zerocode
+	ls -lh omnesagent omnescode
 
 extract-fat:
 	@if ! podman image exists $(IMAGE_NAME):$(IMAGE_FAT_TAG) 2>/dev/null; then \
@@ -26,7 +26,7 @@ extract-fat:
 	fi
 	podman create --name omnesagent-fat-extract $(IMAGE_NAME):$(IMAGE_FAT_TAG)
 	podman cp omnesagent-fat-extract:/usr/bin/omnesagent .
-	podman cp omnesagent-fat-extract:/usr/bin/zerocode .
+	podman cp omnesagent-fat-extract:/usr/bin/omnescode .
 	podman rm omnesagent-fat-extract
 	mv omnesagent omnesagent-fat
 	ls -lh omnesagent-fat
@@ -38,4 +38,4 @@ shell-debug:
 
 clean:
 	-podman rmi $(IMAGE_NAME):$(IMAGE_TAG) $(IMAGE_NAME):$(IMAGE_FAT_TAG) 2>/dev/null
-	rm -f omnesagent zerocode omnesagent-fat
+	rm -f omnesagent omnescode omnesagent-fat

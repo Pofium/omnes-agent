@@ -207,6 +207,11 @@ Examples:
         /// Host of the running gateway to query; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Print one JSON object (`pairing_code`, `message`) instead of text,
+        /// for programs such as the desktop app
+        #[arg(long)]
+        json: bool,
     },
 }
 

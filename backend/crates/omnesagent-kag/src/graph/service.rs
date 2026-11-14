@@ -1,5 +1,6 @@
 //! Сервис графа знаний: дедупликация, поиск и KAG-рассуждение.
 
+use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::embedding::EmbeddingProvider;
+use crate::telemetry::AccessTelemetry;
 use crate::vector::top_k;
 
 pub const REASON_SYSTEM_PROMPT: &str = "\
@@ -57,6 +59,8 @@ pub struct EdgeWithLabels {
 pub struct GraphSearchResult {
     pub nodes: Vec<NodeWithNeighbors>,
     pub edges: Vec<EdgeWithLabels>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,15 +90,83 @@ pub struct GraphStats {
     pub god_nodes: i64,
 }
 
+/// Apply one accumulated `(node_id, count)` access batch to `graph_nodes` in a
+/// single transaction (ADR-O6). Only the telemetry columns are written, so the
+/// label/description-scoped FTS trigger stays quiet on the access path.
+fn apply_graph_access_batch(
+    conn: &Connection,
+    batch: &[(String, i64)],
+    now: &str,
+) -> rusqlite::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    for (node_id, count) in batch {
+        conn.execute(
+            "UPDATE graph_nodes SET access_count = COALESCE(access_count, 0) + ?1, \
+             last_accessed = ?2 WHERE node_id = ?3",
+            params![count, now, node_id],
+        )?;
+    }
+    conn.execute_batch("COMMIT")?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct GraphService {
     conn: Arc<Mutex<Connection>>,
     embedder: Arc<dyn EmbeddingProvider>,
+    /// Batched `graph_nodes.access_count` telemetry (ADR-O6). Shared across
+    /// clones so every read funnels into one flush.
+    access: Arc<AccessTelemetry>,
 }
 
 impl GraphService {
     pub fn new(conn: Arc<Mutex<Connection>>, embedder: Arc<dyn EmbeddingProvider>) -> Self {
-        Self { conn, embedder }
+        Self {
+            conn,
+            embedder,
+            access: Arc::new(AccessTelemetry::new()),
+        }
+    }
+
+    /// Flush accumulated node-access counts to `graph_nodes` in one batch
+    /// (ADR-O6). Returns the number of distinct nodes written. On error the
+    /// drained batch is requeued so the next cadence retries it (fail-open:
+    /// telemetry loss on a transient store error is avoided). Safe to call from
+    /// a shutdown path.
+    pub fn flush_access_telemetry(&self) -> anyhow::Result<usize> {
+        let batch = self.access.drain();
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let applied = batch.len();
+        let conn = self.conn.lock();
+        let now = Local::now().to_rfc3339();
+        match apply_graph_access_batch(&conn, &batch, &now) {
+            Ok(()) => {
+                self.access.mark_flushed();
+                Ok(applied)
+            }
+            Err(error) => {
+                self.access.requeue(batch);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Record read nodes into the batched access accumulator (ADR-O6). The read
+    /// funnel (`search`) calls this so every real fork access grows
+    /// `graph_nodes.access_count` — ob2h's Access Telemetry Parity (pillar
+    /// III/VI). Only a short accumulator mutex is taken; the store write is
+    /// deferred to the flush cadence, so the read path never pays per node.
+    fn note_reads(&self, node_ids: &[String]) {
+        if node_ids.is_empty() {
+            return;
+        }
+        self.access.record_many(node_ids);
+        if self.access.flush_due() {
+            // Fail-open: a failed flush requeues the batch for the next cadence.
+            self.flush_access_telemetry().ok();
+        }
     }
 
     /// Быстрый поиск по графу знаний (лексический + векторный RRF)
@@ -113,83 +185,163 @@ impl GraphService {
 
         let mut scored: HashMap<i64, f64> = HashMap::new();
 
-        // 1. Полнотекстовый / лексический скоринг
-        let all_nodes = {
-            let conn = self.conn.lock();
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT id, label, description 
-                FROM graph_nodes 
-                WHERE (deleted_at IS NULL OR deleted_at = '')
-                  AND (?1 IS NULL OR project_id = ?1)
-                "#,
-            )?;
-            let rows = stmt.query_map(params![project_id_filter], |row| {
-                let id: i64 = row.get(0)?;
-                let label: String = row.get(1)?;
-                let desc: Option<String> = row.get(2)?;
-                Ok((id, label, desc))
-            })?;
-            let mut list = Vec::new();
-            for r in rows.flatten() {
-                list.push(r);
-            }
-            list
-        };
+        // 1. Лексический скоринг. Ф1.5: кандидаты берём из FTS5 (trigram →
+        //    поиск по подстроке), а не полным перебором `SELECT … FROM graph_nodes`.
+        //    Ранжирование (label/desc) прежнее; FTS5 недоступен → fallback (без регресса).
+        if !words.is_empty() {
+            let match_expr = words
+                .iter()
+                .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" OR ");
 
-        for (id, label, desc_opt) in all_nodes {
-            let label_lower = label.to_lowercase();
-            let desc_lower = desc_opt.unwrap_or_default().to_lowercase();
-            let mut score = 0.0;
-            for w in &words {
-                if label_lower == *w {
-                    score += 20.0;
-                } else if label_lower.contains(w) {
-                    score += 10.0;
-                } else if desc_lower.contains(w) {
-                    score += 2.0;
+            let candidates = {
+                let conn = self.conn.lock();
+                let fts_res = (|| -> rusqlite::Result<Vec<(i64, String, Option<String>)>> {
+                    let mut stmt = conn.prepare(
+                        r#"
+                        SELECT n.id, n.label, n.description
+                        FROM graph_nodes n
+                        WHERE (n.deleted_at IS NULL OR n.deleted_at = '')
+                          AND (n.valid_until IS NULL OR n.valid_until = '' OR n.valid_until > datetime('now'))
+                          AND n.id NOT IN (
+                            SELECT target_id FROM graph_edges WHERE label = 'SUPERSEDES' AND (deleted_at IS NULL OR deleted_at = '')
+                          )
+                          AND n.id NOT IN (
+                            SELECT source_id FROM graph_edges WHERE label = 'SUPERSEDED' AND (deleted_at IS NULL OR deleted_at = '')
+                          )
+                          AND (?2 IS NULL OR n.project_id = ?2)
+                          AND n.id IN (
+                            SELECT rowid FROM graph_nodes_fts
+                            WHERE graph_nodes_fts MATCH ?1
+                          )
+                        "#,
+                    )?;
+                    let rows = stmt.query_map(params![match_expr, project_id_filter], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })?;
+                    Ok(rows.flatten().collect())
+                })();
+
+                match fts_res {
+                    Ok(list) => list,
+                    Err(e) => {
+                        // FTS5 недоступен/индекс битый — прежний полный перебор.
+                        tracing::warn!("graph FTS5 недоступен, fallback на полный перебор: {e}");
+                        let mut stmt = conn.prepare(
+                            r#"
+                            SELECT id, label, description
+                            FROM graph_nodes
+                            WHERE (deleted_at IS NULL OR deleted_at = '')
+                              AND id NOT IN (
+                                SELECT target_id FROM graph_edges WHERE label = 'SUPERSEDES' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
+                              AND id NOT IN (
+                                SELECT source_id FROM graph_edges WHERE label = 'SUPERSEDED' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
+                              AND (?1 IS NULL OR project_id = ?1)
+                            "#,
+                        )?;
+                        let rows = stmt.query_map(params![project_id_filter], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        })?;
+                        rows.flatten().collect()
+                    }
                 }
-            }
-            if score > 0.0 {
-                scored.insert(id, score);
+            };
+
+            for (id, label, desc_opt) in candidates {
+                let label_lower = label.to_lowercase();
+                let desc_lower = desc_opt.unwrap_or_default().to_lowercase();
+                let mut score = 0.0;
+                for w in &words {
+                    if label_lower == *w {
+                        score += 20.0;
+                    } else if label_lower.contains(w) {
+                        score += 10.0;
+                    } else if desc_lower.contains(w) {
+                        score += 2.0;
+                    }
+                }
+                if score > 0.0 {
+                    scored.insert(id, score);
+                }
             }
         }
 
-        // 2. Векторный скоринг
-        if let Ok(q_embs) = self.embedder.embed(&[query.to_string()]).await
-            && let Some(q_vec) = q_embs.first()
-        {
-            let candidates = {
-                let conn = self.conn.lock();
-                let mut stmt = conn.prepare(
-                    r#"
-                        SELECT id, embedding 
-                        FROM graph_nodes 
-                        WHERE embedding IS NOT NULL 
-                          AND (deleted_at IS NULL OR deleted_at = '')
-                          AND (?1 IS NULL OR project_id = ?1)
-                        "#,
-                )?;
-                let rows = stmt.query_map(params![project_id_filter], |row| {
-                    let id: i64 = row.get(0)?;
-                    let blob: Vec<u8> = row.get(1)?;
-                    Ok((id, blob))
-                })?;
-                let mut list = Vec::new();
-                for r in rows.flatten() {
-                    list.push(r);
+        // 2. Векторный скоринг с защитой Stale-While-Revalidate (degraded_mode)
+        let mut degraded_mode = None;
+        match self.embedder.embed_query(query).await {
+            Ok(q_vec) => {
+                let vec0_hits: Vec<(i64, f32)> = {
+                    #[cfg(feature = "vec0")]
+                    {
+                        let conn = self.conn.lock();
+                        crate::vector::vec0::knn_rescore(&conn, &q_vec, limit, project_id_filter)
+                            .unwrap_or_default()
+                    }
+                    #[cfg(not(feature = "vec0"))]
+                    {
+                        Vec::new()
+                    }
+                };
+
+                let vector_hits = if vec0_hits.is_empty() {
+                    let candidates = {
+                        let conn = self.conn.lock();
+                        let mut stmt = conn.prepare(
+                            r#"
+                            SELECT id, embedding 
+                            FROM graph_nodes 
+                            WHERE embedding IS NOT NULL 
+                              AND (deleted_at IS NULL OR deleted_at = '')
+                              AND id NOT IN (
+                                SELECT target_id FROM graph_edges WHERE label = 'SUPERSEDES' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
+                              AND id NOT IN (
+                                SELECT source_id FROM graph_edges WHERE label = 'SUPERSEDED' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
+                              AND (?1 IS NULL OR project_id = ?1)
+                            "#,
+                        )?;
+                        let rows = stmt.query_map(params![project_id_filter], |row| {
+                            let id: i64 = row.get(0)?;
+                            let blob: Vec<u8> = row.get(1)?;
+                            Ok((id, blob))
+                        })?;
+                        let mut list = Vec::new();
+                        for r in rows.flatten() {
+                            list.push(r);
+                        }
+                        list
+                    };
+
+                    let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
+                        .iter()
+                        .map(|(id, b)| (*id, Some(b.as_slice())))
+                        .collect();
+
+                    top_k(&q_vec, &cand_refs, limit, 0.0)
+                } else {
+                    vec0_hits
+                };
+
+                for (nid, vscore) in vector_hits {
+                    let entry = scored.entry(nid).or_insert(0.0);
+                    *entry += (vscore as f64) * 10.0;
                 }
-                list
-            };
-
-            let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
-                .iter()
-                .map(|(id, b)| (*id, Some(b.as_slice())))
-                .collect();
-
-            for (nid, vscore) in top_k(q_vec, &cand_refs, limit, 0.0) {
-                let entry = scored.entry(nid).or_insert(0.0);
-                *entry += (vscore as f64) * 10.0;
+            }
+            Err(e) => {
+                tracing::warn!("Векторный поиск недоступен ({e}), переход в degraded_mode");
+                degraded_mode = Some("warming_up_embeddings".to_string());
             }
         }
 
@@ -312,9 +464,15 @@ impl GraphService {
             }
         }
 
+        // Access telemetry (ADR-O6): every node surfaced to the caller counts as
+        // read. Recorded into the batch accumulator, not written per node.
+        let read_ids: Vec<String> = nodes_map.values().map(|n| n.node_id.clone()).collect();
+        self.note_reads(&read_ids);
+
         Ok(GraphSearchResult {
             nodes: nodes_map.into_values().collect(),
             edges,
+            degraded_mode,
         })
     }
 
@@ -397,6 +555,21 @@ impl GraphService {
             chunks,
             god_nodes,
         })
+    }
+}
+
+impl Drop for GraphService {
+    /// Best-effort flush of telemetry still pending when the service is
+    /// released — the "on shutdown" arm of ADR-O6. Synchronous and panic-free: a
+    /// failure while unwinding must never abort the process.
+    fn drop(&mut self) {
+        let batch = self.access.drain();
+        if batch.is_empty() {
+            return;
+        }
+        let conn = self.conn.lock();
+        let now = Local::now().to_rfc3339();
+        let _ = apply_graph_access_batch(&conn, &batch, &now);
     }
 }
 
@@ -606,7 +779,61 @@ mod tests {
         assert!(context.contains("нет данных"));
     }
 
+    #[tokio::test]
+    async fn search_records_access_telemetry_until_flush() {
+        let service = seeded_service();
+
+        let hit = service.search("schema.rs", 10, false, None).await.unwrap();
+        assert!(hit.nodes.iter().any(|n| n.label == "schema.rs"));
+
+        // Batched (ADR-O6): the read is accumulated, not written per node yet.
+        assert_eq!(
+            access_count(&service, "aaa"),
+            0,
+            "access_count must not be written before the flush"
+        );
+
+        let written = service.flush_access_telemetry().unwrap();
+        assert!(written >= 1, "flush must persist the batched nodes");
+        assert_eq!(access_count(&service, "aaa"), 1);
+
+        let last: Option<String> = {
+            let conn = service.conn.lock();
+            conn.query_row(
+                "SELECT last_accessed FROM graph_nodes WHERE node_id = 'aaa'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(last.is_some(), "last_accessed must be stamped on flush");
+    }
+
+    #[tokio::test]
+    async fn search_counts_expanded_neighbors_as_reads() {
+        let service = seeded_service();
+
+        let expanded = service.search("schema.rs", 10, true, None).await.unwrap();
+        assert!(labels_of(&expanded).contains(&"runtime loop".to_string()));
+
+        service.flush_access_telemetry().unwrap();
+        assert!(
+            access_count(&service, "bbb") >= 1,
+            "a 1-hop neighbor surfaced to the caller counts as a read"
+        );
+    }
+
     // -- helpers ---------------------------------------------------------
+
+    fn access_count(service: &GraphService, node_id: &str) -> i64 {
+        let conn = service.conn.lock();
+        conn.query_row(
+            "SELECT access_count FROM graph_nodes WHERE node_id = ?1",
+            params![node_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
 
     fn labels_of(result: &GraphSearchResult) -> Vec<String> {
         result.nodes.iter().map(|n| n.label.clone()).collect()

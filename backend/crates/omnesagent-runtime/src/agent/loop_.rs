@@ -887,7 +887,13 @@ async fn agent_turn_with_sop_reassembly(
         .as_ref()
         .cloned()
     {
-        hook(sop_reassembly.is_some());
+        hook(
+            sop_reassembly.is_some(),
+            sop_reassembly
+                .as_ref()
+                .and_then(|reassembly| reassembly.live_config.as_ref())
+                .is_some(),
+        );
     }
     // Bracket the turn with AgentStart/AgentEnd so entry points that dispatch
     // through `agent_turn` (gateway webhook chat via `process_message`, peer
@@ -1134,7 +1140,7 @@ static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentFor
     LazyLock::new(|| Mutex::new(None));
 
 #[cfg(test)]
-type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool) + Send + Sync>;
+type AgentTurnSopReassemblyTestHook = Arc<dyn Fn(bool, bool) + Send + Sync>;
 
 #[cfg(test)]
 static AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK: LazyLock<
@@ -1606,7 +1612,7 @@ pub async fn run(
         tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
         tool_descs.push((
         "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
+        "Capture a screenshot of the current screen. Returns the saved file path. Use when: visual verification, UI inspection, debugging displays.",
     ));
         tool_descs.push((
         "image_info",
@@ -1998,6 +2004,7 @@ pub async fn run(
                                 turn_id: &turn_id,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    live_config: None,
                                 }),
                             }),
                         ),
@@ -2182,6 +2189,9 @@ pub async fn run(
                 vec![ChatMessage::system(&system_prompt)]
             };
 
+            // The shipped REPL reads stdin directly instead of going through
+            // `CliChannel::listen`, so it must own the terminal erase guard.
+            let _utf8_erase_guard = crate::cli_input::ensure_terminal_utf8_erase();
             loop {
                 print!("> ");
                 let _ = std::io::stdout().flush();
@@ -2558,6 +2568,7 @@ pub async fn run(
                                     turn_id: &turn_id,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        live_config: None,
                                     }),
                                 }),
                             ),
@@ -2841,6 +2852,38 @@ pub async fn process_message(
     session_id: Option<&str>,
     origin: TurnOrigin,
 ) -> Result<String> {
+    process_message_inner(config, None, agent_alias, message, session_id, origin).await
+}
+
+/// Process a single message while preserving the daemon/gateway's live config
+/// source for tools that resolve security policy at execution time.
+pub async fn process_message_with_live_config(
+    config: Config,
+    live_config: Arc<parking_lot::RwLock<Config>>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_inner(
+        config,
+        Some(live_config),
+        agent_alias,
+        message,
+        session_id,
+        origin,
+    )
+    .await
+}
+
+async fn process_message_inner(
+    config: Config,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
     use ::omnesagent_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
@@ -2976,7 +3019,7 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
-            None,
+            live_config.clone(),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3390,7 +3433,10 @@ pub async fn process_message(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    Some(SopStepReassembly {
+                        config: &config,
+                        live_config,
+                    }),
                 ),
             )
             .await
@@ -4613,6 +4659,103 @@ mod tests {
         }
     }
 
+    /// Streams the same fixed text on every call and counts the calls, so a
+    /// test can pin exactly how many provider attempts a turn spent. Unlike
+    /// [`StreamingScriptedModelProvider`] it advertises streaming tool
+    /// events, which keeps the live-stream path active while tools are
+    /// registered. From the second call on, `repeat_suffix` is appended, so
+    /// a test can vary only trailing whitespace between attempts.
+    struct RepeatedStreamTextProvider {
+        text: String,
+        repeat_suffix: String,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    impl RepeatedStreamTextProvider {
+        fn new(text: String) -> Self {
+            Self {
+                text,
+                repeat_suffix: String::new(),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_repeat_suffix(text: String, repeat_suffix: &str) -> Self {
+            Self {
+                repeat_suffix: repeat_suffix.to_string(),
+                ..Self::new(text)
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RepeatedStreamTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in repeated stream tests")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("chat should not be called when streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            omnesagent_providers::traits::StreamResult<StreamChunk>,
+        > {
+            let previous_calls = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+            let mut text = self.text.clone();
+            if previous_calls > 0 {
+                text.push_str(&self.repeat_suffix);
+            }
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(text)),
+                Ok(StreamChunk::final_chunk()),
+            ]))
+        }
+    }
+
+    impl ::omnesagent_api::attribution::Attributable for RepeatedStreamTextProvider {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Provider(
+                ::omnesagent_api::attribution::ProviderKind::Model(
+                    ::omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RepeatedStreamTextProvider"
+        }
+    }
+
     struct VisibleThenServerStreamFailureModelProvider {
         chat_calls: Arc<AtomicUsize>,
     }
@@ -5391,6 +5534,7 @@ mod tests {
         delay_ms: u64,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
+        execution_order: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     impl DelayTool {
@@ -5405,7 +5549,16 @@ mod tests {
                 delay_ms,
                 active,
                 max_active,
+                execution_order: None,
             }
+        }
+
+        fn with_execution_order(
+            mut self,
+            execution_order: Arc<std::sync::Mutex<Vec<String>>>,
+        ) -> Self {
+            self.execution_order = Some(execution_order);
+            self
         }
     }
 
@@ -5433,6 +5586,13 @@ mod tests {
             &self,
             args: serde_json::Value,
         ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(execution_order) = &self.execution_order {
+                execution_order
+                    .lock()
+                    .expect("execution order lock should be valid")
+                    .push(self.name.clone());
+            }
+
             let now_active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now_active, Ordering::SeqCst);
 
@@ -5509,7 +5669,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -5739,8 +5899,15 @@ mod tests {
         let uploads = temp.path().join("uploads");
         std::fs::create_dir(&uploads).unwrap();
         let image_path = uploads.join("cached.png");
-        let original_bytes = [
-            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
+        // A real decodable 1x1 PNG, not a bare signature: preparation fully
+        // decodes image content now, so bytes that only carry the magic
+        // number are refused and no data URI would ever reach the provider.
+        let original_bytes: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
         let replacement_bytes = vec![
             0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 5, 6, 7, 8,
@@ -5759,9 +5926,10 @@ mod tests {
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
                 CountingTool::new("probe", Arc::clone(&invocations)),
             )]);
+        let marker_path = image_path.to_string_lossy().replace('\\', "/");
         let mut history = vec![ChatMessage::user(format!(
             "inspect [IMAGE:{}]",
-            image_path.display()
+            marker_path
         ))];
         let observer = NoopObserver;
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -5830,7 +5998,7 @@ mod tests {
         // message is plain text.
         let mut history = vec![
             ChatMessage::user(
-                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "please inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
             ChatMessage::user("what is WAL?".to_string()),
         ];
@@ -5909,7 +6077,7 @@ mod tests {
             "carried-over image marker must be stripped, got: {sent_blob}"
         );
         assert!(
-            sent_blob.contains("[media attachment]"),
+            sent_blob.contains(omnesagent_providers::multimodal::MEDIA_PLACEHOLDER),
             "stripped marker should become the text placeholder, got: {sent_blob}"
         );
     }
@@ -5923,7 +6091,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "Analyze this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -5997,7 +6165,7 @@ mod tests {
         let mut history = vec![
             ChatMessage::user("inspect the screenshot".to_string()),
             ChatMessage::tool(
-                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+                "File: /tmp/x.png\n[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
             ),
         ];
         let tools_registry =
@@ -6070,7 +6238,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -6493,7 +6661,7 @@ mod tests {
         )
         .await;
         assert!(msg.starts_with(omnesagent_memory::MEMORY_CONTEXT_OPEN));
-        assert!(msg.contains("- remembered: the server is prod-3"));
+        assert!(msg.contains("remembered: the server is prod-3"));
         assert!(msg.ends_with("what server?"));
         assert_eq!(recalls.len(), 1);
         assert!(recalls[0].1, "recall event must report success");
@@ -6527,7 +6695,7 @@ mod tests {
         };
 
         let mut history = vec![ChatMessage::user(
-            "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+            "look [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]".to_string(),
         )];
         let tools_registry =
             crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
@@ -7353,6 +7521,151 @@ mod tests {
                 msg.content
             );
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_file_mutation_rewrites_force_sequential_execution() {
+        struct RewriteAsFileMutations;
+
+        #[async_trait]
+        impl crate::hooks::HookHandler for RewriteAsFileMutations {
+            fn name(&self) -> &str {
+                "rewrite-as-file-mutations"
+            }
+
+            async fn before_tool_call(
+                &self,
+                name: String,
+                args: serde_json::Value,
+            ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+                let prepared_name = match name.as_str() {
+                    "delay_a" => "file_edit",
+                    "delay_b" => "file_write",
+                    _ => &name,
+                };
+                crate::hooks::HookResult::Continue((prepared_name.to_string(), args))
+            }
+        }
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"delay_a","arguments":{"value":"A"}}
+</tool_call>
+<tool_call>
+{"name":"delay_b","arguments":{"value":"B"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(DelayTool::new(
+                "delay_a",
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(DelayTool::new(
+                "delay_b",
+                100,
+                Arc::clone(&active),
+                Arc::clone(&max_active),
+            )),
+            Box::new(
+                DelayTool::new(
+                    "file_edit",
+                    100,
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                )
+                .with_execution_order(Arc::clone(&execution_order)),
+            ),
+            Box::new(
+                DelayTool::new(
+                    "file_write",
+                    100,
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                )
+                .with_execution_order(Arc::clone(&execution_order)),
+            ),
+        ]);
+        let approval_mgr =
+            ApprovalManager::from_risk_profile(&omnesagent_config::schema::RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..omnesagent_config::schema::RiskProfileConfig::default()
+            });
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(RewriteAsFileMutations));
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: Some(&approval_mgr),
+                multimodal_config: &omnesagent_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &omnesagent_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: true,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("sequential execution should complete");
+
+        assert!(result.ends_with("done"), "got: {result}");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            1,
+            "prepared file mutations must never run concurrently"
+        );
+        assert_eq!(
+            *execution_order.lock().unwrap(),
+            vec!["file_edit".to_string(), "file_write".to_string()],
+            "prepared file mutations must execute in model order"
+        );
     }
 
     struct CompletesAndSignalsTool {
@@ -8797,6 +9110,130 @@ mod tests {
             1,
             "non-exempt tool should still be deduped"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_browser_and_search_preserve_tool_boundaries() {
+        for (requested_name, registered_name, parameter, value) in [
+            ("browser_open", "browser_open", "url", "https://example.com"),
+            ("browser", "browser", "action", "snapshot"),
+            (
+                "web_search",
+                "web_search_tool",
+                "query",
+                "rust release notes",
+            ),
+        ] {
+            let arguments = serde_json::json!({ parameter: value });
+            for response in [
+                format!("{requested_name}/{parameter}>{value}"),
+                format!(
+                    "<tool_call>{}</tool_call>",
+                    serde_json::json!({"name": requested_name, "arguments": arguments})
+                ),
+            ] {
+                for availability in ["registered", "missing", "excluded"] {
+                    let model_provider =
+                        ScriptedModelProvider::from_text_responses(vec![response.as_str(), "done"]);
+                    let recorded_args = Arc::new(Mutex::new(Vec::new()));
+                    let shell_args = Arc::new(Mutex::new(Vec::new()));
+                    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+                    if availability != "missing" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            registered_name,
+                            Arc::clone(&recorded_args),
+                        )));
+                    }
+                    // An available browser/search tool must work without shell;
+                    // an unavailable one must not borrow shell's authority.
+                    if availability != "registered" {
+                        tools.push(Box::new(RecordingArgsTool::new(
+                            "shell",
+                            Arc::clone(&shell_args),
+                        )));
+                    }
+                    let tools_registry =
+                        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools);
+                    let excluded_tools = if availability == "excluded" {
+                        vec![registered_name.to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut history = vec![
+                        ChatMessage::system("test-system"),
+                        ChatMessage::user("run the requested tool"),
+                    ];
+                    let observer = NoopObserver;
+                    let turn_id = uuid::Uuid::new_v4().to_string();
+                    let result = run_tool_call_loop(ToolLoop {
+                        parent_agent_alias: None,
+                        sop_reassembly: None,
+                        exec: ResolvedAgentExecution {
+                            model_access: ResolvedModelAccess {
+                                model_provider: &model_provider,
+                                provider_name: "mock-provider",
+                                model: "mock-model",
+                                temperature: Some(0.0),
+                            },
+                            tools_registry: &tools_registry,
+                            observer: &observer,
+                            silent: true,
+                            approval: None,
+                            multimodal_config: &omnesagent_config::schema::MultimodalConfig::default(
+                            ),
+                            config: None,
+                            max_tool_iterations: 4,
+                            hooks: None,
+                            excluded_tools: &excluded_tools,
+                            dedup_exempt_tools: &[],
+                            activated_tools: None,
+                            model_switch_callback: None,
+                            pacing: &omnesagent_config::schema::PacingConfig::default(),
+                            strict_tool_parsing: false,
+                            parallel_tools: false,
+                            max_tool_result_chars: 0,
+                            context_token_budget: 0,
+                            receipt_generator: None,
+                            knobs: &LoopKnobs::default(),
+                        },
+                        history: &mut history,
+                        channel_name: "cli",
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: None,
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        memory: None,
+                        ingress: IngressContext::sub_turn(),
+                        agent_alias: None,
+                        turn_id: &turn_id,
+                    })
+                    .await
+                    .expect("browser/search boundary turn should complete");
+
+                    let expected = if availability == "registered" {
+                        assert!(result.ends_with("done"), "{response}: {result}");
+                        vec![arguments.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(
+                        *recorded_args.lock().unwrap(),
+                        expected,
+                        "{availability}: {response}"
+                    );
+                    assert!(
+                        shell_args.lock().unwrap().is_empty(),
+                        "browser/search must never execute shell: {availability}: {response}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -15124,6 +15561,7 @@ Let me check the result."#;
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15227,6 +15665,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(5),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15237,6 +15676,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(7),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15588,6 +16028,7 @@ Let me check the result."#;
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15815,6 +16256,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15886,6 +16328,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -16007,6 +16450,7 @@ Let me check the result."#;
                         input_tokens: Some(1_000_000),
                         output_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 },
@@ -16076,6 +16520,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -16900,22 +17345,32 @@ Let me check the result."#;
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
 
-        let seen = Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(bool, bool)>::new()));
         let seen_for_hook = Arc::clone(&seen);
         {
             let mut hook = super::AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
                 .lock()
                 .expect("agent-turn reassembly test hook lock should not be poisoned");
-            *hook = Some(Arc::new(move |has_reassembly| {
+            *hook = Some(Arc::new(move |has_reassembly, has_live_config| {
                 seen_for_hook
                     .lock()
                     .expect("seen lock should not be poisoned")
-                    .push(has_reassembly);
+                    .push((has_reassembly, has_live_config));
             }));
         }
 
-        let result = super::process_message(
+        let snapshot_result = super::process_message(
+            config.clone(),
+            "process-message-reassembly-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+        )
+        .await;
+        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let live_result = super::process_message_with_live_config(
             config,
+            live_config,
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
@@ -16932,10 +17387,193 @@ Let me check the result."#;
 
         let seen = seen.lock().expect("seen lock should not be poisoned");
         assert!(
-            seen.iter().any(|has_reassembly| *has_reassembly),
+            seen.iter()
+                .any(|(has_reassembly, has_live_config)| *has_reassembly && !*has_live_config),
             "process_message must pass a config-backed SopStepReassembly handle into agent_turn; \
-             observed {seen:?}; process_message result: {result:?}"
+             observed {seen:?}; process_message result: {snapshot_result:?}"
         );
+        assert!(
+            seen.iter()
+                .any(|(has_reassembly, has_live_config)| *has_reassembly && *has_live_config),
+            "process_message_with_live_config must pass a live-config-backed SopStepReassembly \
+             handle into agent_turn; observed {seen:?}; process_message result: {live_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_message_with_live_config_file_download_observes_revoked_private_host() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path, query_param},
+        };
+        use omnesagent_config::schema::{AliasedAgentConfig, FileDownloadConfig, RiskProfileConfig};
+
+        #[derive(Clone)]
+        struct ProviderState {
+            calls: Arc<AtomicUsize>,
+            requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        async fn respond_with_file_download_then_done(
+            State(state): State<ProviderState>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state
+                .requests
+                .lock()
+                .expect("provider request capture lock should be valid")
+                .push(body);
+            let call = state.calls.fetch_add(1, Ordering::SeqCst);
+            Json(if call == 0 {
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-file-download",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_download",
+                                    "arguments": "{\"document_id\":\"doc-1\",\"dest_path\":\"out.bin\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                })
+            })
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let download_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .and(query_param("document_id", "doc-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"should-not-download"))
+            .expect(0)
+            .mount(&download_server)
+            .await;
+
+        let provider_state = ProviderState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test provider listener should bind");
+        let provider_addr = listener.local_addr().expect("test provider address");
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(respond_with_file_download_then_done),
+            )
+            .with_state(provider_state.clone());
+        let provider_server = omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let mut config = omnesagent_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            file_download: FileDownloadConfig {
+                url: Some(format!("{}/download", download_server.uri())),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..omnesagent_config::schema::Config::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{provider_addr}"));
+        provider.native_tools = Some(true);
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "full".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "live-file-download-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "full".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(config.agent_workspace_dir("live-file-download-agent"))
+            .expect("agent workspace directory");
+
+        let live_config = Arc::new(RwLock::new(config.clone()));
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let result = super::process_message_with_live_config(
+            config.clone(),
+            live_config,
+            "live-file-download-agent",
+            "download the private document",
+            Some("session"),
+            TurnOrigin::Channel,
+        )
+        .await
+        .expect("process_message_with_live_config should complete");
+
+        provider_server.abort();
+        assert_eq!(result, "done");
+        assert_eq!(
+            provider_state.calls.load(Ordering::SeqCst),
+            2,
+            "the second model call should receive the denied tool result"
+        );
+        {
+            let requests = provider_state
+                .requests
+                .lock()
+                .expect("provider requests lock should be valid");
+            assert!(
+                requests.iter().any(|body| body
+                    .to_string()
+                    .contains("file_download.allowed_private_hosts")),
+                "model provider should receive the live-policy denial result, got {requests:?}"
+            );
+        }
+        assert!(
+            !config
+                .agent_workspace_dir("live-file-download-agent")
+                .join("out.bin")
+                .exists(),
+            "revoked private-host policy must fail before writing the download"
+        );
+        assert!(
+            download_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty(),
+            "revoked private-host policy must fail before contacting the private endpoint"
+        );
+        download_server.verify().await;
     }
 
     #[tokio::test]
@@ -18147,4 +18785,249 @@ Pin 13: LED
             other => panic!("expected Line, got {other:?}"),
         }
     }
+
+    /// The streaming text guard suppressed a whole-message tool-result
+    /// envelope twice in a row: the second suppression, which differs from
+    /// the first only by one trailing newline, must still end the turn with
+    /// the protocol-guard notice instead of spending the full retry budget
+    /// on the same text. The notice also reaches the event stream, once at
+    /// the end, so a consumer that never drains the deltas still sees the
+    /// turn's visible outcome.
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_retrying_identical_guard_suppressed_text() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let provider = RepeatedStreamTextProvider::with_repeat_suffix(
+            "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}".to_string(),
+            "\n",
+        );
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("explain the tool result shape"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<omnesagent_api::agent::TurnEvent>(16);
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &omnesagent_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &omnesagent_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("identical guard-suppressed text should end the turn with a notice");
+
+        let notice =
+            crate::i18n::get_required_cli_string("cli-agent-error-protocol-guard-withheld");
+        assert_eq!(result, notice);
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            2,
+            "a guard suppression repeated up to a trailing newline must stop retries after two provider calls"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "suppressed protocol text must never execute as a tool call"
+        );
+        let feedback_count = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
+            .count();
+        assert_eq!(
+            feedback_count, 1,
+            "only the first suppression earns feedback"
+        );
+        let mut visible_deltas = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible_deltas, notice,
+            "the suppressed text must stay withheld and the notice must be the only text delta"
+        );
+        let mut event_chunks = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let omnesagent_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push_str(&delta);
+            }
+        }
+        assert_eq!(
+            event_chunks, notice,
+            "the notice must be the event stream's only chunk, at the end"
+        );
+    }
+
+    /// The same identical-suppression stop with a prose prefix in the same
+    /// delta as the envelope: the prefix is ordinary text the guard
+    /// releases ahead of the withheld candidate, so it reaches the deltas
+    /// once per attempt (the envelope itself never does) and the notice
+    /// follows it. The notice text therefore claims nothing about what else
+    /// the reply carried. The event stream mirrors the deltas: the prefix
+    /// once per attempt with the notice at the end.
+    #[tokio::test]
+    async fn run_tool_call_loop_stops_retrying_identical_guard_suppressed_text_with_prose_prefix() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prefix = "Sure! ";
+        let envelope =
+            "{\"toolcalls\": [{\"call_id\": \"call_1\", \"arguments\": {\"command\": \"ls\"}}";
+        let provider = RepeatedStreamTextProvider::new(format!("{prefix}{envelope}"));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run the command"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<omnesagent_api::agent::TurnEvent>(16);
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &omnesagent_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 6,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &omnesagent_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: Some(delta_tx),
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("guard-suppressed text with a prose prefix should end the turn with a notice");
+
+        let notice =
+            crate::i18n::get_required_cli_string("cli-agent-error-protocol-guard-withheld");
+        assert_eq!(result, notice);
+        assert_eq!(
+            provider.stream_calls.load(Ordering::SeqCst),
+            2,
+            "an identical guard suppression with a released prefix must stop retries after two provider calls"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "suppressed protocol text must never execute as a tool call"
+        );
+        let feedback_count = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]"))
+            .count();
+        assert_eq!(
+            feedback_count, 1,
+            "only the first suppression earns feedback"
+        );
+        let mut visible_deltas = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                visible_deltas.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible_deltas,
+            format!("{prefix}{prefix}{notice}"),
+            "the prefix must stream once per attempt with the notice after it, and the envelope must never reach the deltas"
+        );
+        let mut event_chunks = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let omnesagent_api::agent::TurnEvent::Chunk { delta } = event {
+                event_chunks.push_str(&delta);
+            }
+        }
+        assert_eq!(
+            event_chunks,
+            format!("{prefix}{prefix}{notice}"),
+            "the event stream must mirror the deltas: the prefix once per attempt with the notice at the end"
+        );
+    }
+
 }

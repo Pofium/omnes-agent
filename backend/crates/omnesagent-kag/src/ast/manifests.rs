@@ -78,6 +78,7 @@ impl ManifestExtractor {
                     file_path: rel_path.to_string(),
                     line_start: 1,
                     line_end: 1,
+                    ..Default::default()
                 });
 
                 out.edges.push(AstEdge {
@@ -120,6 +121,7 @@ impl ManifestExtractor {
                             file_path: rel_path.to_string(),
                             line_start: idx + 1,
                             line_end: idx + 1,
+                            ..Default::default()
                         });
 
                         out.edges.push(AstEdge {
@@ -157,6 +159,7 @@ impl ManifestExtractor {
                         file_path: rel_path.to_string(),
                         line_start: 1,
                         line_end: 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -184,6 +187,7 @@ impl ManifestExtractor {
                                 file_path: rel_path.to_string(),
                                 line_start: 1,
                                 line_end: 1,
+                                ..Default::default()
                             });
 
                             out.edges.push(AstEdge {
@@ -235,6 +239,7 @@ impl ManifestExtractor {
                                 file_path: rel_path.to_string(),
                                 line_start: idx + 1,
                                 line_end: idx + 1,
+                                ..Default::default()
                             });
 
                             out.edges.push(AstEdge {
@@ -271,6 +276,7 @@ impl ManifestExtractor {
                             file_path: rel_path.to_string(),
                             line_start: idx + 1,
                             line_end: idx + 1,
+                            ..Default::default()
                         });
 
                         out.edges.push(AstEdge {
@@ -310,6 +316,7 @@ impl ManifestExtractor {
                     file_path: rel_path.to_string(),
                     line_start: 1,
                     line_end: 1,
+                    ..Default::default()
                 });
 
                 out.edges.push(AstEdge {
@@ -356,6 +363,7 @@ impl ManifestExtractor {
                             file_path: rel_path.to_string(),
                             line_start: idx + 1,
                             line_end: idx + 1,
+                            ..Default::default()
                         });
 
                         out.edges.push(AstEdge {
@@ -395,6 +403,7 @@ impl ManifestExtractor {
                     file_path: rel_path.to_string(),
                     line_start: 1,
                     line_end: 1,
+                    ..Default::default()
                 });
 
                 out.edges.push(AstEdge {
@@ -436,6 +445,7 @@ impl ManifestExtractor {
                             file_path: rel_path.to_string(),
                             line_start: idx + 1,
                             line_end: idx + 1,
+                            ..Default::default()
                         });
 
                         out.edges.push(AstEdge {
@@ -473,6 +483,7 @@ impl ManifestExtractor {
                         file_path: rel_path.to_string(),
                         line_start: 1,
                         line_end: 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -500,6 +511,7 @@ impl ManifestExtractor {
                                 file_path: rel_path.to_string(),
                                 line_start: 1,
                                 line_end: 1,
+                                ..Default::default()
                             });
 
                             out.edges.push(AstEdge {

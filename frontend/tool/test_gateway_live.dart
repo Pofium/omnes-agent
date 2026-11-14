@@ -100,7 +100,7 @@ void main() async {
 
   print('\n--- Result: chunks=$chunksReceived, responseLength=${fullText.length} ---');
   if (chunksReceived > 0 || fullText.isNotEmpty) {
-    print('SUCCESS: ZeroClaw streaming chat verified end-to-end!');
+    print('SUCCESS: OmnesAgent streaming chat verified end-to-end!');
   } else {
     print('WARNING: No chunks returned yet.');
   }

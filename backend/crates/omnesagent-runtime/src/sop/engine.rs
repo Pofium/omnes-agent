@@ -5923,14 +5923,26 @@ fn amqp_match_from(pat: &[&str], words: &[&str]) -> bool {
 /// Glob match a filesystem trigger `pattern` against a normalized `path`,
 /// supporting `*` (single segment) and `**` (recursive) wildcards via the
 /// `glob` crate. A bare directory pattern also matches paths nested beneath it.
+/// Both sides are compared with every platform separator spelled `/`. Watchers
+/// report Windows paths with `\`, which the nested-path check would otherwise
+/// never see as a separator; on Unix `\` is an ordinary filename character and
+/// is left alone.
 pub(crate) fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
-    if let Ok(compiled) = glob::Pattern::new(pattern)
-        && compiled.matches(path)
+    let pattern = with_forward_separators(pattern);
+    let path = with_forward_separators(path);
+    if let Ok(compiled) = glob::Pattern::new(&pattern)
+        && compiled.matches(&path)
     {
         return true;
     }
     let prefix = pattern.trim_end_matches('/');
     path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn with_forward_separators(path: &str) -> String {
+    path.chars()
+        .map(|c| if std::path::is_separator(c) { '/' } else { c })
+        .collect()
 }
 
 /// Whether the payload's `event` field names one of the trigger's listed kinds.
@@ -6647,6 +6659,40 @@ mod tests {
         assert!(mqtt_topic_matches("#", "a/b/c"));
         assert!(mqtt_topic_matches("a/#", "a/b/c"));
         assert!(!mqtt_topic_matches("b/#", "a/b/c"));
+    }
+
+    #[test]
+    fn filesystem_path_matching_directories_and_globs() {
+        assert!(filesystem_path_matches("/w/in", "/w/in"));
+        assert!(filesystem_path_matches("/w/in", "/w/in/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/", "/w/in/sub/a.pdf"));
+        assert!(!filesystem_path_matches("/w/in", "/w/inbox/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/*.pdf", "/w/in/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/**/*.pdf", "/w/in/sub/a.pdf"));
+        assert!(!filesystem_path_matches("/w/in/*.pdf", "/w/in/a.txt"));
+    }
+
+    /// Watchers report Windows paths with `\`, so a directory trigger must
+    /// treat it as a separator there, whichever separator the trigger uses.
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_path_matching_accepts_windows_separators() {
+        assert!(filesystem_path_matches(r"C:\w\in", r"C:\w\in\a.pdf"));
+        assert!(filesystem_path_matches(r"C:\w\in\", r"C:\w\in\sub\a.pdf"));
+        assert!(filesystem_path_matches("C:/w/in", r"C:\w\in\a.pdf"));
+        assert!(filesystem_path_matches(
+            r"\\?\C:\w\in",
+            r"\\?\C:\w\in\a.pdf"
+        ));
+        assert!(filesystem_path_matches(r"C:\w\in\*.pdf", r"C:\w\in\a.pdf"));
+        assert!(!filesystem_path_matches(r"C:\w\in", r"C:\w\inbox\a.pdf"));
+    }
+
+    /// On Unix `\` is an ordinary filename character, not a separator.
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_path_matching_keeps_backslash_literal_on_unix() {
+        assert!(!filesystem_path_matches("/w/in", r"/w/in\a.pdf"));
     }
 
     // ── Calendar trigger matching ─────────────────────
@@ -12147,7 +12193,7 @@ mod tests {
         let store = std::sync::Arc::new(FailingSaveLeasedStore::healthy());
         let mut sop = deterministic_sop("det-cp-state-file-fails");
         let location_file = std::env::temp_dir().join(format!(
-            "zc-state-location-file-{}",
+            "oc-state-location-file-{}",
             now_iso8601().replace(':', "-")
         ));
         std::fs::write(&location_file, "not a directory").unwrap();
@@ -15426,7 +15472,7 @@ type = "manual"
         // Fix 0b: a resolved run must not leave a stale `<run_id>.state.json`
         // claiming it is still paused — the run store and approval ledger are
         // the durable record, the snapshot is only a rehydration artifact.
-        let dir = std::env::temp_dir().join(format!("zc-snapshot-cleanup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oc-snapshot-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut sop = capability_checkpoint_sop("cp-snapshot");
         sop.location = Some(dir.clone());
@@ -15510,7 +15556,7 @@ type = "manual"
     fn engine_restores_runs_from_store() {
         use super::super::store::SqliteRunStore;
         let path =
-            std::env::temp_dir().join(format!("zc-sop-engine-restore-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("oc-sop-engine-restore-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         // Seed a WaitingApproval run directly into a durable store.
         let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
@@ -15554,7 +15600,7 @@ type = "manual"
     fn engine_persist_bumps_revision_across_active_and_terminal() {
         use super::super::store::SqliteRunStore;
         let path =
-            std::env::temp_dir().join(format!("zc-sop-engine-persist-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("oc-sop-engine-persist-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
         let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
@@ -15614,7 +15660,7 @@ type = "manual"
     fn deterministic_active_run_persists_and_restores_before_terminal() {
         use super::super::store::SqliteRunStore;
         let path =
-            std::env::temp_dir().join(format!("zc-sop-det-restore-{}.db", std::process::id()));
+            std::env::temp_dir().join(format!("oc-sop-det-restore-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
 
@@ -16149,7 +16195,7 @@ type = "manual"
     fn engine_restores_finished_runs_from_store() {
         use super::super::store::SqliteRunStore;
         let path = std::env::temp_dir().join(format!(
-            "zc-sop-engine-restore-fin-{}.db",
+            "oc-sop-engine-restore-fin-{}.db",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);

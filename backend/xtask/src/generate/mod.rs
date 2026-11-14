@@ -15,7 +15,7 @@ pub mod setup_bat;
 pub mod sop_syntax;
 pub mod spec;
 pub mod tools_ftl;
-pub mod zerocode_themes;
+pub mod omnescode_themes;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
@@ -132,9 +132,9 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| docker_tags::render_file(root, cur),
         },
         Surface {
-            name: "zerocode-themes",
+            name: "omnescode-themes",
             file: "apps/omnescode/src/generated_themes.rs",
-            render: zerocode_themes::render_file,
+            render: omnescode_themes::render_file,
         },
     ]
 }

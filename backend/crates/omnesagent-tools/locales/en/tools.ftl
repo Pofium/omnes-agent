@@ -78,6 +78,11 @@ tool-file-download-error-missing-dest-path = Missing 'dest_path' parameter
 tool-file-download-error-invalid-file-name = Invalid dest_path '{ $dest_path }': must end in a concrete file name
 tool-file-download-error-no-parent = Invalid dest_path '{ $dest_path }': has no parent directory
 tool-file-download-error-resolve-dir = Cannot resolve destination directory for '{ $dest_path }': { $err }
+tool-file-download-error-bad-scheme = file_download endpoint URL scheme '{ $scheme }' is not supported; only http:// and https:// are allowed
+tool-file-download-error-invalid-url = file_download endpoint URL is invalid: { $err }
+tool-file-download-error-private-host = file_download endpoint host '{ $host }' is loopback / private / link-local. To allow this host, add it (or "*") to { $config_key } in config.toml
+tool-file-download-error-metadata-endpoint = file_download endpoint host '{ $host }' resolved to cloud metadata or credential-delivery address { $ip }, which cannot be enabled by file_download.allowed_private_hosts
+tool-file-download-error-invalid-nat64-prefix = file_download config '{ $config_key }' contains malformed entry '{ $prefix }': fix or remove it, then retry (a network-specific NAT64 prefix must be an IPv6 CIDR with length 32, 40, 48, 56, 64, or 96)
 tool-file-download-error-client-build = Failed to build download client: { $err }
 tool-file-download-error-request = Download request failed: { $err }
 tool-file-download-error-status = Download endpoint returned status { $status }
@@ -94,8 +99,11 @@ tool-file-read = Read file contents with line numbers. Supports partial reading 
 
 tool-file-write = Write contents to a file in the workspace
 
-tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
+tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = No Git repository is reachable within the authorized roots for '{ $path }'. Choose a path inside a repository covered by the applicable allowed root, or initialize a repository before running git_operations.
+tool-git-operations-error-repository-not-authorized = Git repository metadata at '{ $path }' is not authorized for this operation. Choose a repository covered by the applicable allowed root.
+tool-git-operations-error-path-not-authorized = Git path '{ $path }' is not authorized for this operation. Choose a path covered by the applicable allowed root.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
@@ -152,7 +160,7 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
-tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
+tool-screenshot = Capture a screenshot of the current screen. Returns the saved file path.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
 tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist
 tool-browser-screenshot-error-path-outside-workspace = Screenshot path '{ $path }' resolves to '{ $canonical }' which is outside the workspace

@@ -2,8 +2,10 @@
 //!
 //! Conforms to §4.2, §7.2 and Appendix B of specification.
 
+use crate::ast::SymbolChange;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -48,9 +50,15 @@ pub struct IterationRecord {
     pub result: ExecutionResult,
     pub tests_summary: TestsSummary,
     pub verdict: String,
+    /// Who produced `verdict` (ADR-K4): `auto_tests` | `human` | `dream`.
+    #[serde(default)]
+    pub verdict_source: String,
     pub ladder_rung: String,
     #[serde(default)]
     pub markers: Vec<String>,
+    /// Symbol-level changes produced by this iteration (Ф3.2), from the fork AST.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ast_changes: Vec<SymbolChange>,
     #[serde(default)]
     pub git_before: Option<String>,
     #[serde(default)]
@@ -70,7 +78,22 @@ pub struct FindingRecord {
     pub content: String,
     pub verdict: String, // verified | failed | unconfirmed | stale
     pub symbols: Vec<String>,
+    #[serde(default)]
+    pub git_head_sha: Option<String>,
     pub at: DateTime<Utc>,
+}
+
+impl FindingRecord {
+    /// Проверяет свежесть вывода против текущего git HEAD SHA.
+    pub fn is_fresh(&self, current_head: Option<&str>) -> bool {
+        if self.verdict == "stale" {
+            return false;
+        }
+        match (&self.git_head_sha, current_head) {
+            (Some(saved), Some(current)) => saved == current,
+            _ => true,
+        }
+    }
 }
 
 /// Envelope for records written to `journal.jsonl`.
@@ -130,17 +153,63 @@ impl Journal {
             .collect())
     }
 
-    /// Read only findings from `journal.jsonl`.
+    /// Append a finding to `journal.jsonl`.
+    pub fn append_finding(path: &Path, finding: &FindingRecord) -> Result<(), JournalError> {
+        Self::append(path, &JournalEntry::Finding(finding.clone()))
+    }
+
+    /// Read findings, resolving the latest version of each `finding_id`.
+    ///
+    /// The journal is append-only, so a `stale` re-statement of an earlier
+    /// finding is a later entry with the same id — the reader collapses those
+    /// to the most recent record while preserving first-seen order.
     pub fn read_findings(path: &Path) -> Result<Vec<FindingRecord>, JournalError> {
         let all = Self::read_all(path)?;
-        Ok(all
+        let mut order: Vec<String> = Vec::new();
+        let mut latest: BTreeMap<String, FindingRecord> = BTreeMap::new();
+        for entry in all {
+            if let JournalEntry::Finding(f) = entry {
+                if !latest.contains_key(&f.finding_id) {
+                    order.push(f.finding_id.clone());
+                }
+                latest.insert(f.finding_id.clone(), f);
+            }
+        }
+        Ok(order
             .into_iter()
-            .filter_map(|e| match e {
-                JournalEntry::Finding(f) => Some(f),
-                _ => None,
-            })
+            .filter_map(|id| latest.remove(&id))
             .collect())
     }
+}
+
+/// Findings invalidated by a symbol change, re-stated as `stale` (Ф3.3, ADR-K5).
+///
+/// A finding is invalidated when any of its `symbols` resolves to a label that
+/// was modified or removed (`changed`). Symbols may be bare labels (`alpha`) or
+/// prefixed paths (`fn:alpha`); comparison uses the last `:`-segment. Findings
+/// already marked `stale` are ignored, so the pass is idempotent.
+pub fn stale_findings(
+    findings: &[FindingRecord],
+    changed: &BTreeSet<String>,
+) -> Vec<FindingRecord> {
+    if changed.is_empty() {
+        return Vec::new();
+    }
+    findings
+        .iter()
+        .filter(|finding| finding.verdict != "stale")
+        .filter(|finding| {
+            finding.symbols.iter().any(|symbol| {
+                let label = symbol.rsplit(':').next().unwrap_or(symbol);
+                changed.contains(label)
+            })
+        })
+        .map(|finding| {
+            let mut updated = finding.clone();
+            updated.verdict = "stale".to_string();
+            updated
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -171,8 +240,10 @@ mod tests {
                 exit_code: 0,
             },
             verdict: "verified".to_string(),
+            verdict_source: "auto_tests".to_string(),
             ladder_rung: "stdlib: std::fs".to_string(),
             markers: vec!["ponytail: limit 100, upgrade with sqlite".to_string()],
+            ast_changes: vec![],
             git_before: Some("abc".to_string()),
             git_after: Some("def".to_string()),
             tokens_used: 1200,
@@ -186,5 +257,55 @@ mod tests {
         assert_eq!(iterations.len(), 1);
         assert_eq!(iterations[0].task, "T-001");
         assert_eq!(iterations[0].verdict, "verified");
+    }
+
+    fn finding(id: &str, verdict: &str, symbols: &[&str]) -> FindingRecord {
+        FindingRecord {
+            finding_id: id.to_string(),
+            task: "T-001".to_string(),
+            content: format!("finding {id}"),
+            verdict: verdict.to_string(),
+            symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            git_head_sha: None,
+            at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn read_findings_resolves_latest_version_per_id() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+
+        Journal::append_finding(&path, &finding("f1", "verified", &["alpha"])).unwrap();
+        Journal::append_finding(&path, &finding("f2", "verified", &["beta"])).unwrap();
+        // Later re-statement of f1 as stale (append-only journal).
+        Journal::append_finding(&path, &finding("f1", "stale", &["alpha"])).unwrap();
+
+        let findings = Journal::read_findings(&path).unwrap();
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].finding_id, "f1");
+        assert_eq!(findings[0].verdict, "stale");
+        assert_eq!(findings[1].finding_id, "f2");
+    }
+
+    #[test]
+    fn stale_findings_marks_only_matching_symbols() {
+        let findings = vec![
+            finding("f1", "verified", &["fn:alpha"]),
+            finding("f2", "verified", &["beta"]),
+            finding("f3", "stale", &["alpha"]),
+        ];
+        let changed = BTreeSet::from(["alpha".to_string()]);
+
+        let stale = stale_findings(&findings, &changed);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].finding_id, "f1");
+        assert_eq!(stale[0].verdict, "stale");
+    }
+
+    #[test]
+    fn stale_findings_is_a_noop_without_changes() {
+        let findings = vec![finding("f1", "verified", &["alpha"])];
+        assert!(stale_findings(&findings, &BTreeSet::new()).is_empty());
     }
 }

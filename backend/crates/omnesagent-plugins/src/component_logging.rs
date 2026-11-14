@@ -142,7 +142,7 @@ fn plugin_log_queue() -> &'static SyncSender<QueuedPluginLog> {
         // enqueue lands in the drop counter: logging degrades but a guest
         // export still cannot block, which is the invariant that matters.
         let _ = std::thread::Builder::new()
-            .name("zc-plugin-log".to_string())
+            .name("oc-plugin-log".to_string())
             .spawn(move || drain_plugin_logs(&rx));
         tx
     })

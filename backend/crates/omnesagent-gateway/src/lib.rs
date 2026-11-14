@@ -147,7 +147,10 @@ use omnesagent_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use omnesagent_runtime::cost::CostTracker;
 use omnesagent_runtime::i18n;
 use omnesagent_runtime::platform;
-use omnesagent_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
+use omnesagent_runtime::security::pairing::{
+    GATEWAY_ADMIN_TOKEN_HEADER, PairingGuard, constant_time_eq, gateway_admin_token_path,
+    is_public_bind,
+};
 use omnesagent_runtime::tools;
 use omnesagent_runtime::tools::CanvasStore;
 use omnesagent_runtime::tools::scoped;
@@ -1421,6 +1424,24 @@ pub async fn run_gateway(
              (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to build it"
         );
     }
+    // Start this run's admin-token generation. The pairing-code admin routes
+    // accept only the token the guard holds in memory. If the file cannot be
+    // written the guard holds none, so they refuse everyone (fail closed) and
+    // no file left by an earlier run is honoured; the banner below stays the
+    // way to read the first-run code.
+    let admin_token_path = gateway_admin_token_path(&config.data_dir);
+    if let Err(e) = pairing.rotate_admin_token(&config.data_dir) {
+        ::omnesagent_log::record!(
+            WARN,
+            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "path": admin_token_path.display().to_string(),
+                    "error": e.to_string(),
+                })),
+            "gateway admin token could not be written; pairing-code admin routes will refuse all callers"
+        );
+    }
     if let Some(code) = pairing.pairing_code() {
         println!();
         println!("  🔐 PAIRING REQUIRED — use this one-time code:");
@@ -1429,7 +1450,7 @@ pub async fn run_gateway(
         println!("     └──────────────┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
-        for line in already_paired_pairing_notice(host, actual_port, pfx) {
+        for line in already_paired_pairing_notice(host, actual_port, pfx, &admin_token_path) {
             println!("{line}");
         }
         println!();
@@ -2274,7 +2295,12 @@ fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
     format!("omnesagent gateway get-paircode --new --port {port}")
 }
 
-fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Vec<String> {
+fn already_paired_pairing_notice(
+    host: &str,
+    port: u16,
+    path_prefix: &str,
+    admin_token_path: &std::path::Path,
+) -> Vec<String> {
     vec![
         "  🔒 Pairing: ACTIVE — this gateway is already paired, so no new \
          one-time code was generated on this start."
@@ -2284,18 +2310,31 @@ fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Ve
             format_paircode_recovery_command(host, port)
         ),
         format!(
-            "     Fallback (localhost only): {}",
-            format_paircode_recovery_curl(host, port, path_prefix)
+            "     Fallback (on this host, as this user): {}",
+            format_paircode_recovery_curl(host, port, path_prefix, admin_token_path)
         ),
     ]
 }
 
-fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
+fn format_paircode_recovery_curl(
+    host: &str,
+    port: u16,
+    path_prefix: &str,
+    admin_token_path: &std::path::Path,
+) -> String {
     // Admin paircode routes are localhost-only, so the curl fallback must point
     // at loopback. Bind-only hosts and non-loopback advertised hosts are
-    // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
+    // normalized to `127.0.0.1`; explicit loopback hosts are preserved. They
+    // also require this run's admin secret, read from its owner-only file.
     let recovery_host = paircode_recovery_curl_host(host);
-    format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
+    format!(
+        "curl -s -X POST -H \"{GATEWAY_ADMIN_TOKEN_HEADER}: $(cat '{}')\" \
+         http://{recovery_host}:{port}{path_prefix}/admin/paircode/new",
+        admin_token_path
+            .display()
+            .to_string()
+            .replace('\'', "'\\''")
+    )
 }
 
 fn paircode_recovery_curl_host(host: &str) -> &str {
@@ -2310,13 +2349,39 @@ fn paircode_recovery_curl_host(host: &str) -> &str {
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
+fn public_health_snapshot() -> serde_json::Value {
+    let snapshot = omnesagent_runtime::health::snapshot();
+    let components = snapshot
+        .components
+        .into_iter()
+        .map(|(name, component)| {
+            (
+                name,
+                serde_json::json!({
+                    "status": component.status,
+                    "updated_at": component.updated_at,
+                    "last_ok": component.last_ok,
+                    "restart_count": component.restart_count,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "pid": snapshot.pid,
+        "updated_at": snapshot.updated_at,
+        "uptime_seconds": snapshot.uptime_seconds,
+        "components": components,
+    })
+}
+
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
         "require_pairing": state.pairing.require_pairing(),
-        "runtime": omnesagent_runtime::health::snapshot_json(),
+        "runtime": public_health_snapshot(),
     });
     Json(body)
 }
@@ -2718,8 +2783,9 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             omnesagent_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                omnesagent_runtime::agent::process_message(
+                omnesagent_runtime::agent::process_message_with_live_config(
                     config,
+                    std::sync::Arc::clone(&state.config),
                     &agent_alias,
                     message,
                     session_id,
@@ -3824,6 +3890,36 @@ fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_js
     }
 }
 
+/// Reject a pairing-code admin request that does not present this run's admin
+/// secret. [`require_localhost`] alone is not enough for these routes: a reverse
+/// proxy or tunnel on the same host relays remote callers from loopback, and
+/// a code read or minted here is exchanged at `/pair` for a shared-operator
+/// bearer. The secret reaches local clients through an owner-only file, so
+/// presenting it proves the caller runs as the gateway's user on its host.
+/// Admission compares against the token the pairing guard holds for this
+/// run, never the file, so a stale file or a failed rotation matches nothing.
+fn require_gateway_admin_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let presented = headers
+        .get(GATEWAY_ADMIN_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if state.pairing.admin_token_matches(presented) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Pairing-code admin requests need this gateway's admin token. \
+                          Run `omnesagent gateway get-paircode` on the gateway host, as the \
+                          user that runs the gateway."
+            })),
+        ))
+    }
+}
+
 /// POST /admin/shutdown — graceful shutdown from CLI (localhost only)
 async fn handle_admin_shutdown(
     State(state): State<AppState>,
@@ -3963,12 +4059,15 @@ async fn handle_admin_reload(
     ))
 }
 
-/// GET /admin/paircode — fetch current pairing code (localhost only)
+/// GET /admin/paircode — fetch current pairing code (localhost only, and only
+/// with this run's admin token)
 async fn handle_admin_paircode(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
     let code = state.pairing.pairing_code();
 
     let body = if let Some(c) = code {
@@ -4003,9 +4102,11 @@ pub struct AdminPaircodeQuery {
 async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Query(params): Query<AdminPaircodeQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_gateway_admin_token(&state, &headers)?;
 
     if !state.pairing.require_pairing() {
         let body = serde_json::json!({
@@ -4149,21 +4250,20 @@ async fn handle_admin_paircode_new(
     Ok((StatusCode::OK, Json(body)))
 }
 
+/// GET /pair/code — whether pairing is required. It never returns the code.
+///
+/// No HTTP caller can prove it is on this host: a reverse proxy or tunnel on
+/// the same host relays remote callers from loopback, with or without
+/// forwarding headers, and whoever reads a first-run code can pair as the
+/// shared operator. The code reaches operators only through the startup
+/// banner in the gateway log and `omnesagent gateway get-paircode`, which
+/// presents the owner-only admin token. `pairing_code` stays in the response,
+/// always `null`, so existing dashboard clients fall back to manual entry.
 async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
-    let require = state.pairing.require_pairing();
-    let is_paired = state.pairing.is_paired();
-
-    // Only expose the code during initial setup (before first pairing)
-    let code = if require && !is_paired {
-        state.pairing.pairing_code()
-    } else {
-        None
-    };
-
     let body = serde_json::json!({
         "success": true,
-        "pairing_required": require,
-        "pairing_code": code,
+        "pairing_required": state.pairing.require_pairing(),
+        "pairing_code": serde_json::Value::Null,
     });
 
     (StatusCode::OK, Json(body))
@@ -4334,9 +4434,15 @@ mod tests {
             "recovery command should omit --host so the CLI uses its loopback default: {cmd}"
         );
 
-        let curl = format_paircode_recovery_curl("192.168.1.20", 42617, "");
+        let curl = format_paircode_recovery_curl(
+            "192.168.1.20",
+            42617,
+            "",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         assert_eq!(
-            curl, "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new",
+            curl,
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new",
             "curl fallback must target loopback, not the non-loopback bound host"
         );
         assert!(
@@ -4346,16 +4452,26 @@ mod tests {
 
         // Path prefix is still preserved while the host is normalized.
         assert_eq!(
-            format_paircode_recovery_curl("192.168.1.20", 42617, "/gw"),
-            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "192.168.1.20",
+                42617,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
     #[test]
     fn paircode_recovery_curl_targets_running_instance() {
         assert_eq!(
-            format_paircode_recovery_curl("127.0.0.1", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "127.0.0.1",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
     }
 
@@ -4364,7 +4480,12 @@ mod tests {
         // the banner must say plainly that NO code exists
         // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
         // hits the dashboard's 6-digit prompt with no code printed anywhere.
-        let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
+        let lines = already_paired_pairing_notice(
+            "127.0.0.1",
+            3001,
+            "",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains("already paired"),
@@ -4381,14 +4502,24 @@ mod tests {
         // The notice is the single source of truth for the on-demand recovery
         // commands; it must reuse the loopback-safe builders so the banner and
         // any future surface never drift from's no-`--host` rule.
-        let lines = already_paired_pairing_notice("192.168.1.20", 3001, "/gw");
+        let lines = already_paired_pairing_notice(
+            "192.168.1.20",
+            3001,
+            "/gw",
+            std::path::Path::new("/zc/data/gateway-admin.token"),
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains(&format_paircode_recovery_command("192.168.1.20", 3001)),
             "notice must surface the get-paircode recovery command: {joined}"
         );
         assert!(
-            joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
+            joined.contains(&format_paircode_recovery_curl(
+                "192.168.1.20",
+                3001,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            )),
             "notice must surface the curl fallback (honoring the path prefix): {joined}"
         );
         // never advertise the non-loopback bound host in the hint.
@@ -4401,32 +4532,113 @@ mod tests {
     #[test]
     fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
         assert_eq!(
-            format_paircode_recovery_curl("0.0.0.0", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "0.0.0.0",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
         assert_eq!(
-            format_paircode_recovery_curl("::", 42617, ""),
-            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "::",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/admin/paircode/new"
         );
     }
 
     #[test]
     fn paircode_recovery_curl_preserves_actual_loopback_hosts() {
         assert_eq!(
-            format_paircode_recovery_curl("localhost", 42617, ""),
-            "curl -s -X POST http://localhost:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "localhost",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://localhost:42617/admin/paircode/new"
         );
         assert_eq!(
-            format_paircode_recovery_curl("::1", 42617, ""),
-            "curl -s -X POST http://[::1]:42617/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "::1",
+                42617,
+                "",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://[::1]:42617/admin/paircode/new"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paircode_recovery_curl_quotes_admin_token_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_path = tmp.path().join("owner's $(touch escaped).token");
+        std::fs::write(&token_path, "synthetic-admin-token").unwrap();
+        let command = format_paircode_recovery_curl("127.0.0.1", 42617, "", &token_path);
+        // Intercept curl: exercise actual shell parsing and cat without a
+        // network call, and verify path contents cannot become shell syntax.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("curl() {{ printf '%s\\n' \"$@\"; }}; {command}"))
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let args = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            args.lines()
+                .any(|arg| arg == "x-omnesagent-admin-token: synthetic-admin-token"),
+            "{args}"
+        );
+        assert!(!tmp.path().join("escaped").exists());
     }
 
     #[test]
     fn paircode_recovery_curl_preserves_path_prefix() {
         assert_eq!(
-            format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
-            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+            format_paircode_recovery_curl(
+                "127.0.0.1",
+                42617,
+                "/gw",
+                std::path::Path::new("/zc/data/gateway-admin.token")
+            ),
+            "curl -s -X POST -H \"x-omnesagent-admin-token: $(cat '/zc/data/gateway-admin.token')\" http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_health_omits_component_error_details() {
+        let component = format!("health-public-{}", uuid::Uuid::new_v4());
+        let sensitive_error = "provider failed: token=not-for-public-health";
+        omnesagent_runtime::health::mark_component_ok(&component);
+        omnesagent_runtime::health::mark_component_error(&component, sensitive_error);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let response = handle_health(State(admin_paircode_state(&tmp, false, false)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let public_component = &json["runtime"]["components"][&component];
+
+        assert_eq!(public_component["status"], "error");
+        assert!(public_component["updated_at"].is_string());
+        assert!(public_component["last_ok"].is_string());
+        assert_eq!(public_component["restart_count"], 0);
+        assert!(public_component.get("last_error").is_none());
+        assert!(!json.to_string().contains(sensitive_error));
+        assert_eq!(
+            omnesagent_runtime::health::snapshot().components[&component]
+                .last_error
+                .as_deref(),
+            Some(sensitive_error)
         );
     }
 
@@ -4722,6 +4934,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery::default()),
             )
             .await,
@@ -4747,6 +4960,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
@@ -4786,6 +5000,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("dev-a".into()),
                 }),
@@ -4822,6 +5037,7 @@ path = "{trigger_path}"
             handle_admin_paircode_new(
                 State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("ghost".into()),
                 }),
@@ -4844,8 +5060,9 @@ path = "{trigger_path}"
 
         let (status, json) = admin_paircode_response_json(
             handle_admin_paircode_new(
-                State(state),
+                State(state.clone()),
                 test_connect_info(),
+                admin_headers(&state),
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
@@ -4865,8 +5082,13 @@ path = "{trigger_path}"
 
         let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
         let (status, _json) = admin_paircode_response_json(
-            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
-                .await,
+            handle_admin_paircode_new(
+                State(state.clone()),
+                remote,
+                admin_headers(&state),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
         )
         .await;
 
@@ -4875,6 +5097,258 @@ path = "{trigger_path}"
             StatusCode::FORBIDDEN,
             "minting a pairing code must be rejected for non-loopback peers"
         );
+    }
+
+    /// Headers carrying this test gateway's admin secret, minted the way a
+    /// gateway start mints it.
+    fn admin_headers(state: &AppState) -> HeaderMap {
+        let data_dir = state.config.read().data_dir.clone();
+        let secret = state
+            .pairing
+            .rotate_admin_token(&data_dir)
+            .expect("rotate admin token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GATEWAY_ADMIN_TOKEN_HEADER,
+            HeaderValue::from_str(&secret).expect("admin token is a valid header value"),
+        );
+        headers
+    }
+
+    /// Headers a same-host reverse proxy or tunnel produces for a remote
+    /// caller. Some proxies add a forwarding header and some add none; the
+    /// admin gates must not depend on either.
+    fn proxied_headers(with_forwarding_header: bool) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if with_forwarding_header {
+            headers.insert("X-Forwarded-For", HeaderValue::from_static("203.0.113.7"));
+        }
+        headers
+    }
+
+    async fn json_of(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn pair_with(state: &AppState, code: &str) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Pairing-Code",
+            HeaderValue::from_str(code).expect("code is a valid header value"),
+        );
+        json_of(
+            handle_pair(State(state.clone()), test_connect_info(), headers)
+                .await
+                .into_response(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn pair_code_never_returns_the_code_even_to_a_loopback_caller() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        assert!(
+            state.pairing.pairing_code().is_some(),
+            "a fresh guard holds a first-run code"
+        );
+
+        let (status, json) = json_of(handle_pair_code(State(state)).await.into_response()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_required"], true);
+        assert!(
+            json["pairing_code"].is_null(),
+            "no HTTP caller can prove it is local, so the code is never served: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_refuses_loopback_callers_without_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let _current = admin_headers(&state);
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            GATEWAY_ADMIN_TOKEN_HEADER,
+            HeaderValue::from_static("zc_wrong"),
+        );
+        for headers in [proxied_headers(true), proxied_headers(false), wrong] {
+            let (status, json) = admin_paircode_response_json(
+                handle_admin_paircode(State(state.clone()), test_connect_info(), headers).await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert!(json.get("pairing_code").is_none(), "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_serves_the_code_with_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let expected = state.pairing.pairing_code();
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(&state),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["pairing_code"].as_str(), expected.as_deref());
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_refuses_loopback_callers_without_the_admin_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let _current = admin_headers(&state);
+        let before = state.pairing.pairing_code();
+
+        for headers in [proxied_headers(true), proxied_headers(false)] {
+            let (status, _json) = admin_paircode_response_json(
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    headers,
+                    Query(AdminPaircodeQuery::default()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(
+            state.pairing.pairing_code(),
+            before,
+            "a refused mint must not issue or replace a code"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_token_from_an_earlier_gateway_start_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let stale = admin_headers(&state);
+        let _restart = admin_headers(&state);
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode(State(state), test_connect_info(), stale).await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A rotation that cannot write its file must fail closed: the token that
+    /// worked before, still sitting in the file, is refused afterwards.
+    #[tokio::test]
+    async fn failed_admin_token_rotation_refuses_the_token_left_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, false);
+        let working = admin_headers(&state);
+        let data_dir = state.config.read().data_dir.clone();
+        let on_disk = std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap();
+
+        let unwritable = tmp.path().join("not-a-dir");
+        std::fs::write(&unwritable, b"x").unwrap();
+        assert!(state.pairing.rotate_admin_token(&unwritable).is_err());
+        assert_eq!(
+            std::fs::read_to_string(gateway_admin_token_path(&data_dir)).unwrap(),
+            on_disk,
+            "the previous token file is still in place"
+        );
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode(State(state), test_connect_info(), working).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert!(json.get("pairing_code").is_none(), "{json}");
+    }
+
+    /// The composed attack from review A1: a remote caller relayed from
+    /// loopback by a same-host proxy tries every route that reads or mints a
+    /// code, then tries to pair. It must end with no code, no paired token and
+    /// no authenticated access. A caller holding the admin token completes the
+    /// same sequence, so the admin token is the only thing standing between.
+    #[tokio::test]
+    async fn proxied_loopback_caller_cannot_reach_operator_access_through_any_code_route() {
+        for with_forwarding_header in [true, false] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let _current = admin_headers(&state);
+
+            let (_, public) =
+                json_of(handle_pair_code(State(state.clone())).await.into_response()).await;
+            assert!(public["pairing_code"].is_null());
+
+            let (read_status, _) = admin_paircode_response_json(
+                handle_admin_paircode(
+                    State(state.clone()),
+                    test_connect_info(),
+                    proxied_headers(with_forwarding_header),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(read_status, StatusCode::FORBIDDEN);
+
+            let (mint_status, _) = admin_paircode_response_json(
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    proxied_headers(with_forwarding_header),
+                    Query(AdminPaircodeQuery::default()),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(mint_status, StatusCode::FORBIDDEN);
+
+            // With no code in hand, a guess cannot pair.
+            let (pair_status, _) = pair_with(&state, "000000").await;
+            assert_ne!(pair_status, StatusCode::OK);
+            assert!(!state.pairing.is_paired(), "no token may have been minted");
+            assert!(
+                api::require_auth(&state, &HeaderMap::new()).is_err(),
+                "the caller must end with no authenticated access"
+            );
+        }
+
+        // Control: the same sequence with the admin token reaches a bearer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        let (_, minted) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state.clone()),
+                test_connect_info(),
+                admin_headers(&state),
+                Query(AdminPaircodeQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        let code = minted["pairing_code"]
+            .as_str()
+            .expect("admin mint issues a code");
+        let (pair_status, paired) = pair_with(&state, code).await;
+        assert_eq!(pair_status, StatusCode::OK, "{paired}");
+        let bearer = paired["token"].as_str().expect("pairing returns a bearer");
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {bearer}")).unwrap(),
+        );
+        assert!(api::require_auth(&state, &auth).is_ok());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 use crate::auth::AuthService;
 use crate::multimodal;
 use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
+use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -18,10 +19,9 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
-use omnesagent_config::schema::ToolResultImagePolicy;
+use omnesagent_config::schema::{CacheTtl, ToolResultImagePolicy};
 
-/// Maximum silence between body reads for OpenAI-compatible SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
 /// Appended to a tool result whose image payloads were moved out of the
@@ -50,6 +50,9 @@ pub struct OpenAiCompatibleModelProvider {
     pub auth_header: AuthStyle,
     supports_vision: bool,
     tool_result_image_policy: ToolResultImagePolicy,
+    /// Operator `[multimodal]` policy for this provider's image-marker
+    /// expansion pass. Resolved once at build time.
+    multimodal: omnesagent_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// When true, collect all `system` messages and prepend their content
     /// to the first `user` message, then drop the system messages.
@@ -68,6 +71,14 @@ pub struct OpenAiCompatibleModelProvider {
     /// assistant history messages. Some providers reject reasoning fields as
     /// input even though they may return them in responses.
     replay_assistant_reasoning: bool,
+    /// Whether Anthropic prompt-cache breakpoints should be injected into
+    /// outbound request bodies (system prompt; rolling last message).
+    /// Drives `capabilities().prompt_caching` and the request-build path.
+    cache_passthrough: bool,
+    /// Cache entry lifetime carried by every breakpoint injected behind
+    /// `cache_passthrough`. One TTL per request by design. Inert without
+    /// passthrough: no markers are placed, so nothing carries a TTL.
+    cache_ttl: Option<CacheTtl>,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -341,8 +352,28 @@ struct ModelEntry {
     /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
     /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
     /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
-    #[serde(default)]
+    /// Vendors also use `pricing` for other shapes (xAI image models send an
+    /// array of per-tier objects); those read as unknown pricing rather than
+    /// failing the whole listing.
+    #[serde(default, deserialize_with = "deserialize_lenient_pricing")]
     pricing: Option<omnesagent_api::model_provider::ModelPricing>,
+}
+
+/// Accept only the per-token object shape for `pricing`; any other shape (an
+/// array, a scalar, an object with non-string rates) is `None`. Arrays must be
+/// rejected explicitly: serde would otherwise read them positionally into the
+/// struct.
+fn deserialize_lenient_pricing<'de, D>(
+    deserializer: D,
+) -> Result<Option<omnesagent_api::model_provider::ModelPricing>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(object @ serde_json::Value::Object(_)) => serde_json::from_value(object).ok(),
+        _ => None,
+    })
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -354,6 +385,11 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+pub(crate) fn parse_model_ids_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let body: ModelsResponse = serde_json::from_slice(bytes)?;
+    Ok(normalize_model_ids(body))
 }
 
 /// Extract model IDs with pricing from a ModelsResponse.
@@ -413,6 +449,7 @@ pub struct OpenAiCompatibleBuilder {
     auth_style: Option<AuthStyle>,
     supports_vision: bool,
     tool_result_image_policy: ToolResultImagePolicy,
+    multimodal: omnesagent_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user`] — the
     /// combined "merge + drop native tool calling" preset. Distinct from
@@ -422,7 +459,7 @@ pub struct OpenAiCompatibleBuilder {
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user_preserving_native`]
     /// to enable the merge behaviour without disabling native tool calling.
     merge_system_into_user_preserve_native: bool,
-    /// Set to `Some(false)` by [`OpenAiCompatibleBuilder::without_native_tools`].
+    /// Set to `Some(bool)` by [`OpenAiCompatibleBuilder::with_native_tools`].
     /// `None` preserves the default derived from `merge_system_into_user`.
     native_tool_calling_override: Option<bool>,
     timeout_secs: Option<u64>,
@@ -432,6 +469,12 @@ pub struct OpenAiCompatibleBuilder {
     /// [`OpenAiCompatibleBuilder::without_assistant_reasoning_replay`]. `None`
     /// preserves the default (replay enabled).
     replay_assistant_reasoning_override: Option<bool>,
+    /// Set by [`OpenAiCompatibleBuilder::with_cache_passthrough`]. Default
+    /// `false`: requests and capability reporting are unchanged.
+    cache_passthrough: bool,
+    /// Set by [`OpenAiCompatibleBuilder::with_cache_ttl`]. Default `None`:
+    /// breakpoints keep the 5-minute API default.
+    cache_ttl: Option<CacheTtl>,
     api_path: Option<String>,
     max_tokens: Option<u32>,
     models_dev_key: Option<String>,
@@ -446,6 +489,17 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// The configured `[multimodal]` policy this provider normalizes under.
+    ///
+    /// Defaults to `MultimodalConfig::default()`; `apply_compat_options`
+    /// overwrites it with the operator's configured policy so the provider
+    /// boundary does not re-trim history under different rules than the
+    /// runtime already applied.
+    pub fn multimodal(mut self, config: omnesagent_config::schema::MultimodalConfig) -> Self {
+        self.multimodal = config;
+        self
+    }
+
     /// Human-readable display name (e.g. `"Groq"`, `"MiniMax"`). Surfaced
     /// in logs, `Attributable` output, and the onboarding UI. Required.
     pub fn display_name(mut self, name: &str) -> Self {
@@ -528,10 +582,17 @@ impl OpenAiCompatibleBuilder {
         self
     }
 
-    /// Disable native tool calling, forcing prompt-guided tool use instead.
-    pub fn without_native_tools(mut self) -> Self {
-        self.native_tool_calling_override = Some(false);
+    /// Override native tool calling for this provider instance.
+    ///
+    /// When disabled, tools are injected into the system prompt as text.
+    pub fn with_native_tools(mut self, native_tool_calling: bool) -> Self {
+        self.native_tool_calling_override = Some(native_tool_calling);
         self
+    }
+
+    /// Disable native tool calling, forcing prompt-guided tool use instead.
+    pub fn without_native_tools(self) -> Self {
+        self.with_native_tools(false)
     }
 
     /// Override the HTTP request timeout for LLM API calls. Values of 0
@@ -560,6 +621,28 @@ impl OpenAiCompatibleBuilder {
     /// history messages.
     pub fn without_assistant_reasoning_replay(mut self) -> Self {
         self.replay_assistant_reasoning_override = Some(false);
+        self
+    }
+
+    /// Opt this provider into Anthropic prompt-cache passthrough: request
+    /// bodies gain `cache_control` breakpoints (system prompt; rolling last
+    /// message once the conversation has more than one non-system message),
+    /// mirroring the native Anthropic provider's placement strategy, and
+    /// gateway-reported cache usage is captured. The flag also reports
+    /// `prompt_caching` in the provider capabilities.
+    pub fn with_cache_passthrough(mut self) -> Self {
+        self.cache_passthrough = true;
+        self
+    }
+
+    /// Request the given cache entry lifetime on every breakpoint injected
+    /// behind `cache_passthrough`. Effective only together with
+    /// [`Self::with_cache_passthrough`]: without passthrough no breakpoints
+    /// are placed, so the setting is inert (no parse-time warning вЂ” an
+    /// operator may stage the value before switching passthrough on).
+    /// Defaults to the 5-minute API default when unset.
+    pub fn with_cache_ttl(mut self, cache_ttl: CacheTtl) -> Self {
+        self.cache_ttl = Some(cache_ttl);
         self
     }
 
@@ -690,6 +773,7 @@ impl OpenAiCompatibleBuilder {
             auth_header: auth_style,
             supports_vision: self.supports_vision,
             tool_result_image_policy: self.tool_result_image_policy,
+            multimodal: self.multimodal,
             user_agent: self.user_agent,
             native_tool_calling,
             merge_system_into_user,
@@ -697,6 +781,8 @@ impl OpenAiCompatibleBuilder {
             extra_headers: self.extra_headers,
             reasoning_effort: self.reasoning_effort,
             replay_assistant_reasoning: self.replay_assistant_reasoning_override.unwrap_or(true),
+            cache_passthrough: self.cache_passthrough,
+            cache_ttl: self.cache_ttl,
             api_path: self.api_path,
             max_tokens: self.max_tokens,
             models_dev_key: self.models_dev_key,
@@ -728,6 +814,7 @@ impl OpenAiCompatibleModelProvider {
             auth_style: None,
             supports_vision: false,
             tool_result_image_policy: ToolResultImagePolicy::default(),
+            multimodal: omnesagent_config::schema::MultimodalConfig::default(),
             user_agent: None,
             merge_system_into_user: false,
             merge_system_into_user_preserve_native: false,
@@ -736,6 +823,8 @@ impl OpenAiCompatibleModelProvider {
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             replay_assistant_reasoning_override: None,
+            cache_passthrough: false,
+            cache_ttl: None,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -770,7 +859,13 @@ impl OpenAiCompatibleModelProvider {
     /// Collect all `system` role messages and keep them in a provider-safe
     /// shape. Strict OpenAI-compatible endpoints accept a leading system
     /// message but reject system messages later in the history.
-    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> Vec<ChatMessage> {
+    /// Flatten system messages per `merge`. Returns the flattened list plus
+    /// whether the system content was merged INTO a user message (or a
+    /// synthetic user inserted for it): that first user message is the
+    /// system-equivalent carrier and the only place a system-role
+    /// breakpoint can ride when merging is on. `false` means a system-role
+    /// message still exists on the wire (or there never was one).
+    fn flatten_system_messages(messages: &[ChatMessage], merge: bool) -> (Vec<ChatMessage>, bool) {
         let mut saw_system = false;
         let mut system_content = String::new();
         let mut result: Vec<ChatMessage> = Vec::with_capacity(messages.len());
@@ -790,28 +885,26 @@ impl OpenAiCompatibleModelProvider {
         }
 
         if !saw_system {
-            return messages.to_vec();
+            return (messages.to_vec(), false);
         }
 
         if system_content.is_empty() {
-            return result;
+            return (result, false);
         }
 
         if !merge {
             result.insert(0, ChatMessage::system(system_content));
-            return result;
+            return (result, false);
         }
 
         if let Some(first_user) = result.iter_mut().find(|m| m.role == "user") {
-            if !system_content.is_empty() {
-                first_user.content = format!("{system_content}\n\n{}", first_user.content);
-            }
+            first_user.content = format!("{system_content}\n\n{}", first_user.content);
         } else {
             // No user message found: insert a synthetic user message with system content
             result.insert(0, ChatMessage::user(&system_content));
         }
 
-        result
+        (result, true)
     }
 
     fn http_client(&self) -> Client {
@@ -819,8 +912,12 @@ impl OpenAiCompatibleModelProvider {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
+        // An OpenCode client needs its own redirect policy, which the shared
+        // cached client below does not carry.
+        let endpoint = self.chat_completions_url();
+        let targets_opencode = crate::opencode_session::is_opencode_target(&endpoint);
 
-        if has_user_agent || has_extra_headers || has_tls_cert {
+        if has_user_agent || has_extra_headers || has_tls_cert || targets_opencode {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -854,6 +951,7 @@ impl OpenAiCompatibleModelProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = omnesagent_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -883,9 +981,13 @@ impl OpenAiCompatibleModelProvider {
 
     /// HTTP client for streaming SSE connections — no overall timeout (reqwest's
     /// total timeout kills long-running streams mid-response), but a `read_timeout`
-    /// idle bound (`STREAM_IDLE_TIMEOUT`) so a silent connection fails fast instead
-    /// of hanging forever. Streaming paths must use this client instead of http_client().
+    /// idle bound so a silent connection fails fast instead of hanging forever.
+    /// The bound is derived as `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: the 300 s
+    /// floor applies when `timeout_secs` is unset or lower, and a higher
+    /// `timeout_secs` raises the bound to match. Streaming paths must use this
+    /// client instead of http_client().
     fn streaming_http_client(&self) -> Client {
+        let endpoint = self.chat_completions_url();
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
         let has_tls_cert = self.tls_ca_cert_pem.is_some();
@@ -922,8 +1024,9 @@ impl OpenAiCompatibleModelProvider {
 
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(STREAM_IDLE_TIMEOUT)
+                .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration())
                 .default_headers(headers);
+            let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
             let builder = self.add_tls_cert_to_builder(builder);
             let builder = omnesagent_config::schema::apply_runtime_proxy_to_builder(
                 builder,
@@ -945,7 +1048,8 @@ impl OpenAiCompatibleModelProvider {
 
         let builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
+        let builder = crate::opencode_session::restrict_redirects(builder, &endpoint);
         let builder =
             omnesagent_config::schema::apply_runtime_proxy_to_builder(builder, "provider.compatible");
         builder.build().unwrap_or_else(|error| {
@@ -962,6 +1066,85 @@ impl OpenAiCompatibleModelProvider {
 
     fn models_url(&self) -> String {
         format!("{}/models", self.base_url)
+    }
+
+    /// Inject Anthropic prompt-cache breakpoints behind `cache_passthrough`.
+    ///
+    /// The native Anthropic provider is the reference for the breakpoint
+    /// gate: `AnthropicModelProvider::should_cache_conversation` and
+    /// `apply_cache_to_last_message` in `anthropic.rs`. (a) The system prompt
+    /// always carries a breakpoint when one exists on the wire. With
+    /// `merge_system_into_user`, the system role disappears from the wire,
+    /// so the carrier index of the merged system content (the first user
+    /// message, or the synthetic user carrying it) takes over that role and
+    /// is marked unconditionally. (b) Once the conversation has more than
+    /// one non-system message, a rolling breakpoint lands on the last
+    /// non-system message with a non-empty text part: the last message when
+    /// it carries text, otherwise the nearest earlier non-system message
+    /// that does, so an image-only turn rolls the breakpoint back instead
+    /// of silently dropping it. System messages are never marked twice, and
+    /// when nothing qualifies there is no rolling breakpoint. At most two
+    /// breakpoints per request; only breakpoint-carrying messages convert
+    /// from string content to block form, every other message serializes
+    /// exactly as before.
+    fn apply_cache_breakpoints<T: CacheBreakpointMessage>(
+        &self,
+        messages: &mut [T],
+        merged_system_carrier: Option<usize>,
+    ) {
+        if !self.cache_passthrough {
+            return;
+        }
+        // One TTL per request: every breakpoint this pass places carries
+        // the same configured lifetime. `None` resolves to the 5-minute
+        // API default, whose markers serialize without a `ttl` field.
+        let cache_ttl = self.cache_ttl.unwrap_or_default();
+        let carrier = merged_system_carrier.and_then(|idx| {
+            (idx < messages.len() && messages[idx].cache_role() != "system").then_some(idx)
+        });
+        match carrier {
+            Some(idx) => {
+                if let Some(content) = messages[idx].cache_content() {
+                    content.apply_cache_control(cache_ttl);
+                }
+            }
+            None => {
+                if let Some(system) = messages.iter_mut().find(|m| m.cache_role() == "system")
+                    && let Some(content) = system.cache_content()
+                {
+                    content.apply_cache_control(cache_ttl);
+                }
+            }
+        }
+        let non_system_count = messages
+            .iter()
+            .filter(|m| m.cache_role() != "system")
+            .count();
+        if non_system_count > 1 {
+            for message in messages.iter_mut().rev() {
+                if message.cache_role() == "system" {
+                    continue;
+                }
+                if let Some(content) = message.cache_content()
+                    && content.apply_cache_control(cache_ttl)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Index of the merged system-content carrier (the first user message)
+    /// when `flatten_system_messages` reported a merge, else `None`.
+    fn merged_system_carrier_index<T: CacheBreakpointMessage>(
+        messages: &[T],
+        system_merged: bool,
+    ) -> Option<usize> {
+        if system_merged {
+            messages.iter().position(|m| m.cache_role() == "user")
+        } else {
+            None
+        }
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -1150,11 +1333,91 @@ enum MessageContent {
     Parts(Vec<MessagePart>),
 }
 
+impl MessageContent {
+    /// Mark this content as an Anthropic prompt-cache breakpoint and return
+    /// whether a markable text part was found: plain string content
+    /// converts to the single-text-block wire form (block conversion
+    /// touches only breakpoint-carrying messages); block-form content gains
+    /// the marker on its last non-empty text part. A message ending in an
+    /// image part therefore carries the breakpoint on its text, and the
+    /// image part stays unmarked: the image is covered by the following
+    /// turn's rolling breakpoint. Empty text is never marked, because the
+    /// wire format rejects empty text blocks that carry `cache_control`.
+    fn apply_cache_control(&mut self, cache_ttl: CacheTtl) -> bool {
+        match self {
+            MessageContent::Text(text) => {
+                if text.is_empty() {
+                    return false;
+                }
+                *self = MessageContent::Parts(vec![MessagePart::Text {
+                    text: std::mem::take(text),
+                    cache_control: Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                        cache_ttl,
+                    )),
+                }]);
+                true
+            }
+            MessageContent::Parts(parts) => {
+                for part in parts.iter_mut().rev() {
+                    if let MessagePart::Text {
+                        text,
+                        cache_control,
+                    } = part
+                        && !text.is_empty()
+                    {
+                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
+                            cache_ttl,
+                        ));
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Uniform (role, content) access over the two wire message shapes so one
+/// breakpoint-injection routine serves both the no-tools and the native-tools
+/// request types.
+trait CacheBreakpointMessage {
+    fn cache_role(&self) -> &str;
+    fn cache_content(&mut self) -> Option<&mut MessageContent>;
+}
+
+impl CacheBreakpointMessage for Message {
+    fn cache_role(&self) -> &str {
+        &self.role
+    }
+
+    fn cache_content(&mut self) -> Option<&mut MessageContent> {
+        Some(&mut self.content)
+    }
+}
+
+impl CacheBreakpointMessage for NativeMessage {
+    fn cache_role(&self) -> &str {
+        &self.role
+    }
+
+    fn cache_content(&mut self) -> Option<&mut MessageContent> {
+        self.content.as_mut()
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MessagePart {
-    Text { text: String },
-    ImageUrl { image_url: ImageUrlPart },
+    Text {
+        text: String,
+        /// Anthropic prompt-cache breakpoint, injected only behind
+        /// `cache_passthrough` and only on breakpoint-carrying messages.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<crate::anthropic::CacheControl>,
+    },
+    ImageUrl {
+        image_url: ImageUrlPart,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1200,29 +1463,73 @@ struct UsageInfo {
     prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     prompt_cache_hit_tokens: Option<u64>,
+    /// Anthropic-shaped cache counters, forwarded by translating gateways
+    /// on Anthropic-backed routes. `cache_read_input_tokens` is the
+    /// authoritative cached-read count (it comes from the upstream API
+    /// itself), so it takes precedence over the gateway-accounted OpenAI
+    /// and DeepSeek shapes.
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_read_input_tokens: Option<u64>,
+    /// Anthropic-shaped cache-write counter. Not part of `TokenUsage`
+    /// (cached reads are the billing-relevant figure there); logged so
+    /// write-premium spend is visible in logs.
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct PromptTokensDetails {
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     cached_tokens: Option<u64>,
+    /// Cache-write tokens reported by translating gateways that forward
+    /// Anthropic usage (`prompt_tokens_details.cache_creation_input_tokens`).
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 impl UsageInfo {
+    /// Cached-read tokens across the three coexisting provider shapes.
+    /// Precedence: Anthropic `cache_read_input_tokens` (upstream-reported
+    /// on translated routes) over DeepSeek `prompt_cache_hit_tokens` over
+    /// OpenAI `prompt_tokens_details.cached_tokens` (gateway-accounted).
     fn cached_input_tokens(&self) -> Option<u64> {
-        self.prompt_cache_hit_tokens.or_else(|| {
+        self.cache_read_input_tokens
+            .or(self.prompt_cache_hit_tokens)
+            .or_else(|| {
+                self.prompt_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+            })
+    }
+
+    fn cache_creation_input_tokens(&self) -> Option<u64> {
+        self.cache_creation_input_tokens.or_else(|| {
             self.prompt_tokens_details
                 .as_ref()
-                .and_then(|details| details.cached_tokens)
+                .and_then(|details| details.cache_creation_input_tokens)
         })
     }
 
     fn into_provider_usage(self) -> omnesagent_api::model_provider::TokenUsage {
+        if let Some(creation) = self.cache_creation_input_tokens.filter(|count| *count > 0) {
+            ::omnesagent_log::record!(
+                DEBUG,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "cache_creation_input_tokens": creation,
+                        "cache_read_input_tokens": self.cache_read_input_tokens,
+                    })),
+                "gateway-reported Anthropic cache write (billed at the write premium)"
+            );
+        }
         let cached_input_tokens = self.cached_input_tokens();
+        let cache_creation_input_tokens = self.cache_creation_input_tokens();
         omnesagent_api::model_provider::TokenUsage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens,
         }
     }
 }
@@ -1856,9 +2163,13 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
 }
 
 /// Convert SSE byte stream to text chunks.
+/// Convert an SSE byte stream into structured chunks. `idle_timeout` is the
+/// streaming client's read-idle bound; it names the bound that fired in
+/// body-read timeout errors, including whether `timeout_secs` can raise it.
 fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -1937,7 +2248,10 @@ fn sse_bytes_to_chunks(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -1959,13 +2273,19 @@ pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-    sse_bytes_to_events_for_contract(response, count_tokens, false)
+    sse_bytes_to_events_for_contract(
+        response,
+        count_tokens,
+        false,
+        super::StreamIdleBound::Fixed(super::STREAM_IDLE_TIMEOUT),
+    )
 }
 
 fn sse_bytes_to_events_for_contract(
     response: reqwest::Response,
     count_tokens: bool,
     targets_mistral_tool_call_contract: bool,
+    idle_timeout: super::StreamIdleBound,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -2116,7 +2436,10 @@ fn sse_bytes_to_events_for_contract(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(StreamError::Http(super::stream_idle_error_message(
+                            &e,
+                            idle_timeout,
+                        ))))
                         .await;
                     return;
                 }
@@ -2175,6 +2498,40 @@ impl OpenAiCompatibleModelProvider {
         credential: Option<&str>,
     ) -> reqwest::RequestBuilder {
         apply_auth_to_request(req, &self.auth_header, credential)
+    }
+
+    /// OpenCode affinity header value for the calling conversation, or `None`
+    /// when this provider does not target OpenCode.
+    ///
+    /// Classifies `chat_completions_url()`, the URL every header-carrying
+    /// request is sent to, rather than `base_url`: an `api_path` is appended to
+    /// the base, so the base alone need not name the destination host.
+    ///
+    /// Returns `None` when the operator has already pinned a valid header value
+    /// through `extra_headers`: those are baked into the client's default
+    /// headers, so adding a second value here would put the header on the wire
+    /// twice. A pinned value the client builder skips as invalid does not count.
+    fn opencode_session_value(&self) -> Option<String> {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
+            return None;
+        }
+        crate::opencode_session::session_token(&self.chat_completions_url())
+    }
+
+    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// caller's task.
+    ///
+    /// Streaming paths must not use this: they build inside
+    /// `omnesagent_spawn::spawn!`, where the conversation task-local is no longer
+    /// readable. Those resolve `opencode_session_value` before the spawn.
+    fn apply_opencode_session_header(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.opencode_session_value() {
+            Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
+            None => req,
+        }
     }
 
     fn convert_tool_specs(
@@ -2243,13 +2600,18 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        system_merged: bool,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let tool_choice = has_tool_entries.then(|| "auto".to_string());
+        let mut messages =
+            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
 
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            messages,
             temperature,
             stream: Some(false),
             // Non-streaming path; `usage` is on the final response body, not
@@ -2271,11 +2633,16 @@ impl OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
         allow_user_image_parts: bool,
+        system_merged: bool,
     ) -> NativeChatRequest<&'a [serde_json::Value]> {
         let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
+        let mut messages =
+            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            messages,
             temperature,
             stream: Some(false),
             stream_options: None,
@@ -2298,6 +2665,7 @@ impl OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options_enabled: bool,
         merge: bool,
+        system_merged: bool,
     ) -> NativeChatRequest {
         // Guard on the converted tools being non-empty (not just the raw
         // input being non-empty): convert_tool_specs_for_model can sanitize
@@ -2307,9 +2675,12 @@ impl OpenAiCompatibleModelProvider {
         let tool_choice = tools
             .as_ref()
             .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
+        let mut messages = self.convert_messages_for_native(effective_messages, !merge);
+        let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+        self.apply_cache_breakpoints(&mut messages, carrier);
         NativeChatRequest {
             model: model.to_string(),
-            messages: self.convert_messages_for_native(effective_messages, !merge),
+            messages,
             temperature,
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: if options_enabled {
@@ -2331,11 +2702,19 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
+    /// Normalize image markers into inline data URIs for the upstream request.
+    ///
+    /// Takes the configured policy rather than `MultimodalConfig::default()`:
+    /// this pass decodes pixels and applies `max_images` / `max_image_size_mb`,
+    /// so running it under defaults would re-trim a history the runtime had
+    /// already accepted under the operator's configuration.
     async fn normalize_messages_for_upstream(
         &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        let config = omnesagent_config::schema::MultimodalConfig::default();
+        // Provider policy may strip image markers from native tool results
+        // before normalization; the normalization itself then runs under the
+        // configured `[multimodal]` policy rather than defaults.
         let sanitized;
         let messages = if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
             sanitized = messages
@@ -2355,7 +2734,8 @@ impl OpenAiCompatibleModelProvider {
         } else {
             messages
         };
-        let prepared = multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared =
+            multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
         Ok(prepared.messages)
     }
 
@@ -2381,6 +2761,7 @@ impl OpenAiCompatibleModelProvider {
         if !trimmed_text.is_empty() {
             parts.push(MessagePart::Text {
                 text: trimmed_text.to_string(),
+                cache_control: None,
             });
         }
 
@@ -2955,7 +3336,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         omnesagent_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
-            prompt_caching: false,
+            prompt_caching: self.cache_passthrough,
             extended_thinking: false,
         }
     }
@@ -3205,14 +3586,21 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
+        // No cache breakpoints here, deliberately: this text-only helper
+        // never surfaces response usage to dispatch accounting, so a
+        // premium cache write it triggered could never be accounted for
+        // (fallback re-entries through this path return `usage: None`).
+        // The flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
 
         let url = self.chat_completions_url();
 
         let response = match self
-            .apply_auth_header(
+            .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
-            )
+            ))
             .send()
             .await
         {
@@ -3271,7 +3659,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, _system_merged) =
+            Self::flatten_system_messages(&normalized, merge);
         // Strip native tool constructs for non-native-tool model_providers.
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
         let api_messages: Vec<Message> = effective_messages
@@ -3295,13 +3684,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         };
+        // No cache breakpoints here, deliberately: this text-only helper
+        // never surfaces response usage to dispatch accounting, so a
+        // premium cache write it triggered could never be accounted for
+        // (fallback re-entries through this path return `usage: None`).
+        // The flag is honored on the structured paths (`chat`,
+        // `chat_with_tools`, `stream_chat`), which capture usage; the
+        // provider docs describe this usage-capture boundary.
 
         let url = self.chat_completions_url();
         let response = match self
-            .apply_auth_header(
+            .apply_opencode_session_header(self.apply_auth_header(
                 self.http_client().post(&url).json(&request),
                 credential.as_deref(),
-            )
+            ))
             .send()
             .await
         {
@@ -3356,7 +3752,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
             effective_messages
         } else {
@@ -3368,6 +3764,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            system_merged,
         );
         let mut payload = serde_json::to_value(request)?;
         let tools_count = payload
@@ -3378,10 +3775,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = loop {
             let response = match self
-                .apply_auth_header(
+                .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                )
+                ))
                 .send()
                 .await
             {
@@ -3470,7 +3867,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .normalize_messages_for_upstream(request.messages)
             .await?;
         let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
             effective_messages
         } else {
@@ -3484,6 +3881,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             model,
             temperature,
             !merge,
+            system_merged,
         );
         let mut payload = serde_json::to_value(native_request)?;
         let tools_count = payload
@@ -3517,10 +3915,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let url = self.chat_completions_url();
         let response = loop {
             let response = match self
-                .apply_auth_header(
+                .apply_opencode_session_header(self.apply_auth_header(
                     self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
-                )
+                ))
                 .send()
                 .await
             {
@@ -3626,6 +4024,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
 
         let provider = self.clone();
+        // Resolved here, not in the spawned task: `spawn!` propagates the
+        // tracing span but not task-locals, so the conversation scope is
+        // unreadable past this point.
+        let opencode_session = self.opencode_session_value();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<omnesagent_api::tool::ToolSpec>> =
             request.tools.map(<[omnesagent_api::tool::ToolSpec]>::to_vec);
@@ -3650,7 +4052,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let merge = provider.effective_merge_system(&model);
-            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let (effective_messages, system_merged) =
+                Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
             let tools_count = tools.as_ref().map_or(0, Vec::len);
@@ -3669,9 +4072,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     temperature,
                     options_enabled,
                     merge,
+                    system_merged,
                 ))
             } else {
-                let messages = effective_messages
+                let mut messages: Vec<Message> = effective_messages
                     .iter()
                     .map(|message| Message {
                         role: message.role.clone(),
@@ -3683,6 +4087,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         ),
                     })
                     .collect();
+                let carrier = Self::merged_system_carrier_index(&messages, system_merged);
+                provider.apply_cache_breakpoints(&mut messages, carrier);
 
                 serde_json::to_value(ApiChatRequest {
                     model: model.clone(),
@@ -3734,6 +4140,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3751,12 +4158,25 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 req_builder =
                     apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
                 req_builder = req_builder.header("Accept", "text/event-stream");
+                if let Some(session) = opencode_session.as_deref() {
+                    req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
+                }
 
                 let response = match req_builder.send().await {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx
-                            .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                            .send(Err(if e.is_connect() {
+                                StreamError::ConnectFailed(super::stream_idle_error_message(
+                                    &e,
+                                    idle_timeout,
+                                ))
+                            } else {
+                                StreamError::Http(super::stream_idle_error_message(
+                                    &e,
+                                    idle_timeout,
+                                ))
+                            }))
                             .await;
                         return;
                     }
@@ -3803,6 +4223,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 response,
                 count_tokens,
                 targets_mistral_tool_call_contract,
+                idle_timeout,
             );
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
@@ -3827,6 +4248,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let provider = self.clone();
+        // Resolved here, not in the spawned task: `spawn!` propagates the
+        // tracing span but not task-locals, so the conversation scope is
+        // unreadable past this point.
+        let opencode_session = self.opencode_session_value();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
         let model = model.to_string();
@@ -3897,9 +4322,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
+            // No cache breakpoints here, deliberately: this legacy chunk
+            // stream never converts the final usage chunk into a
+            // `TokenUsage`, so a premium cache write it triggered could
+            // never be accounted for. The flag is honored on the structured
+            // streaming path (`stream_chat`), which emits
+            // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -3919,13 +4351,23 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
 
             // Send request
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))
+                        } else {
+                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                        }))
                         .await;
                     return;
                 }
@@ -3943,7 +4385,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             // Convert to chunk stream and forward to channel
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break; // Receiver dropped
@@ -3967,6 +4409,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         let provider = self.clone();
+        // Resolved here, not in the spawned task: `spawn!` propagates the
+        // tracing span but not task-locals, so the conversation scope is
+        // unreadable past this point.
+        let opencode_session = self.opencode_session_value();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
         let count_tokens = options.count_tokens;
@@ -3989,7 +4435,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
 
             let merge = provider.effective_merge_system(&model);
-            let effective_messages = Self::flatten_system_messages(&normalized, merge);
+            let (effective_messages, _system_merged) =
+                Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let api_messages: Vec<Message> = effective_messages
                 .iter()
@@ -4014,9 +4461,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 max_tokens: provider.max_tokens,
                 extra_body: provider.extra_body.clone(),
             };
+            // No cache breakpoints here, deliberately: this legacy chunk
+            // stream never converts the final usage chunk into a
+            // `TokenUsage`, so a premium cache write it triggered could
+            // never be accounted for. The flag is honored on the structured
+            // streaming path (`stream_chat`), which emits
+            // `StreamEvent::Usage`.
 
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
+            let idle_timeout = super::stream_idle_timeout(provider.timeout_secs);
             let auth_header = provider.auth_header.clone();
             let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
@@ -4031,12 +4485,22 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let mut req_builder = client.post(&url).json(&request);
             req_builder = apply_auth_to_request(req_builder, &auth_header, credential.as_deref());
             req_builder = req_builder.header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                req_builder = req_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
 
             let response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::stream_idle_error_message(
+                                &e,
+                                idle_timeout,
+                            ))
+                        } else {
+                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                        }))
                         .await;
                     return;
                 }
@@ -4052,7 +4516,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 return;
             }
 
-            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens);
+            let mut chunk_stream = sse_bytes_to_chunks(response, count_tokens, idle_timeout);
             while let Some(chunk) = chunk_stream.next().await {
                 if tx.send(chunk).await.is_err() {
                     break;
@@ -4304,6 +4768,895 @@ mod tests {
         (provider, captured, server)
     }
 
+    fn make_cache_passthrough_model_provider(
+        name: &str,
+        url: &str,
+    ) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider::builder("test")
+            .display_name(name)
+            .base_url(url)
+            .auth_style(AuthStyle::Bearer)
+            .with_cache_passthrough()
+            .build()
+    }
+
+    /// Capability pin: the compat provider reports prompt caching exactly
+    /// when the flag is set, so routing and UI gating can trust capability
+    /// reporting instead of probing the wire.
+    #[test]
+    fn cache_passthrough_capability_reports_flag_state() {
+        let off = make_model_provider("custom", "http://127.0.0.1:1", None);
+        assert!(!off.capabilities().prompt_caching);
+        let on = make_cache_passthrough_model_provider("custom", "http://127.0.0.1:1");
+        assert!(on.capabilities().prompt_caching);
+    }
+
+    /// Byte-identity pin for the default path: the flag-off request body is
+    /// fully specified, so any future injection work that leaks into the
+    /// default path fails this test instead of silently changing the wire.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_request_body_is_pinned() {
+        let (provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}]
+        }))
+        .await;
+        let result = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        server.abort();
+        let result = result.unwrap_or_else(|error| panic!("flag-off request failed: {error}"));
+        assert_eq!(result, "ok");
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": false,
+            }),
+            "flag-off request body must stay byte-identical to the pre-feature wire"
+        );
+    }
+
+    /// Capture mock for the TTL path: passthrough on or off, provider
+    /// built with the requested `cache_ttl` when set. Same wire as
+    /// [`Self::mock_streaming_cache_capture`] so tests pin both paths
+    /// against one shape.
+    async fn mock_cache_capture_with_ttl(
+        cache_passthrough: bool,
+        cache_ttl: Option<CacheTtl>,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    captured.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut builder = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer);
+        if cache_passthrough {
+            builder = builder.with_cache_passthrough();
+        }
+        if let Some(cache_ttl) = cache_ttl {
+            builder = builder.with_cache_ttl(cache_ttl);
+        }
+        let provider = builder.build();
+
+        (provider, captured, server)
+    }
+
+    /// D2 + D5: behind the flag, the 1h lifetime lands on every breakpoint
+    /// the compat provider places (system prompt; rolling last message),
+    /// and only breakpoint-carrying messages convert to block form. With
+    /// the default lifetime the body contains no `ttl` key at all.
+    #[tokio::test]
+    async fn cache_ttl_one_hour_marks_every_compat_breakpoint() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("1h request failed: {error}"));
+
+        {
+            let requests = captured.lock().unwrap();
+            let body = &requests[0];
+            let msgs = body["messages"].as_array().expect("messages array");
+
+            let system_block = msgs[0]["content"][0]["cache_control"]
+                .as_object()
+                .expect("system breakpoint in block form");
+            assert_eq!(system_block["type"], "ephemeral");
+            assert_eq!(
+                system_block["ttl"], "1h",
+                "system marker carries the 1h lifetime"
+            );
+
+            let rolling_block = msgs[3]["content"][0]["cache_control"]
+                .as_object()
+                .expect("rolling breakpoint in block form");
+            assert_eq!(rolling_block["type"], "ephemeral");
+            assert_eq!(
+                rolling_block["ttl"], "1h",
+                "rolling marker carries the 1h lifetime"
+            );
+
+            assert_eq!(
+                msgs[2]["content"], "first answer",
+                "non-carrier messages must keep plain string serialization"
+            );
+        }
+
+        // Default-lifetime control run: same placement, no ttl anywhere.
+        let (provider, captured, server) = mock_cache_capture_with_ttl(true, None).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("default request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        let body = &requests[0];
+        assert!(
+            !body.to_string().contains("\"ttl\""),
+            "default config must keep the compat wire free of ttl keys: {body}"
+        );
+        let msgs = body["messages"].as_array().expect("messages array");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// D3: `cache_ttl` without `cache_passthrough` is inert вЂ” the structured
+    /// `chat` path hits the `!cache_passthrough` early return in
+    /// `apply_cache_breakpoints`, so the body is byte-identical to the
+    /// flag-off structured wire and a staged value waiting for a passthrough
+    /// flip changes nothing on the wire. Removing that early return fails
+    /// this test (breakpoints would appear in the body).
+    #[tokio::test]
+    async fn cache_ttl_one_hour_without_passthrough_is_inert() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(false, Some(CacheTtl::OneHour)).await;
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("inert request failed: {error}"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"},
+                ],
+                "stream": false,
+            }),
+            "cache_ttl without passthrough must leave the structured body identical to flag-off"
+        );
+    }
+
+    /// Streaming capture mock: records every request body, answers with a
+    /// minimal SSE stream. Returns the provider built with or without the
+    /// cache flag so tests can pin both wire paths.
+    async fn mock_streaming_cache_capture(
+        cache_passthrough: bool,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_route = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                async move {
+                    let streaming =
+                        body.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+                    captured.lock().unwrap().push(body);
+                    if streaming {
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            concat!(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut builder = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("custom")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer);
+        if cache_passthrough {
+            builder = builder.with_cache_passthrough();
+        }
+        let provider = builder.build();
+
+        (provider, captured, server)
+    }
+
+    /// D3 wire shape: behind the flag, the system prompt converts from
+    /// string content to the single-text-block form carrying
+    /// `cache_control`, while every other message keeps its existing
+    /// serialization untouched.
+    #[tokio::test]
+    async fn cache_passthrough_system_breakpoint_serializes_block_form() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![ChatMessage::system("be brief"), ChatMessage::user("hello")];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "be brief",
+                         "cache_control": {"type": "ephemeral"}},
+                    ]},
+                    {"role": "user", "content": "hello"},
+                ],
+                "stream": false,
+            }),
+            "system prompt must serialize as a cache_control text block; other messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "single exchange must carry exactly one breakpoint"
+        );
+    }
+
+    /// Rolling breakpoint: once the conversation has more than one
+    /// non-system message (the native provider's gate), the last message
+    /// gains the second breakpoint and converts to block form; messages in
+    /// between serialize exactly as before.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_after_first_exchange() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "bye",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "system and last message carry the breakpoints; middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "rolling breakpoint must never exceed two per request"
+        );
+    }
+
+    /// Writes a minimal real PNG (a 1x1 transparent pixel) into a fresh
+    /// tempdir and returns the dir plus the file path. The dir must outlive
+    /// the request so the multimodal prepare pass can inline the file, and
+    /// tests build the image marker at runtime from the path so this
+    /// source never carries a literal marker.
+    fn write_minimal_png() -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let image_path = temp.path().join("pixel.png");
+        std::fs::write(&image_path, png).unwrap();
+        (temp, image_path)
+    }
+
+    /// Wire form of [`write_minimal_png`]'s file once the multimodal
+    /// prepare pass inlines it: MIME detected from the PNG signature,
+    /// standard padded base64.
+    const MINIMAL_PNG_DATA_URI: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
+
+    /// Rolling breakpoint on an image-ending turn: the last user message
+    /// serializes as [text, image] parts, and the breakpoint must land on
+    /// that text part instead of vanishing because the final part is an
+    /// image. The image part stays unmarked; the following turn's rolling
+    /// breakpoint covers it.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_lands_on_text_before_trailing_image() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on image-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "system and the text part ahead of the trailing image carry the breakpoints; middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "an image-ending turn must still carry exactly two breakpoints"
+        );
+    }
+
+    /// Streaming twin of the image-turn pin: the streaming path must place
+    /// the rolling breakpoint on the same text part when the final user
+    /// message ends with an image.
+    #[tokio::test]
+    async fn cache_passthrough_streaming_rolling_breakpoint_lands_on_text_before_trailing_image() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "streaming image-turn request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "streaming path must inject the image-turn breakpoints identically"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "streaming image-ending turn must carry exactly two breakpoints"
+        );
+    }
+
+    /// Image-only turn: a message whose content is just the image carries
+    /// no text part at all, so it cannot host the rolling breakpoint. The
+    /// breakpoint rolls back onto the nearest earlier non-system message
+    /// with text, the image part stays unmarked, and the two-breakpoint
+    /// ceiling holds.
+    #[tokio::test]
+    async fn cache_passthrough_rolling_breakpoint_falls_back_when_last_message_is_image_only() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!("[{}:{}]", "IMAGE", image_path.display())),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on image-only request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "image-only turn rolls the breakpoint onto the nearest earlier non-system message; the image part stays unmarked"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "image-only fallback must still carry exactly two breakpoints"
+        );
+    }
+
+    /// Unit pin for the fallback walk on hand-built messages, so the
+    /// invariant holds regardless of how a history was constructed: an
+    /// image-only last message rolls the rolling breakpoint back onto the
+    /// nearest earlier non-system message with text, a trailing system
+    /// message never absorbs the slot or gains a second mark, and the
+    /// two-breakpoint ceiling holds.
+    #[test]
+    fn cache_passthrough_breakpoint_walk_handles_hand_built_image_only_messages() {
+        let provider = make_cache_passthrough_model_provider("custom", "http://127.0.0.1:1");
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: MessageContent::Text("you are brief".to_string()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![MessagePart::ImageUrl {
+                    image_url: ImageUrlPart {
+                        url: "data:image/png;base64,abcd".to_string(),
+                    },
+                }]),
+            },
+            Message {
+                role: "system".to_string(),
+                content: MessageContent::Text("extra".to_string()),
+            },
+        ];
+        provider.apply_cache_breakpoints(&mut messages, None);
+        let value = serde_json::to_value(&messages).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"role": "system", "content": [
+                    {"type": "text", "text": "you are brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "hello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abcd"}},
+                ]},
+                {"role": "system", "content": "extra"},
+            ]),
+            "image-only turn rolls the breakpoint onto the nearest earlier non-system message; system messages never take the rolling slot"
+        );
+        assert_eq!(
+            value.to_string().matches("cache_control").count(),
+            2,
+            "hand-built fallback must keep the two-breakpoint ceiling"
+        );
+    }
+
+    /// Flag-off twin for the multimodal shape: with the flag off, the
+    /// image-ending history serializes byte-identically to the pre-feature
+    /// wire, with plain string content where the flag-on path would mark,
+    /// the same unmarked image parts, and no cache markers anywhere in the
+    /// body.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_image_turn_body_unmarked() {
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let (_temp, image_path) = write_minimal_png();
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user(format!(
+                "look at this [{}:{}]",
+                "IMAGE",
+                image_path.display()
+            )),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-off image-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "system", "content": "you are brief"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image_url", "image_url": {"url": MINIMAL_PNG_DATA_URI}},
+                ]},
+            ]),
+            "flag-off multimodal body must stay byte-identical: plain strings and unmarked image parts"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off image-ending turn must carry no cache markers"
+        );
+    }
+
+    /// The rolling breakpoint follows the native provider's gate: a
+    /// conversation with only one non-system message gets the system
+    /// breakpoint alone.
+    #[tokio::test]
+    async fn cache_passthrough_single_exchange_skips_rolling_breakpoint() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on history request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "one non-system message means no rolling breakpoint"
+        );
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            serde_json::json!("hi"),
+            "first user message must stay a plain string"
+        );
+    }
+
+    /// Streaming twin of the system-breakpoint pin: the injection must be
+    /// identical on the streaming path (a previous feature shipped the
+    /// non-streaming path and silently missed streaming).
+    #[tokio::test]
+    async fn cache_passthrough_streaming_system_breakpoint_matches_non_streaming() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "streaming request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"][0],
+            serde_json::json!({
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "be brief",
+                     "cache_control": {"type": "ephemeral"}},
+                ],
+            }),
+            "streaming path must inject the system breakpoint identically"
+        );
+        assert_eq!(
+            requests[0]["messages"][1]["content"],
+            serde_json::json!("hello"),
+            "streaming user message must stay a plain string"
+        );
+    }
+
+    /// Flag-off streaming twin: the default path stays byte-identical on
+    /// the streaming wire too.
+    #[tokio::test]
+    async fn cache_passthrough_flag_off_streaming_body_unmarked() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(events.iter().all(Result::is_ok));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"][0]["content"],
+            serde_json::json!("be brief"),
+            "flag-off system message must stay a plain string"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off streaming body must carry no cache markers"
+        );
+    }
+
+    /// Native-tools path: the same two-breakpoint placement applies to the
+    /// native-tools request builder, so tool-bearing agent loops get the
+    /// same caching shape as plain conversations.
+    #[tokio::test]
+    async fn cache_passthrough_tools_path_rolls_breakpoint_onto_last_message() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let result = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-on tools request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "tools path must carry at most the two standard breakpoints"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system breakpoint present on the tools path"
+        );
+        assert_eq!(
+            requests[0]["messages"].as_array().unwrap().last().unwrap()["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling breakpoint lands on the last message of the tools path"
+        );
+    }
+
     fn non_streaming_response_cases() -> Vec<(&'static str, serde_json::Value, Option<&'static str>)>
     {
         vec![
@@ -4464,6 +5817,7 @@ mod tests {
             Some(0.5),
             true,
             false,
+            false,
         ))
         .unwrap();
 
@@ -4494,6 +5848,7 @@ mod tests {
             Some(vec![]),
             None,
             true,
+            false,
             false,
         ))
         .unwrap();
@@ -4562,7 +5917,7 @@ mod tests {
         // directly.
 
         // None tools → no tool_choice key.
-        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
+        let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false, false);
         let value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("tool_choice").is_none(),
@@ -4571,7 +5926,7 @@ mod tests {
 
         // Empty tools vec → still no tool_choice key.
         let req_empty =
-            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
+            p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false, false);
         let value_empty = serde_json::to_value(&req_empty).unwrap();
         assert!(
             value_empty.get("tool_choice").is_none(),
@@ -4593,8 +5948,14 @@ mod tests {
                 parameters: std::sync::Arc::new(serde_json::json!({})),
             },
         }];
-        let req =
-            p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
+        let req = p.build_native_tool_chat_request(
+            &messages,
+            Some(tools),
+            "test-model",
+            None,
+            false,
+            false,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value.get("tool_choice").and_then(serde_json::Value::as_str),
@@ -4627,7 +5988,8 @@ mod tests {
             },
         }];
 
-        let req = p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false);
+        let req =
+            p.build_native_tool_chat_request(&messages, Some(tools), "gpt-5", None, false, false);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -4652,7 +6014,7 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
 
-        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false);
+        let req = p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false, false);
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -5305,6 +6667,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn operator_max_images_bounds_the_outbound_request() {
+        // Behaviour boundary: the number of images that survive into the
+        // messages this provider is about to send upstream. Asserting the
+        // config field alone would still pass if the expansion pass kept
+        // using library defaults.
+        let temp = tempfile::tempdir().unwrap();
+        // Use a complete decodable image: content validation now performs
+        // pixel decoding after MIME detection, so a bare signature is
+        // correctly rejected as a corrupt image.
+        let png = boundary_test_png();
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        std::fs::write(&first, &png).unwrap();
+        std::fs::write(&second, &png).unwrap();
+
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both in a single message would exercise that eviction
+        // granularity rather than whether the operator's cap is honoured.
+        let messages = vec![
+            ChatMessage::user(format!("first [IMAGE:{}]", first.display())),
+            ChatMessage::user(format!("second [IMAGE:{}]", second.display())),
+        ];
+
+        let build = |multimodal| {
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url("https://example.com")
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .multimodal(multimodal)
+                .build()
+        };
+
+        let permissive = build(omnesagent_config::schema::MultimodalConfig::default());
+        let prepared = permissive
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("default policy prepares both images");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            2,
+            "default policy admits both images"
+        );
+
+        let capped = build(omnesagent_config::schema::MultimodalConfig {
+            max_images: 1,
+            ..Default::default()
+        });
+        let prepared = capped
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("capped policy still prepares the message");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            1,
+            "an operator capping max_images must bound the outbound request"
+        );
+    }
+
+    #[test]
+    fn builder_without_multimodal_falls_back_to_library_defaults() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+
+        let defaults = omnesagent_config::schema::MultimodalConfig::default();
+        assert_eq!(provider.multimodal.max_images, defaults.max_images);
+    }
+
     #[test]
     fn with_tls_ca_cert_path_invalid_pem_stores_bytes_and_http_client_still_builds() {
         // The path-read step stores raw bytes; PEM parsing happens in http_client().
@@ -5428,7 +6863,11 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
         )
         .await;
-        let mut stream = sse_bytes_to_chunks(response, false);
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+        );
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
             .await
@@ -5921,6 +7360,161 @@ mod tests {
         assert!(zhipu_jwt_bearer("").is_err());
         assert!(zhipu_jwt_bearer(".secret").is_err());
         assert!(zhipu_jwt_bearer("id.").is_err());
+    }
+
+    fn opencode_provider(base_url: &str) -> OpenAiCompatibleModelProvider {
+        OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url(base_url)
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .build()
+    }
+
+    /// Request as the chat paths build it, addressed to the real endpoint,
+    /// without sending anything.
+    fn built_opencode_request(provider: &OpenAiCompatibleModelProvider) -> reqwest::Request {
+        provider
+            .apply_opencode_session_header(
+                reqwest::Client::new().post(provider.chat_completions_url()),
+            )
+            .build()
+            .expect("request must build")
+    }
+
+    /// Header value as it would go on the wire, without sending anything.
+    fn built_session_header(provider: &OpenAiCompatibleModelProvider) -> Option<String> {
+        built_opencode_request(provider)
+            .headers()
+            .get(OPENCODE_SESSION_HEADER)
+            .map(|value| value.to_str().expect("header must be ASCII").to_string())
+    }
+
+    #[test]
+    fn opencode_session_header_follows_the_built_request_destination() {
+        // Header selection must agree with the parser that addresses the
+        // request, not with a textual reading of the configured URI.
+        for (base_url, api_path, expected_host) in [
+            // `\` ends the authority; `@opencode.ai/v1` is only path.
+            (
+                "https://relay.example\\@opencode.ai/v1",
+                None,
+                "relay.example",
+            ),
+            // A percent-encoded host decodes to the relay.
+            ("https://%6fpencode.ai/v1", None, "opencode.ai"),
+            // `api_path` is appended to the base, so the base alone need not
+            // name the destination; only the finished endpoint does.
+            (
+                "https:",
+                Some("//opencode.ai/zen/v1/chat/completions"),
+                "opencode.ai",
+            ),
+            (
+                "https:",
+                Some("//relay.example/v1/chat/completions"),
+                "relay.example",
+            ),
+        ] {
+            let provider = OpenAiCompatibleModelProvider::builder("opencode")
+                .display_name("OpenCode Zen")
+                .base_url(base_url)
+                .api_path(api_path.map(str::to_string))
+                .credential(Some("test-key"))
+                .auth_style(AuthStyle::Bearer)
+                .build();
+            let request = built_opencode_request(&provider);
+            let host = request.url().host_str().expect("request must have a host");
+            assert_eq!(host, expected_host, "{base_url} + {api_path:?}");
+            assert_eq!(
+                request.headers().contains_key(OPENCODE_SESSION_HEADER),
+                host == "opencode.ai",
+                "{base_url} + {api_path:?}: header selection must match the request host {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_requests_carry_the_session_header() {
+        for base_url in [
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen/go/v1",
+        ] {
+            let header = built_session_header(&opencode_provider(base_url))
+                .unwrap_or_else(|| panic!("{base_url} must carry the affinity header"));
+            assert_eq!(header.len(), 32, "expected a 128-bit hex token");
+            assert!(header.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn non_opencode_requests_do_not_carry_the_session_header() {
+        assert!(
+            built_session_header(&opencode_provider("https://api.openai.com/v1")).is_none(),
+            "the header must not leak to unrelated providers"
+        );
+    }
+
+    #[test]
+    fn operator_pinned_session_header_is_not_overridden() {
+        // `extra_headers` become client default headers, so emitting our own
+        // value too would put the header on the wire twice.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "X-Opencode-Session".to_string(),
+            "pinned-by-operator".to_string(),
+        );
+        let provider = OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url("https://opencode.ai/zen/v1")
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        assert!(
+            provider.opencode_session_value().is_none(),
+            "an operator-pinned header must win over the derived value"
+        );
+    }
+
+    #[test]
+    fn malformed_pinned_session_header_falls_back_to_the_derived_token() {
+        // The client builder skips a header value it cannot encode, so treating
+        // it as a pin would leave the request with no affinity header at all.
+        let headers = std::collections::HashMap::from([(
+            "x-opencode-session".to_string(),
+            "bad\nvalue".to_string(),
+        )]);
+        let provider = OpenAiCompatibleModelProvider::builder("opencode")
+            .display_name("OpenCode Zen")
+            .base_url("https://opencode.ai/zen/v1")
+            .credential(Some("test-key"))
+            .auth_style(AuthStyle::Bearer)
+            .extra_headers(headers)
+            .build();
+
+        assert!(
+            built_session_header(&provider).is_some(),
+            "an invalid pinned value must not suppress the derived token"
+        );
+    }
+
+    #[test]
+    fn opencode_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest strips only credential headers on a cross-host redirect, so
+        // every client an OpenCode provider builds must stop there instead.
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+
+        let opencode = opencode_provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_http_client()));
+
+        let other = opencode_provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_http_client()));
     }
 
     #[test]
@@ -7044,7 +8638,9 @@ mod tests {
             ChatMessage::assistant("post-user"),
         ];
 
-        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        let (output, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        assert!(system_merged, "merged into the existing user message");
         assert_eq!(output.len(), 3);
         assert_eq!(output[0].role, "assistant");
         assert_eq!(output[0].content, "ack");
@@ -7062,7 +8658,9 @@ mod tests {
             ChatMessage::assistant("ack"),
         ];
 
-        let output = OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        let (output, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&input, true);
+        assert!(system_merged, "synthetic user inserted as the carrier");
         assert_eq!(output.len(), 2);
         assert_eq!(output[0].role, "user");
         assert_eq!(output[0].content, "core policy");
@@ -7596,8 +9194,12 @@ mod tests {
             content: format!("Caption please [IMAGE:{}]", path_str),
         };
 
+        // Omit-policy tool-result stripping must not touch user-message
+        // normalization: this user image still rewrites to a data URI with
+        // the policy active.
         let mut provider = make_model_provider("test", "https://example.com", None);
         provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
+
         let normalized = provider
             .normalize_messages_for_upstream(std::slice::from_ref(&msg))
             .await
@@ -7615,6 +9217,93 @@ mod tests {
         );
     }
 
+    /// A real 1x1 PNG. Content validation drops undecodable bytes, so a bare
+    /// signature would be skipped before reaching the boundary assertions.
+    fn boundary_test_png() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_honours_the_configured_multimodal_policy() {
+        // The provider boundary re-normalizes messages, and that pass now
+        // decodes pixels and applies `max_images`. Under
+        // `MultimodalConfig::default()` it would trim to 4 images, silently
+        // discarding one the runtime had already accepted under a configured
+        // `max_images = 8`. The configured policy must reach the provider.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut markers = String::from("compare these");
+        for index in 0..5 {
+            let path = tmp.path().join(format!("shot{index}.png"));
+            std::fs::write(&path, boundary_test_png()).expect("write fixture");
+            markers.push_str(&format!(" [IMAGE:{}]", path.display()));
+        }
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: markers,
+        };
+
+        let configured = omnesagent_config::schema::MultimodalConfig {
+            max_images: 8,
+            max_image_size_mb: 10,
+            ..Default::default()
+        };
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .multimodal(configured)
+            .build();
+
+        let normalized = provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+
+        let content = &normalized[0].content;
+        let surviving = content.matches("[IMAGE:data:image/png;base64,").count();
+        assert_eq!(
+            surviving, 5,
+            "all five images must survive the configured max_images = 8; \
+             a default-config boundary pass would have trimmed to 4: {content}"
+        );
+
+        // The default policy is what the boundary used before this fix. The
+        // boundary trims in batches, so the same five-image message drops to
+        // the low-water mark of 2 under the default cap of 4 — images evicted
+        // even though the operator's configuration had accepted all five.
+        // That boundary-side re-trim is the data loss the configured policy
+        // prevents, so pin it so a regression cannot quietly restore the
+        // default-config pass.
+        let default_provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let default_normalized = default_provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+        let default_surviving = default_normalized[0]
+            .content
+            .matches("[IMAGE:data:image/png;base64,")
+            .count();
+        assert_eq!(
+            default_surviving, 2,
+            "under the default max_images = 4 the boundary pass evicts down to the \
+             low-water mark of 2; that re-trim is what the configured policy prevents"
+        );
+    }
     #[tokio::test]
     async fn normalize_messages_for_upstream_omit_preserves_tool_envelope() {
         let provider = OpenAiCompatibleModelProvider::builder("test")
@@ -7909,6 +9598,7 @@ mod tests {
             "deepseek-v4-flash",
             Some(0.7),
             true,
+            false,
         );
         let value = serde_json::to_value(&request).unwrap();
         let first_message = &value["messages"][0];
@@ -7945,7 +9635,9 @@ mod tests {
             ChatMessage::tool(r#"{"ok":true}"#),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        assert!(system_merged);
         assert_eq!(flattened.len(), 3);
         assert_eq!(flattened[0].role, "assistant");
         assert_eq!(
@@ -7967,7 +9659,9 @@ mod tests {
             ChatMessage::user("Follow-up"),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        assert!(!system_merged);
         assert_eq!(
             flattened
                 .iter()
@@ -7994,7 +9688,9 @@ mod tests {
             ChatMessage::system(""),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, false);
+        assert!(!system_merged, "empty system content merged nothing");
 
         assert_eq!(flattened.len(), 1);
         assert_eq!(flattened[0].role, "user");
@@ -8008,7 +9704,9 @@ mod tests {
             ChatMessage::system("Synthetic system"),
         ];
 
-        let flattened = OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        let (flattened, system_merged) =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&messages, true);
+        assert!(system_merged);
         assert_eq!(flattened.len(), 2);
         assert_eq!(flattened[0].role, "user");
         assert_eq!(flattened[0].content, "Synthetic system");
@@ -8414,6 +10112,27 @@ mod tests {
     }
 
     #[test]
+    fn api_response_parses_gateway_cache_creation_tokens() {
+        // Translating gateways forward Anthropic's cache-write counter inside
+        // `prompt_tokens_details` when providers include that usage detail.
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_tokens_details": {
+                    "cached_tokens": 120,
+                    "cache_creation_input_tokens": 25
+                }
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(120));
+        assert_eq!(usage.cache_creation_input_tokens, Some(25));
+    }
+
+    #[test]
     fn api_response_parses_deepseek_cached_tokens() {
         let json = r#"{
             "choices": [{"message": {"content": "Hello"}}],
@@ -8505,6 +10224,226 @@ mod tests {
     }
 
     #[test]
+    fn api_response_parses_anthropic_cache_read_tokens() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 4802,
+                "cache_creation_input_tokens": 0
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(4863));
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+    }
+
+    /// All three cached-token shapes on one response: the Anthropic fields
+    /// are upstream-reported and win over the gateway-accounted DeepSeek
+    /// and OpenAI shapes, which keep their existing relative order.
+    #[test]
+    fn api_response_prefers_anthropic_cache_read_across_all_shapes() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 4802,
+                "prompt_cache_hit_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+    }
+
+    /// An upstream-reported zero is authoritative, not missing data: when
+    /// the Anthropic shape says zero reads, the gateway-accounted OpenAI
+    /// figure must NOT be substituted (that would double-count gateway-side
+    /// accounting against the upstream's authoritative answer).
+    #[test]
+    fn api_response_anthropic_zero_read_blocks_openai_fallback() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn stream_chunk_parses_anthropic_cache_read_tokens() {
+        let json = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 99,
+                "completion_tokens": 11,
+                "cache_read_input_tokens": 42,
+                "cache_creation_input_tokens": 0
+            }
+        }"#;
+        let chunk: StreamChunkResponse = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(99));
+        assert_eq!(usage.output_tokens, Some(11));
+        assert_eq!(usage.cached_input_tokens, Some(42));
+    }
+
+    /// Cache-write tokens are logged for write-premium visibility. The log
+    /// must carry the counts, not the prompt content.
+    #[test]
+    fn cache_creation_tokens_are_logged_with_counts_only() {
+        let _writer_guard = omnesagent_log::__private_test_writer_lock();
+        let _hook_guard = omnesagent_log::__private_test_hook_lock();
+        omnesagent_log::try_install_capture_subscriber();
+        let mut rx = omnesagent_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 0,
+                "cache_creation_input_tokens": 4803
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        // Write-only response: upstream reported no cache read, so the
+        // cached-token figure stays unset.
+        assert_eq!(usage.cached_input_tokens, None);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let found = 'search: loop {
+            while let Ok(event) = rx.try_recv() {
+                let matches_message = event.get("message").and_then(|value| value.as_str())
+                    == Some("gateway-reported Anthropic cache write (billed at the write premium)");
+                let matches_counts = event
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get("cache_creation_input_tokens"))
+                    == Some(&serde_json::json!(4803));
+                if matches_message && matches_counts && matches_source_file(&event) {
+                    break 'search true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break 'search false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(found, "cache-write log record with counts must be emitted");
+    }
+
+    fn matches_source_file(event: &serde_json::Value) -> bool {
+        event
+            .get("attributes")
+            .and_then(|attributes| attributes.get("_file"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|file| file.ends_with("compatible.rs"))
+    }
+
+    /// End to end on the tools path: a translated-gateway response carrying
+    /// Anthropic-shaped usage populates `TokenUsage.cached_input_tokens`.
+    /// Parsing is flag-independent (the gateway sends these fields on
+    /// Anthropic-backed routes regardless of the client flag).
+    #[tokio::test]
+    async fn chat_with_tools_surfaces_anthropic_cache_read_tokens() {
+        let (provider, _captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 4863,
+                "completion_tokens": 4,
+                "cache_read_input_tokens": 4802,
+                "cache_creation_input_tokens": 0
+            }
+        }))
+        .await;
+        let messages = vec![ChatMessage::user("hi")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let response = provider
+            .chat_with_tools(&messages, &tools, "test-model", None)
+            .await;
+        server.abort();
+        let response = response.unwrap_or_else(|error| panic!("tools request failed: {error}"));
+        let usage = response.usage.expect("usage must be captured");
+        assert_eq!(usage.cached_input_tokens, Some(4802));
+        assert_eq!(usage.input_tokens, Some(4863));
+    }
+
+    /// Flag interaction: the thinking object reaches the wire through
+    /// `extra_body` (the same surface the thinking-passthrough feature
+    /// uses), and it must ride alongside the cache breakpoints in one
+    /// request: neither injection disturbs the other. This proves generic
+    /// flattened-body coexistence on the structured path; full proof that
+    /// the two operator flags compose awaits the thinking-passthrough
+    /// provider flag landing in this tree.
+    #[tokio::test]
+    async fn cache_breakpoints_coexist_with_thinking_object_in_one_request() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        // Builder-level extra_body mirrors what provider_extra supplies for
+        // thinking-capable gateways; swap in the flag-side equivalent when
+        // the thinking-passthrough provider flag lands in this tree.
+        let provider = OpenAiCompatibleModelProvider {
+            extra_body: Some(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 2048},
+            })),
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("combined request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            "the thinking object must ride at the top level untouched"
+        );
+        assert_eq!(
+            requests[0]["messages"][0]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "system cache breakpoint present alongside the thinking object"
+        );
+        assert_eq!(
+            requests[0]["messages"][3]["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "rolling cache breakpoint present alongside the thinking object"
+        );
+    }
+
+    #[test]
     fn api_response_parses_without_usage() {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -8512,6 +10451,301 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+        // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+    // merged-system carrier + usage-capture boundary tests
+    // в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+
+    /// Merged-carrier, single-turn: with `merge_system_into_user`, the
+    /// system role never reaches the wire, so the merged first user message
+    /// is the only system-equivalent carrier and must carry the breakpoint
+    /// unconditionally. Before the repair this shape sent zero breakpoints.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_marks_first_user_single_turn() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("merged single-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "merged user message is the system-equivalent carrier and must be marked"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "single exchange carries exactly the carrier breakpoint"
+        );
+    }
+
+    /// Merged-carrier, multi-turn: the carrier keeps the system breakpoint
+    /// and the rolling breakpoint still lands on the last message, exactly
+    /// two total, middle messages untouched.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_carrier_plus_rolling_multi_turn() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("merged multi-turn request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhi",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "bye",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "merged carrier and rolling breakpoint with middle messages untouched"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            2,
+            "merged multi-turn must carry exactly two breakpoints"
+        );
+    }
+
+    /// Merged-carrier, assistant-first history: the merged user is not
+    /// message zero; the carrier index must follow the first user wherever
+    /// it sits.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_marks_first_user_after_assistant() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::assistant("ack"),
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("assistant-first merged request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "core policy\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "carrier breakpoint lands on the merged user, not on message zero"
+        );
+        assert_eq!(
+            requests[0].to_string().matches("cache_control").count(),
+            1,
+            "assistant + merged user is a single exchange: no rolling breakpoint"
+        );
+    }
+
+    /// Streaming twin of the merged-carrier pin.
+    #[tokio::test]
+    async fn cache_passthrough_merged_system_streaming_matches_non_streaming() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let events = provider
+            .stream_chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        assert!(
+            events.iter().all(Result::is_ok),
+            "merged streaming request must succeed: {events:?}"
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "be brief\n\nhello",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ]),
+            "streaming merged carrier carries the breakpoint identically"
+        );
+    }
+
+    /// Flag-off merged: the merge behavior is unchanged and the wire stays
+    /// free of markers.
+    #[tokio::test]
+    async fn cache_passthrough_merged_flag_off_body_unmarked() {
+        let (provider, captured, server) = mock_streaming_cache_capture(false).await;
+        let provider = OpenAiCompatibleModelProvider {
+            merge_system_into_user: true,
+            ..provider
+        };
+        let messages = vec![
+            ChatMessage::system("core policy"),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("flag-off merged request failed: {error}"));
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0]["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "core policy\n\nhello"},
+            ]),
+            "flag-off merged body must be byte-identical to the pre-feature wire"
+        );
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "flag-off merged request must carry no cache markers"
+        );
+    }
+
+    /// Capture-boundary regression: the text-only helpers must never emit
+    /// cache breakpoints even with the flag on, because their responses
+    /// drop usage and could never account for the premium.
+    #[tokio::test]
+    async fn cache_passthrough_simple_paths_emit_no_breakpoints_even_when_enabled() {
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let _ = provider
+            .chat_with_system(Some("be brief"), "hello", "test-model", None)
+            .await;
+        let messages = vec![
+            ChatMessage::system("you are brief"),
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let _ = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await;
+        server.abort();
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                !request.to_string().contains("cache_control"),
+                "simple path {index} must not emit cache breakpoints: {request}"
+            );
+        }
+    }
+
+    /// Capture-boundary regression, streaming side: the legacy chunk stream
+    /// drops usage, so it must not trigger premium writes either.
+    #[tokio::test]
+    async fn cache_passthrough_legacy_stream_emits_no_breakpoints_even_when_enabled() {
+        use futures_util::StreamExt as _;
+
+        let (provider, captured, server) = mock_streaming_cache_capture(true).await;
+        let events = provider
+            .stream_chat_with_system(
+                Some("be brief"),
+                "hello",
+                "test-model",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect::<Vec<_>>()
+            .await;
+        server.abort();
+        let _ = events;
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].to_string().contains("cache_control"),
+            "legacy chunk stream must carry no cache markers even with the flag on"
+        );
+    }
+
+
     // reasoning_content pass-through tests
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -8627,6 +10861,7 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            false,
         );
         let default_message = &default_request.messages[0];
         assert_eq!(default_message.role, "assistant");
@@ -8662,6 +10897,7 @@ mod tests {
             "openai/gpt-oss-120b",
             None,
             true,
+            false,
         );
         let groq_message = &groq_request.messages[0];
         assert_eq!(groq_message.role, "assistant");
@@ -8898,6 +11134,170 @@ mod tests {
     fn default_timeout_is_120s() {
         let p = make_model_provider("test", "https://example.com", None);
         assert_eq!(p.timeout_secs, 120);
+    }
+
+    #[test]
+    fn stream_idle_timeout_keeps_300s_floor_when_timeout_secs_is_lower() {
+        assert_eq!(
+            crate::stream_idle_timeout(120),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(300),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_raises_bound_when_timeout_secs_exceeds_floor() {
+        assert_eq!(
+            crate::stream_idle_timeout(301),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(301))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(3600),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_names_bound_on_read_timeout() {
+        // Accept the connection, then never write a byte: the read-idle bound
+        // fires while the streaming client waits for response headers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            err.is_timeout(),
+            "client must experience the silence as a timeout: {err}"
+        );
+        assert!(!err.is_connect(), "the connection itself succeeded: {err}");
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            message.contains("raise timeout_secs above 300s"),
+            "idle message must name the knob that raises the bound: {message}"
+        );
+        assert!(
+            message.contains(&crate::format_error_chain(&err)),
+            "the underlying reqwest error must stay in the chain: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_error_message_leaves_connect_errors_unchanged() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/stream")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_connect(),
+            "a refused local port is a connect error: {err}"
+        );
+        let message = crate::stream_idle_error_message(
+            &err,
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300)),
+        );
+        assert_eq!(
+            message,
+            crate::format_error_chain(&err),
+            "connect errors must keep the plain error chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_chunk_stream_names_idle_bound_when_body_goes_silent() {
+        use axum::{Router, response::IntoResponse, routing::get};
+        use futures_util::StreamExt as _;
+
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                    ))
+                });
+                let open = futures_util::stream::pending::<
+                    Result<axum::body::Bytes, std::convert::Infallible>,
+                >();
+                axum::body::Body::from_stream(first.chain(open)).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // A 1 s read-idle bound gives the header exchange and first chunk a
+        // comfortable window on a slow runner; the silent body still trips it
+        // in about a second, keeping the whole test under ~2 s.
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = sse_bytes_to_chunks(
+            response,
+            false,
+            crate::StreamIdleBound::Fixed(std::time::Duration::from_secs(300)),
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("first chunk must arrive before the stall")
+            .expect("chunk stream must yield a chunk")
+            .expect("first chunk must be valid");
+        assert_eq!(first.delta, "hi");
+        let item = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("stall must hit the read-idle bound")
+            .expect("stalled chunk stream must yield an item");
+        server.abort();
+        let message = match item {
+            Err(StreamError::Http(message)) => message,
+            Err(other) => panic!("expected an HTTP stream error, got {other:?}"),
+            Ok(_) => panic!("expected an error after the stalled body"),
+        };
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            !message.contains("timeout_secs"),
+            "a fixed idle bound has no knob advice: {message}"
+        );
     }
 
     #[test]
@@ -9221,6 +11621,109 @@ mod tests {
         assert_eq!(stripped[1].content, "Here are the results");
     }
 
+    /// A streaming request to a closed local port fails at connect on the
+    /// first hop: the adapter must tag the transport failure as
+    /// `ConnectFailed` so Reliable can retry the entry.
+    #[tokio::test]
+    async fn connect_failed_tagged_on_connect_failure_to_closed_port() {
+        use futures_util::StreamExt as _;
+
+        // Take a port and drop the listener: nothing is listening there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions::new(true),
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .expect("closed-port stream must fail immediately");
+        match first.expect("closed-port stream must yield an item") {
+            Err(StreamError::ConnectFailed(message)) => {
+                assert!(
+                    message.contains("error sending request"),
+                    "the transport chain must stay in the message: {message}"
+                );
+            }
+            Err(other) => {
+                panic!("connect failure must be tagged ConnectFailed, got {other:?}")
+            }
+            Ok(_) => panic!("a closed port cannot produce stream events"),
+        }
+    }
+
+    /// An accepted HTTP 200 stream whose SSE body carries an error frame is
+    /// a body-level failure: the send succeeded, so nothing in it may be
+    /// tagged `ConnectFailed`, whatever the frame text says. (The
+    /// chat-completions parser currently swallows such a frame without
+    /// surfacing an error; the pin is that it can never become a
+    /// connect-failed transport verdict either way.)
+    #[tokio::test]
+    async fn connect_failed_not_tagged_on_accepted_stream_body_error() {
+        use axum::response::IntoResponse;
+        use axum::{Router, http::header, routing::post};
+        use futures_util::StreamExt as _;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"error\":{\"message\":\"failed to resolve backend\"}}\n\n",
+                )
+                    .into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
+        let mut stream = provider.stream_chat(
+            crate::traits::ChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "test-model",
+            None,
+            StreamOptions::new(true),
+        );
+        let mut items = Vec::new();
+        while let Some(item) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("accepted stream must not hang")
+        {
+            items.push(item);
+        }
+        server.abort();
+        assert!(
+            !items.is_empty(),
+            "an accepted stream must yield at least its final event"
+        );
+        for item in items {
+            if let Err(err) = item {
+                assert!(
+                    !matches!(err, StreamError::ConnectFailed(_)),
+                    "an accepted stream's body error must not be tagged ConnectFailed: {err:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stream_chat_with_tools_sends_typed_tools_in_streaming_body() {
         use axum::response::IntoResponse;
@@ -9537,6 +12040,67 @@ mod tests {
         assert!(models[0].pricing.is_none());
         assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
         assert!(models[1].pricing.is_none());
+    }
+
+    /// xAI's `/v1/models` mixes chat models (flat integer price fields, no
+    /// `pricing`) with image models whose `pricing` is an array of per-tier
+    /// objects. One unrecognized `pricing` shape must not fail the listing.
+    const XAI_MODELS_WITH_TIERED_IMAGE_PRICING: &str = r#"{
+        "data": [
+            {"id": "grok-4.6", "aliases": [], "context_length": 256000,
+             "created": 1768003200, "object": "model", "owned_by": "xai",
+             "prompt_text_token_price": 20000, "completion_text_token_price": 80000,
+             "capabilities": {"reasoning_effort": ["low", "high"]}},
+            {"id": "grok-imagine-image", "aliases": [], "created": 1769472000,
+             "object": "model", "owned_by": "xai", "image_price": 200000000,
+             "pricing": [
+                 {"quality": "medium", "resolution": "1k", "image_price": 200000000},
+                 {"quality": "high", "resolution": "2k", "image_price": 400000000}
+             ]}
+        ],
+        "object": "list"
+    }"#;
+
+    #[test]
+    fn model_ids_parse_despite_tiered_array_pricing() {
+        let ids = parse_model_ids_from_bytes(XAI_MODELS_WITH_TIERED_IMAGE_PRICING.as_bytes())
+            .expect("array-shaped pricing must not fail the model list");
+        assert_eq!(ids, vec!["grok-4.6", "grok-imagine-image"]);
+    }
+
+    #[test]
+    fn models_with_pricing_drop_unrecognized_pricing_shape() {
+        let body: ModelsResponse =
+            serde_json::from_str(XAI_MODELS_WITH_TIERED_IMAGE_PRICING).unwrap();
+        let models = normalize_models_with_pricing(body);
+        assert_eq!(models.len(), 2);
+        assert!(
+            models.iter().all(|m| m.pricing.is_none()),
+            "a pricing shape we cannot read is unknown pricing, not a parse failure"
+        );
+    }
+
+    #[test]
+    fn models_with_pricing_keep_object_pricing() {
+        // OpenRouter/Kilo object shape must still parse; a malformed object
+        // (non-string rate) degrades that entry to unknown pricing only.
+        let body: ModelsResponse = serde_json::from_str(
+            r#"{"data": [
+                {"id": "a", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+                {"id": "b", "pricing": {"prompt": {"tier": 1}}},
+                {"id": "c", "pricing": null}
+            ]}"#,
+        )
+        .unwrap();
+        let models = normalize_models_with_pricing(body);
+        let a = models[0]
+            .pricing
+            .as_ref()
+            .expect("object pricing preserved");
+        assert_eq!(a.prompt.as_deref(), Some("0.000003"));
+        assert_eq!(a.completion.as_deref(), Some("0.000015"));
+        assert!(models[1].pricing.is_none());
+        assert!(models[2].pricing.is_none());
     }
 
     #[test]

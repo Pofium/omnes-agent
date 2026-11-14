@@ -3,6 +3,7 @@
 
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:http/http.dart' as http;
 import 'package:omnes_shared/omnes_shared.dart';
 
@@ -114,7 +115,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   offset: const Offset(0, 12),
                 ),
                 BoxShadow(
-                  color: const Color(0xFF00D2FF).withOpacity(0.08),
+                  color: DesktopTheme.accentBrand.withOpacity(0.08),
                   blurRadius: 24,
                   spreadRadius: 1,
                 ),
@@ -130,20 +131,25 @@ class _LoginScreenState extends State<LoginScreen> {
                     width: 52,
                     height: 52,
                     decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(12),
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: const Color(0xFFF4F5F7).withOpacity(0.24),
+                        width: 1.2,
+                      ),
                       boxShadow: [
                         BoxShadow(
-                          color: const Color(0xFF00D2FF).withOpacity(0.4),
-                          blurRadius: 16,
-                          offset: const Offset(0, 4),
+                          color: DesktopTheme.accentBrand.withOpacity(0.22),
+                          blurRadius: 14,
+                          offset: const Offset(0, 3),
                         ),
                       ],
                     ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Image.asset(
-                        'assets/Logo/app_launcher.png',
-                        fit: BoxFit.cover,
+                    child: ClipOval(
+                      child: SvgPicture.asset(
+                        'assets/Logo/OA_icon.svg',
+                        width: 52,
+                        height: 52,
+                        fit: BoxFit.contain,
                       ),
                     ),
                   ),
@@ -155,10 +161,12 @@ class _LoginScreenState extends State<LoginScreen> {
                   child: Text(
                     'OmnesAgent',
                     style: TextStyle(
+                      fontFamily: DesktopTheme.fontHeading,
+                      fontFamilyFallback: const ['Segoe UI', 'Inter', 'sans-serif'],
                       color: DesktopTheme.textPrimary,
                       fontSize: 22,
                       fontWeight: FontWeight.bold,
-                      letterSpacing: 0.8,
+                      letterSpacing: 0.6,
                     ),
                   ),
                 ),
@@ -170,7 +178,8 @@ class _LoginScreenState extends State<LoginScreen> {
                       Text(
                         'WEB ADE',
                         style: TextStyle(
-                          color: DesktopTheme.accentCyan,
+                          fontFamily: DesktopTheme.fontHeading,
+                          color: DesktopTheme.accentBrand,
                           fontSize: 11,
                           fontWeight: FontWeight.bold,
                           letterSpacing: 1.5,
@@ -254,18 +263,18 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     focusedBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8),
-                      borderSide: const BorderSide(color: Color(0xFF00D2FF), width: 1.5),
+                      borderSide: BorderSide(color: DesktopTheme.borderFocus, width: 1.5),
                     ),
                   ),
                 ),
                 const SizedBox(height: 24),
 
-                // Submit Button
+                // Submit Button (Main Accented CTA)
                 ElevatedButton(
                   onPressed: _isLoading ? null : _submitLogin,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF00D2FF),
-                    foregroundColor: Colors.black,
+                    backgroundColor: DesktopTheme.btnCtaBg,
+                    foregroundColor: const Color(0xFF111827),
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(8),
@@ -276,7 +285,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       ? const SizedBox(
                           width: 20,
                           height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black),
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF111827)),
                         )
                       : const Text(
                           'Войти в систему',

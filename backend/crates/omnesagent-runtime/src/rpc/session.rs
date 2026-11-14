@@ -11,6 +11,18 @@ use omnesagent_api::plan::PlanEntry;
 use omnesagent_infra::session_queue::SessionActorQueue;
 use omnesagent_providers::ModelProvider;
 
+/// One transient, generation-bound provider publication. Every field is
+/// derived from the same config snapshot and committed under the session
+/// generation fence; this is a transfer object, not another source of truth.
+pub(crate) struct ModelProviderUpdate {
+    pub model_provider: Box<dyn ModelProvider>,
+    pub model_provider_name: String,
+    pub model_name: String,
+    pub tool_dispatcher: Box<dyn ToolDispatcher>,
+    pub temperature: Option<Option<f64>>,
+    pub multimodal_config: omnesagent_config::schema::MultimodalConfig,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -194,6 +206,47 @@ impl SessionStore {
     pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
+        sessions.insert(id, session);
+        Ok(())
+    }
+
+    /// Refuse to publish over a session that is already present.
+    /// `session/new` uses this at the external boundary so
+    /// two concurrent resume requests cannot replace one another.
+    pub async fn insert_if_absent(
+        &self,
+        id: String,
+        session: RpcSession,
+    ) -> Result<(), &'static str> {
+        self.publish_prepared(id, session, None).await
+    }
+
+    /// Publish a fully prepared incarnation without exposing an empty slot.
+    /// The caller holds session admission; the generation check also protects
+    /// against removal or replacement by another store-level owner.
+    pub(crate) async fn publish_prepared(
+        &self,
+        id: String,
+        mut session: RpcSession,
+        expected_generation: Option<u64>,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.get(&id).map(|s| s.generation) != expected_generation {
+            return Err(if expected_generation.is_some() {
+                "session changed during preparation"
+            } else {
+                "session already exists"
+            });
+        }
+        // A replacement over a live incarnation claims no new capacity.
+        if expected_generation.is_none() && sessions.len() >= self.max_sessions {
             return Err("session limit reached");
         }
         let generation = self
@@ -418,15 +471,15 @@ impl SessionStore {
     /// When `temperature` is `None`, the agent's temperature is left unchanged
     /// — used by `session/configure` where temperature is already committed
     /// via `set_overrides_gated`.
-    pub async fn apply_model_provider(
+    ///
+    /// `multimodal_config` must be the same `[multimodal]` policy snapshot the
+    /// caller built the provider box from, so the agent-side preparation pass
+    /// and the provider boundary stay on one policy after a live refresh.
+    pub(crate) async fn apply_model_provider(
         &self,
         id: &str,
         generation: u64,
-        model_provider: Box<dyn ModelProvider>,
-        model_provider_name: String,
-        model_name: String,
-        tool_dispatcher: Box<dyn ToolDispatcher>,
-        temperature: Option<Option<f64>>,
+        update: ModelProviderUpdate,
     ) -> bool {
         let done = self.wait_test_gate().await;
         let agent = {
@@ -444,11 +497,12 @@ impl SessionStore {
             }
         };
         let mut guard = agent.lock().await;
-        guard.set_model_provider(model_provider);
-        guard.set_model_provider_name(model_provider_name);
-        guard.set_model_name(model_name);
-        guard.set_tool_dispatcher(tool_dispatcher);
-        if let Some(t) = temperature {
+        guard.set_model_provider(update.model_provider);
+        guard.set_model_provider_name(update.model_provider_name);
+        guard.set_model_name(update.model_name);
+        guard.set_tool_dispatcher(update.tool_dispatcher);
+        guard.set_multimodal_config(update.multimodal_config);
+        if let Some(t) = update.temperature {
             guard.set_temperature(t);
         }
         self.signal_test_gate_done(done);
@@ -1098,6 +1152,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_mode_replacement_publication_is_capacity_neutral_and_fenced() {
+        let store = make_store(1);
+        let candidate =
+            || RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat);
+        store
+            .insert_if_absent("s".into(), candidate())
+            .await
+            .unwrap();
+        let first = store.get_agent("s").await.unwrap();
+        let first_generation = store.get_generation("s").await.unwrap();
+        store
+            .publish_prepared("s".into(), candidate(), Some(first_generation))
+            .await
+            .unwrap();
+        let successor = store.get_agent("s").await.unwrap();
+        let successor_generation = store.get_generation("s").await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &successor));
+        assert_eq!(successor_generation, first_generation + 1);
+        assert_eq!(store.count().await, 1);
+        assert_eq!(
+            store.insert_if_absent("other".into(), candidate()).await,
+            Err("session limit reached")
+        );
+
+        // A stale candidate must neither replace the successor nor advance its generation.
+        assert_eq!(
+            store
+                .publish_prepared("s".into(), candidate(), Some(first_generation))
+                .await,
+            Err("session changed during preparation")
+        );
+        assert!(Arc::ptr_eq(
+            &successor,
+            &store.get_agent("s").await.unwrap()
+        ));
+        assert_eq!(store.get_generation("s").await, Some(successor_generation));
+        assert_eq!(
+            store.insert_if_absent("s".into(), candidate()).await,
+            Err("session already exists")
+        );
+
+        store.remove("s").await;
+        assert_eq!(
+            store
+                .publish_prepared("s".into(), candidate(), Some(successor_generation))
+                .await,
+            Err("session changed during preparation")
+        );
+        assert_eq!(
+            store.count().await,
+            0,
+            "removed session must not be resurrected"
+        );
+    }
+
+    #[tokio::test]
     async fn evict_same_mode_sibling_drops_only_same_mode_owner() {
         use crate::rpc::types::ChatMode;
         let store = make_store(8);
@@ -1475,6 +1585,22 @@ mod tests {
         assert_eq!(overrides.temperature, Some(0.7));
     }
 
+    fn test_model_provider_update(
+        provider_name: &str,
+        model_name: &str,
+        temperature: Option<Option<f64>>,
+        multimodal_config: omnesagent_config::schema::MultimodalConfig,
+    ) -> ModelProviderUpdate {
+        ModelProviderUpdate {
+            model_provider: Box::new(StubProvider),
+            model_provider_name: provider_name.into(),
+            model_name: model_name.into(),
+            tool_dispatcher: Box::new(NativeToolDispatcher),
+            temperature,
+            multimodal_config,
+        }
+    }
+
     #[tokio::test]
     async fn apply_model_provider_rejects_stale_generation() {
         let store = make_store(4);
@@ -1500,11 +1626,12 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                Box::new(StubProvider),
-                "stale-provider".into(),
-                "stale-model".into(),
-                Box::new(NativeToolDispatcher),
-                Some(Some(0.99)),
+                test_model_provider_update(
+                    "stale-provider",
+                    "stale-model",
+                    Some(Some(0.99)),
+                    omnesagent_config::schema::MultimodalConfig::default(),
+                ),
             )
             .await;
         assert!(
@@ -1544,11 +1671,12 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                Box::new(StubProvider),
-                "new-provider".into(),
-                "new-model".into(),
-                Box::new(NativeToolDispatcher),
-                Some(Some(0.42)),
+                test_model_provider_update(
+                    "new-provider",
+                    "new-model",
+                    Some(Some(0.42)),
+                    omnesagent_config::schema::MultimodalConfig::default(),
+                ),
             )
             .await;
         assert!(applied, "current generation must be accepted");
@@ -1562,6 +1690,52 @@ mod tests {
             guard.temperature_for_test(),
             Some(0.42),
             "temperature must be set on the captured agent under the generation check"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_model_provider_applies_multimodal_policy_to_captured_agent() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // A live refresh swaps the provider alongside a tightened
+        // `[multimodal]` policy; the agent-side preparation pass must see the
+        // same snapshot the provider boundary was built from, or a refresh
+        // that lowers the caps leaves the agent counting against the old,
+        // looser limits.
+        let refreshed = omnesagent_config::schema::MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 1,
+            ..Default::default()
+        };
+
+        let applied = store
+            .apply_model_provider(
+                "s",
+                captured_gen,
+                test_model_provider_update("new-provider", "new-model", None, refreshed),
+            )
+            .await;
+        assert!(applied, "current generation must be accepted");
+
+        let agent = store.get_agent("s").await.unwrap();
+        let guard = agent.lock().await;
+        assert_eq!(
+            guard.multimodal_config_for_test().max_images,
+            1,
+            "max_images must be refreshed on the captured agent"
+        );
+        assert_eq!(
+            guard.multimodal_config_for_test().max_image_size_mb,
+            1,
+            "max_image_size_mb must be refreshed on the captured agent"
         );
     }
 }

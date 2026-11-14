@@ -2,12 +2,16 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/state.rs"]
+mod state_support;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use state_support::state_service;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -120,9 +124,10 @@ async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> Fixture {
     // the guest expects.
     let services = {
         let manifest = manifest.clone();
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&manifest, scope, None)
-        }))
+        PluginHostServices::new(
+            PluginConfigResolver::new(move |scope| resolve_plugin_config(&manifest, scope, None)),
+            state_service(),
+        )
     };
     let plugin = runtime::create_plugin_with_egress(
         path,
@@ -339,11 +344,11 @@ async fn uninterrupted_guest_compute_cannot_starve_wall_clock_deadline() {
 /// the drop count on its own schedule.
 #[tokio::test]
 async fn blocked_host_log_writer_cannot_stall_export_or_exhaust_host_memory() {
-    const ATTRIB_MARKER: &str = "zc-log-attribution-marker";
+    const ATTRIB_MARKER: &str = "oc-log-attribution-marker";
     const ATTRIB_ALIAS: &str = "e2e-plugin-agent";
-    const STALL_MARKER: &str = "zc-blocked-log-writer-marker";
-    const FLOOD_MARKER: &str = "zc-log-flood-marker";
-    const OVERSIZED_MARKER: &str = "zc-log-oversized-marker";
+    const STALL_MARKER: &str = "oc-blocked-log-writer-marker";
+    const FLOOD_MARKER: &str = "oc-log-flood-marker";
+    const OVERSIZED_MARKER: &str = "oc-log-oversized-marker";
 
     /// Test-local attributable whose role maps to the `agent_alias`
     /// attribution field, mirroring how a host agent scope labels events.

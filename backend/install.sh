@@ -25,8 +25,8 @@ die() {
 bold() { printf "${BOLD}%s${RESET}" "$*"; }
 
   # >>> generated:route-contract by `cargo generate installers` - do not edit <<<
-TUI_BIN_NAME="zerocode"
-DEFAULT_APPS="zerocode"
+TUI_BIN_NAME="omnescode"
+DEFAULT_APPS="omnescode"
 PIPED_INSTALL_MODE="prebuilt"
 QUICKSTART_COMMAND="omnesagent quickstart"
 QUICKSTART_SUBCOMMAND="quickstart"
@@ -94,7 +94,7 @@ expand_default_features() {
 # Apps are standalone binaries under `apps/<dir>` installed via
 # `cargo install --path apps/<dir>` — they are NOT cargo features of the
 # main binary. The installable set is discovered from `apps/*/Cargo.toml`
-# so adding an app surfaces here without editing this script. `zerocode`
+# so adding an app surfaces here without editing this script. `omnescode`
 # (the TUI) is the default app. Tauri-based apps (e.g. omnesagent-desktop)
 # need the Tauri toolchain + system webview deps and are excluded from the
 # simple `cargo install` path.
@@ -400,7 +400,7 @@ Options:
                        installable app (implies --source)
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
-  --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
+  --apps X,Y           Select apps to install (e.g. omnescode); "none" to skip all
   --with-gateway       Force the gateway feature on (overrides preset/feature default)
   --without-gateway    Force the gateway feature off (overrides preset/feature default)
   --without-tui        Skip building the TUI ($TUI_BIN_NAME) [alias for --apps without it]
@@ -424,7 +424,7 @@ Examples:
   $0 --source --preset full                   # every channel plus heavyweight extras
   $0 --full                                    # everything: full preset + every app
   $0 --skip-quickstart                            # install only, configure later
-  $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
+  $0 --prefix /tmp/oc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
   $0 --uninstall                               # remove OmnesAgent
 
@@ -552,7 +552,7 @@ interactive_feature_picker() {
     esac
   done
 
-  # Apps default-on set (zerocode); features pre-checked from the crate's
+  # Apps default-on set (omnescode); features pre-checked from the crate's
   # `default = [...]` list, expanded transitively so aggregate defaults like
   # `default-channels` pre-check their leaf channel-* rows.
   selected_apps="$DEFAULT_APPS"
@@ -761,7 +761,7 @@ INSTALL_MODE="" # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
-USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
+USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "omnescode")
 FULL_APPS=false # true when --full: install every discovered app, not just the defaults
 
 # Support legacy env var
@@ -800,7 +800,7 @@ while [ $# -gt 0 ]; do
     ;;
   --apps)
     if [ $# -lt 2 ]; then
-      die "Missing value for --apps. Expected: --apps zerocode[,...] or --apps none"
+      die "Missing value for --apps. Expected: --apps omnescode[,...] or --apps none"
     fi
     shift
     USER_APPS="${USER_APPS:+$USER_APPS,}$1"
@@ -1388,7 +1388,7 @@ fi
   # >>> end generated:quickstart-handoff <<<
 
 echo
-# Next-step hint, smartest-first: if zerocode (the TUI) was installed, that's
+# Next-step hint, smartest-first: if omnescode (the TUI) was installed, that's
 # the best place to start; otherwise point at the daemon + web dashboard, then
 # fall back to a one-off CLI agent run.
 if [ -f "$CARGO_HOME/bin/$TUI_BIN_NAME" ]; then

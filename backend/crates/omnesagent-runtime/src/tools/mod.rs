@@ -59,14 +59,14 @@ pub use omnesagent_tools::discord_search::DiscordSearchTool;
 pub use omnesagent_tools::email_read::EmailReadTool;
 pub use omnesagent_tools::email_search::EmailSearchTool;
 pub use omnesagent_tools::escalate::EscalateToHumanTool;
-pub use omnesagent_tools::file_download::FileDownloadTool;
+pub use omnesagent_tools::file_download::{FileDownloadSsrfPolicy, FileDownloadTool};
 pub use omnesagent_tools::file_edit::FileEditTool;
 pub use omnesagent_tools::file_upload::FileUploadTool;
 pub use omnesagent_tools::file_upload_bundle::FileUploadBundleTool;
 pub use omnesagent_tools::file_write::FileWriteTool;
 pub use omnesagent_tools::gemini_cli::GeminiCliTool;
 pub use omnesagent_tools::git_forge::GitForgeTool;
-pub use omnesagent_tools::git_operations::GitOperationsTool;
+pub use omnesagent_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use omnesagent_tools::glob_search::GlobSearchTool;
 pub use omnesagent_tools::google_workspace::GoogleWorkspaceTool;
 pub use omnesagent_tools::hardware_board_info::HardwareBoardInfoTool;
@@ -167,11 +167,12 @@ use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use omnesagent_config::schema::{AliasedAgentConfig, Config};
 use omnesagent_memory::Memory;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::sync::{Arc, Mutex};
 
 pub type PerToolChannelHandle =
     Arc<RwLock<HashMap<String, Arc<dyn omnesagent_api::channel::Channel>>>>;
@@ -436,6 +437,19 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
                     tool.name()
                 )
             );
+        } else if policy
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|list| list.is_empty())
+        {
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
+                &format!(
+                    "Skill tool '{}' denied by empty allowed_tools (deny-all), skipping",
+                    tool.name()
+                )
+            );
         } else if policy.is_tool_excluded(tool.name()) {
             ::omnesagent_log::record!(
                 INFO,
@@ -582,6 +596,16 @@ impl AllToolsResult {
 }
 
 /// Create full tool registry including memory tools and optional Composio
+fn runtime_for_all_tools(
+    root_config: &omnesagent_config::schema::Config,
+    tui_env: Option<&HashMap<String, String>>,
+) -> anyhow::Result<Arc<dyn RuntimeAdapter>> {
+    let tui_path = tui_env.and_then(|env| env.get("PATH")).map(OsStr::new);
+    Ok(Arc::from(
+        omnesagent_config::platform::create_runtime_with_path(&root_config.runtime, tui_path)?,
+    ))
+}
+
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -606,12 +630,14 @@ pub fn all_tools(
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
 ) -> AllToolsResult {
+    let runtime = runtime_for_all_tools(root_config, tui_env.as_ref())
+        .unwrap_or_else(|_| Arc::new(NativeRuntime::new()));
     all_tools_with_runtime(
         config,
         security,
         risk_profile,
         agent_alias,
-        Arc::new(NativeRuntime::new()),
+        runtime,
         memory,
         composio_key,
         composio_entity_id,
@@ -648,6 +674,26 @@ fn filter_agent_peer_groups(
 struct RuntimeShellAssembly {
     shell_tool: ShellTool,
     sandbox: Arc<dyn Sandbox>,
+}
+
+/// Adapts the runtime's canonical per-agent sandbox to the Git tool without
+/// making the lower-level tools crate depend on the runtime crate.
+struct RuntimeGitCommandBoundary {
+    sandbox: Arc<dyn Sandbox>,
+    runtime_kind: omnesagent_config::schema::RuntimeKind,
+}
+
+impl GitCommandBoundary for RuntimeGitCommandBoundary {
+    fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
+        if self.runtime_kind == omnesagent_config::schema::RuntimeKind::Docker {
+            anyhow::bail!(crate::i18n::get_required_cli_string(
+                "tool-git-operations-error-docker-runtime-write-unsupported"
+            ));
+        }
+        self.sandbox
+            .wrap_command(command)
+            .map_err(anyhow::Error::from)
+    }
 }
 
 /// Pair the canonical runtime kind with one shared sandbox instance for every
@@ -942,9 +988,10 @@ pub fn all_tools_with_runtime(
             SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
                 .with_subagent_caller(is_subagent_caller),
         ),
-        Arc::new(SendMessageToPeerTool::new(
+        Arc::new(SendMessageToPeerTool::new_with_live_config(
             Arc::new(root_config.clone()),
             agent_alias,
+            live_config.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -952,9 +999,12 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
+        Arc::new(GitOperationsTool::new_with_command_boundary(
             security.clone(),
-            workspace_dir.to_path_buf(),
+            Arc::new(RuntimeGitCommandBoundary {
+                sandbox: sandbox.clone(),
+                runtime_kind: root_config.runtime.kind,
+            }),
         )),
         Arc::new(PushoverTool::new(
             security.clone(),
@@ -1027,10 +1077,11 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — registered using the calling agent's provider
+    // LLM task tool — registered using the calling agent's provider.
+    // Preserves family + alias identity so alias-specific typed config
+    // (e.g. requires_openai_auth) survives into llm_task execution.
     if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
-        let llm_task_provider = family.to_string();
         let llm_task_model = entry
             .model
             .clone()
@@ -1039,7 +1090,9 @@ pub fn all_tools_with_runtime(
             omnesagent_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
-            llm_task_provider,
+            config.clone(),
+            family.to_string(),
+            alias.to_string(),
             llm_task_model,
             entry.temperature,
             entry.api_key.clone(),
@@ -1524,11 +1577,30 @@ pub fn all_tools_with_runtime(
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
     {
-        tool_arcs.push(Arc::new(FileDownloadTool::new_with_persistence(
-            security.clone(),
-            root_config.file_download.clone(),
-            persistent_writes,
-        )));
+        let policy_resolver: Arc<dyn Fn() -> FileDownloadSsrfPolicy + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || {
+                    let config = live.read();
+                    FileDownloadSsrfPolicy {
+                        allowed_private_hosts: config.file_download.allowed_private_hosts.clone(),
+                        nat64_prefixes: config.security.nat64_prefixes.clone(),
+                    }
+                })
+            } else {
+                let snapshot = FileDownloadSsrfPolicy {
+                    allowed_private_hosts: root_config.file_download.allowed_private_hosts.clone(),
+                    nat64_prefixes: root_config.security.nat64_prefixes.clone(),
+                };
+                Arc::new(move || snapshot.clone())
+            };
+        tool_arcs.push(Arc::new(
+            FileDownloadTool::new_with_persistence_and_resolver(
+                security.clone(),
+                root_config.file_download.clone(),
+                persistent_writes,
+                move || policy_resolver(),
+            ),
+        ));
     }
 
     // Poll tool — always registered; owns its own late-bound channel map.
@@ -1693,9 +1765,12 @@ pub fn all_tools_with_runtime(
                 Err(e) => {
                     ::omnesagent_log::record!(
                         ERROR,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
-                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Fail
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "microsoft365: failed to initialize tool"
                     );
                 }
@@ -1833,9 +1908,7 @@ pub fn all_tools_with_runtime(
                         .iter()
                         .map(|tool| tool.name().to_string())
                         .collect();
-                    if root_config.pipeline.enabled {
-                        registered_names.insert(PipelineTool::NAME.to_string());
-                    }
+                    reserve_deferred_host_names(root_config, &mut registered_names);
                     let plugin_limits = omnesagent_plugins::component::PluginLimits {
                         call_fuel: config.plugins.limits.call_fuel,
                         max_memory_bytes: config
@@ -1864,9 +1937,12 @@ pub fn all_tools_with_runtime(
                 Err(e) => {
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
-                            .with_outcome(::omnesagent_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Note
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "Failed to load WASM plugins"
                     );
                 }
@@ -1905,6 +1981,23 @@ pub fn all_tools_with_runtime(
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
     }
+}
+
+/// Reserve the names of host tools that are minted during assembly, *after*
+/// the plugin (guest) tools register, so the plugin loader cannot see them.
+/// Reserving them up front stops a plugin from registering a tool that shadows
+/// one. The generic MCP capability tools ([`build_mcp_capability_tools`]) are
+/// minted during assembly and are always reserved; `execute_pipeline` is
+/// reserved when `[pipeline] enabled = true`.
+#[cfg(feature = "plugins-wasm")]
+fn reserve_deferred_host_names(
+    config: &Config,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+) {
+    if config.pipeline.enabled {
+        reserved_host_names.insert(PipelineTool::NAME.to_string());
+    }
+    reserved_host_names.extend(["mcp_resources", "mcp_prompts"].map(String::from));
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2005,13 +2098,16 @@ fn register_plugin_tools(
                 if !claim_plugin_tool_name(registered_names, tool.name()) {
                     ::omnesagent_log::record!(
                         WARN,
-                        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Load)
-                            .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "plugin": manifest.name,
-                                "tool": tool.name(),
-                                "error_key": "plugin_tool_name_conflict",
-                            })),
+                        ::omnesagent_log::Event::new(
+                            module_path!(),
+                            ::omnesagent_log::Action::Load
+                        )
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "plugin": manifest.name,
+                            "tool": tool.name(),
+                            "error_key": "plugin_tool_name_conflict",
+                        })),
                         "Plugin tool conflicts with an already registered tool"
                     );
                     continue;
@@ -2050,11 +2146,207 @@ fn register_plugin_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use omnesagent_config::schema::{
-        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
-        SopApprovalConfig,
+        ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
+        MemoryConfig, SopApprovalConfig,
     };
+    use tempfile::TempDir;
+
+    #[test]
+    fn git_write_boundary_rejects_docker_runtime_writes() {
+        const KEY: &str = "tool-git-operations-error-docker-runtime-write-unsupported";
+        const ENGLISH: &str = "Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.";
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: omnesagent_config::schema::RuntimeKind::Docker,
+        };
+        let mut command = std::process::Command::new("git");
+
+        let error = boundary.wrap_command(&mut command).unwrap_err();
+        let expected_error = crate::i18n::get_required_cli_string(KEY);
+
+        assert_eq!(
+            error.to_string(),
+            expected_error,
+            "Docker runtime must return its localized Git-write rejection"
+        );
+        assert_ne!(
+            expected_error,
+            format!("{{{KEY}}}"),
+            "Docker runtime must not expose the missing-localization sentinel"
+        );
+        assert_eq!(
+            crate::i18n::get_english_cli_string_with_args(KEY, &[]),
+            ENGLISH,
+            "the English diagnostic contract must remain stable"
+        );
+        assert_eq!(command.get_program(), "git");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registry_rejects_docker_git_writes_before_hook_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const KEY: &str = "tool-git-operations-error-docker-runtime-write-unsupported";
+
+        let tmp = TempDir::new().unwrap();
+        let repository = tmp.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-C", repository.to_str().unwrap()])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "test setup git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "OmnesAgent Test"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        run_git(&["config", "tag.gpgsign", "false"]);
+        std::fs::write(repository.join("tracked.txt"), "initial\n").unwrap();
+        run_git(&["add", "tracked.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+        run_git(&["branch", "target"]);
+
+        let marker = tmp.path().join("host-hook-ran");
+        let hook = repository.join(".git/hooks/post-checkout");
+        run_git(&[
+            "config",
+            "core.hooksPath",
+            hook.parent().unwrap().to_str().unwrap(),
+        ]);
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+
+        let filter_marker = tmp.path().join("host-filter-ran");
+        let filter = tmp.path().join("clean-filter");
+        std::fs::write(
+            &filter,
+            format!("#!/bin/sh\ntouch {}\ncat\n", filter_marker.display()),
+        )
+        .unwrap();
+        let mut filter_permissions = std::fs::metadata(&filter).unwrap().permissions();
+        filter_permissions.set_mode(0o755);
+        std::fs::set_permissions(&filter, filter_permissions).unwrap();
+        run_git(&["config", "filter.marker.clean", filter.to_str().unwrap()]);
+        std::fs::write(
+            repository.join(".gitattributes"),
+            "filtered.txt filter=marker\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("filtered.txt"), "filtered\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: repository.clone(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(omnesagent_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let mut cfg = test_config(&tmp);
+        cfg.runtime.kind = omnesagent_config::schema::RuntimeKind::Docker;
+        let risk = omnesagent_config::schema::RiskProfileConfig {
+            sandbox_enabled: Some(true),
+            sandbox_backend: Some("docker".to_string()),
+            ..omnesagent_config::schema::RiskProfileConfig::default()
+        };
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(omnesagent_config::platform::DockerRuntime::new(
+                cfg.runtime.docker.clone(),
+            )),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &omnesagent_config::schema::HttpRequestConfig::default(),
+            &omnesagent_config::schema::WebFetchConfig::default(),
+            repository.as_path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("production registry must build")
+        .tools;
+        let git_operations = tools
+            .iter()
+            .find(|tool| tool.name() == "git_operations")
+            .expect("production registry must install git_operations");
+        let expected_error = crate::i18n::get_required_cli_string(KEY);
+        assert_ne!(
+            expected_error,
+            format!("{{{KEY}}}"),
+            "Docker runtime must not expose the missing-localization sentinel"
+        );
+        let expected_checkout_error = format!("Checkout failed: {expected_error}");
+        let expected_add_error = format!("Add failed: {expected_error}");
+
+        let result = git_operations
+            .execute(serde_json::json!({
+                "operation": "checkout",
+                "branch": "target",
+                "path": repository,
+            }))
+            .await
+            .expect("git_operations must report a structured tool result");
+
+        assert!(!result.success, "Docker Git write must be rejected");
+        assert_eq!(
+            result.error.as_deref(),
+            Some(expected_checkout_error.as_str())
+        );
+        assert!(
+            !marker.exists(),
+            "Docker registry wiring must reject before host Git can execute a repository hook"
+        );
+
+        let result = git_operations
+            .execute(serde_json::json!({
+                "operation": "add",
+                "paths": "filtered.txt",
+                "path": repository,
+            }))
+            .await
+            .expect("git_operations must report a structured tool result");
+
+        assert!(!result.success, "Docker Git write must be rejected");
+        assert_eq!(result.error.as_deref(), Some(expected_add_error.as_str()));
+        assert!(
+            !filter_marker.exists(),
+            "Docker registry wiring must reject before host Git can execute a clean filter"
+        );
+    }
+
+    #[test]
+    fn git_write_boundary_preserves_native_none_mode() {
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: omnesagent_config::schema::RuntimeKind::Native,
+        };
+        let mut command = std::process::Command::new("git");
+
+        boundary.wrap_command(&mut command).unwrap();
+
+        assert_eq!(command.get_program(), "git");
+    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
@@ -2074,6 +2366,28 @@ mod tests {
         let names: Vec<_> = one.iter().map(|t| t.name().to_string()).collect();
         assert!(names.contains(&"mcp_resources".to_string()));
         assert!(!names.contains(&"mcp_prompts".to_string()));
+    }
+
+    /// The MCP capability tools register during assembly, after plugin tools,
+    /// so their names are reserved up front for the plugin loader.
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn mcp_capability_tool_names_are_reserved_before_plugins_load() {
+        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let mut reserved = std::collections::HashSet::new();
+        reserve_deferred_host_names(&Config::default(), &mut reserved);
+
+        let built: Vec<String> = build_mcp_capability_tools(&registry, None)
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let mut names = built.clone();
+        names.sort();
+        assert_eq!(names, ["mcp_prompts", "mcp_resources"]);
+        // Every capability tool, including one added later, must be reserved.
+        for name in &built {
+            assert!(reserved.contains(name), "{name}");
+        }
     }
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -2442,8 +2756,9 @@ permissions = ["http_client"]
         write_tool_package(plugins.path(), "shell");
         write_tool_package(plugins.path(), "novel-tool");
 
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
         let config = plugin_activation_config(plugins.path());
 
         // `shell` is already taken by a native tool; `novel-tool` is free.
@@ -2469,8 +2784,9 @@ permissions = ["http_client"]
         write_tool_package(plugins.path(), "alpha");
         write_tool_package(plugins.path(), "beta");
 
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
         let config = plugin_activation_config(plugins.path());
 
         let probed = tool_packages_reaching_construction(&config, &host, &[]);
@@ -2525,8 +2841,9 @@ permissions = ["http_client"]
     fn shared_ceiling_keeps_an_unadmitted_tool_and_skill_out_of_the_real_loaders() {
         let plugins = TempDir::new().unwrap();
         let mut config = mixed_capability_fixture(&plugins);
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
 
         // Control: a ceiling wide enough for every candidate loads all of them,
         // so the assertions below cannot pass for want of a working fixture.
@@ -2564,8 +2881,9 @@ permissions = ["http_client"]
         let plugins = TempDir::new().unwrap();
         let mut config = mixed_capability_fixture(&plugins);
         config.plugins.max_active_instances = 2;
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
 
         let first_tools = tool_packages_reaching_construction(&config, &host, &[]);
         let second_tools = tool_packages_reaching_construction(&config, &host, &[]);
@@ -2609,8 +2927,9 @@ permissions = ["http_client"]
         write_tool_package(plugins.path(), "zeta");
         write_skill_package(plugins.path(), "beta");
 
-        let host =
-            Arc::new(omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let host = Arc::new(
+            omnesagent_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap(),
+        );
 
         let mut config = Config::default();
         config.plugins.enabled = true;
@@ -2707,6 +3026,53 @@ permissions = ["http_client"]
             tools.iter().all(|tool| tool.name() != "metadata-probe"),
             "a component whose required metadata probe fails must not receive manifest fallback metadata"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shell = tmp.path().join("all-tools-configured-shell");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut root_config = Config::default();
+        root_config.runtime.shell = Some("all-tools-configured-shell".to_string());
+        let path = std::env::join_paths([
+            OsString::new(),
+            OsString::from("relative-decoy"),
+            shell.parent().unwrap().as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let tui_env = HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+        let runtime = runtime_for_all_tools(&root_config, Some(&tui_env)).unwrap();
+        let command = runtime
+            .build_shell_command("echo all-tools", tmp.path())
+            .unwrap();
+
+        assert_eq!(
+            command.as_std().get_program(),
+            shell.canonicalize().unwrap().as_os_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_rejects_empty_or_relative_only_tui_path() {
+        use std::ffi::OsString;
+
+        for path in [OsString::new(), OsString::from("relative-only")] {
+            let mut root_config = Config::default();
+            root_config.runtime.shell = Some("all-tools-missing-shell".to_string());
+            let tui_env =
+                HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+            assert!(runtime_for_all_tools(&root_config, Some(&tui_env)).is_err());
+        }
     }
 
     /// `web_search_tool` must be registered behind `RateLimitedTool` like
@@ -3013,14 +3379,14 @@ permissions = ["http_client"]
             #[cfg(windows)]
             let mut process = {
                 let mut process = tokio::process::Command::new("cmd.exe");
-                process.args(["/D", "/S", "/C", "echo zc-runtime"]);
+                process.args(["/D", "/S", "/C", "echo oc-runtime"]);
                 process
             };
             #[cfg(not(windows))]
             let mut process = tokio::process::Command::new("/bin/sh");
             #[cfg(not(windows))]
             process
-                .args(["-c", "printf '%s' \"$0\"", "zc-runtime"])
+                .args(["-c", "printf '%s' \"$0\"", "oc-runtime"])
                 .current_dir(workspace_dir);
             #[cfg(windows)]
             process.current_dir(workspace_dir);
@@ -3124,7 +3490,7 @@ permissions = ["http_client"]
                 "{tool_name} unexpected error: {:?}",
                 result.error
             );
-            assert_eq!(result.output.trim(), "zc-runtime");
+            assert_eq!(result.output.trim(), "oc-runtime");
             let command = seen_command
                 .lock()
                 .unwrap()
@@ -3620,7 +3986,8 @@ permissions = ["http_client"]
         );
 
         // The old hardcoded "default" must fail — proving the fix is load-bearing.
-        let mem_default = omnesagent_memory::create_memory_for_agent(&config, "default", None).await;
+        let mem_default =
+            omnesagent_memory::create_memory_for_agent(&config, "default", None).await;
         assert!(
             mem_default.is_err(),
             "create_memory_for_agent(\"default\") must fail when agents.default is absent"
@@ -4138,7 +4505,8 @@ permissions = ["http_client"]
         let browser = BrowserConfig::default();
         let http = omnesagent_config::schema::HttpRequestConfig::default();
         let mut cfg = test_config(&tmp);
-        cfg.skills.prompt_injection_mode = omnesagent_config::schema::SkillsPromptInjectionMode::Full;
+        cfg.skills.prompt_injection_mode =
+            omnesagent_config::schema::SkillsPromptInjectionMode::Full;
 
         let tools = all_tools(
             Arc::new(cfg.clone()),
@@ -4230,7 +4598,8 @@ permissions = ["http_client"]
         let mut cfg = test_config(&tmp);
         // Global stays Full; a runtime profile flips this agent to Compact and
         // the agent selects it via `runtime_profile`.
-        cfg.skills.prompt_injection_mode = omnesagent_config::schema::SkillsPromptInjectionMode::Full;
+        cfg.skills.prompt_injection_mode =
+            omnesagent_config::schema::SkillsPromptInjectionMode::Full;
         cfg.runtime_profiles.insert(
             "compact_profile".to_string(),
             omnesagent_config::schema::RuntimeProfileConfig {
@@ -4387,6 +4756,204 @@ permissions = ["http_client"]
             "positive control: the registry must still be populated"
         );
     }
+
+    // ── Regression: alias-specific provider config ───────────────────
+
+    /// Regression test: llm_task must preserve alias-specific
+    /// provider configuration so that families with typed alias fields
+    /// (e.g. OpenAI with `requires_openai_auth`) are constructed via the
+    /// alias-aware factory, not the legacy name-only factory.
+    ///
+    /// This test goes through the real `all_tools_with_runtime` registration
+    /// path — the same code that runs in production — then calls `execute()`
+    /// on the resulting `llm_task` tool and checks the error message.
+    ///
+    /// - On old master: `LlmTaskTool` stores only the family name ("openai"),
+    ///   `execute()` uses `create_model_provider_with_options("openai", …)`
+    ///   which passes `config=None, alias="default"` → falls back to
+    ///   `openai_missing_entry_fallback_config()` (requires_openai_auth=false)
+    ///   → creates standard `OpenAiModelProvider` → fails with a generic
+    ///   HTTP/auth error that does NOT mention "openai-codex".
+    ///
+    /// - On fixed branch: `LlmTaskTool` stores config + family + alias,
+    ///   `execute()` uses `create_model_provider_for_alias(&config, "openai",
+    ///   "codex", …)` → finds the typed alias with requires_openai_auth=true
+    ///   → creates `OpenAiCodexModelProvider` → fails at OAuth credential
+    ///   resolution with an error mentioning "openai-codex".
+    #[tokio::test]
+    async fn llm_task_uses_alias_aware_provider_for_alias_config() {
+        use omnesagent_config::schema::{
+            HttpRequestConfig, ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig,
+            WebFetchConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+
+        // Config: agent "test-agent" with model_provider = "openai.codex",
+        // where codex has requires_openai_auth = true.
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.codex".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(omnesagent_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &HttpRequestConfig::default(),
+            &WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let llm_task = tools
+            .iter()
+            .find(|t| t.name() == "llm_task")
+            .expect("llm_task must be registered for agent with model_provider");
+
+        let result = llm_task
+            .execute(serde_json::json!({"prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "execute must fail without credentials");
+        let error = result.error.expect("error must be present");
+
+        // The alias-aware factory routes openai.codex (requires_openai_auth=true)
+        // to OpenAiCodexModelProvider, whose credential resolution fails with
+        // an error mentioning "openai-codex".  The legacy factory would create
+        // a standard OpenAI provider whose error does NOT mention "openai-codex".
+        assert!(
+            error.contains("openai-codex"),
+            "llm_task should construct the Codex provider for \
+             openai.codex (requires_openai_auth=true), producing an \
+             openai-codex credential error; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_download_factory_seam_reflects_live_config_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(omnesagent_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut root_config = test_config(&tmp);
+        root_config.file_download = FileDownloadConfig {
+            url: Some(format!("{}/download", server.uri())),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+        let live_config = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(root_config.clone()),
+            &security,
+            &omnesagent_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &omnesagent_config::schema::HttpRequestConfig::default(),
+            &omnesagent_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live_config.clone()),
+        )
+        .tools;
+        let file_download = tools
+            .iter()
+            .find(|tool| tool.name() == "file_download")
+            .expect("file_download must be registered when file_download.url is set");
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        let first = file_download.execute(args.clone()).await.unwrap();
+        assert!(first.success, "allowlisted local endpoint should pass");
+
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let second = file_download.execute(args).await.unwrap();
+        assert!(
+            !second.success,
+            "same tool instance must observe live allowlist revocation"
+        );
+        assert!(
+            second
+                .error
+                .unwrap_or_default()
+                .contains("file_download.allowed_private_hosts")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4425,7 +4992,9 @@ mod wrapper_spec_forwarding_tests {
 
     impl ::omnesagent_api::attribution::Attributable for ArcSchemaTool {
         fn role(&self) -> ::omnesagent_api::attribution::Role {
-            ::omnesagent_api::attribution::Role::Tool(::omnesagent_api::attribution::ToolKind::Plugin)
+            ::omnesagent_api::attribution::Role::Tool(
+                ::omnesagent_api::attribution::ToolKind::Plugin,
+            )
         }
         fn alias(&self) -> &str {
             "arc-schema-tool"

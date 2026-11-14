@@ -75,7 +75,7 @@ fn copy_menu_rect(column: u16, row: u16, bounds: Rect) -> Option<Rect> {
     if bounds.width < 3 || bounds.height < 3 {
         return None;
     }
-    let width = (UnicodeWidthStr::width(crate::i18n::t("zc-logs-copy").as_str()) as u16 + 4)
+    let width = (UnicodeWidthStr::width(crate::i18n::t("oc-logs-copy").as_str()) as u16 + 4)
         .min(bounds.width)
         .max(3);
     let height = 3;
@@ -322,14 +322,14 @@ impl LogDetail {
 
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<11}", crate::i18n::t("zc-logs-label-timestamp")),
+                format!("{:<11}", crate::i18n::t("oc-logs-label-timestamp")),
                 label_style,
             ),
             Span::styled(self.timestamp().to_string(), val_style),
         ]));
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<11}", crate::i18n::t("zc-logs-label-severity")),
+                format!("{:<11}", crate::i18n::t("oc-logs-label-severity")),
                 label_style,
             ),
             Span::styled(
@@ -343,14 +343,14 @@ impl LogDetail {
         ]));
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<11}", crate::i18n::t("zc-logs-label-category")),
+                format!("{:<11}", crate::i18n::t("oc-logs-label-category")),
                 label_style,
             ),
             Span::styled(self.event_field("category").to_string(), val_style),
         ]));
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{:<11}", crate::i18n::t("zc-logs-label-action")),
+                format!("{:<11}", crate::i18n::t("oc-logs-label-action")),
                 label_style,
             ),
             Span::styled(self.event_field("action").to_string(), val_style),
@@ -359,7 +359,7 @@ impl LogDetail {
         if !outcome.is_empty() && outcome != "unknown" {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-logs-label-outcome")),
+                    format!("{:<11}", crate::i18n::t("oc-logs-label-outcome")),
                     label_style,
                 ),
                 Span::styled(outcome.to_string(), val_style),
@@ -368,7 +368,7 @@ impl LogDetail {
         if let Some(ms) = self.duration_ms() {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<11}", crate::i18n::t("zc-logs-label-duration")),
+                    format!("{:<11}", crate::i18n::t("oc-logs-label-duration")),
                     label_style,
                 ),
                 Span::styled(format!("{ms}ms"), val_style),
@@ -379,7 +379,7 @@ impl LogDetail {
         if !msg.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-section-message"),
+                crate::i18n::t("oc-logs-section-message"),
                 theme::heading_style(),
             )));
             for msg_line in msg.lines() {
@@ -390,7 +390,7 @@ impl LogDetail {
         if self.trace_id().is_some() || self.span_id().is_some() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-section-trace"),
+                crate::i18n::t("oc-logs-section-trace"),
                 theme::heading_style(),
             )));
             if let Some(tid) = self.trace_id() {
@@ -411,7 +411,7 @@ impl LogDetail {
         if !zc.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-section-attribution"),
+                crate::i18n::t("oc-logs-section-attribution"),
                 theme::heading_style(),
             )));
             for (k, v) in &zc {
@@ -427,7 +427,7 @@ impl LogDetail {
         if !attrs.is_null() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-section-attributes"),
+                crate::i18n::t("oc-logs-section-attributes"),
                 theme::heading_style(),
             )));
             if let Ok(pretty) = serde_json::to_string_pretty(attrs) {
@@ -440,12 +440,12 @@ impl LogDetail {
         if self.is_preview_only() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-preview-only"),
+                crate::i18n::t("oc-logs-preview-only"),
                 theme::dim_style(),
             )));
             if let Some(path) = active_log_path {
                 lines.push(Line::from(Span::styled(
-                    crate::i18n::t_args("zc-logs-persisted-path", &[("path", path)]),
+                    crate::i18n::t_args("oc-logs-persisted-path", &[("path", path)]),
                     theme::dim_style(),
                 )));
             }
@@ -459,44 +459,44 @@ impl LogDetail {
         let mut out = String::new();
         out.push_str(&format!(
             "{:<11}{}\n",
-            crate::i18n::t("zc-logs-label-timestamp"),
+            crate::i18n::t("oc-logs-label-timestamp"),
             self.timestamp()
         ));
         out.push_str(&format!(
             "{:<11}{} ({})\n",
-            crate::i18n::t("zc-logs-label-severity"),
+            crate::i18n::t("oc-logs-label-severity"),
             severity_label(self.severity_number()),
             self.severity_number()
         ));
         out.push_str(&format!(
             "{:<11}{}\n",
-            crate::i18n::t("zc-logs-label-category"),
+            crate::i18n::t("oc-logs-label-category"),
             self.event_field("category")
         ));
         out.push_str(&format!(
             "{:<11}{}\n",
-            crate::i18n::t("zc-logs-label-action"),
+            crate::i18n::t("oc-logs-label-action"),
             self.event_field("action")
         ));
         let outcome = self.event_field("outcome");
         if !outcome.is_empty() && outcome != "unknown" {
             out.push_str(&format!(
                 "{:<11}{}\n",
-                crate::i18n::t("zc-logs-label-outcome"),
+                crate::i18n::t("oc-logs-label-outcome"),
                 outcome
             ));
         }
         if let Some(ms) = self.duration_ms() {
             out.push_str(&format!(
                 "{:<11}{ms}ms\n",
-                crate::i18n::t("zc-logs-label-duration")
+                crate::i18n::t("oc-logs-label-duration")
             ));
         }
         let msg = self.message();
         if !msg.is_empty() {
             out.push_str(&format!(
                 "\n{}\n{}\n",
-                crate::i18n::t("zc-logs-section-message"),
+                crate::i18n::t("oc-logs-section-message"),
                 msg
             ));
         }
@@ -818,8 +818,8 @@ impl Logs {
         let help: String = if self.search_active {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
-                apply = crate::i18n::t("zc-logs-search-action-apply"),
-                cancel = crate::i18n::t("zc-logs-search-action-cancel"),
+                apply = crate::i18n::t("oc-logs-search-action-apply"),
+                cancel = crate::i18n::t("oc-logs-search-action-cancel"),
             )
         } else {
             String::new()
@@ -965,14 +965,14 @@ impl Logs {
 
         let lines = if self.selected_event_idx().is_none() {
             vec![Line::from(Span::styled(
-                crate::i18n::t("zc-logs-no-event-selected"),
+                crate::i18n::t("oc-logs-no-event-selected"),
                 theme::dim_style(),
             ))]
         } else if let Some(detail) = self.current_resolved_detail() {
             detail.detail_lines(self.active_log_path.as_deref())
         } else {
             vec![Line::from(Span::styled(
-                crate::i18n::t("zc-logs-loading"),
+                crate::i18n::t("oc-logs-loading"),
                 theme::dim_style(),
             ))]
         };
@@ -1313,7 +1313,7 @@ impl Logs {
         use unicode_width::UnicodeWidthStr;
 
         let bounds = self.snapshot(surface)?.area;
-        let label = crate::i18n::t("zc-logs-copied");
+        let label = crate::i18n::t("oc-logs-copied");
         let width = (UnicodeWidthStr::width(label.as_str()) as u16).min(bounds.width);
         if width == 0 || bounds.height == 0 {
             return None;
@@ -1353,7 +1353,7 @@ impl Logs {
         frame.render_widget(Clear, feedback.rect);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-copied"),
+                crate::i18n::t("oc-logs-copied"),
                 theme::success_style().add_modifier(Modifier::BOLD),
             )))
             .alignment(Alignment::Center),
@@ -1368,7 +1368,7 @@ impl Logs {
         frame.render_widget(Clear, menu.rect);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-copy"),
+                crate::i18n::t("oc-logs-copy"),
                 theme::accent_style().add_modifier(Modifier::BOLD),
             )))
             .alignment(Alignment::Center)
@@ -1825,8 +1825,8 @@ impl crate::widgets::HelpContext for Logs {
             entries.push(E::spacer());
             entries.push(E::desc(format!(
                 "{}: {}",
-                crate::i18n::t("zc-logs-help-mouse-label"),
-                crate::i18n::t("zc-logs-help-mouse-desc"),
+                crate::i18n::t("oc-logs-help-mouse-label"),
+                crate::i18n::t("oc-logs-help-mouse-desc"),
             )));
             HelpNode::entries(entries)
         }
@@ -1961,9 +1961,9 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(text.contains(&crate::i18n::t("zc-logs-preview-only")));
+        assert!(text.contains(&crate::i18n::t("oc-logs-preview-only")));
         // And it must not sit on the "Loading…" placeholder.
-        assert!(!text.contains(&crate::i18n::t("zc-logs-loading")));
+        assert!(!text.contains(&crate::i18n::t("oc-logs-loading")));
     }
 
     #[test]
@@ -1977,7 +1977,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(rendered.contains(&crate::i18n::t_args(
-            "zc-logs-persisted-path",
+            "oc-logs-persisted-path",
             &[("path", "/var/lib/omnesagent/runtime-trace.jsonl")],
         )));
     }
@@ -1998,7 +1998,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+        assert!(!text.contains(&crate::i18n::t("oc-logs-preview-only")));
         assert!(!text.contains("runtime-trace.jsonl"));
     }
 
@@ -2026,7 +2026,7 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("switched-model"));
-        assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+        assert!(!text.contains(&crate::i18n::t("oc-logs-preview-only")));
     }
 
     #[tokio::test]

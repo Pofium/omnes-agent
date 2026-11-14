@@ -7,11 +7,11 @@ use crate::keymap::{RebindableActions, action_key_labels};
 use crate::widgets::HelpEntry;
 
 /// Localized help description for an action. Derives the i18n key from the
-/// action's stable `<tag>.<variant>` identity (`zc-help-<tag>-<variant>`),
+/// action's stable `<tag>.<variant>` identity (`oc-help-<tag>-<variant>`),
 /// falling back to the action's built-in English label when no localized
 /// string is registered.
 pub fn action_help_text<A: RebindableActions>(action: A) -> String {
-    let i18n_key = format!("zc-help-{}", action.key().replace('.', "-"));
+    let i18n_key = format!("oc-help-{}", action.key().replace('.', "-"));
     crate::i18n::try_t(&i18n_key).unwrap_or_else(|| action.human_label().to_string())
 }
 

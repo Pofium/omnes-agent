@@ -39,6 +39,8 @@ omnesagent-macros = { path = "crates/omnesagent-macros", version = "0.8.4" }
 omnesagent-compression = { path = "crates/omnesagent-compression", version = "0.8.4" }
 omnesagent-s1 = { path = "crates/omnesagent-s1", version = "0.8.4", default-features = false }
 omnescode = { path = "apps/omnescode", version = "0.8.4" }
+# Secret material wiped on drop (plugin host secrets, TLS PKCS#8 keys).
+zeroize = "1.8"
 directories = "6.0"
 sys-locale = "0.3"
 
@@ -333,7 +335,7 @@ observability-otel = ["omnesagent-runtime/observability-otel"]
 hardware = ["dep:omnesagent-hardware", "omnesagent-hardware/hardware"]
 peripheral-rpi = ["dep:omnesagent-hardware", "omnesagent-hardware/peripheral-rpi"]
 # Forwards `omnesagent-hardware/dev-sim`: extends the serial allow-list with
-# `/tmp/zc-sim-*` for hardware-free simulation. Off by default; opt-in for the
+# `/tmp/oc-sim-*` for hardware-free simulation. Off by default; opt-in for the
 # simulator and demo.
 dev-sim = ["dep:omnesagent-hardware", "omnesagent-hardware/dev-sim"]
 sandbox-landlock = ["omnesagent-runtime/sandbox-landlock"]
@@ -425,6 +427,9 @@ panic = "abort"
 # registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
 # binary build, so the assemble()-only seal holds in production.
 omnesagent-runtime = { workspace = true, features = ["test-util"] }
+# test-only: gateway component tests construct `AppState` and must stamp the
+# editor registry field the production struct requires.
+omnesagent-editor = { workspace = true }
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"

@@ -21,6 +21,7 @@ pub mod multimodal;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
+pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
@@ -90,6 +91,37 @@ const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
+
+/// Test-only override for the Qwen OAuth token endpoint URL.
+/// When set via [`set_qwen_oauth_endpoint_for_test`], the refresh
+/// function uses this URL instead of the hardcoded production endpoint.
+/// Gated on `test-helpers` feature so downstream crates can use it in
+/// their own tests.
+#[cfg(any(test, feature = "test-helpers"))]
+static QWEN_OAUTH_ENDPOINT_OVERRIDE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// Override the Qwen OAuth token endpoint for deterministic testing.
+/// Call with `None` to restore the production endpoint after a test.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_qwen_oauth_endpoint_for_test(url: Option<String>) {
+    *QWEN_OAUTH_ENDPOINT_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = url;
+}
+
+/// Return the active Qwen OAuth token endpoint: the test override
+/// when running under `#[cfg(test)]`, or the production constant.
+fn qwen_oauth_token_endpoint() -> String {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Ok(guard) = QWEN_OAUTH_ENDPOINT_OVERRIDE.read()
+        && let Some(ref url) = *guard
+    {
+        return url.clone();
+    }
+    QWEN_OAUTH_TOKEN_ENDPOINT.to_string()
+}
+
 const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -326,7 +358,7 @@ pub(crate) fn refresh_qwen_oauth_access_token(
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
     let response = client
-        .post(QWEN_OAUTH_TOKEN_ENDPOINT)
+        .post(qwen_oauth_token_endpoint())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -632,6 +664,16 @@ pub struct ModelProviderRuntimeOptions {
     /// When `Some(false)`, strip assistant reasoning fields from outbound
     /// history replay. `None` honours provider default.
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic prompt caching through OpenAI-compatible providers:
+    /// inject `cache_control` breakpoints (system prompt; rolling last
+    /// message) into request bodies and capture gateway-reported cache
+    /// usage. Propagated from `ModelProviderConfig::cache_passthrough`.
+    pub cache_passthrough: bool,
+    /// Prompt-cache entry lifetime for providers that place Anthropic
+    /// cache markers (native Anthropic; compatible ones behind
+    /// `cache_passthrough`). `None` keeps the 5-minute default.
+    /// Propagated from `ModelProviderConfig::cache_ttl`.
+    pub cache_ttl: Option<omnesagent_config::schema::CacheTtl>,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -655,6 +697,16 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// The configured `[multimodal]` policy.
+    ///
+    /// Providers normalize image markers on their own boundary (a channel can
+    /// call `chat` with raw `[IMAGE:<path>]` markers that never passed through
+    /// the runtime), and that normalization now decodes pixels and applies
+    /// `max_images` / `max_image_size_mb`. Carrying the configured policy here
+    /// keeps that second pass on the same rules the runtime already applied,
+    /// instead of silently reverting to defaults and re-trimming history a
+    /// configured request had legitimately accepted.
+    pub multimodal: omnesagent_config::schema::MultimodalConfig,
     /// How compatible chat-completions providers handle image markers in
     /// native role=`tool` results.
     pub tool_result_image_policy: omnesagent_config::schema::ToolResultImagePolicy,
@@ -677,6 +729,8 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
+            cache_passthrough: false,
+            cache_ttl: None,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -684,6 +738,7 @@ impl Default for ModelProviderRuntimeOptions {
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
             tool_result_image_policy: Default::default(),
+            multimodal: Default::default(),
         }
     }
 }
@@ -741,12 +796,15 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
+        cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
+        cache_ttl: entry.and_then(|e| e.cache_ttl),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
         vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        multimodal: config.multimodal.clone(),
         tool_result_image_policy: entry
             .map(|e| e.tool_result_image_policy)
             .unwrap_or_default(),
@@ -817,6 +875,16 @@ pub fn options_for_provider_ref(
             // fallback family must use its own default rather than inherit
             // the previous provider alias's policy.
             options.tool_result_image_policy = Default::default();
+            // Cache settings are provider-entry opt-ins: `cache_ttl` is a
+            // paid lifetime choice and `cache_passthrough` gates marker
+            // injection, so a bare family ref must not inherit another
+            // alias's cache opt-ins (there is no entry to turn them off on).
+            options.cache_ttl = None;
+            options.cache_passthrough = false;
+            // `multimodal` is deliberately NOT reset: it is the root
+            // `[multimodal]` section, identical for every alias, so a bare
+            // family ref inherits the same operator policy rather than
+            // silently reverting to library defaults.
             options
         }
     }
@@ -1072,6 +1140,68 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         current = source.source();
     }
     sanitize_api_error(&formatted)
+}
+
+/// Maximum silence between body reads on provider SSE streams. A provider's
+/// effective bound is derived from this floor by [`stream_idle_timeout`].
+pub(crate) const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The streaming read-idle bound in effect on a provider connection, and
+/// whether a configuration knob can raise it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamIdleBound {
+    /// `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: `timeout_secs` governs the
+    /// bound, so idle-timeout errors also name the knob that raises it.
+    Configurable(std::time::Duration),
+    /// A fixed client constant: no configuration knob moves it, so
+    /// idle-timeout errors name the bound without knob advice.
+    Fixed(std::time::Duration),
+}
+
+impl StreamIdleBound {
+    /// The bound's duration, regardless of whether it is configurable.
+    pub(crate) fn duration(self) -> std::time::Duration {
+        match self {
+            StreamIdleBound::Configurable(duration) | StreamIdleBound::Fixed(duration) => duration,
+        }
+    }
+}
+
+/// Effective streaming idle bound for a provider configured with
+/// `timeout_secs`: the 300 s [`STREAM_IDLE_TIMEOUT`] floor, or `timeout_secs`
+/// when set higher, as a [`StreamIdleBound::Configurable`] bound. An unset or
+/// lower `timeout_secs` keeps the 300 s default, so the bound is never
+/// tightened below the floor.
+pub(crate) fn stream_idle_timeout(timeout_secs: u64) -> StreamIdleBound {
+    StreamIdleBound::Configurable(
+        STREAM_IDLE_TIMEOUT.max(std::time::Duration::from_secs(timeout_secs)),
+    )
+}
+
+/// Error text for a failed streaming read. A read/idle timeout names the bound
+/// that fired instead of reqwest's bare "operation timed out"; when
+/// `timeout_secs` governs the bound the message also says that raising it
+/// waits longer. Every other error, including connect failures, keeps the
+/// sanitized reqwest chain unchanged.
+pub(crate) fn stream_idle_error_message(
+    error: &reqwest::Error,
+    idle_timeout: StreamIdleBound,
+) -> String {
+    if error.is_timeout() && !error.is_connect() {
+        let secs = idle_timeout.duration().as_secs();
+        let advice = match idle_timeout {
+            StreamIdleBound::Configurable(_) => {
+                format!("; raise timeout_secs above {secs}s to wait longer")
+            }
+            StreamIdleBound::Fixed(_) => String::new(),
+        };
+        format!(
+            "no data from provider for {secs}s (stream idle timeout{advice}): {}",
+            format_error_chain(error)
+        )
+    } else {
+        format_error_chain(error)
+    }
 }
 
 /// Build a sanitized model_provider error from a failed HTTP response.
@@ -1761,18 +1891,46 @@ pub fn create_model_provider_from_ref_with_model(
             .map(ToString::to_string);
         return Ok(ResolvedModelProviderRef { provider, model });
     }
-    let provider = create_model_provider_inner(
-        None,
-        name,
-        "default",
-        None,
-        None,
-        &ModelProviderRuntimeOptions::default(),
-    )?;
+    let options = provider_runtime_options_for_bare_family(config);
+    let provider = create_model_provider_inner(None, name, "default", None, None, &options)?;
     Ok(ResolvedModelProviderRef {
         provider,
         model: None,
     })
+}
+
+/// Runtime options for a **bare family** reference (e.g. `ollama`), which has no
+/// alias entry to resolve.
+///
+/// Provider construction for these names stays on the family-default path
+/// (`config = None` at `create_model_provider_inner`) — that is what keeps a
+/// dotted-but-dangling ref fail-closed, per the exclusions documented in
+/// [`create_model_provider_from_ref_with_model`]. The config-owned
+/// `[multimodal]` policy must still reach the provider, though.
+///
+/// `ModelProviderRuntimeOptions::default()` embeds `MultimodalConfig::default()`
+/// (`max_images = 4`, `max_image_size_mb = 5`). A configured
+/// `vision_model_provider = "ollama"` with `max_images = 8` would otherwise
+/// re-normalize already-prepared messages under the default cap at the provider
+/// boundary, evicting the request's oldest images down to 4 even though the
+/// operator's configuration legitimately accepted 8.
+///
+/// Only config-owned policy is carried across; every entry-specific option
+/// (kind, URI, credentials, `vision`, ...) stays at its default, since a bare
+/// family name names no entry to take them from.
+///
+/// Public because the runtime's live model-switch path builds a replacement
+/// provider from the same config and must resolve the same options — a bare
+/// family switch that fell back to `ModelProviderRuntimeOptions::default()`
+/// would rebuild the provider boundary under default caps, exactly the
+/// mismatch above.
+pub fn provider_runtime_options_for_bare_family(
+    config: &omnesagent_config::schema::Config,
+) -> ModelProviderRuntimeOptions {
+    ModelProviderRuntimeOptions {
+        multimodal: config.multimodal.clone(),
+        ..ModelProviderRuntimeOptions::default()
+    }
 }
 
 fn create_resilient_model_provider_from_ref_with_model_override(
@@ -2215,6 +2373,65 @@ pub mod test_util {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_passthrough_config_field_maps_into_runtime_options() {
+        use omnesagent_config::schema::{Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_passthrough: true,
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert!(opts.cache_passthrough);
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert!(!defaults.cache_passthrough);
+    }
+
+    #[test]
+    fn cache_ttl_config_field_maps_into_runtime_options() {
+        use omnesagent_config::schema::{CacheTtl, Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_ttl: Some(CacheTtl::OneHour),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.cache_ttl, Some(CacheTtl::OneHour));
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert_eq!(defaults.cache_ttl, None);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_does_not_inherit_cache_settings() {
+        use omnesagent_config::schema::{
+            AnthropicModelProviderConfig, CacheTtl, Config, ModelProviderConfig,
+        };
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "primary".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    cache_ttl: Some(CacheTtl::OneHour),
+                    cache_passthrough: true,
+                    ..Default::default()
+                },
+            },
+        );
+        let fallback = ModelProviderRuntimeOptions::default();
+        let opts = options_for_provider_ref(&config, "anthropic.primary", &fallback);
+        assert_eq!(opts.cache_ttl, Some(CacheTtl::OneHour));
+        assert!(opts.cache_passthrough);
+        let bare = options_for_provider_ref(&config, "anthropic", &opts);
+        assert_eq!(bare.cache_ttl, None);
+        assert!(!bare.cache_passthrough);
+    }
+
     use super::test_util::{EnvGuard, env_lock};
     use super::*;
 
@@ -2332,7 +2549,10 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/omnesagent-qwen-oauth-home-{}-file", std::process::id());
+        let fake_home = format!(
+            "/tmp/omnesagent-qwen-oauth-home-{}-file",
+            std::process::id()
+        );
         let creds_dir = PathBuf::from(&fake_home).join(".qwen");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let creds_path = creds_dir.join("oauth_creds.json");
@@ -2356,7 +2576,10 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_returns_none_without_cache() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/omnesagent-qwen-oauth-home-{}-empty", std::process::id());
+        let fake_home = format!(
+            "/tmp/omnesagent-qwen-oauth-home-{}-empty",
+            std::process::id()
+        );
         let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
@@ -2737,6 +2960,40 @@ mod tests {
     }
 
     #[test]
+    fn root_multimodal_section_maps_into_runtime_options() {
+        use omnesagent_config::schema::{Config, ModelProviderConfig};
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+        config.multimodal.max_image_size_mb = 2;
+        config.multimodal.max_image_turns = 3;
+
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &config,
+            Some(&ModelProviderConfig::default()),
+        );
+
+        // Operator limits must reach the adapter that expands `[IMAGE:...]`
+        // markers; library defaults here mean the section is inert.
+        assert_eq!(opts.multimodal.max_images, 1);
+        assert_eq!(opts.multimodal.max_image_size_mb, 2);
+        assert_eq!(opts.multimodal.max_image_turns, 3);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_inherits_root_multimodal_policy() {
+        use omnesagent_config::schema::Config;
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+
+        let fallback = model_provider_runtime_options_from_model_provider_entry(&config, None);
+        let options = options_for_provider_ref(&config, "ollama", &fallback);
+
+        // `[multimodal]` is root-scoped, so unlike the provider-specific
+        // `tool_result_image_policy` it must survive a bare family ref.
+        assert_eq!(options.multimodal.max_images, 1);
+    }
+
+    #[test]
     fn openai_responses_alias_honors_configured_vision_capability() {
         use omnesagent_config::schema::{
             Config, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
@@ -3011,9 +3268,9 @@ mod tests {
     #[tokio::test]
     async fn routed_alias_uses_call_model_instead_of_configured_pin() {
         use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use omnesagent_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
         use serde_json::{Value, json};
         use std::sync::{Arc, Mutex};
-        use omnesagent_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
 
         type Capture = Arc<Mutex<Option<String>>>;
 
@@ -3437,6 +3694,117 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bare_family_ref_carries_multimodal_policy_into_prepared_images() {
+        // `resolve_vision_provider` builds the configured vision provider through
+        // this factory, and a bare/`custom:<url>` ref resolves no entry. Building
+        // it with default runtime options made the adapter re-apply library image
+        // limits to messages the runtime had already prepared under the
+        // operator's policy, dropping allowed attachments. Drive a real request
+        // and count the images that actually leave.
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use omnesagent_api::model_provider::ChatRequest;
+        use omnesagent_config::schema::Config;
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            *capture.lock().expect("capture lock poisoned") = Some(body.to_string());
+            (
+                StatusCode::OK,
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})),
+            )
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        // Image preparation validates and decodes every candidate before it
+        // reaches the provider. Keep this fixture a real 1x1 PNG rather than
+        // only the eight-byte signature, otherwise the test measures decoder
+        // rejection instead of the configured image cap.
+        const DECODABLE_PNG: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let mut markers = Vec::new();
+        for index in 0..2 {
+            let path = temp.path().join(format!("bare-{index}.png"));
+            std::fs::write(&path, DECODABLE_PNG).unwrap();
+            markers.push(format!("[IMAGE:{}]", path.display()));
+        }
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both would measure that eviction granularity instead of
+        // whether the operator policy reached this adapter at all.
+        let prompts: Vec<String> = markers
+            .iter()
+            .map(|marker| format!("look {marker}"))
+            .collect();
+
+        // Same server, same ref, same messages; only the operator policy differs.
+        let outbound_images = |max_images: usize, prompts: Vec<String>| async move {
+            let capture: Capture = Arc::new(Mutex::new(None));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let app = Router::new()
+                .route("/chat/completions", post(capture_chat_request))
+                .with_state(capture.clone());
+            let server = ::omnesagent_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve test server");
+            });
+
+            let mut config = Config::default();
+            config.multimodal.max_images = max_images;
+
+            let resolved = create_model_provider_from_ref_with_model(
+                &config,
+                &format!("custom:http://{addr}"),
+            )
+            .expect("bare custom:<url> ref builds a provider");
+
+            let messages: Vec<ChatMessage> = prompts.into_iter().map(ChatMessage::user).collect();
+            let _ = resolved
+                .provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+
+            let body = capture
+                .lock()
+                .expect("capture lock poisoned")
+                .clone()
+                .expect("provider must have sent a request");
+            server.abort();
+            body.matches("data:image/png;base64,").count()
+        };
+
+        assert_eq!(
+            outbound_images(2, prompts.clone()).await,
+            2,
+            "a policy admitting both images must send both"
+        );
+        assert_eq!(
+            outbound_images(1, prompts).await,
+            1,
+            "an operator cap of one must reach the adapter built from a bare ref"
+        );
+    }
+
     #[test]
     fn create_model_provider_from_ref_preserves_custom_url_with_dotted_host() {
         use omnesagent_api::attribution::Attributable;
@@ -3475,6 +3843,48 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[test]
+    fn bare_family_vision_provider_carries_the_configured_multimodal_policy() {
+        use omnesagent_config::schema::Config;
+        // A bare `vision_model_provider = "ollama"` resolves through the
+        // family-default branch, which previously passed
+        // `ModelProviderRuntimeOptions::default()` and so silently reverted the
+        // provider boundary to `max_images = 4` / `max_image_size_mb = 5`.
+        //
+        // The runtime prepares history under the configured policy, then the
+        // vision provider re-normalizes the already-prepared markers. Running
+        // that second pass under defaults re-trims a history the operator's
+        // configuration had legitimately accepted, evicting the oldest images
+        // down to the default cap of 4.
+        //
+        // Dotted aliases already resolved this through
+        // `provider_runtime_options_for_alias`; this pins the bare branch.
+        let mut config = Config::default();
+        config.multimodal.max_images = 8;
+        config.multimodal.max_image_size_mb = 10;
+
+        let options = provider_runtime_options_for_bare_family(&config);
+
+        assert_eq!(
+            options.multimodal.max_images, 8,
+            "a bare family ref must carry the configured max_images, not the default 4"
+        );
+        assert_eq!(
+            options.multimodal.max_image_size_mb, 10,
+            "a bare family ref must carry the configured max_image_size_mb, not the default 5"
+        );
+
+        // Entry-specific options have no alias to come from and must stay unset,
+        // exactly as they were before the multimodal policy was threaded through.
+        let defaults = ModelProviderRuntimeOptions::default();
+        assert_eq!(options.provider_kind, defaults.provider_kind);
+        assert_eq!(options.provider_api_url, defaults.provider_api_url);
+        assert_eq!(
+            options.vision, defaults.vision,
+            "a bare family ref must not inherit a provider-specific vision override"
+        );
     }
 
     // ── Error cases ──────────────────────────────────────────
@@ -5093,10 +5503,9 @@ mod tests {
         let n = omnesagent_config::providers::MAX_FALLBACK_DEPTH + 50;
         for i in 0..n {
             let fallback = if i + 1 < n {
-                vec![omnesagent_config::providers::ModelProviderRef::new(format!(
-                    "openai.a{}",
-                    i + 1
-                ))]
+                vec![omnesagent_config::providers::ModelProviderRef::new(
+                    format!("openai.a{}", i + 1),
+                )]
             } else {
                 vec![]
             };

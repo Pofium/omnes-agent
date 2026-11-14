@@ -41,10 +41,11 @@ pub mod git_forge;
 pub mod git_operations;
 pub mod glob_search;
 pub mod google_workspace;
+pub mod handy;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
-pub mod handy;
+mod http_decode;
 pub mod http_request;
 pub mod image_gen;
 pub mod image_info;
@@ -108,14 +109,53 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_feedback",
 ];
 
+/// Shared test-only isolation for the process-global runtime proxy state that
+/// production `Tool::execute` paths read (`http_request`, `web_fetch`) and
+/// `proxy_config` tests mutate through the real setters.
+///
+/// One binary-wide async mutex serializes those tests, and the guard restores
+/// the value observed on entry when it drops, so a writer test can neither leak
+/// its configured proxy into later tests nor race a concurrent reader mid-test.
+/// A reset alone would still race; production proxy state is untouched.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use omnesagent_config::schema::{ProxyConfig, runtime_proxy_config, set_runtime_proxy_config};
+    use tokio::sync::{Mutex, MutexGuard};
+
+    static RUNTIME_PROXY_STATE_LOCK: Mutex<()> = Mutex::const_new(());
+
+    pub(crate) struct RuntimeProxyStateGuard {
+        _lock: MutexGuard<'static, ()>,
+        snapshot: ProxyConfig,
+    }
+
+    impl RuntimeProxyStateGuard {
+        /// Hold while the test reads or mutates the runtime proxy state.
+        pub(crate) async fn acquire() -> Self {
+            let lock = RUNTIME_PROXY_STATE_LOCK.lock().await;
+            let snapshot = runtime_proxy_config();
+            Self {
+                _lock: lock,
+                snapshot,
+            }
+        }
+    }
+
+    impl Drop for RuntimeProxyStateGuard {
+        fn drop(&mut self) {
+            set_runtime_proxy_config(self.snapshot.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod memory_tool_names_guard {
     use super::*;
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
     use omnesagent_api::tool::Tool;
     use omnesagent_config::policy::SecurityPolicy;
     use omnesagent_memory::NoneMemory;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     #[test]
     fn memory_tool_names_match_tools() {

@@ -1,5 +1,5 @@
 //! Hand-maintained mirrors for every type that crosses the JSON-RPC
-//! wire between `zerocode` and the OmnesAgent daemon.
+//! wire between `omnescode` and the OmnesAgent daemon.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -94,7 +94,7 @@ pub struct ModelProviderChoice {
 pub struct ChannelQuickStart {
     pub channel_type: String,
     pub alias: String,
-    /// Schema-keyed fields from `quickstart/fields`. ZeroCode's initialize
+    /// Schema-keyed fields from `quickstart/fields`. OmnesCode's initialize
     /// handshake rejects daemon package-version mismatches before this wire
     /// shape can be submitted.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -329,7 +329,7 @@ impl PropKind {
 }
 
 /// Alias namespace for `PropKind::AliasRef` fields. Wire mirror of
-/// `omnesagent_config::traits::AliasSource`; zerocode does not depend on
+/// `omnesagent_config::traits::AliasSource`; omnescode does not depend on
 /// `omnesagent-config`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

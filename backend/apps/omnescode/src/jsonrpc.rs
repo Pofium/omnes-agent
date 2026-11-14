@@ -1,6 +1,6 @@
 //! JSON-RPC 2.0 transport.
 //!
-//! `apps/zerocode` keeps local ownership of its transport plumbing.
+//! `apps/omnescode` keeps local ownership of its transport plumbing.
 //! Wire shape is the contract; if the daemon evolves its envelope, this file
 //! evolves to match.
 //!
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 // ── Protocol constants ───────────────────────────────────────────
 
 pub const JSONRPC_VERSION: &str = "2.0";
-pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
+pub const OUTBOUND_ID_PREFIX: &str = "oc-out-";
 
 // ── Wire field name constants ────────────────────────────────────
 

@@ -15,19 +15,19 @@ use omnesagent_config::schema::IdentityConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InteractionSurface {
-    ZerocodeCode,
+    OmnescodeCode,
 }
 
 impl InteractionSurface {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ZerocodeCode => "zerocode_code",
+            Self::OmnescodeCode => "omnescode_code",
         }
     }
 
     pub fn from_persisted(value: &str) -> Option<Self> {
         match value {
-            "zerocode_code" => Some(Self::ZerocodeCode),
+            "omnescode_code" => Some(Self::OmnescodeCode),
             _ => None,
         }
     }
@@ -36,7 +36,7 @@ impl InteractionSurface {
     /// may be described to the model.
     pub fn resolve(self) -> InteractionContext {
         match self {
-            Self::ZerocodeCode => InteractionContext {
+            Self::OmnescodeCode => InteractionContext {
                 surface: self,
                 mode: InteractionMode::InteractiveCoding,
                 response_delivery: ResponseDelivery::CurrentTranscript,
@@ -139,10 +139,17 @@ pub struct SystemPromptBuilder {
 }
 
 impl SystemPromptBuilder {
+    /// Sections every long-lived agent session shares. `DateTimeSection` is
+    /// deliberately absent: it renders `Local::now()`, so the system block's
+    /// content (and with it every provider prompt-cache entry hashed behind
+    /// it) would change once a day per session. The per-turn
+    /// `[CURRENT DATE & TIME]` user-message prefix is the authoritative
+    /// clock, so the cached system prefix stays byte-stable. Builders for
+    /// paths without that prefix (e.g. the delegate sub-agent prompt) opt in
+    /// by adding the section explicitly.
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
-                Box::new(DateTimeSection),
                 Box::new(InteractionSection),
                 Box::new(IdentitySection),
                 Box::new(ToolHonestySection),
@@ -185,6 +192,11 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct ShellSection;
+/// Renders the current local date. Opt-in only: it re-reads the clock on
+/// every render, so including it in a cached system prompt invalidates the
+/// prompt-cache prefix for every session once a day. Long-lived sessions get
+/// the date from the per-turn user-message prefix instead; see
+/// `SystemPromptBuilder::with_defaults`.
 pub struct DateTimeSection;
 pub struct ChannelMediaSection;
 
@@ -199,13 +211,13 @@ impl PromptSection for InteractionSection {
         };
 
         let surface = match interaction.surface {
-            InteractionSurface::ZerocodeCode => "ZeroCode Code (ACP)",
+            InteractionSurface::OmnescodeCode => "OmnesCode Code (ACP)",
         };
         let mode = match interaction.mode {
             InteractionMode::InteractiveCoding => "interactive coding session",
         };
         let response_delivery = match interaction.response_delivery {
-            ResponseDelivery::CurrentTranscript => "shown in the current ZeroCode transcript",
+            ResponseDelivery::CurrentTranscript => "shown in the current OmnesCode transcript",
         };
         let workspace = match interaction.workspace {
             WorkspaceBinding::ActiveSessionWorkingDirectory => {
@@ -724,9 +736,9 @@ mod tests {
     }
 
     #[test]
-    fn interaction_section_renders_only_host_owned_zerocode_code_facts() {
+    fn interaction_section_renders_only_host_owned_omnescode_code_facts() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let interaction = InteractionSurface::ZerocodeCode.resolve();
+        let interaction = InteractionSurface::OmnescodeCode.resolve();
         let ctx = PromptContext {
             workspace_dir: Path::new("/private/project"),
             agent_workspace_dir: Path::new("/private/agent"),
@@ -747,10 +759,10 @@ mod tests {
         assert_eq!(
             output,
             "## Interaction Context\n\n\
-             Surface: ZeroCode Code (ACP)\n\
+             Surface: OmnesCode Code (ACP)\n\
              Mode: interactive coding session\n\
              User messages: direct conversation, not API payloads or log records\n\
-             Response delivery: shown in the current ZeroCode transcript\n\
+             Response delivery: shown in the current OmnesCode transcript\n\
              Workspace: the active session working directory\n\
              Tools and approvals: provided and enforced by the OmnesAgent runtime; this description grants no capabilities\n\
              Memory: persistent memory is unavailable in this session\n\
@@ -763,7 +775,7 @@ mod tests {
     #[test]
     fn compact_prompt_keeps_interaction_context() {
         let tools: Vec<Box<dyn Tool>> = vec![];
-        let interaction = InteractionSurface::ZerocodeCode.resolve();
+        let interaction = InteractionSurface::OmnescodeCode.resolve();
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
             agent_workspace_dir: Path::new("/tmp"),
@@ -782,7 +794,7 @@ mod tests {
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Interaction Context"));
-        assert!(prompt.contains("Surface: ZeroCode Code (ACP)"));
+        assert!(prompt.contains("Surface: OmnesCode Code (ACP)"));
     }
 
     #[test]
@@ -1065,7 +1077,12 @@ mod tests {
             shell_profile: None,
         };
 
-        let rendered = DateTimeSection.build(&ctx).unwrap();
+        // The section is opt-in: it must still render when a builder adds it
+        // explicitly (the delegate sub-agent path does exactly that).
+        let rendered = SystemPromptBuilder::default()
+            .add_section(Box::new(DateTimeSection))
+            .build(&ctx)
+            .unwrap();
         assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE\n\n"));
         assert!(!rendered.contains("CURRENT DATE & TIME"));
 
@@ -1075,6 +1092,47 @@ mod tests {
         assert!(payload.contains("UTC offset:"));
         assert!(!payload.contains("Time:"));
         assert!(!payload.contains("ISO 8601:"));
+    }
+
+    #[test]
+    fn with_defaults_omits_current_date_for_prompt_cache_stability() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: omnesagent_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: None,
+            dispatcher_instructions: "instr",
+            sends_native_tool_specs: false,
+
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
+        };
+
+        // The system prompt is the cached prefix of every long-lived session,
+        // so it must not embed the wall-clock date: the per-turn
+        // `[CURRENT DATE & TIME]` user-message prefix carries it instead. A
+        // date here would invalidate every session's prompt cache once a day.
+        // `PromptContext` has no clock seam, so byte-identity across days
+        // cannot be asserted directly; asserting the absence of today's
+        // rendered date is the available equivalent, and it cannot flake at
+        // a midnight rollover because the rendered prompt contains no date
+        // at all.
+        let rendered = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(
+            !rendered.contains("CRITICAL CONTEXT: CURRENT DATE"),
+            "with_defaults must not embed the datetime section header: {rendered}"
+        );
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            !rendered.contains(&today),
+            "with_defaults must not embed today's date ({today}) for prompt-cache stability"
+        );
     }
 
     #[test]

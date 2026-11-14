@@ -57,7 +57,7 @@ enum ProcessIdentity {
 
 fn parse_process_identity(boot_id: &str) -> ProcessIdentity {
     let mut parts = boot_id.split(':');
-    if parts.next() != Some("zc-process-v1") {
+    if parts.next() != Some("oc-process-v1") {
         return ProcessIdentity::Legacy;
     }
     let (Some(pid), Some(started_at), Some(nonce), None) =
@@ -88,6 +88,12 @@ fn parse_process_identity(boot_id: &str) -> ProcessIdentity {
 fn process_state(pid: u32, expected_started_at: Option<u64>) -> ProcessState {
     if !sysinfo::IS_SUPPORTED_SYSTEM {
         return ProcessState::Unknown;
+    }
+    // A retained Windows process object is not proof that its owner is alive.
+    // Only definite exit bypasses the existing identity and uncertainty checks.
+    #[cfg(windows)]
+    if pid_is_definitely_absent(pid) == Some(true) {
+        return ProcessState::AbsentOrReused;
     }
     let pid = sysinfo::Pid::from_u32(pid);
     let mut system = sysinfo::System::new();
@@ -237,7 +243,7 @@ mod tests {
 
     #[test]
     fn live_structured_owner_is_not_reclaimed_by_another_boot() {
-        let rec = rec(42, "zc-process-v1:42:123:owner");
+        let rec = rec(42, "oc-process-v1:42:123:owner");
         assert!(!is_authoritative_with_process_probe(
             &rec,
             |pid, started_at| {
@@ -250,7 +256,7 @@ mod tests {
 
     #[test]
     fn same_second_pid_reuse_is_conservatively_treated_as_live() {
-        let rec = rec(42, "zc-process-v1:42:123:owner");
+        let rec = rec(42, "oc-process-v1:42:123:owner");
         assert!(!is_authoritative_with_process_probe(
             &rec,
             |pid, started_at| {
@@ -265,7 +271,7 @@ mod tests {
 
     #[test]
     fn reused_pid_is_reclaimable_when_start_time_differs() {
-        let rec = rec(42, "zc-process-v1:42:123:owner");
+        let rec = rec(42, "oc-process-v1:42:123:owner");
         assert!(is_authoritative_with_process_probe(&rec, |_, _| {
             ProcessState::AbsentOrReused
         },));
@@ -273,7 +279,7 @@ mod tests {
 
     #[test]
     fn malformed_structured_identity_fails_closed() {
-        let rec = rec(42, "zc-process-v1:42:not-a-time:owner");
+        let rec = rec(42, "oc-process-v1:42:not-a-time:owner");
         assert!(!is_authoritative_with_process_probe(&rec, |_, _| {
             ProcessState::AbsentOrReused
         },));
@@ -281,7 +287,7 @@ mod tests {
 
     #[test]
     fn structured_identity_without_start_time_uses_proven_pid_state() {
-        let rec = rec(42, "zc-process-v1:42:unknown:owner");
+        let rec = rec(42, "oc-process-v1:42:unknown:owner");
         assert!(is_authoritative_with_process_probe(
             &rec,
             |_, started_at| {
@@ -313,11 +319,16 @@ mod tests {
             .spawn()
             .expect("spawn long-lived Windows child");
         let pid = child.id();
-        let live = rec(pid, &format!("zc-process-v1:{pid}:unknown:test"));
+        let live = rec(pid, &format!("oc-process-v1:{pid}:unknown:test"));
         assert!(!is_authoritative(&live));
 
         child.kill().expect("terminate Windows child");
         child.wait().expect("reap Windows child");
+        assert_eq!(
+            pid_is_definitely_absent(pid),
+            Some(true),
+            "Windows must report exit while the child handle remains open"
+        );
         assert!(is_authoritative(&live));
     }
 }

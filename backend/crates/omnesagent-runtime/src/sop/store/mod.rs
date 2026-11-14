@@ -971,7 +971,7 @@ mod tests {
     fn factory_defaults_to_durable_sqlite() {
         // persist_runs now defaults on (HITL admission durability) -> the durable
         // sqlite backend is selected so a run parked at an approval survives restart.
-        let dir = std::env::temp_dir().join(format!("zc-sop-default-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oc-sop-default-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = cfg();
         c.run_state_dir = Some(dir.to_string_lossy().into_owned());
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn factory_builds_sqlite_in_configured_dir() {
-        let dir = std::env::temp_dir().join(format!("zc-sop-factory-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("oc-sop-factory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = cfg();
         c.persist_runs = true;

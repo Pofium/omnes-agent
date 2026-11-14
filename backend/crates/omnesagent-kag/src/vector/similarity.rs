@@ -68,27 +68,11 @@ pub fn normalize(vec: &[f32]) -> Vec<f32> {
     vec.iter().map(|v| v / norm).collect()
 }
 
-/// Косинусное сходство между двумя векторами.
+/// Косинусное сходство между двумя векторами (Ф6.3: SIMD-ядро с AVX2+FMA и
+/// скалярным fallback). Контракт прежний: несовпадение длин/пустой вход/нулевая
+/// норма → `0.0`.
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0f32;
-    let mut norm_a_sq = 0.0f32;
-    let mut norm_b_sq = 0.0f32;
-
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a_sq += x * x;
-        norm_b_sq += y * y;
-    }
-
-    let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
+    crate::vector::simd::cosine(a, b)
 }
 
 /// Поиск top_k ближайших кандидатов по косинусному сходству.

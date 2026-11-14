@@ -1132,15 +1132,15 @@ Examples:
     #[command(long_about = "\
 Fetch translated Fluent (.ftl) catalogues for a locale from the upstream \
 repository and install them under `<config-dir>/data/ftl/<locale>/`, where the \
-runtime and zerocode loaders read them.
+runtime and omnescode loaders read them.
 
 Pass a single locale. By default every catalogue is fetched; restrict with \
---catalog (comma-separated): cli, tools, zerocode.
+--catalog (comma-separated): cli, tools, omnescode.
 
 Examples:
   omnesagent locales fetch ja
   omnesagent locales fetch fr --catalog cli,tools
-  omnesagent locales fetch zh-CN --catalog zerocode")]
+  omnesagent locales fetch zh-CN --catalog omnescode")]
     Locales {
         #[command(subcommand)]
         locales_command: LocalesCommands,
@@ -1192,6 +1192,17 @@ enum RalphCliCommands {
         #[arg(long)]
         repo: Option<String>,
     },
+
+    /// Route a natural-language task through the Triage Router and start a
+    /// Ralph run only when the router selects the autonomous engine
+    Dispatch {
+        /// The engineering task to classify and, when routed to Ralph, execute
+        message: String,
+
+        /// Working repository directory (default: current dir)
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1201,7 +1212,7 @@ enum LocalesCommands {
     Fetch {
         /// Locale code to fetch (e.g. `ja`, `fr`, `zh-CN`).
         locale: String,
-        /// Comma-separated catalogues to fetch: cli, tools, zerocode.
+        /// Comma-separated catalogues to fetch: cli, tools, omnescode.
         /// Omit to fetch all of them.
         #[arg(long)]
         catalog: Option<String>,
@@ -2479,8 +2490,8 @@ async fn run_quickstart_cli(
                     &[("alias", &applied.alias)]
                 )
             );
-            if which_zerocode_on_path() {
-                println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
+            if which_omnescode_on_path() {
+                println!("  omnescode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
         }
@@ -2792,9 +2803,9 @@ fn pick_preset(
 }
 
 #[cfg(feature = "agent-runtime")]
-fn which_zerocode_on_path() -> bool {
+fn which_omnescode_on_path() -> bool {
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("zerocode").is_file()))
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("omnescode").is_file()))
         .unwrap_or(false)
 }
 
@@ -3050,11 +3061,11 @@ enum SecurityCommands {
     ///
     /// Reads the per-daemon CA at `<data_dir>/tls/ca.{crt,key}` (auto-generated on
     /// first run when `[wss]` is enabled) and writes a `clientAuth` certificate +
-    /// key that zerocode (or any client) can present to the mutually-authenticated
+    /// key that omnescode (or any client) can present to the mutually-authenticated
     /// WSS plane.
     IssueClientCert {
         /// Subject/device identity stamped into the certificate (CN).
-        #[arg(long, default_value = "zerocode")]
+        #[arg(long, default_value = "omnescode")]
         name: String,
 
         /// Directory to write the certificate / key. Defaults to `<data_dir>/tls`.
@@ -3095,7 +3106,7 @@ enum SecurityCommands {
 
     /// Ask the running daemon to mint another enrollment pairing code.
     ///
-    /// This adds another browser/zerocode device without restarting the daemon.
+    /// This adds another browser/omnescode device without restarting the daemon.
     /// It is a local operator command: the request is exchanged through the
     /// daemon's data dir, not through the public enrollment route.
     EnrollPaircode {
@@ -3374,7 +3385,7 @@ fn issue_wss_client_cert(
     })?;
 
     // When issuing into a separate out-dir, also lay it out as a drop-in client
-    // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
+    // `tls/` directory (ca.crt + client.crt + client.key). omnescode looks for
     // exactly these names under its <config-dir>/tls, so a client that copies this
     // directory needs no --tls-* flags at all.
     if has_out_dir {
@@ -3473,15 +3484,15 @@ fn issue_wss_client_cert(
         }
         println!("{}", t("cli-mtls-relay-connect-header", "relay connect"));
         if has_out_dir {
-            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            // i18n-exempt: literal omnescode command line; the flags are not translatable
             println!(
-                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
+                "  omnescode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
                 relay.url, relay_node, relay_flags
             );
         } else {
-            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            // i18n-exempt: literal omnescode command line; the flags are not translatable
             println!(
-                "  zerocode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+                "  omnescode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
                 relay.url,
                 relay_node,
                 relay_flags,
@@ -3494,9 +3505,9 @@ fn issue_wss_client_cert(
         println!("{}", t("cli-mtls-relay-ca-note-2", "daemon CA note"));
     } else {
         println!("{}", t("cli-mtls-direct-connect-header", "direct connect"));
-        // i18n-exempt: literal zerocode command line; the flags are not translatable
+        // i18n-exempt: literal omnescode command line; the flags are not translatable
         println!(
-            "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+            "  omnescode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
             ca_cert.display(),
             cert_path.display(),
             key_path.display()
@@ -4068,7 +4079,8 @@ async fn handle_ralph_command(
     let repo_root = match &cmd {
         RalphCliCommands::Run { repo, .. }
         | RalphCliCommands::Status { repo, .. }
-        | RalphCliCommands::Debt { repo, .. } => repo
+        | RalphCliCommands::Debt { repo, .. }
+        | RalphCliCommands::Dispatch { repo, .. } => repo
             .as_ref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
@@ -4101,33 +4113,18 @@ async fn handle_ralph_command(
 
             println!("Starting Ralph Orchestrator for slug: {slug}");
             let knowledge = omnesagent_ralph::knowledge::RalphKnowledgeService::new(None, None);
-            let orchestrator = omnesagent_ralph::RalphOrchestrator::new(repo_root.clone(), ralph_cfg, knowledge);
+            let orchestrator = omnesagent_ralph::RalphOrchestrator::new(
+                repo_root.clone(),
+                ralph_cfg,
+                knowledge,
+                config.ob2h_bridge.clone(),
+            );
             let mut rx = orchestrator.subscribe();
             let run_id = orchestrator.start_run(&slug, None).await
                 .map_err(|e| anyhow::anyhow!("Failed to start Ralph run: {e}"))?;
 
             println!("Run started with id: {run_id}. Subscribing to events...");
-            while let Ok(evt) = rx.recv().await {
-                match evt {
-                    omnesagent_ralph::events::RalphEvent::IterationCompleted { task, n, verdict, ladder_rung, duration_ms } => {
-                        println!("[{task}] iteration {n}: {verdict} (ladder: {ladder_rung}, {duration_ms}ms)");
-                    }
-                    omnesagent_ralph::events::RalphEvent::IterationFailed { task, n, fingerprint, exit_code } => {
-                        println!("[{task}] iteration {n} FAILED (code: {exit_code}, fp: {fingerprint})");
-                    }
-                    omnesagent_ralph::events::RalphEvent::ReviewDeleteList { count, files_affected } => {
-                        println!("Minimality review: deleted {count} items across {files_affected:?}");
-                    }
-                    omnesagent_ralph::events::RalphEvent::DebtHarvested { count, no_trigger_count } => {
-                        println!("Debt harvested: {count} items ({no_trigger_count} without trigger)");
-                    }
-                    omnesagent_ralph::events::RalphEvent::RunStopped { reason, .. } => {
-                        println!("Run STOPPED: {reason}");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            stream_ralph_events(&mut rx).await;
         }
         RalphCliCommands::Status { slug, .. } => {
             let state_path = repo_root.join("openspec").join("changes").join(&slug).join("state.json");
@@ -4161,8 +4158,79 @@ async fn handle_ralph_command(
                 Err(e) => eprintln!("Failed to inspect git diff: {e}"),
             }
         }
+        RalphCliCommands::Dispatch { message, .. } => {
+            let profile = omnesagent_runtime::agent::orchestrator::triage(&message, &[]);
+            let route =
+                omnesagent_runtime::agent::orchestrator::resolve_engine_route(&profile, &message);
+
+            match route {
+                omnesagent_runtime::agent::orchestrator::EngineRoute::Ralph(dispatch) => {
+                    println!(
+                        "Triage Router selected the autonomous engine (intent: {}, mode: {}).",
+                        profile.intent.as_str(),
+                        profile.ui_flags.display_mode
+                    );
+                    println!("Feature slug: {}", dispatch.slug);
+
+                    let knowledge = omnesagent_ralph::knowledge::RalphKnowledgeService::new(None, None);
+                    let orchestrator = omnesagent_ralph::RalphOrchestrator::new(
+                        repo_root.clone(),
+                        config.ralph.clone(),
+                        knowledge,
+                        config.ob2h_bridge.clone(),
+                    );
+                    let mut rx = orchestrator.subscribe();
+                    let run_id = orchestrator
+                        .start_run(&dispatch.slug, None)
+                        .await
+                        .with_context(|| {
+                            format!("failed to start Ralph run for slug '{}'", dispatch.slug)
+                        })?;
+
+                    println!("Run started with id: {run_id}. Subscribing to events...");
+                    stream_ralph_events(&mut rx).await;
+                }
+                omnesagent_runtime::agent::orchestrator::EngineRoute::StandardLoop => {
+                    println!(
+                        "Triage Router selected the standard loop (intent: {}, mode: {}); \
+                         not starting a Ralph run.",
+                        profile.intent.as_str(),
+                        profile.ui_flags.display_mode
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Print a running Ralph orchestrator's phase events until the run stops.
+/// Shared by the explicit `ralph run` and the Triage-Router driven `ralph dispatch`.
+#[cfg(feature = "agent-runtime")]
+async fn stream_ralph_events(
+    rx: &mut tokio::sync::broadcast::Receiver<omnesagent_ralph::events::RalphEvent>,
+) {
+    while let Ok(evt) = rx.recv().await {
+        match evt {
+            omnesagent_ralph::events::RalphEvent::IterationCompleted { task, n, verdict, ladder_rung, duration_ms } => {
+                println!("[{task}] iteration {n}: {verdict} (ladder: {ladder_rung}, {duration_ms}ms)");
+            }
+            omnesagent_ralph::events::RalphEvent::IterationFailed { task, n, fingerprint, exit_code } => {
+                println!("[{task}] iteration {n} FAILED (code: {exit_code}, fp: {fingerprint})");
+            }
+            omnesagent_ralph::events::RalphEvent::ReviewDeleteList { count, files_affected } => {
+                println!("Minimality review: deleted {count} items across {files_affected:?}");
+            }
+            omnesagent_ralph::events::RalphEvent::DebtHarvested { count, no_trigger_count } => {
+                println!("Debt harvested: {count} items ({no_trigger_count} without trigger)");
+            }
+            omnesagent_ralph::events::RalphEvent::RunStopped { reason, .. } => {
+                println!("Run STOPPED: {reason}");
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(not(feature = "agent-runtime"))]
@@ -5266,6 +5334,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     rotate_device,
                     port,
                     host,
+                    json,
                 }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     let endpoint = format!("{host}:{port}");
@@ -5281,14 +5350,26 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     };
                     let rotating = action.is_rotation();
 
-                    match fetch_paircode(
+                    let fetched = fetch_paircode(
                         &host,
                         port,
                         config.gateway.path_prefix.as_deref(),
+                        &config.data_dir,
                         &action,
                     )
-                    .await
-                    {
+                    .await;
+                    if json {
+                        let (code, message) = match fetched? {
+                            PaircodeResult::Code { code, message } => (Some(code), message),
+                            PaircodeResult::NoCode { message } => (None, message),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::json!({ "pairing_code": code, "message": message })
+                        );
+                        return Ok(());
+                    }
+                    match fetched {
                         Ok(PaircodeResult::Code { code, message }) => {
                             println!(
                                 "{}",
@@ -6477,6 +6558,64 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row.
+                            // The warning qualifies the monthly spend line,
+                            // so it reads the current-UTC-month model rollup
+                            // rather than `summary.by_model`, which stays
+                            // daily-scoped for other consumers; unpriced usage
+                            // from an earlier day this month must not vanish
+                            // at day rollover. Surface any explicitly unpriced
+                            // subset loudly rather than let an understated
+                            // dollar total reassure the operator. Configured
+                            // zero rates and legacy rows without provenance
+                            // remain compatible and do not trigger this
+                            // warning.
+                            let month_by_model = match tracker.get_current_month_model_stats() {
+                                Ok(by_model) => by_model,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        ta(
+                                            "cli-warn-cost-usage",
+                                            &[("err", &e.to_string())],
+                                            "Could not load cost usage"
+                                        )
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            };
+                            let unpriced =
+                                omnesagent_runtime::agent::cost::unpriced_models_in_summary(
+                                    &month_by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -8806,8 +8945,19 @@ async fn fetch_paircode(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
+    data_dir: &std::path::Path,
     action: &PaircodeAction,
 ) -> Result<PaircodeResult> {
+    // The pairing-code admin routes accept only this run's admin token, which
+    // the gateway writes owner-only into its data directory at startup.
+    let admin_token =
+        omnesagent_config::pairing::read_gateway_admin_token(data_dir).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "No gateway admin token at {}. Run this on the gateway host, as the user that \
+             runs the gateway, while the gateway is running.",
+                omnesagent_config::pairing::gateway_admin_token_path(data_dir).display()
+            ))
+        })?;
     let client = reqwest::Client::new();
 
     let response = if action.mints_code() {
@@ -8818,6 +8968,10 @@ async fn fetch_paircode(
         }
         client
             .post(&url)
+            .header(
+                omnesagent_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -8825,6 +8979,10 @@ async fn fetch_paircode(
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
+            .header(
+                omnesagent_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -8854,6 +9012,12 @@ async fn fetch_paircode(
         );
         anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
+
+    if status == reqwest::StatusCode::FORBIDDEN
+        && let Some(error) = json.get("error").and_then(|v| v.as_str())
+    {
+        anyhow::bail!("{error}");
+    }
 
     let message = json
         .get("message")
@@ -11101,6 +11265,7 @@ mod tests {
                         rotate_device,
                         port,
                         host,
+                        json,
                     }),
             } => {
                 assert!(new);
@@ -11108,6 +11273,7 @@ mod tests {
                 assert_eq!(rotate_device, None);
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
+                assert!(!json, "text output is the default");
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }

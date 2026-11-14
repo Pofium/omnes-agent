@@ -4,6 +4,7 @@ use super::traits::{
     is_recent_recall_query,
 };
 use super::vector;
+use omnesagent_kag::telemetry::AccessTelemetry;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
@@ -58,6 +59,41 @@ fn merge_meta_objects(old_meta: Option<&str>, new_meta: Option<&str>) -> Option<
     }
 }
 
+/// Apply one accumulated `(key, count)` access batch to the store in a single
+/// transaction. Shared by the async flush and the drop-path flush so both keep
+/// identical semantics: `access_count` grows by `count` and each touch adds the
+/// same `+0.02` trust nudge as an individual `Memory::touch_access`.
+fn apply_access_batch(
+    conn: &Connection,
+    batch: &[(String, i64)],
+    now: &str,
+) -> anyhow::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let res: anyhow::Result<()> = (|| {
+        let mut stmt = conn.prepare_cached(
+            "UPDATE memories SET access_count = COALESCE(access_count, 0) + ?1, \
+             last_accessed_at = ?2, trust = MIN(1.0, trust + 0.02 * ?1) WHERE key = ?3",
+        )?;
+        for (key, count) in batch {
+            stmt.execute(params![count, now, key])?;
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SqliteMemory {
     alias: String,
@@ -67,6 +103,9 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
+    /// Batched `access_count` telemetry accumulator (ADR-O6). Shared across
+    /// clones so every touch funnel into one flush.
+    access: Arc<AccessTelemetry>,
 }
 
 impl SqliteMemory {
@@ -95,6 +134,7 @@ impl SqliteMemory {
             keyword_weight: 0.3,
             cache_max: 10_000,
             search_mode: SearchMode::default(),
+            access: Arc::new(AccessTelemetry::new()),
         })
     }
 
@@ -119,6 +159,7 @@ impl SqliteMemory {
             keyword_weight,
             cache_max,
             search_mode,
+            access: Arc::new(AccessTelemetry::new()),
         })
     }
 
@@ -140,6 +181,7 @@ impl SqliteMemory {
             // `REFERENCES agents(id)` constraint would be unenforced
             // without this. Set it before any writes flow through.
             "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
              PRAGMA mmap_size    = 8388608;
@@ -151,6 +193,13 @@ impl SqliteMemory {
         Self::init_schema(&conn)?;
         omnesagent_kag::schema::migrate(&conn)?;
         Ok(conn)
+    }
+
+    /// Reclaim WAL pages and refresh SQLite planner statistics after maintenance.
+    pub fn wal_checkpoint_and_optimize(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")?;
+        Ok(())
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -380,6 +429,16 @@ impl SqliteMemory {
             conn,
             "meta",
             "ALTER TABLE memories ADD COLUMN meta TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "valid_until",
+            "ALTER TABLE memories ADD COLUMN valid_until TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "bq_mask",
+            "ALTER TABLE memories ADD COLUMN bq_mask BLOB;",
         )?;
         execute_batch_retry(
             conn,
@@ -680,6 +739,90 @@ impl SqliteMemory {
     /// Provide access to the connection for advanced queries (e.g. retrieval pipeline).
     pub fn connection(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
+    }
+
+    /// Shared access-telemetry accumulator. Exposed so callers that touch
+    /// records outside the `Memory` trait can accumulate on the same batch.
+    #[must_use]
+    pub fn access_telemetry(&self) -> &Arc<AccessTelemetry> {
+        &self.access
+    }
+
+    /// Flush the accumulated access counts to the store in one batch (ADR-O6).
+    ///
+    /// Returns the number of distinct keys written. On error the drained batch
+    /// is requeued so the next cadence retries it (fail-open: telemetry loss on
+    /// a transient store error is avoided). Safe to call from a shutdown path.
+    pub async fn flush_access_telemetry(&self) -> anyhow::Result<usize> {
+        let batch = self.access.drain();
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let applied = batch.len();
+        let conn = self.conn.clone();
+        let now = Local::now().to_rfc3339();
+        let write_batch = batch.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            apply_access_batch(&conn, &write_batch, &now)
+        })
+        .await?;
+
+        match result {
+            Ok(()) => {
+                self.access.mark_flushed();
+                Ok(applied)
+            }
+            Err(error) => {
+                self.access.requeue(batch);
+                Err(error)
+            }
+        }
+    }
+
+    /// Schedule a background flush when the cadence is due. Fire-and-forget so
+    /// the turn loop never blocks on the store; failures are logged and the
+    /// batch is requeued for the next cadence.
+    fn schedule_access_flush(&self) {
+        if !self.access.try_begin_flush() {
+            return;
+        }
+        let this = self.clone();
+        ::omnesagent_spawn::spawn!(async move {
+            if let Err(error) = this.flush_access_telemetry().await {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({
+                            "error": error.to_string(),
+                        })),
+                    "access telemetry flush failed"
+                );
+            }
+        });
+    }
+
+    /// Record keys as read into the batched access accumulator (ADR-O6). The
+    /// read funnels (`recall`/`get`) call this so every real fork access grows
+    /// `access_count` — ob2h's Access Telemetry Parity (pillar III/VI). Only a
+    /// short accumulator mutex is taken; the store write is deferred to the
+    /// flush cadence, so the turn loop never blocks here.
+    fn note_read_keys(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        self.access.record_many(keys);
+        self.schedule_access_flush();
+    }
+
+    /// [`note_read_keys`](Self::note_read_keys) over recalled entries.
+    fn note_reads(&self, entries: &[MemoryEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = entries.iter().map(|entry| entry.key.clone()).collect();
+        self.note_read_keys(&keys);
     }
 
     /// Provide a ProjectService bound to this memory database.
@@ -1208,19 +1351,23 @@ impl SqliteMemory {
             let raw = self
                 .recall_by_time_only(recall_limit, session_id, since, until)
                 .await?;
-            if allowed_agent_ids.is_empty() {
-                return Ok(raw);
-            }
-            return Ok(raw
-                .into_iter()
-                .filter(|entry| {
-                    entry
-                        .agent_id
-                        .as_deref()
-                        .is_some_and(|agent_id| allowed_agent_ids.iter().any(|id| id == agent_id))
-                })
-                .take(limit)
-                .collect());
+            let entries: Vec<MemoryEntry> = if allowed_agent_ids.is_empty() {
+                raw
+            } else {
+                raw.into_iter()
+                    .filter(|entry| {
+                        entry
+                            .agent_id
+                            .as_deref()
+                            .is_some_and(|agent_id| {
+                                allowed_agent_ids.iter().any(|id| id == agent_id)
+                            })
+                    })
+                    .take(limit)
+                    .collect()
+            };
+            self.note_reads(&entries);
+            return Ok(entries);
         }
 
         // Compute query embedding only when needed (skip for BM25-only mode)
@@ -1240,7 +1387,7 @@ impl SqliteMemory {
         let search_mode = self.search_mode.clone();
         let allowed = allowed_agent_ids;
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
             let since_ref = since_owned.as_deref();
@@ -1593,7 +1740,9 @@ impl SqliteMemory {
             results.truncate(limit);
             Ok(results)
         })
-        .await?
+        .await??;
+        self.note_reads(&entries);
+        Ok(entries)
     }
 
     /// Replace the live embedder in place. Shared by the runtime
@@ -1624,6 +1773,22 @@ impl SqliteMemory {
     /// took effect after a `config/set` provider-profile change.
     pub fn embedder_dimensions(&self) -> usize {
         self.embedder.read().dimensions()
+    }
+}
+
+impl Drop for SqliteMemory {
+    /// Best-effort flush of telemetry still pending when the backend is
+    /// released — the "on shutdown" arm of ADR-O6. `SqliteMemory` is cheap to
+    /// clone, so this runs only when the last handle goes away. Synchronous and
+    /// panic-free: a failure while unwinding must never abort the process.
+    fn drop(&mut self) {
+        let batch = self.access.drain();
+        if batch.is_empty() {
+            return;
+        }
+        let conn = self.conn.lock();
+        let now = Local::now().to_rfc3339();
+        let _ = apply_access_batch(&conn, &batch, &now);
     }
 }
 
@@ -1684,7 +1849,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+        let entry = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
@@ -1719,7 +1884,11 @@ impl Memory for SqliteMemory {
                 _ => Ok(None),
             }
         })
-        .await?
+        .await??;
+        if let Some(read) = entry.as_ref() {
+            self.note_read_keys(std::slice::from_ref(&read.key));
+        }
+        Ok(entry)
     }
 
     async fn get_for_agent(
@@ -1731,7 +1900,7 @@ impl Memory for SqliteMemory {
         let key = key.to_string();
         let agent_id = agent_id.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+        let entry = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id, m.trust, m.last_feedback_at \
@@ -1766,7 +1935,11 @@ impl Memory for SqliteMemory {
                 _ => Ok(None),
             }
         })
-        .await?
+        .await??;
+        if let Some(read) = entry.as_ref() {
+            self.note_read_keys(std::slice::from_ref(&read.key));
+        }
+        Ok(entry)
     }
 
     async fn record_feedback(
@@ -1840,19 +2013,44 @@ impl Memory for SqliteMemory {
         if keys.is_empty() {
             return Ok(());
         }
-        let now = Local::now().to_rfc3339();
+        // ADR-O6: accumulate in memory instead of one `UPDATE` per key on the
+        // turn path. The batch reaches SQLite on the next flush cadence or an
+        // explicit `flush_access_telemetry` at shutdown.
+        self.access.record_many(keys);
+        self.schedule_access_flush();
+        Ok(())
+    }
+
+    async fn access_counts(&self, keys: &[String]) -> anyhow::Result<Vec<i64>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.clone();
-        let keys_owned = keys.to_vec();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let keys = keys.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<i64>> {
             let conn = conn.lock();
-            for key in keys_owned {
-                let _ = conn.execute(
-                    "UPDATE memories SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ?1, \
-                     trust = MIN(1.0, trust + 0.02) WHERE key = ?2",
-                    params![now, key],
-                );
+            // Keys are passed as bound parameters, never interpolated, so a
+            // hostile key cannot break out of the `IN` list.
+            let placeholders = std::iter::repeat_n("?", keys.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT key, COALESCE(access_count, 0) FROM memories WHERE key IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut by_key: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::with_capacity(keys.len());
+            for row in rows {
+                let (key, count) = row?;
+                by_key.insert(key, count);
             }
-            Ok(())
+            Ok(keys
+                .iter()
+                .map(|key| by_key.get(key).copied().unwrap_or(0))
+                .collect())
         })
         .await?
     }
@@ -2514,6 +2712,18 @@ mod tests {
         (tmp, mem)
     }
 
+    /// Read the raw access telemetry columns for `key` (no `Memory` accessor
+    /// exposes them yet).
+    fn read_access(mem: &SqliteMemory, key: &str) -> (i64, f64) {
+        let conn = mem.connection().lock();
+        conn.query_row(
+            "SELECT COALESCE(access_count, 0), COALESCE(trust, 0.5) FROM memories WHERE key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn sqlite_name() {
         let (_tmp, mem) = temp_sqlite();
@@ -2554,6 +2764,175 @@ mod tests {
         let entry = mem.get("pref").await.unwrap().unwrap();
         assert_eq!(entry.content, "loves Rust");
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn touch_access_is_batched_until_flush() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let (before_count, before_trust) = read_access(&mem, "k");
+
+        mem.touch_access(&["k".to_string()]).await.unwrap();
+        mem.touch_access(&["k".to_string()]).await.unwrap();
+
+        // Deferred (ADR-O6): the turn path wrote nothing yet.
+        let (deferred_count, _) = read_access(&mem, "k");
+        assert_eq!(deferred_count, before_count);
+
+        let written = mem.flush_access_telemetry().await.unwrap();
+        assert_eq!(written, 1, "one distinct key flushed");
+
+        let (count, trust) = read_access(&mem, "k");
+        assert_eq!(count, before_count + 2, "both touches landed");
+        // Two touches add the same cumulative trust nudge as two separate calls.
+        assert!((trust - (before_trust + 0.04).min(1.0)).abs() < 1e-9);
+
+        // A second flush with an empty accumulator is a no-op.
+        assert_eq!(mem.flush_access_telemetry().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn recall_records_access_telemetry_until_flush() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "Rust is fast", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(mem.access_telemetry().pending(), 0);
+
+        let hits = mem.recall("Rust", 5, None, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        // The read is accumulated, not written (ADR-O6).
+        assert_eq!(mem.access_telemetry().pending(), 1);
+        assert_eq!(read_access(&mem, "k").0, 0, "no store write on the read path");
+
+        assert_eq!(mem.flush_access_telemetry().await.unwrap(), 1);
+        assert_eq!(read_access(&mem, "k").0, 1, "recall grew access_count");
+    }
+
+    #[tokio::test]
+    async fn access_counts_reads_persisted_telemetry_by_key() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("hot", "hot fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("cold", "cold fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Nothing recorded yet: every key reports zero, unknown keys included.
+        assert_eq!(
+            mem.access_counts(&["hot".into(), "cold".into(), "missing".into()])
+                .await
+                .unwrap(),
+            vec![0, 0, 0]
+        );
+
+        mem.touch_access(&["hot".to_string()]).await.unwrap();
+        mem.flush_access_telemetry().await.unwrap();
+
+        // Positional alignment follows the requested key order, with the
+        // unknown key in the middle still reporting zero.
+        assert_eq!(
+            mem.access_counts(&["cold".into(), "hot".into(), "missing".into()])
+                .await
+                .unwrap(),
+            vec![0, 1, 0]
+        );
+        assert!(mem.access_counts(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_records_access_telemetry() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let entry = mem.get("k").await.unwrap();
+        assert!(entry.is_some());
+        assert_eq!(mem.access_telemetry().pending(), 1);
+        // A miss records nothing.
+        assert!(mem.get("absent").await.unwrap().is_none());
+        assert_eq!(mem.access_telemetry().pending(), 1);
+    }
+
+    #[tokio::test]
+    async fn drop_flushes_pending_access_telemetry() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            mem.store("k", "content", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            let hits = mem.recall("content", 5, None, None, None).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(mem.access_telemetry().pending(), 1);
+            // Dropping the last handle must flush the pending batch ("on
+            // shutdown" arm of ADR-O6).
+        }
+
+        let reopened = SqliteMemory::new("test", tmp.path()).unwrap();
+        assert!(
+            read_access(&reopened, "k").0 >= 1,
+            "drop must flush pending telemetry",
+        );
+    }
+
+    /// Ф5.3 latency gate: the access-telemetry write stays off the turn path.
+    /// "До" is a per-touch store `UPDATE` on the calling thread; "после" is the
+    /// batched accumulator. The accumulator must be non-blocking (p99 well
+    /// under a store round-trip).
+    #[tokio::test]
+    async fn access_telemetry_p99_stays_off_the_store() {
+        use std::time::Instant;
+
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k", "content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let key = "k".to_string();
+        const N: usize = 500;
+
+        // "До": one awaited store write per touch (pre-ADR-O6 behaviour).
+        let mut before = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start = Instant::now();
+            {
+                let conn = mem.connection();
+                let conn = conn.lock();
+                conn.execute(
+                    "UPDATE memories SET access_count = COALESCE(access_count, 0) + 1 \
+                     WHERE key = ?1",
+                    params!["k"],
+                )
+                .unwrap();
+            }
+            before.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+
+        // "После": accumulate in memory; the write is deferred to the flush.
+        for _ in 0..50 {
+            mem.touch_access(std::slice::from_ref(&key)).await.unwrap();
+        }
+        let mut after = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start = Instant::now();
+            mem.touch_access(std::slice::from_ref(&key)).await.unwrap();
+            after.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+
+        let before_p99 = omnesagent_kag::bench::percentile(&mut before, 99.0);
+        let after_p99 = omnesagent_kag::bench::percentile(&mut after, 99.0);
+        assert!(
+            after_p99 < 10.0,
+            "turn-path telemetry p99 = {after_p99:.3} ms; must be non-blocking",
+        );
+        assert!(
+            after_p99 < before_p99,
+            "batched p99 {after_p99:.3} ms must beat per-touch store p99 {before_p99:.3} ms",
+        );
     }
 
     #[tokio::test]

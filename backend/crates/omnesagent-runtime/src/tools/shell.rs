@@ -5,6 +5,7 @@ use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use omnesagent_api::platform::is_android;
@@ -300,10 +301,16 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        let effective_path = self
+            .tui_env
+            .as_ref()
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let mut cmd = match self.runtime.build_shell_command_with_effective_path(
+            command,
+            &self.security.workspace_dir,
+            effective_path,
+        ) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -319,16 +326,18 @@ impl Tool for ShellTool {
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
-        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
-            ::omnesagent_log::record!(
-                ERROR,
-                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
-                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "shell tool: sandbox wrap_command failed"
-            );
-            anyhow::Error::msg(format!("Sandbox error: {e}"))
-        })?;
+        self.sandbox
+            .wrap_shell_command(cmd.as_std_mut(), self.runtime.shell_program())
+            .map_err(|e| {
+                ::omnesagent_log::record!(
+                    ERROR,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "shell tool: sandbox wrap_command failed"
+                );
+                anyhow::Error::msg(format!("Sandbox error: {e}"))
+            })?;
 
         cmd.env_clear();
 
@@ -855,6 +864,67 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_bounded_command_configures_redirected_stdout_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let encoding = tool
+            .execute(json!({
+                "command": "Write-Output $OutputEncoding.WebName",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell encoding probe should return a result");
+        assert!(encoding.success, "PowerShell command failed: {encoding:?}");
+        assert_eq!(encoding.output.trim(), "utf-8");
+
+        let output = tool
+            .execute(json!({
+                "command": "Write-Output '标准输出'",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell UTF-8 output should return a result");
+        assert!(output.success, "PowerShell command failed: {output:?}");
+        assert_eq!(output.output.trim(), "标准输出");
+        assert!(output.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_hidden_redirected_output_decodes_stdout_and_stderr_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+        let command = "$out = [Text.Encoding]::UTF8.GetBytes('标准输出'); [Console]::OpenStandardOutput().Write($out, 0, $out.Length); $bytes = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($bytes, 0, $bytes.Length)";
+
+        let result = tool
+            .execute(json!({"command": command, "approved": true}))
+            .await
+            .expect("PowerShell execution should return a result");
+
+        assert!(result.success, "PowerShell command failed: {result:?}");
+        assert_eq!(result.output, "标准输出");
+        assert_eq!(result.error.as_deref(), Some("标准错误"));
     }
 
     #[cfg(windows)]
@@ -2056,6 +2126,78 @@ mod tests {
         assert!(
             env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_resolves_independent_native_runtime_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().expect("launcher tempdir should be created");
+        let launcher = launcher_dir.path().join("tui-only-shell");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho TUI_PATH_SHIM_RAN\nfor arg in \"$@\"; do echo \"arg:$arg\"; done\n",
+        )
+        .expect("recording shell should be written");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("recording shell should be executable");
+        let split_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-decoy"),
+            launcher_dir.path().to_path_buf(),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), split_path)])));
+        let result = tool
+            .execute(json!({"command": "echo direct_tui_path"}))
+            .await
+            .expect("shell tool should return a result");
+
+        assert!(
+            result.success && result.output.contains("TUI_PATH_SHIM_RAN"),
+            "TUI-only launcher should execute, got output={:?} error={:?}",
+            result.output,
+            result.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_with_no_absolute_entries_fails_closed() {
+        let unusable_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-only"),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), unusable_path)])));
+        let result = tool
+            .execute(json!({"command": "echo must_not_run"}))
+            .await
+            .expect("shell tool should return a failed result");
+
+        assert!(!result.success, "unusable TUI PATH must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("effective child PATH")),
+            "unexpected error: {:?}",
+            result.error
         );
     }
 }

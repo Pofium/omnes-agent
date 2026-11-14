@@ -1,4 +1,4 @@
-// Models for OmnesAgent/ZeroClaw WebSocket Gateway frames.
+// Models for OmnesAgent WebSocket Gateway frames.
 // Mirrors web/src/types/api.ts and web/src/contexts/turnStream.logic.ts
 
 import 'trajectory_step.dart';
@@ -83,6 +83,12 @@ sealed class GatewayFrame {
         return ErrorFrame(
           message: json['message'] as String? ?? json['error'] as String? ?? 'Unknown error',
           code: json['code'] as String?,
+        );
+      case 'budget_warning':
+        return BudgetWarningFrame(
+          currentUsd: (json['current_usd'] as num?)?.toDouble() ?? 0.0,
+          limitUsd: (json['limit_usd'] as num?)?.toDouble() ?? 0.0,
+          period: json['period'] as String? ?? '',
         );
       case 'approval_request':
         return ApprovalRequestFrame(
@@ -197,6 +203,26 @@ class ConnectedFrame extends GatewayFrame {
 class UnknownFrame extends GatewayFrame {
   final Map<String, dynamic> raw;
   const UnknownFrame(super.type, this.raw);
+}
+
+/// Recorded spend has reached `cost.warn_at_percent` of a shared daily or
+/// monthly limit. Emitted at most once per turn; the turn keeps running.
+class BudgetWarningFrame extends GatewayFrame {
+  /// Spend recorded in [period] before the next provider call.
+  final double currentUsd;
+
+  /// Configured limit for [period].
+  final double limitUsd;
+
+  /// Which limit is near: `day` or `month` (backend snake_case), empty when
+  /// the gateway omitted it.
+  final String period;
+
+  const BudgetWarningFrame({
+    required this.currentUsd,
+    required this.limitUsd,
+    required this.period,
+  }) : super('budget_warning');
 }
 
 /// A human-in-the-loop approval request for tool execution.

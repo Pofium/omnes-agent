@@ -11,7 +11,7 @@ use super::outcome::{
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
 use crate::agent::cost::check_tool_loop_budget;
-use crate::cost::types::BudgetCheck;
+use crate::cost::types::{BudgetCheck, UsagePeriod};
 use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
@@ -143,6 +143,53 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Surface a `cost.warn_at_percent` crossing to the turn's event stream.
+/// Sends at most one [`TurnEvent::BudgetWarning`] per turn (`*sent` latches)
+/// and never blocks the turn: an exceeded limit is left to
+/// [`enforce_tool_loop_budget`], and a full or closed channel drops the
+/// notice. No-op when unscoped or when the turn has no event stream.
+pub(crate) fn announce_budget_warning(
+    event_tx: Option<&tokio::sync::mpsc::Sender<omnesagent_api::agent::TurnEvent>>,
+    sent: &mut bool,
+) {
+    if *sent {
+        return;
+    }
+    let Some(tx) = event_tx else { return };
+    let Some(BudgetCheck::Warning {
+        current_usd,
+        limit_usd,
+        period,
+    }) = check_tool_loop_budget()
+    else {
+        return;
+    };
+    let period = match period {
+        UsagePeriod::Day => omnesagent_api::agent::BudgetWarningPeriod::Day,
+        UsagePeriod::Month => omnesagent_api::agent::BudgetWarningPeriod::Month,
+        UsagePeriod::Session => return,
+    };
+    *sent = true;
+    ::omnesagent_log::record!(
+        INFO,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+            .with_category(::omnesagent_log::EventCategory::Provider)
+            .with_attrs(::serde_json::json!({
+                "current_usd": current_usd,
+                "limit_usd": limit_usd,
+                "period": format!("{period:?}"),
+            })),
+        "cost warning threshold reached"
+    );
+    // `try_send`: a slow event consumer must never hold up the next
+    // provider call for a heads-up notice.
+    let _ = tx.try_send(omnesagent_api::agent::TurnEvent::BudgetWarning {
+        current_usd,
+        limit_usd,
+        period,
+    });
 }
 
 /// One provider call: streaming via `consume_provider_streaming_response`
@@ -738,6 +785,7 @@ mod streaming_fallback_tests {
                     input_tokens: Some(20),
                     output_tokens: Some(7),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -762,6 +810,7 @@ mod streaming_fallback_tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     })),
                     Ok(StreamEvent::TextDelta(
                         omnesagent_api::model_provider::StreamChunk::reasoning("private reasoning"),
@@ -857,6 +906,7 @@ mod streaming_fallback_tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 });
@@ -1077,7 +1127,7 @@ mod streaming_fallback_tests {
     }
 
     #[tokio::test]
-    async fn stream_failure_without_fallback_keeps_typed_terminal_cause() {
+    async fn stream_failure_without_fallback_recovers_via_non_streaming() {
         let non_stream_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableModelProvider::new(
             "test",
@@ -1114,7 +1164,7 @@ mod streaming_fallback_tests {
             parent_agent_alias: None,
         };
 
-        let error = call_provider(
+        let outcome = call_provider(
             &ctx,
             &provider,
             "test-model",
@@ -1124,25 +1174,16 @@ mod streaming_fallback_tests {
             0,
         )
         .await
-        .expect("stream fallback remains a provider-call outcome")
-        .chat_result
-        .expect_err("the only stream candidate must fail");
+        .expect("stream fallback remains a provider-call outcome");
 
-        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
-        assert!(
-            error
-                .to_string()
-                .contains("All model providers/models failed after 0 failure event(s)")
-        );
-        let terminal = error
-            .chain()
-            .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
-            .expect("recovery error must preserve a typed terminal cause");
-        assert_eq!(
-            terminal.kind(),
-            ReliableProviderTerminalFailureKind::Connection
-        );
-        assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
+        // Since the single-candidate stream-failure recovery grant carries the
+        // configured retry budget (upstream #10803), the failed stream entry is
+        // recovered through one non-streaming attempt of the same entry —
+        // recovery, not replay.
+        let response = outcome.chat_result.expect("fallback response succeeds");
+        assert_eq!(response.text.as_deref(), Some("must not replay"));
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.attempts.len(), 2);
     }
 
     #[tokio::test]
@@ -1306,7 +1347,7 @@ mod streaming_fallback_tests {
                 parent_agent_alias: None,
             };
 
-            let error = call_provider(
+            let outcome = call_provider(
                 &ctx,
                 &provider,
                 "test-model",
@@ -1316,9 +1357,10 @@ mod streaming_fallback_tests {
                 0,
             )
             .await
-            .expect("stream failure is returned as a provider-call outcome")
-            .chat_result
-            .expect_err("the compatible stream failure must remain terminal");
+            .expect("stream failure is returned as a provider-call outcome");
+            let error = outcome
+                .chat_result
+                .expect_err("the compatible stream failure must remain terminal");
             let terminal = error
                 .chain()
                 .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
@@ -1329,7 +1371,11 @@ mod streaming_fallback_tests {
                 expected_kind,
                 "{status} must retain its compatible streaming classification"
             );
-            assert_eq!(request_count.load(Ordering::Relaxed), 1, "{status}");
+            // With the single-candidate recovery grant (upstream #10803), both
+            // the stream and the non-stream attempts are made before the
+            // compatible failure is classified terminal.
+            assert_eq!(request_count.load(Ordering::Relaxed), 2, "{status}");
+            assert_eq!(outcome.attempts.len(), 2, "{status}");
             server.abort();
         }
     }
@@ -1522,5 +1568,138 @@ mod streaming_fallback_tests {
             omnesagent_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+}
+
+#[cfg(test)]
+mod budget_warning_tests {
+    use super::announce_budget_warning;
+
+    /// A tracker with `spent_usd` already recorded against a $10 daily limit
+    /// and the default 80% warning threshold.
+    fn tracker_with_spend(
+        tmp: &tempfile::TempDir,
+        spent_usd: f64,
+    ) -> std::sync::Arc<crate::cost::CostTracker> {
+        let tracker = crate::cost::CostTracker::new(
+            omnesagent_config::schema::CostConfig {
+                enabled: true,
+                daily_limit_usd: 10.0,
+                monthly_limit_usd: 1_000.0,
+                warn_at_percent: 80,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        // 1M input tokens at `spent_usd` per million = `spent_usd`.
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "test/model",
+                1_000_000,
+                0,
+                0,
+                spent_usd,
+                0.0,
+                0.0,
+            ))
+            .unwrap();
+        std::sync::Arc::new(tracker)
+    }
+
+    /// Run `announce_budget_warning` `calls` times inside a cost scope for
+    /// `tracker` and return every event it sent.
+    async fn budget_warnings_for(
+        tracker: std::sync::Arc<crate::cost::CostTracker>,
+        calls: usize,
+    ) -> Vec<omnesagent_api::agent::TurnEvent> {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker,
+            std::sync::Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                let mut sent = false;
+                for _ in 0..calls {
+                    announce_budget_warning(Some(&tx), &mut sent);
+                }
+            })
+            .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn spend_past_the_warning_threshold_announces_once_per_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events = budget_warnings_for(tracker_with_spend(&tmp, 8.5), 3).await;
+        assert_eq!(events.len(), 1, "one warning per turn, got {events:?}");
+        match &events[0] {
+            omnesagent_api::agent::TurnEvent::BudgetWarning {
+                current_usd,
+                limit_usd,
+                period,
+            } => {
+                assert!((current_usd - 8.5).abs() < 1e-9, "{current_usd}");
+                assert!((limit_usd - 10.0).abs() < 1e-9, "{limit_usd}");
+                assert_eq!(*period, omnesagent_api::agent::BudgetWarningPeriod::Day);
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_event_channel_drops_the_warning_instead_of_waiting() {
+        use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker_with_spend(&tmp, 8.5),
+            std::sync::Arc::new(crate::agent::cost::ModelProviderPricing::new()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(omnesagent_api::agent::TurnEvent::Chunk {
+            delta: "filler".into(),
+        })
+        .unwrap();
+        // A blocking send would never return here: nobody reads `rx` until
+        // after the call. The timeout turns a hang into a failure.
+        let mut sent = false;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                announce_budget_warning(Some(&tx), &mut sent);
+            }),
+        )
+        .await
+        .expect("announce_budget_warning must not wait on a full channel");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(omnesagent_api::agent::TurnEvent::Chunk { .. })
+        ));
+        assert!(rx.try_recv().is_err(), "the warning is dropped, not queued");
+    }
+
+    #[tokio::test]
+    async fn spend_below_the_threshold_or_past_the_limit_announces_nothing() {
+        let below = tempfile::tempdir().unwrap();
+        assert!(
+            budget_warnings_for(tracker_with_spend(&below, 7.5), 1)
+                .await
+                .is_empty()
+        );
+        // Past the hard limit the stop belongs to `enforce_tool_loop_budget`;
+        // a warning there would be noise next to the failed turn.
+        let over = tempfile::tempdir().unwrap();
+        assert!(
+            budget_warnings_for(tracker_with_spend(&over, 10.5), 1)
+                .await
+                .is_empty()
+        );
     }
 }

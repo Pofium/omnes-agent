@@ -7,7 +7,7 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const RECEIPT_PREFIX: &str = "zc-receipt";
+const RECEIPT_PREFIX: &str = "oc-receipt";
 
 /// Generates and verifies HMAC-SHA256 receipts for tool executions.
 /// Each session gets an ephemeral key — never exposed to the LLM.
@@ -40,7 +40,7 @@ impl ReceiptGenerator {
 
     /// Generate a receipt for a tool execution.
     /// The receipt encodes: tool_name | args_hash | result_hash | timestamp
-    /// into an HMAC-SHA256 digest, formatted as `zc-receipt-{timestamp}-{hash}`.
+    /// into an HMAC-SHA256 digest, formatted as `oc-receipt-{timestamp}-{hash}`.
     pub fn generate(
         &self,
         tool_name: &str,
@@ -195,9 +195,9 @@ tokio::task_local! {
 }
 
 /// Parse a receipt string into (timestamp, hash).
-/// Expected format: `zc-receipt-{timestamp}-{base64url_hash}`
+/// Expected format: `oc-receipt-{timestamp}-{base64url_hash}`
 fn parse_receipt(receipt: &str) -> Option<(u64, &str)> {
-    let rest = receipt.strip_prefix("zc-receipt-")?;
+    let rest = receipt.strip_prefix("oc-receipt-")?;
     let dash_pos = rest.find('-')?;
     let timestamp: u64 = rest[..dash_pos].parse().ok()?;
     let hash = &rest[dash_pos + 1..];
@@ -231,7 +231,7 @@ mod tests {
     fn receipt_format_parseable() {
         let receipt_gen = ReceiptGenerator::with_key(test_key());
         let receipt = receipt_gen.generate("shell", &test_args(), "output", 1_711_547_700);
-        assert!(receipt.starts_with("zc-receipt-1711547700-"));
+        assert!(receipt.starts_with("oc-receipt-1711547700-"));
         let (ts, hash) = parse_receipt(&receipt).unwrap();
         assert_eq!(ts, 1_711_547_700);
         assert!(!hash.is_empty());
@@ -274,7 +274,7 @@ mod tests {
     fn fabricated_receipt_fails_verification() {
         let receipt_gen = ReceiptGenerator::with_key(test_key());
         let args = test_args();
-        let fake = "zc-receipt-1_711_547_700-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let fake = "oc-receipt-1_711_547_700-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         assert!(!receipt_gen.verify(fake, "shell", &args, "output"));
     }
 
@@ -283,9 +283,9 @@ mod tests {
         let receipt_gen = ReceiptGenerator::with_key(test_key());
         let args = test_args();
         assert!(!receipt_gen.verify("not-a-receipt", "shell", &args, "output"));
-        assert!(!receipt_gen.verify("zc-receipt-", "shell", &args, "output"));
-        assert!(!receipt_gen.verify("zc-receipt-abc-hash", "shell", &args, "output"));
-        assert!(!receipt_gen.verify("zc-receipt-123-", "shell", &args, "output"));
+        assert!(!receipt_gen.verify("oc-receipt-", "shell", &args, "output"));
+        assert!(!receipt_gen.verify("oc-receipt-abc-hash", "shell", &args, "output"));
+        assert!(!receipt_gen.verify("oc-receipt-123-", "shell", &args, "output"));
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
         let receipt_gen = ReceiptGenerator::with_key(test_key());
         let args = test_args();
         let receipt = receipt_gen.generate_now("shell", &args, "output");
-        assert!(receipt.starts_with("zc-receipt-"));
+        assert!(receipt.starts_with("oc-receipt-"));
         assert!(receipt_gen.verify(&receipt, "shell", &args, "output"));
     }
 

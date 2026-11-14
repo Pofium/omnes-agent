@@ -25,9 +25,9 @@ class AgentModeSwitcher extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: AgentExecutionMode.values.map((mode) {
           final isSelected = mode == currentMode;
-          final unselectedBg = isLight ? const Color(0xFF334155) : const Color(0xFF282D37);
-          final unselectedFg = Colors.white;
-          final unselectedBorder = isLight ? const Color(0xFF334155) : const Color(0xFF384152);
+          final unselectedBg = isLight ? const Color(0xFF111827) : const Color(0xFF1F2937);
+          final unselectedFg = const Color(0xFFF4F5F7);
+          final unselectedBorder = isLight ? const Color(0xFF1F2937) : const Color(0xFF252E3D);
 
           return Padding(
             padding: const EdgeInsets.only(right: 6),
@@ -35,16 +35,16 @@ class AgentModeSwitcher extends StatelessWidget {
               message: mode.description,
               preferBelow: false,
               textStyle: TextStyle(
-                color: isLight ? const Color(0xFF020617) : const Color(0xFFF8FAFC),
+                color: isLight ? const Color(0xFF111827) : const Color(0xFFF4F5F7),
                 fontSize: 11,
                 fontFamily: 'Segoe UI',
                 fontWeight: FontWeight.w500,
               ),
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: isLight ? Colors.white : const Color(0xFF131A29),
+                color: isLight ? Colors.white : const Color(0xFF181F2C),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.6), width: 0.8),
+                border: Border.all(color: ShadcnColors.primary.withOpacity(0.6), width: 0.8),
                 boxShadow: [
                   BoxShadow(color: isLight ? Colors.black.withOpacity(0.1) : const Color(0x66000000), blurRadius: 10, offset: const Offset(0, 3)),
                 ],
@@ -57,12 +57,12 @@ class AgentModeSwitcher extends StatelessWidget {
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                   decoration: BoxDecoration(
                     color: isSelected
-                        ? (isLight ? const Color(0xFF00D2FF).withOpacity(0.18) : ShadcnColors.primary.withOpacity(0.15))
+                        ? ShadcnColors.primary.withOpacity(isLight ? 0.14 : 0.16)
                         : unselectedBg,
                     borderRadius: BorderRadius.circular(6),
                     border: Border.all(
                       color: isSelected
-                          ? (isLight ? const Color(0xFF0284C7) : ShadcnColors.primary)
+                          ? (isLight ? const Color(0xFFE05E00) : ShadcnColors.primary)
                           : unselectedBorder,
                       width: 1,
                     ),
@@ -82,7 +82,7 @@ class AgentModeSwitcher extends StatelessWidget {
                         mode.icon,
                         size: 12,
                         color: isSelected
-                            ? (isLight ? const Color(0xFF0284C7) : ShadcnColors.primary)
+                            ? (isLight ? const Color(0xFFE05E00) : ShadcnColors.primary)
                             : unselectedFg,
                       ),
                       const SizedBox(width: 5),
@@ -92,7 +92,7 @@ class AgentModeSwitcher extends StatelessWidget {
                           fontSize: 11,
                           fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
                           color: isSelected
-                              ? (isLight ? const Color(0xFF0284C7) : ShadcnColors.primary)
+                              ? (isLight ? const Color(0xFFE05E00) : ShadcnColors.primary)
                               : unselectedFg,
                           fontFamily: 'JetBrains Mono',
                         ),

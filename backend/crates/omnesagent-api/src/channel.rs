@@ -671,6 +671,52 @@ pub enum ListenerHealth {
     Unhealthy,
 }
 
+/// Error a [`Channel::finalize_draft`] implementation returns when an earlier
+/// chunk was accepted by the chat service but a later chunk failed. The caller
+/// must NOT fall back to resending the whole answer: that would duplicate the
+/// accepted prefix. Callers should treat this as a partial failure and drop
+/// the reply from retry.
+#[derive(Debug)]
+pub struct FinalizePartialDelivery {
+    pub delivered: usize,
+}
+
+impl fmt::Display for FinalizePartialDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "final answer partially delivered ({} chunk(s) accepted); \
+             remainder undelivered and must not be resent",
+            self.delivered
+        )
+    }
+}
+
+impl std::error::Error for FinalizePartialDelivery {}
+
+/// Error a [`Channel::finalize_draft`] implementation returns when it could not
+/// deliver any part of the final answer and the platform has asked it not to
+/// send again yet (for example a Telegram flood limit with `retry_after`).
+/// Nothing is on the wire, but a caller that falls back to resending the whole
+/// answer would only extend the platform's penalty. Callers must treat this as
+/// failed delivery and must NOT resend.
+#[derive(Debug)]
+pub struct FinalizeUndelivered {
+    pub reason: String,
+}
+
+impl fmt::Display for FinalizeUndelivered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "final answer not delivered and must not be resent: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for FinalizeUndelivered {}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens

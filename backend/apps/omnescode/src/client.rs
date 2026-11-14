@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 client over a local IPC stream (Unix socket / Windows
 //! named pipe, NDJSON) or WebSocket (WSS).
 //!
-//! Uses local JSON-RPC transport types so `zerocode` stays an RPC-only surface.
+//! Uses local JSON-RPC transport types so `omnescode` stays an RPC-only surface.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -483,8 +483,8 @@ impl fmt::Display for DaemonVersionMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Version mismatch: zerocode is {} but the daemon is {}. \
-             Rebuild and restart the daemon from the same checkout as zerocode.",
+            "Version mismatch: omnescode is {} but the daemon is {}. \
+             Rebuild and restart the daemon from the same checkout as omnescode.",
             self.client_version, self.server_version
         )
     }
@@ -532,7 +532,7 @@ pub(crate) struct InitializeResponse {
 /// One-release fallback for daemons from the pre-catalogue 0.8.x line, which
 /// share the current package and protocol versions but omit `commands`.
 ///
-/// These descriptors preserve the shared tokens ZeroCode accepted before the
+/// These descriptors preserve the shared tokens OmnesCode accepted before the
 /// RPC catalogue existed. New daemons remain authoritative, including when
 /// they explicitly advertise an empty catalogue.
 fn legacy_tui_command_descriptors() -> Vec<crate::wire::CommandDescriptor> {
@@ -2336,7 +2336,7 @@ impl RpcClient {
                 "tui_id": tui_id,
                 "exclude_memory": true,
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
             }),
         )
         .await
@@ -3059,7 +3059,7 @@ mod skill_frontmatter_tests {
 // `omnesagent_runtime::rpc::types` (the daemon-side single source of
 // truth, which itself mirrors the gateway's HTTP route shapes). The
 // types live in `omnesagent-runtime`, but that crate is not on the
-// `apps/zerocode` dependency tree — pulling it in would compile the
+// `apps/omnescode` dependency tree — pulling it in would compile the
 // entire runtime into the TUI binary. Instead we duplicate the wire
 // shape here; the integration drift test enforces equality across
 // surfaces, so divergence is a CI failure rather than a silent bug.
@@ -3257,7 +3257,7 @@ impl SopStepKind {
     }
 }
 
-// SOP graph wire types. zerocode is an RPC-only surface: it deserializes these
+// SOP graph wire types. omnescode is an RPC-only surface: it deserializes these
 // off `sops/graph` rather than linking the backend crate that produces them.
 // The shape here MUST match `omnesagent-sop-graph`'s serde projection byte for
 // byte (field names, snake_case renames, defaults) or RPC decoding drifts.
@@ -3535,7 +3535,7 @@ pub struct TriggerSourceRegistryView {
 
 /// Run status as serialized by the runtime's `SopRunStatus`. Unknown
 /// variants from a newer daemon fold into [`SopRunStatusView::Unknown`]
-/// so an older zerocode keeps rendering rather than dropping the run.
+/// so an older omnescode keeps rendering rather than dropping the run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SopRunStatusView {
@@ -3566,7 +3566,7 @@ impl SopRunStatusView {
 
 /// One run row from `sops/runs`; mirrors the runtime `SopRunSummary`.
 /// Every field defaults so a field added daemon-side never breaks an
-/// older zerocode.
+/// older omnescode.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SopRunSummaryView {
@@ -3675,7 +3675,7 @@ pub struct SopStep {
     pub mode: serde_json::Value,
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub agent: serde_json::Value,
-    /// Persisted canvas coordinate set by the web Blueprint editor. zerocode
+    /// Persisted canvas coordinate set by the web Blueprint editor. omnescode
     /// preserves it verbatim on round-trip; its TUI renders from the grid layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pos: Option<StepPos>,
@@ -4491,7 +4491,7 @@ mod sop_method_tests {
 
         assert!(
             !view.sources.is_empty(),
-            "backend sources walk must survive deserialization so zerocode \
+            "backend sources walk must survive deserialization so omnescode \
              renders the picker from it without reconstructing"
         );
         assert_eq!(view.bound.len(), 3);
@@ -4750,7 +4750,7 @@ mod session_method_tests {
     }
 
     #[tokio::test]
-    async fn session_new_acp_declares_closed_zerocode_code_surface() {
+    async fn session_new_acp_declares_closed_omnescode_code_surface() {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
 
@@ -4767,10 +4767,10 @@ mod session_method_tests {
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(req["method"], "session/new");
         assert_eq!(req["params"]["chat_mode"], "acp");
-        assert_eq!(req["params"]["interaction_surface"], "zerocode_code");
+        assert_eq!(req["params"]["interaction_surface"], "omnescode_code");
         assert!(
             req["params"].get("interaction_context").is_none(),
-            "ZeroCode must not send prompt prose or capability claims"
+            "OmnesCode must not send prompt prose or capability claims"
         );
 
         let id = req["id"].as_str().unwrap().to_string();
@@ -5002,12 +5002,12 @@ mod notification_tests {
             tokio::spawn(async move { rpc.request("ping", serde_json::Value::Null).await })
         };
         // Drain the one outbound frame the request writes so the spawned
-        // task makes progress and registers its pending id (`zc-out-0`,
+        // task makes progress and registers its pending id (`oc-out-0`,
         // the first id from a fresh RpcOutbound).
         let _outbound = writer_rx.recv().await.expect("request wrote a frame");
         let frame = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": "zc-out-0",
+            "id": "oc-out-0",
             "result": { "pong": true }
         });
         route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);

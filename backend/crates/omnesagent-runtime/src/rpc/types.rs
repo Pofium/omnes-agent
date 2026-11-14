@@ -1411,6 +1411,15 @@ pub enum SessionUpdateEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
     },
+    /// Recorded spend reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking and at most once per turn; the turn
+    /// continues. `period` is `"day"` or `"month"`.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        period: omnesagent_api::agent::BudgetWarningPeriod,
+    },
     /// Emitted when the TodoWrite tool produces a plan. The `entries` array
     /// carries the normalized `PlanEntry` values (content, status, priority,
     /// optional activeForm) so the client can render the live tracker.
@@ -1604,12 +1613,12 @@ mod tests {
         use crate::agent::prompt::InteractionSurface;
 
         assert_eq!(
-            serde_json::to_value(InteractionSurface::ZerocodeCode).unwrap(),
-            json!("zerocode_code")
+            serde_json::to_value(InteractionSurface::OmnescodeCode).unwrap(),
+            json!("omnescode_code")
         );
         assert_eq!(
-            serde_json::from_value::<InteractionSurface>(json!("zerocode_code")).unwrap(),
-            InteractionSurface::ZerocodeCode
+            serde_json::from_value::<InteractionSurface>(json!("omnescode_code")).unwrap(),
+            InteractionSurface::OmnescodeCode
         );
         assert!(
             serde_json::from_value::<InteractionSurface>(json!("client_authored_claims")).is_err()

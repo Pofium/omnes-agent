@@ -1,6 +1,6 @@
 //! RpcApprovalChannel — bridges Channel::request_approval(),
 //! Channel::request_choice(), and Channel::request_multi_choice() to the
-//! daemon Unix socket RPC stream so Zerocode's Code tab can both gate
+//! daemon Unix socket RPC stream so Omnescode's Code tab can both gate
 //! tool calls (the original purpose) and surface ACP-style elicitation
 
 use std::sync::Arc;

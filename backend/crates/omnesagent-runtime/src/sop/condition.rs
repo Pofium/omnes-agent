@@ -224,7 +224,7 @@ pub struct ConditionOpSpec {
 /// A condition string decomposed into the three parts an authoring surface
 /// edits: an optional JSON path (absent for `direct` scalar payloads), the
 /// operator token, and the raw comparand. This is the single authority both
-/// the web and zerocode builders round-trip through, so the two surfaces
+/// the web and omnescode builders round-trip through, so the two surfaces
 /// assemble identical strings from identical parts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConditionParts {

@@ -78,6 +78,7 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: Some(input),
         cached_input_tokens: None,
+        cache_creation_input_tokens: None,
         output_tokens: Some(output),
     }
 }
@@ -741,7 +742,7 @@ async fn safety_net_steering_persistence_includes_tool_round_shapes() {
         })],
     );
     let (tx, _rx) = mpsc::channel(256);
-    let (steer_tx, mut steer_rx) = mpsc::channel::<String>(4);
+    let (steer_tx, mut steer_rx) = mpsc::channel::<crate::agent::SteeringInput>(4);
     steer_tx
         .send("steer-text".into())
         .await

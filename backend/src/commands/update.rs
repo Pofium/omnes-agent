@@ -293,7 +293,7 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
         Ok(()) => {
             // Cleanup backup on success
             let _ = tokio::fs::remove_file(&backup_path).await;
-            // Install everything else the archive shipped (the `zerocode`
+            // Install everything else the archive shipped (the `omnescode`
             // companion, the `web/dist` dashboard bundle, …). Best-effort:
             // the validated main binary is already in place and must not be
             // rolled back if these fail.
@@ -600,14 +600,14 @@ fn main_binary_name() -> &'static str {
 ///
 /// Grow this list — and its `.exe` twin on Windows — deliberately when a new
 /// companion ships. The CI release-artifact list is the source of truth this
-/// mirrors (currently: `zerocode` next to `omnesagent`, plus the `web/dist`
+/// mirrors (currently: `omnescode` next to `omnesagent`, plus the `web/dist`
 /// directory that's handled by the whole-directory swap above).
 #[cfg(windows)]
-const ZEROCODE_BINARY_NAME: &str = "zerocode.exe";
+const OMNESCODE_BINARY_NAME: &str = "omnescode.exe";
 #[cfg(not(windows))]
-const ZEROCODE_BINARY_NAME: &str = "zerocode";
+const OMNESCODE_BINARY_NAME: &str = "omnescode";
 
-const KNOWN_COMPANION_FILES: &[&str] = &[ZEROCODE_BINARY_NAME];
+const KNOWN_COMPANION_FILES: &[&str] = &[OMNESCODE_BINARY_NAME];
 
 fn is_known_companion(name: &str) -> bool {
     KNOWN_COMPANION_FILES.contains(&name)
@@ -989,7 +989,7 @@ async fn smoke_test(binary: &Path) -> Result<()> {
 
 /// Install every artifact in `staging` other than the main binary onto the
 /// running install: the `web/dist` dashboard bundle and any other top-level
-/// files (e.g. the `zerocode` companion).
+/// files (e.g. the `omnescode` companion).
 ///
 /// Best-effort by design — the `omnesagent` binary has already been swapped and
 /// smoke-tested. A failure here (e.g. an unwritable data directory) is logged
@@ -1166,7 +1166,7 @@ async fn swap_file(new: &Path, target: &Path) -> Result<()> {
 /// Atomically(-ish) replace `target` with `new` on Windows.
 ///
 /// If the direct rename fails (the destination is locked because the file
-/// is currently executing — e.g. the user has the `zerocode` TUI open), we
+/// is currently executing — e.g. the user has the `omnescode` TUI open), we
 /// rename the existing `target` aside under a process-unique `.update-old`
 /// name and then rename the staged file into its place — the same idiom
 /// `swap_binary` uses for the main executable.
@@ -1722,7 +1722,7 @@ mod tests {
 
         assert_eq!(std::fs::read(&binary).unwrap(), asset);
         // Bare (non-archive) download path — no siblings should appear.
-        assert!(!staging.join("zerocode").exists());
+        assert!(!staging.join("omnescode").exists());
         assert!(!staging.join("web").exists());
     }
 
@@ -1936,13 +1936,13 @@ mod tests {
     #[test]
     fn unpack_tar_gz_extracts_full_tree() {
         let omnesagent = b"#!/bin/sh\necho omnesagent";
-        let zerocode = b"#!/bin/sh\necho zerocode";
+        let omnescode = b"#!/bin/sh\necho omnescode";
         let index = b"<!doctype html><title>dash</title>";
         let asset = b"console.log('app')";
-        let companion_name = ZEROCODE_BINARY_NAME;
+        let companion_name = OMNESCODE_BINARY_NAME;
         let gz_buf = make_tar_gz(&[
             (main_binary_name(), omnesagent),
-            (companion_name, zerocode),
+            (companion_name, omnescode),
             ("web/dist/index.html", index),
             ("web/dist/assets/app.js", asset),
         ]);
@@ -1956,7 +1956,7 @@ mod tests {
         assert_eq!(std::fs::read(&binary).unwrap(), omnesagent);
         assert_eq!(
             std::fs::read(staging.join(companion_name)).unwrap(),
-            zerocode
+            omnescode
         );
         assert_eq!(
             std::fs::read(staging.join("web").join("dist").join("index.html")).unwrap(),
@@ -2078,11 +2078,11 @@ mod tests {
     #[test]
     fn unpack_zip_extracts_full_tree() {
         let omnesagent = b"fake omnesagent.exe";
-        let zerocode = b"fake zerocode.exe";
+        let omnescode = b"fake omnescode.exe";
         let index = b"<!doctype html>";
         let zip_buf = make_zip(&[
             ("omnesagent.exe", omnesagent),
-            ("zerocode.exe", zerocode),
+            ("omnescode.exe", omnescode),
             ("web/dist/index.html", index),
         ]);
 
@@ -2096,8 +2096,8 @@ mod tests {
             omnesagent
         );
         assert_eq!(
-            std::fs::read(staging.join("zerocode.exe")).unwrap(),
-            zerocode
+            std::fs::read(staging.join("omnescode.exe")).unwrap(),
+            omnescode
         );
         assert_eq!(
             std::fs::read(staging.join("web").join("dist").join("index.html")).unwrap(),
@@ -2261,44 +2261,44 @@ mod tests {
     #[tokio::test]
     async fn swap_file_replaces_target() {
         let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("zerocode");
-        std::fs::write(&target, b"old zerocode").unwrap();
-        let new = tmp.path().join("staging").join("zerocode");
+        let target = tmp.path().join("omnescode");
+        std::fs::write(&target, b"old omnescode").unwrap();
+        let new = tmp.path().join("staging").join("omnescode");
         std::fs::create_dir_all(new.parent().unwrap()).unwrap();
-        std::fs::write(&new, b"new zerocode").unwrap();
+        std::fs::write(&new, b"new omnescode").unwrap();
 
         swap_file(&new, &target).await.unwrap();
 
-        assert_eq!(std::fs::read(&target).unwrap(), b"new zerocode");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new omnescode");
     }
 
     #[tokio::test]
     async fn install_companion_artifacts_swaps_top_level_siblings() {
         // The companion-artifact loop swaps every top-level file that is on
         // the explicit `KNOWN_COMPANION_FILES` allowlist (currently
-        // `zerocode` / `zerocode.exe`) — and only those. The main binary is
+        // `omnescode` / `omnescode.exe`) — and only those. The main binary is
         // handled earlier by the transactional `swap_binary` path; unknown
         // top-level files are covered by the sibling test below.
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
-        let companion_name = ZEROCODE_BINARY_NAME;
+        let companion_name = OMNESCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
         let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"omnesagent").unwrap();
-        std::fs::write(bin_dir.join(companion_name), b"old zerocode").unwrap();
+        std::fs::write(bin_dir.join(companion_name), b"old omnescode").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Main binary lives in the staged tree but must NOT be re-swapped here
         // (it was already handled by the transactional `swap_binary` path).
         std::fs::write(staging.join(main_binary_name()), b"new omnesagent").unwrap();
-        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new omnescode").unwrap();
 
         install_companion_artifacts(&staging, &exe, &[]).await;
 
-        // zerocode swapped in.
-        let expected_zerocode = bin_dir.join(companion_name);
-        assert_eq!(std::fs::read(&expected_zerocode).unwrap(), b"new zerocode");
+        // omnescode swapped in.
+        let expected_omnescode = bin_dir.join(companion_name);
+        assert_eq!(std::fs::read(&expected_omnescode).unwrap(), b"new omnescode");
         // Main binary must be unchanged by the companion pass.
         assert_eq!(std::fs::read(&exe).unwrap(), b"omnesagent");
     }
@@ -2313,7 +2313,7 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_files() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
-        let companion_name = ZEROCODE_BINARY_NAME;
+        let companion_name = OMNESCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
         let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"omnesagent").unwrap();
@@ -2321,7 +2321,7 @@ mod tests {
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
         // Known companion — must be installed.
-        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new omnescode").unwrap();
         // Unknown top-level file — must NOT be installed. This is the
         // defense-in-depth surface: a forged release cannot smuggle a
         // `zerodash`, `.bashrc`, `evil.so`, etc. next to `omnesagent` just by
@@ -2333,7 +2333,7 @@ mod tests {
         // Known companion installed.
         assert_eq!(
             std::fs::read(bin_dir.join(companion_name)).unwrap(),
-            b"new zerocode"
+            b"new omnescode"
         );
         // Unknown sibling NOT installed.
         assert!(
@@ -2351,14 +2351,14 @@ mod tests {
     async fn install_companion_artifacts_skips_unknown_top_level_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
-        let companion_name = ZEROCODE_BINARY_NAME;
+        let companion_name = OMNESCODE_BINARY_NAME;
         std::fs::create_dir_all(&bin_dir).unwrap();
         let exe = bin_dir.join(main_binary_name());
         std::fs::write(&exe, b"omnesagent").unwrap();
 
         let staging = tmp.path().join("staging");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join(companion_name), b"new zerocode").unwrap();
+        std::fs::write(staging.join(companion_name), b"new omnescode").unwrap();
         // An unknown directory (a future layout, a mispackaged release, …).
         std::fs::create_dir_all(staging.join("themes").join("dark")).unwrap();
         std::fs::write(staging.join("themes/dark/index.css"), b"body{}").unwrap();
@@ -2372,7 +2372,7 @@ mod tests {
         // Known artifacts installed.
         assert_eq!(
             std::fs::read(bin_dir.join(companion_name)).unwrap(),
-            b"new zerocode"
+            b"new omnescode"
         );
         assert_eq!(
             std::fs::read(bin_dir.join("web/dist/index.html")).unwrap(),
@@ -2391,42 +2391,42 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path();
         // Simulate residue left by previous PIDs.
-        std::fs::write(parent.join(".zerocode.update-99998"), b"stale tmp").unwrap();
-        std::fs::write(parent.join(".zerocode.update-old-99997"), b"stale old").unwrap();
+        std::fs::write(parent.join(".omnescode.update-99998"), b"stale tmp").unwrap();
+        std::fs::write(parent.join(".omnescode.update-old-99997"), b"stale old").unwrap();
         let stale_dir = parent.join(".dist.update-old-99996");
         std::fs::create_dir_all(stale_dir.join("assets")).unwrap();
         std::fs::write(stale_dir.join("index.html"), b"old").unwrap();
         std::fs::write(stale_dir.join("assets/app.js"), b"old").unwrap();
         // A file that does NOT match the prefix — must survive.
-        std::fs::write(parent.join("zerocode"), b"live").unwrap();
+        std::fs::write(parent.join("omnescode"), b"live").unwrap();
 
-        sweep_update_residue(parent, "zerocode").await;
+        sweep_update_residue(parent, "omnescode").await;
         sweep_update_residue(parent, "dist").await;
 
-        assert!(!parent.join(".zerocode.update-99998").exists());
-        assert!(!parent.join(".zerocode.update-old-99997").exists());
+        assert!(!parent.join(".omnescode.update-99998").exists());
+        assert!(!parent.join(".omnescode.update-old-99997").exists());
         assert!(!stale_dir.exists());
-        assert_eq!(std::fs::read(parent.join("zerocode")).unwrap(), b"live");
+        assert_eq!(std::fs::read(parent.join("omnescode")).unwrap(), b"live");
     }
 
     #[tokio::test]
     async fn swap_file_cleans_up_residue_from_earlier_runs() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let target = dir.join("zerocode");
+        let target = dir.join("omnescode");
         std::fs::write(&target, b"old").unwrap();
         // Pretend a previous update left a sidelined file (e.g. because the
         // old process was still running and the file was locked).
-        std::fs::write(dir.join(".zerocode.update-old-99999"), b"stale").unwrap();
+        std::fs::write(dir.join(".omnescode.update-old-99999"), b"stale").unwrap();
 
-        let new = dir.join("new-zerocode");
+        let new = dir.join("new-omnescode");
         std::fs::write(&new, b"new").unwrap();
         swap_file(&new, &target).await.unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         // The stale sidelined file from the previous run must be swept.
         assert!(
-            !dir.join(".zerocode.update-old-99999").exists(),
+            !dir.join(".omnescode.update-old-99999").exists(),
             "swap_file must sweep residue from previous runs"
         );
     }

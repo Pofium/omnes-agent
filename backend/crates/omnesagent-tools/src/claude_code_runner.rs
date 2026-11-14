@@ -432,7 +432,7 @@ mod tests {
         ClaudeCodeRunnerConfig {
             enabled: true,
             ssh_host: Some("dev.example.com".into()),
-            tmux_prefix: "zc-test-".into(),
+            tmux_prefix: "oc-test-".into(),
             session_ttl: 3600,
         }
     }
@@ -489,7 +489,7 @@ mod tests {
             "http://localhost:3000".into(),
         );
         let name = tool.session_name("abc123");
-        assert_eq!(name, "zc-test-abc123");
+        assert_eq!(name, "oc-test-abc123");
     }
 
     #[test]
@@ -499,10 +499,10 @@ mod tests {
             test_config(),
             "http://localhost:3000".into(),
         );
-        let cmd = tool.ssh_attach_command("zc-test-abc123");
+        let cmd = tool.ssh_attach_command("oc-test-abc123");
         assert_eq!(
             cmd.as_deref(),
-            Some("ssh -t dev.example.com tmux attach-session -t zc-test-abc123")
+            Some("ssh -t dev.example.com tmux attach-session -t oc-test-abc123")
         );
     }
 
@@ -810,7 +810,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let (_temp, binary, log) = fake_tmux(0, 8);
-        let error = cleanup_expired_session(&binary, "zc-test-expired")
+        let error = cleanup_expired_session(&binary, "oc-test-expired")
             .await
             .expect_err("failed cleanup should remain observable");
         assert!(error.contains("Failed to kill session"));

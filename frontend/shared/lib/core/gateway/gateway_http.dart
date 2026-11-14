@@ -10,6 +10,16 @@ import 'api/api.dart';
 
 export 'api/api.dart';
 
+/// Outcome of an admin pairing-code request. Distinguishes an admin-token
+/// rejection (HTTP 403, needs the master key) from a plain failure.
+class AdminPaircodeResult {
+  final String? code;
+  final String? message;
+  final bool needsAdminToken;
+  final bool pairingDisabled;
+  const AdminPaircodeResult({this.code, this.message, this.needsAdminToken = false, this.pairingDisabled = false});
+}
+
 class GatewayHttpClient {
   final http.Client _client;
   late final GatewayHttpTransport transport;
@@ -38,6 +48,54 @@ class GatewayHttpClient {
       'Accept': 'application/json',
       if (token.isNotEmpty) 'Authorization': 'Bearer $token',
     };
+  }
+
+  /// Bearer headers plus the gateway admin token when configured.
+  ///
+  /// The localhost-only `/admin/*` endpoints reject requests that lack the
+  /// `x-omnesagent-admin-token` header once pairing is enabled.
+  Future<Map<String, String>> _adminAuthHeaders() async {
+    final headers = await _authHeaders();
+    final adminToken = await GatewayConfig.getAdminToken();
+    if (adminToken.isNotEmpty) {
+      headers['x-omnesagent-admin-token'] = adminToken;
+    }
+    return headers;
+  }
+
+  /// Maps a `/admin/paircode*` HTTP response to a typed [AdminPaircodeResult].
+  AdminPaircodeResult _parsePaircodeResponse(http.Response res) {
+    dynamic data;
+    try {
+      data = _decodeBody(res);
+    } catch (_) {
+      data = null;
+    }
+    if (res.statusCode == 200) {
+      if (data is Map) {
+        return AdminPaircodeResult(
+          code: data['pairing_code']?.toString(),
+          message: data['message']?.toString(),
+        );
+      }
+      return const AdminPaircodeResult();
+    }
+    if (res.statusCode == 400 && data is Map && data['pairing_required'] == false) {
+      return AdminPaircodeResult(
+        pairingDisabled: true,
+        message: data['message']?.toString(),
+      );
+    }
+    if (res.statusCode == 401 || res.statusCode == 403) {
+      final msg = (data is Map)
+          ? (data['error']?.toString() ?? data['message']?.toString())
+          : null;
+      return AdminPaircodeResult(needsAdminToken: true, message: msg);
+    }
+    final fallback = (data is Map)
+        ? (data['message']?.toString() ?? data['error']?.toString())
+        : null;
+    return AdminPaircodeResult(message: fallback);
   }
 
   /// Checks whether gateway is reachable and responsive.
@@ -1308,6 +1366,26 @@ class GatewayHttpClient {
     }
   }
 
+  /// Fetches the run overlay for one SOP run via
+  /// GET /api/sops/{name}/runs/{run_id}/overlay.
+  ///
+  /// The overlay projects the run onto the SOP graph: per-node states
+  /// (pending / active / completed / failed / skipped), the current step, and
+  /// the recorded step results. Returns `null` when the run, SOP, or SOP
+  /// subsystem is unavailable.
+  Future<Map<String, dynamic>?> sopRunOverlay(String name, String runId) async {
+    try {
+      final base = GatewayConfig.getBaseUrl();
+      final uri = Uri.parse('$base/api/sops/${Uri.encodeComponent(name)}/runs/${Uri.encodeComponent(runId)}/overlay');
+      final headers = await _authHeaders();
+      final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        return _decodeBody(res) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   /// Generates pure SOP wire draft via POST /api/sops/wire-draft.
   Future<Map<String, dynamic>?> sopWireDraft(Map<String, dynamic> spec) async {
     try {
@@ -1815,39 +1893,32 @@ class GatewayHttpClient {
   }
 
   /// Generates a new one-time pairing code via POST /admin/paircode/new.
-  Future<String?> adminPaircodeNew() async {
+  ///
+  /// Sends the `x-omnesagent-admin-token` header when configured; a 403 result
+  /// surfaces as [AdminPaircodeResult.needsAdminToken].
+  Future<AdminPaircodeResult> adminPaircodeNew() async {
     try {
       final base = GatewayConfig.getBaseUrl();
       final uri = Uri.parse('$base/admin/paircode/new');
-      final headers = await _authHeaders();
+      final headers = await _adminAuthHeaders();
       final res = await _client.post(uri, headers: headers).timeout(const Duration(seconds: 10));
-      if (res.statusCode == 200) {
-        final data = _decodeBody(res);
-        if (data is Map && data['code'] != null) {
-          return data['code'].toString();
-        }
-        return res.body.trim();
-      }
-    } catch (_) {}
-    return null;
+      return _parsePaircodeResponse(res);
+    } catch (_) {
+      return const AdminPaircodeResult();
+    }
   }
 
   /// Fetches pairing code info via GET /admin/paircode.
-  Future<String?> adminPaircode() async {
+  Future<AdminPaircodeResult> adminPaircode() async {
     try {
       final base = GatewayConfig.getBaseUrl();
       final uri = Uri.parse('$base/admin/paircode');
-      final headers = await _authHeaders();
+      final headers = await _adminAuthHeaders();
       final res = await _client.get(uri, headers: headers).timeout(const Duration(seconds: 5));
-      if (res.statusCode == 200) {
-        final data = _decodeBody(res);
-        if (data is Map && data['code'] != null) {
-          return data['code'].toString();
-        }
-        return res.body.trim();
-      }
-    } catch (_) {}
-    return null;
+      return _parsePaircodeResponse(res);
+    } catch (_) {
+      return const AdminPaircodeResult();
+    }
   }
 
   // ── Config Sections Wizard & Advanced Config API ──────────────────────────
@@ -1947,7 +2018,10 @@ class GatewayHttpClient {
     return null;
   }
 
-  /// Fetches list of config files or properties via GET /api/config/list.
+  /// Fetches the per-property config list via GET /api/config/list.
+  ///
+  /// The gateway answers `{entries: [...], drifted: [...]}`; older builds used
+  /// `items`. Both shapes are accepted so the caller only ever sees rows.
   Future<List<dynamic>> configList() async {
     try {
       final base = GatewayConfig.getBaseUrl();
@@ -1957,6 +2031,7 @@ class GatewayHttpClient {
       if (res.statusCode == 200) {
         final data = _decodeBody(res);
         if (data is List) return data;
+        if (data is Map && data['entries'] is List) return data['entries'] as List;
         if (data is Map && data['items'] is List) return data['items'] as List;
       }
     } catch (_) {}

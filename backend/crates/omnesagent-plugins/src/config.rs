@@ -1,18 +1,21 @@
 //! Schema-driven plugin config resolution.
 //!
 //! The operator's canonical values remain a secret-marked string map in
-//! OmnesAgent config, encrypted when persisted. The manifest-owned schema supplies
+//! omnesagent config, encrypted when persisted. The manifest-owned schema supplies
 //! their types. This module materializes a validated JSON object only for the
 //! duration of a host call.
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use std::sync::Arc;
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
 use serde_json::Map;
 use serde_json::Value;
+use omnesagent_api::plugin_key::SecretPropertyRef;
+#[cfg(any(feature = "plugins-wasmtime", test))]
+use zeroize::Zeroizing;
 
 use crate::error::PluginError;
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -21,6 +24,8 @@ use crate::{PluginCapability, PluginManifest, PluginPermission};
 
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 32;
+/// Keep admission-time validator compilation bounded for wide object schemas.
+const MAX_SCHEMA_PROPERTIES: usize = 256;
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// Ceiling on one compiled `pattern` program, in bytes.
@@ -73,7 +78,9 @@ const DYNAMIC_KEY_KEYWORDS: [&str; 3] = [
 pub struct ResolvedPluginConfig {
     scope: PluginInstanceScope,
     public_json: Value,
-    secrets: HashMap<String, String>,
+    secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
+    host_only: HashSet<SecretPropertyRef>,
+    tls_config_witness: Option<crate::egress::TlsConfigWitness>,
 }
 
 #[cfg(any(feature = "plugins-wasmtime", test))]
@@ -81,13 +88,85 @@ impl ResolvedPluginConfig {
     fn new(
         scope: &PluginInstanceScope,
         public_json: Value,
-        secrets: HashMap<String, String>,
+        secrets: HashMap<SecretPropertyRef, Zeroizing<String>>,
     ) -> Self {
         Self {
             scope: scope.clone(),
             public_json,
             secrets,
+            host_only: HashSet::new(),
+            tls_config_witness: None,
         }
+    }
+
+    /// Bind this frame view to the canonical inputs used for TLS authorization.
+    #[must_use]
+    pub fn with_tls_config_witness(mut self, witness: crate::egress::TlsConfigWitness) -> Self {
+        self.tls_config_witness = Some(witness);
+        self
+    }
+
+    /// Refuse pairing frame-owned material with a different policy view.
+    /// Call before reading any TLS secret or constructing a connection.
+    pub fn ensure_tls_authorization(
+        &self,
+        authorized: &crate::egress::AuthorizedEgress,
+    ) -> Result<(), crate::egress::EgressError> {
+        use crate::egress::EgressError;
+        if !self.scope.same_issuance(authorized.request().scope()) {
+            return Err(EgressError::AuthorizationScopeMismatch);
+        }
+        if authorized.tls_config_witness().is_none()
+            || self.tls_config_witness.as_ref() != authorized.tls_config_witness()
+        {
+            return Err(EgressError::TlsConfigMismatch);
+        }
+        Ok(())
+    }
+
+    /// Materialize a connection-owned TLS config only from a coherent authorization.
+    /// System roots are supplied by the host transport; private profiles need none.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub fn tls_client_config(
+        &self,
+        authorized: &crate::egress::AuthorizedEgress,
+        roots: &rustls::RootCertStore,
+    ) -> Result<std::sync::Arc<rustls::ClientConfig>, crate::egress::EgressError> {
+        self.ensure_tls_authorization(authorized)?;
+        let profile = authorized.tls_profile();
+        crate::egress::build_tls_client_config(profile, roots, |reference| {
+            self.secret_ref(reference)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| crate::egress::EgressError::TlsSecretUnavailable {
+                    profile: profile
+                        .map(|p| p.name().as_str())
+                        .unwrap_or("system-roots")
+                        .to_string(),
+                    property: reference.as_str().to_string(),
+                })
+        })
+    }
+
+    /// Withhold `references` from the guest while leaving them readable by
+    /// the host.
+    ///
+    /// The runtime marks the secret properties an instance's TLS profiles
+    /// reference: that material, a client private key included, is consumed
+    /// when the host builds a TLS connection and must not come back through
+    /// the guest's `secrets` import.
+    #[must_use]
+    pub fn reserve_for_host(
+        mut self,
+        references: impl IntoIterator<Item = SecretPropertyRef>,
+    ) -> Self {
+        self.host_only.extend(references);
+        self
+    }
+
+    /// Whether the guest-facing `secrets` import must refuse `name`.
+    #[must_use]
+    pub(crate) fn is_host_only(&self, name: &str) -> bool {
+        SecretPropertyRef::parse(name).is_ok_and(|reference| self.host_only.contains(&reference))
     }
 
     /// Borrow the validated non-secret JSON object for immediate guest injection.
@@ -99,7 +178,15 @@ impl ResolvedPluginConfig {
     /// Borrow one schema-designated secret for an immediate host-mediated use.
     #[must_use]
     pub(crate) fn secret(&self, name: &str) -> Option<&str> {
-        self.secrets.get(name).map(String::as_str)
+        SecretPropertyRef::parse(name)
+            .ok()
+            .and_then(|reference| self.secret_ref(&reference))
+    }
+
+    /// Borrow one secret through the canonical portable reference type.
+    #[must_use]
+    pub(crate) fn secret_ref(&self, reference: &SecretPropertyRef) -> Option<&str> {
+        self.secrets.get(reference).map(|secret| secret.as_str())
     }
 
     /// Reject pairing this materialized view with another admission decision.
@@ -278,14 +365,6 @@ fn compile_manifest_config(
         )));
     }
 
-    let validator = manifest_schema_options().build(schema).map_err(|error| {
-        invalid_manifest(format!(
-            "plugin '{}' config_schema cannot be compiled: {}",
-            manifest.name,
-            error.masked()
-        ))
-    })?;
-
     let properties = schema
         .get("properties")
         .and_then(Value::as_object)
@@ -295,6 +374,22 @@ fn compile_manifest_config(
                 manifest.name
             ))
         })?;
+    if properties.len() > MAX_SCHEMA_PROPERTIES {
+        return Err(invalid_manifest(format!(
+            "plugin '{}' config_schema declares {} root properties, exceeding the maximum of {MAX_SCHEMA_PROPERTIES}",
+            manifest.name,
+            properties.len()
+        )));
+    }
+
+    let validator = manifest_schema_options().build(schema).map_err(|error| {
+        invalid_manifest(format!(
+            "plugin '{}' config_schema cannot be compiled: {}",
+            manifest.name,
+            error.masked()
+        ))
+    })?;
+
     for (name, property) in properties {
         let kind = property_type(schema, property).map_err(|message| {
             invalid_manifest(format!(
@@ -305,6 +400,12 @@ fn compile_manifest_config(
         if is_secret_property(property) && !matches!(kind, PropertyKind::String) {
             return Err(invalid_manifest(format!(
                 "plugin '{}' config_schema property '{name}' marks x-secret but does not resolve to type string",
+                manifest.name
+            )));
+        }
+        if is_secret_property(property) && SecretPropertyRef::parse(name.clone()).is_err() {
+            return Err(invalid_manifest(format!(
+                "plugin '{}' config_schema secret property '{name}' is not a portable top-level property reference",
                 manifest.name
             )));
         }
@@ -430,7 +531,13 @@ pub fn resolve_plugin_config_from(
                     manifest.name
                 )));
             };
-            secrets.insert(name, secret);
+            let reference = SecretPropertyRef::parse(name).map_err(|_| {
+                PluginError::InvalidConfig(format!(
+                    "plugin '{}' resolved secret property is not portable",
+                    manifest.name
+                ))
+            })?;
+            secrets.insert(reference, Zeroizing::new(secret));
         } else {
             public.insert(name, value);
         }
@@ -449,8 +556,18 @@ fn validate_config_instance(
     config: &Value,
 ) -> Result<(), PluginError> {
     if let Err(error) = validator.validate(config) {
+        // A missing required property is named, since the name is the
+        // schema's own. Configured values, and configured keys the schema does
+        // not declare, are never repeated: either could hold a secret.
+        let missing = match error.kind() {
+            jsonschema::error::ValidationErrorKind::Required { property } => property
+                .as_str()
+                .map(|property| format!(": missing required property '{property}'"))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         return Err(PluginError::InvalidConfig(format!(
-            "plugin '{}' config violates config_schema at '{}'",
+            "plugin '{}' config violates config_schema at '{}'{missing}",
             manifest.name,
             error.schema_path()
         )));
@@ -698,7 +815,9 @@ mod tests {
             description: None,
             author: None,
             wasm_path: Some("fixture.wasm".to_string()),
+            wasm_sha256: None,
             capabilities: vec![PluginCapability::Tool],
+            provides: None,
             permissions: requests_config
                 .then_some(PluginPermission::ConfigRead)
                 .into_iter()
@@ -1069,6 +1188,25 @@ x-secret = true
     }
 
     #[test]
+    fn secret_property_references_use_the_shared_portable_key_grammar() {
+        for name in [
+            "plugin://other/key",
+            "../key",
+            "key:value",
+            "other\\key",
+            "café",
+        ] {
+            let schema = object_schema(json!({
+                (name): {"type": "string", "x-secret": true}
+            }));
+            assert!(matches!(
+                validate_manifest_config(&manifest(Some(schema), true)),
+                Err(PluginError::InvalidManifest(_))
+            ));
+        }
+    }
+
+    #[test]
     fn secret_annotations_require_a_tool_or_channel_consumer() {
         let schema = object_schema(json!({
             "api_key": {"type": "string", "x-secret": true}
@@ -1160,6 +1298,15 @@ x-secret = true
         assert_eq!(resolved.secret("api_key"), Some("secret-value"));
         assert_eq!(resolved.secret("endpoint"), None);
         assert_eq!(resolved.secret("missing"), None);
+        assert!(!resolved.is_host_only("api_key"));
+        let resolved =
+            resolved.reserve_for_host([SecretPropertyRef::parse("api_key").expect("portable")]);
+        assert!(resolved.is_host_only("api_key"));
+        assert_eq!(
+            resolved.secret("api_key"),
+            Some("secret-value"),
+            "reserving a secret hides it from the guest, not from the host"
+        );
         assert!(!resolved.public_json().to_string().contains("secret-value"));
     }
 
@@ -1221,6 +1368,27 @@ x-secret = true
         ] {
             assert!(resolve_plugin_config(&manifest, &scope, Some(&values)).is_err());
         }
+    }
+
+    /// A missing required property is named, since the name is the schema's
+    /// own; the values configured beside it are not repeated.
+    #[test]
+    fn a_missing_required_property_is_named_and_no_value_is_repeated() {
+        let mut schema = object_schema(json!({
+            "retries": {"type": "integer"},
+            "label": {"type": "string"}
+        }));
+        schema["required"] = json!(["retries"]);
+        let manifest = manifest(Some(schema), true);
+        let scope = scope(&manifest, true);
+
+        let values = configured(&[("label", "sekrit-value")]);
+        let missing = resolve_plugin_config(&manifest, &scope, Some(&values))
+            .err()
+            .expect("a missing required property is rejected")
+            .to_string();
+        assert!(missing.contains("'retries'"), "{missing}");
+        assert!(!missing.contains("sekrit-value"), "{missing}");
     }
 
     #[test]
@@ -1367,6 +1535,37 @@ x-secret = true
         let mut too_deep = object_schema(json!({}));
         too_deep["annotation"] = nested;
         assert!(validate_manifest_config(&manifest(Some(too_deep), true)).is_err());
+    }
+
+    #[test]
+    fn root_property_count_limit_is_enforced_at_admission() {
+        let at_limit = (0..MAX_SCHEMA_PROPERTIES)
+            .map(|index| (format!("key_{index}"), json!({"type": "string"})))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(
+            validate_manifest_config(&manifest(
+                Some(object_schema(Value::Object(at_limit))),
+                true
+            ))
+            .is_ok()
+        );
+
+        let over_limit = (0..=MAX_SCHEMA_PROPERTIES)
+            .map(|index| {
+                (
+                    format!("key_{index}"),
+                    json!({"type": "string", "pattern": "(?=x)"}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let error = validate_manifest_config(&manifest(
+            Some(object_schema(Value::Object(over_limit))),
+            true,
+        ))
+        .expect_err("schema over the root property cap must fail closed");
+        assert!(matches!(error, PluginError::InvalidManifest(_)));
+        assert!(error.to_string().contains("root properties"));
+        assert!(error.to_string().contains("maximum of 256"));
     }
 
     #[test]

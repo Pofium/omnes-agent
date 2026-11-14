@@ -121,6 +121,70 @@ pub(crate) struct InterpretedResponse {
     pub(crate) usage: Option<omnesagent_providers::traits::TokenUsage>,
 }
 
+/// Recover double-encoded structured arguments without interpreting free text.
+/// This is intentionally not a schema validator: opaque or composed schemas
+/// leave the value unchanged for the tool's normal validation path.
+fn recover_structured_arguments(
+    value: &mut serde_json::Value,
+    schema: &serde_json::Value,
+    depth: usize,
+) {
+    use serde_json::Value;
+
+    if depth >= 64
+        || [
+            "$ref",
+            "$dynamicRef",
+            "allOf",
+            "anyOf",
+            "oneOf",
+            "not",
+            "if",
+            "then",
+            "else",
+        ]
+        .iter()
+        .any(|key| schema.get(*key).is_some())
+    {
+        return;
+    }
+    let Some(kind @ ("object" | "array")) = schema.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    // Tuple schemas do not describe every position with the same item schema.
+    if kind == "array" && schema.get("prefixItems").is_some() {
+        return;
+    }
+    if let Value::String(text) = value {
+        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        if (kind == "object" && !parsed.is_object()) || (kind == "array" && !parsed.is_array()) {
+            return;
+        }
+        *value = parsed;
+    }
+    match (kind, value) {
+        ("object", Value::Object(fields)) => {
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                for (name, field) in fields {
+                    if let Some(property) = properties.get(name) {
+                        recover_structured_arguments(field, property, depth + 1);
+                    }
+                }
+            }
+        }
+        ("array", Value::Array(items)) => {
+            if let Some(item_schema) = schema.get("items").filter(|item| item.is_object()) {
+                for item in items {
+                    recover_structured_arguments(item, item_schema, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Interpret a successful chat response. Takes the response by value and
 /// holds no borrows of `ctx` past the call (RUN_SHEET `turn.parse_response`).
 pub(crate) async fn interpret_chat_response(
@@ -177,6 +241,12 @@ pub(crate) async fn interpret_chat_response(
             parsed_text = fallback_text;
         }
         calls = filtered_calls;
+    }
+
+    for call in &mut calls {
+        if let Some(spec) = specs.tool_specs.iter().find(|spec| spec.name == call.name) {
+            recover_structured_arguments(&mut call.arguments, &spec.parameters, 0);
+        }
     }
 
     let parse_issue = if ctx.strict_tool_parsing {
@@ -431,6 +501,252 @@ mod tests {
 }
 
 #[cfg(test)]
+mod argument_preservation_tests {
+    use super::*;
+    use crate::tools::{FileWriteTool, Tool, ToolSpec};
+    use serde_json::{Value, json};
+    use std::{collections::HashSet, sync::Arc};
+    use omnesagent_config::{autonomy::AutonomyLevel, policy::SecurityPolicy};
+
+    async fn interpret(
+        spec: ToolSpec,
+        arguments: Value,
+        native: bool,
+        use_native_tools: bool,
+    ) -> InterpretedResponse {
+        let pacing = omnesagent_config::schema::PacingConfig::default();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "test.provider",
+            model: "test-model",
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: omnesagent_config::schema::StreamReasoningMode::Status,
+            turn_id: "argument-preservation",
+        };
+        let name = spec.name.clone();
+        let specs = IterationToolSpecs {
+            known_tool_names: HashSet::from([name.clone()]),
+            tool_specs: vec![spec],
+            use_native_tools,
+        };
+        let resp = if native {
+            ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-test".into(),
+                    name,
+                    arguments: arguments.to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            }
+        } else {
+            ChatResponse {
+                text: Some(format!(
+                    "<tool_call>{}</tool_call>",
+                    json!({"id": "call-test", "name": name, "arguments": arguments})
+                )),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }
+        };
+        interpret_chat_response(
+            &ctx,
+            "test.provider",
+            "test-model",
+            resp,
+            &[],
+            &specs,
+            false,
+            0,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn json_document_reaches_file_write_unchanged() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tool = FileWriteTool::new(Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_owned(),
+            ..SecurityPolicy::default()
+        }));
+        let document = "{\n  \"message\": \"дЅ еҐЅ\", \"nested\": \"[1,2]\"\n}\n";
+        let interpreted = interpret(
+            tool.spec(),
+            json!({"path": "document.json", "content": document}),
+            false,
+            false,
+        )
+        .await;
+        assert!(!interpreted.parse_issue_detected);
+        assert_eq!(interpreted.tool_calls.len(), 1);
+        let call = &interpreted.tool_calls[0];
+        assert_eq!(call.name, "file_write");
+        assert_eq!(call.arguments["content"], document);
+        let result = tool.execute(call.arguments.clone()).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            std::fs::read(workspace.path().join("document.json")).unwrap(),
+            document.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_recovers_structured_fields_for_fallback_and_native_calls() {
+        let schema = json!({"type":"object", "properties":{
+            "params":{"type":"object"},
+            "items":{"type":"array", "items":{"type":"string"}},
+            "content":{"type":"string"}
+        }});
+        let args = json!({"params":"{\"maxResults\":3}", "items":"[\"{\\\"id\\\":1}\"]", "content":"[1,2]"});
+        for use_native_tools in [false, true] {
+            let fallback = interpret(
+                ToolSpec::new("test_tool", "test", schema.clone()),
+                args.clone(),
+                false,
+                use_native_tools,
+            )
+            .await;
+            assert!(!fallback.parse_issue_detected);
+            let recovered = &fallback.tool_calls[0].arguments;
+            assert_eq!(recovered["params"], json!({"maxResults":3}));
+            assert_eq!(recovered["items"], json!(["{\"id\":1}"]));
+            assert_eq!(recovered["content"], "[1,2]");
+            if use_native_tools {
+                let history: Value =
+                    serde_json::from_str(&fallback.assistant_history_content).unwrap();
+                let history_args: Value =
+                    serde_json::from_str(history["tool_calls"][0]["arguments"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(&history_args, recovered);
+            } else {
+                // Prompt-guided providers retain their original textual transcript.
+                assert_eq!(fallback.assistant_history_content, fallback.response_text);
+            }
+        }
+        let native = interpret(
+            ToolSpec::new("test_tool", "test", schema),
+            args.clone(),
+            true,
+            true,
+        )
+        .await;
+        let recovered = &native.tool_calls[0].arguments;
+        assert_eq!(recovered["params"], json!({"maxResults":3}));
+        assert_eq!(recovered["items"], json!(["{\"id\":1}"]));
+        assert_eq!(recovered["content"], "[1,2]");
+    }
+
+    #[tokio::test]
+    async fn native_call_recovers_schema_declared_structured_fields() {
+        let schema = json!({"type":"object", "properties":{
+            "action":{"type":"string"},
+            "options":{"type":"object"},
+            "filters":{"type":"array", "items":{"type":"object"}},
+            "label":{"type":"string"}
+        }});
+        let arguments = json!({
+            "action":"upsert",
+            "options":"{\"allowMultiple\":false,\"color\":\"default\"}",
+            "filters":"[{\"field\":\"status\",\"value\":\"active\"}]",
+            "label":"Site web"
+        });
+
+        let native = interpret(
+            ToolSpec::new("customermates__manage_custom_columns", "test", schema),
+            arguments,
+            true,
+            true,
+        )
+        .await;
+        let recovered = &native.tool_calls[0].arguments;
+        assert_eq!(
+            recovered["options"],
+            json!({"allowMultiple":false, "color":"default"})
+        );
+        assert_eq!(
+            recovered["filters"],
+            json!([{"field":"status", "value":"active"}])
+        );
+        assert_eq!(recovered["action"], "upsert");
+        assert_eq!(recovered["label"], "Site web");
+    }
+
+    #[test]
+    fn recovery_follows_declared_children_not_json_looking_data() {
+        let schema = json!({"type":"object", "properties":{
+            "rows":{"type":"array", "items":{"type":"object", "properties":{
+                "structured":{"type":"object"}, "text":{"type":"string"}
+            }}},
+            "opaque":{"type":"object"}
+        }});
+        let mut value = json!({
+            "rows":[{"structured":"{\"x\":1}", "text":"{\"x\":1}", "unknown":"[1]"}],
+            "opaque":{"unknown":"{\"x\":1}"}, "unknown":"[1]"
+        });
+        recover_structured_arguments(&mut value, &schema, 0);
+        assert_eq!(value["rows"][0]["structured"], json!({"x":1}));
+        assert_eq!(value["rows"][0]["text"], "{\"x\":1}");
+        assert_eq!(value["rows"][0]["unknown"], "[1]");
+        assert_eq!(value["opaque"]["unknown"], "{\"x\":1}");
+        assert_eq!(value["unknown"], "[1]");
+    }
+
+    #[test]
+    fn ambiguous_invalid_and_mismatched_values_are_untouched() {
+        for (schema, input) in [
+            (json!({}), json!("{}")),
+            (json!({"type":"string"}), json!("{}")),
+            (json!({"type":["object","string"]}), json!("{}")),
+            (
+                json!({"type":"object", "$ref":"#/$defs/thing"}),
+                json!("{}"),
+            ),
+            (json!({"type":"object", "anyOf":[{}]}), json!("{}")),
+            (json!({"type":"array", "prefixItems":[{}]}), json!("[]")),
+            (json!({"type":"object"}), json!("{bad")),
+            (json!({"type":"object"}), json!("[]")),
+            (json!({"type":"array"}), json!("{}")),
+            (json!({"type":"object"}), json!(null)),
+        ] {
+            let mut value = input.clone();
+            recover_structured_arguments(&mut value, &schema, 0);
+            assert_eq!(value, input, "schema: {schema}");
+        }
+    }
+
+    #[test]
+    fn recovery_depth_limit_keeps_deeper_values_untouched() {
+        let mut schema = json!({"type":"object"});
+        let mut value = json!("{}");
+        for _ in 0..64 {
+            schema = json!({"type":"object", "properties":{"child":schema}});
+            value = json!({"child":value});
+        }
+        let original = value.clone();
+        recover_structured_arguments(&mut value, &schema, 0);
+        assert_eq!(value, original);
+    }
+}
+
+#[cfg(test)]
 mod cost_usd_regression_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
@@ -511,6 +827,7 @@ mod cost_usd_regression_tests {
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
                 cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -650,6 +967,7 @@ mod cost_usd_regression_tests {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let interpreted = interpret_chat_response(
             &ctx,

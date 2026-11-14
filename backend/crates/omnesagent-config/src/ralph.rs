@@ -186,6 +186,14 @@ pub struct Ob2hBridgeConfig {
     pub push_scope: BridgePushScope,
     #[serde(default)]
     pub auto_push_after_archive: bool,
+    /// Ф8.2: also publish verified findings as procedural lessons (`lesson_save`)
+    /// and recall them before each iteration. Opt-in, default `false`.
+    #[serde(default)]
+    pub push_lessons: bool,
+    /// Ф10.1: on archive, ingest the run journal and save a session recap so the
+    /// published facts carry provenance. Opt-in, default `false`.
+    #[serde(default)]
+    pub recap_on_archive: bool,
 }
 
 fn default_ob2h_command() -> String {
@@ -204,6 +212,8 @@ impl Default for Ob2hBridgeConfig {
             projects: Vec::new(),
             push_scope: BridgePushScope::default(),
             auto_push_after_archive: false,
+            push_lessons: false,
+            recap_on_archive: false,
         }
     }
 }

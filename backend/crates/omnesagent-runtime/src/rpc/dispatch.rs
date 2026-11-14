@@ -797,7 +797,8 @@ impl RpcDispatcher {
             Method::Initialize => self.handle_initialize(&req.params).await,
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
-            Method::DoctorRun => self.handle_doctor_run().await,
+            // Heap-pinned for the same reason as `ConfigSet` below.
+            Method::DoctorRun => Box::pin(self.handle_doctor_run()).await,
 
             // Sessions
             Method::SessionNew => Box::pin(self.handle_session_new(&req.params)).await,
@@ -847,28 +848,42 @@ impl RpcDispatcher {
             Method::CronPatch => self.handle_cron_patch(&req.params).await,
             Method::CronDelete => self.handle_cron_delete(&req.params).await,
             Method::CronRuns => self.handle_cron_runs(&req.params).await,
-            Method::CronTrigger => self.handle_cron_trigger(&req.params).await,
+            // Heap-pinned for the same reason as `ConfigSet` above.
+            Method::CronTrigger => Box::pin(self.handle_cron_trigger(&req.params)).await,
             Method::CronSettings => self.handle_cron_settings(&req.params).await,
 
             // Config
             Method::ConfigGet => self.handle_config_get(&req.params),
-            Method::ConfigSet => self.handle_config_set(&req.params).await,
+            // Heap-pinned like `SessionNew` below: this handler's future is
+            // one of the largest in this match (see the stack-regression
+            // test in `tests`), and an exhaustive `match` sizes its state
+            // machine to the largest inline branch regardless of which arm
+            // actually runs. Boxing keeps that branch off this function's
+            // own stack frame.
+            Method::ConfigSet => Box::pin(self.handle_config_set(&req.params)).await,
             Method::ConfigValidate => self.handle_config_validate(),
             Method::ConfigReload => self.handle_config_reload(),
             Method::ConfigList => self.handle_config_list(&req.params),
-            Method::ConfigDelete => self.handle_config_delete(&req.params).await,
+            // Heap-pinned for the same reason as `ConfigSet` above.
+            Method::ConfigDelete => Box::pin(self.handle_config_delete(&req.params)).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
             Method::ConfigResolveAliasSource => {
                 self.handle_config_resolve_alias_source(&req.params)
             }
-            Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
-            Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
+            // Heap-pinned for the same reason as `ConfigSet` above.
+            Method::ConfigMapKeyCreate => {
+                Box::pin(self.handle_config_map_key_create(&req.params)).await
+            }
+            Method::ConfigMapKeyDelete => {
+                Box::pin(self.handle_config_map_key_delete(&req.params)).await
+            }
             Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
             Method::ConfigTemplates => self.handle_config_templates(),
 
             // Agents
             Method::AgentsList => self.handle_agents_list(),
-            Method::AgentsStatus => self.handle_agents_status().await,
+            // Heap-pinned for the same reason as `ConfigSet` above.
+            Method::AgentsStatus => Box::pin(self.handle_agents_status()).await,
 
             // Cost
             Method::CostQuery => self.handle_cost_query(&req.params),
@@ -891,7 +906,10 @@ impl RpcDispatcher {
             Method::ConfigSections => self.handle_config_sections(),
             Method::ConfigStatus => self.handle_config_status(),
             Method::ConfigCatalog => self.handle_config_catalog(),
-            Method::ConfigCatalogModels => self.handle_config_catalog_models(&req.params).await,
+            // Heap-pinned for the same reason as `ConfigSet` above.
+            Method::ConfigCatalogModels => {
+                Box::pin(self.handle_config_catalog_models(&req.params)).await
+            }
 
             // Logs
             Method::LogsSubscribe => self.handle_logs_subscribe().await,
@@ -915,7 +933,9 @@ impl RpcDispatcher {
             Method::QuickstartState => self.handle_quickstart_state(),
             Method::QuickstartFields => self.handle_quickstart_fields(&req.params),
             Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
-            Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
+            // Heap-pinned for the same reason as `ConfigSet` above; this is
+            // currently the single largest inline branch in this match.
+            Method::QuickstartApply => Box::pin(self.handle_quickstart_apply(&req.params)).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
             Method::CertRenew => self.handle_renew_cert(&req.params).await,
 
@@ -1370,6 +1390,12 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
+        // Capture the admitted incarnation before any durable side effect or
+        // long preparation. A same-ID replacement may only publish over this
+        // exact generation; if the slot changes while the candidate is being
+        // prepared, the stale work is refused and the live session survives.
+        let expected_generation = self.ctx.sessions.get_generation(&session_id).await;
+
         let config = self.ctx.config.read().clone();
         let chat_mode = req
             .chat_mode
@@ -1483,6 +1509,27 @@ impl RpcDispatcher {
             }
         }
 
+        // Fork-gap guard: a caller-supplied `cwd` becomes this session's
+        // SecurityPolicy workspace root (`Agent::from_config_...` overwrites
+        // `policy.workspace_dir` with the session cwd), so an unconfined value
+        // would let any RPC caller re-root the agent's sandbox outside its
+        // configured scope. Confine it to the agent's workspace allowlist — the
+        // per-agent workspace plus its risk-profile `allowed_roots` and
+        // cross-agent grants — and fail closed. Only the caller-supplied value
+        // is checked: a resumed session's persisted cwd was validated when that
+        // session was first created.
+        if let Some(requested) = req.cwd.as_deref() {
+            let policy =
+                omnesagent_config::policy::SecurityPolicy::for_agent(&config, &req.agent_alias)
+                    .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
+            if !policy.is_resolved_path_allowed(std::path::Path::new(requested)) {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!("cwd is outside the agent workspace allowlist: {requested}"),
+                ));
+            }
+        }
+
         // The session cwd: caller-supplied wins, then a resumed ACP session's
         // persisted cwd, then the agent's workspace dir.
         let cwd = req
@@ -1540,15 +1587,186 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        self.ctx
-            .sessions
-            .insert(
-                session_id.clone(),
-                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-            .map_err(|_| rpc_err(SESSION_LIMIT_REACHED, "Session limit reached"))?;
+        let candidate =
+            super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                .with_owner(self.tui_id.clone());
+        let candidate_agent = Arc::clone(&candidate.agent);
+        // Fresh sessions must claim capacity before creating durable rows.
+        // Only a replacement can keep its existing slot throughout preparation;
+        // the live incarnation stays published while the candidate is built.
+        let unpublished = if expected_generation.is_none() {
+            self.ctx
+                .sessions
+                .insert_if_absent(session_id.clone(), candidate)
+                .await
+                .map_err(|message| {
+                    if message == "session already exists" {
+                        rpc_err(SESSION_BUSY, "Session resume already in progress")
+                    } else {
+                        rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+                    }
+                })?;
+            None
+        } else {
+            Some(candidate)
+        };
+
+        // Prepare the replacement history without touching the original Agent.
+        let prepared = async {
+            let mut agent = candidate_agent.lock().await;
+        enum AcpSessionNewLoad {
+            Restored(omnesagent_infra::acp_session_store::AcpSessionData),
+            Created,
+            Killed,
+        }
+
+        let mut message_count = 0;
+        let mut seed_event = None;
+        let mut plan = Vec::new();
+        match chat_mode {
+            crate::rpc::types::ChatMode::Acp => {
+                // Reuse the data already loaded for cwd recovery on resume so the
+                // store isn't hit twice; otherwise fall through to the restore-
+                // aware load-or-create path below.
+                let loaded = if let Some(data) = preloaded_acp.take() {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
+                } else {
+                    let Some(ref store) = self.ctx.acp_session_store else {
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            "ACP session store is not available",
+                        ));
+                    };
+
+                    let store_cloned = store.clone();
+                    let sid = session_id.clone();
+                    let alias = req.agent_alias.clone();
+                    let cwd_owned = cwd.clone();
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
+                        match store_cloned.load_session_for_restore(&sid)? {
+                            omnesagent_infra::acp_session_store::AcpSessionRestore::Restorable(
+                                data,
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            omnesagent_infra::acp_session_store::AcpSessionRestore::Missing => {
+                                store_cloned.create_session_with_interaction_surface(
+                                    &sid,
+                                    &alias,
+                                    &cwd_owned,
+                                    resolved_interaction_surface.map(|surface| surface.as_str()),
+                                )?;
+                                Ok(AcpSessionNewLoad::Created)
+                            }
+                            omnesagent_infra::acp_session_store::AcpSessionRestore::Killed => {
+                                Ok(AcpSessionNewLoad::Killed)
+                            }
+                        }
+                    })
+                    .await
+                };
+                match loaded {
+                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                        if data.agent_alias != req.agent_alias {
+                            return Err(rpc_err(
+                                INVALID_PARAMS,
+                                "ACP session belongs to a different agent",
+                            ));
+                        }
+                        message_count = data.messages.len();
+                        seed_event = agent.seed_conversation_history_with_event(data.messages);
+                        // Restore the durable TodoWrite plan into the fresh
+                        // in-memory session and re-emit it so the resuming /
+                        // reconnecting client's tracker repopulates without a
+                        // model round-trip. Robust against tmux detach, socket
+                        // drop, suspend/resume, and daemon restart.
+                        if let Some(ref store) = self.ctx.acp_session_store {
+                            let store = store.clone();
+                            let sid = session_id.clone();
+                            plan = tokio::task::spawn_blocking(move || {
+                                store.get_plan(&sid).unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default();
+                        }
+                    }
+                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
+                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                    }
+                    Ok(Err(e)) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
+                            "Failed to load or create ACP session"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to load or create ACP session: {e}"),
+                        ));
+                    }
+                    Err(join) => {
+                        ::omnesagent_log::record!(
+                            WARN,
+                            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                                .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
+                            "ACP session load task failed"
+                        );
+                        return Err(rpc_err(
+                            INTERNAL_ERROR,
+                            format!("ACP session load task failed: {join}"),
+                        ));
+                    }
+                }
+            }
+            crate::rpc::types::ChatMode::Chat => {
+                if let Some(ref backend) = self.ctx.session_backend {
+                    let session_key = format!("rpc_{session_id}");
+                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                    let stored = backend.load(&session_key);
+                    if !stored.is_empty() {
+                        seed_event = agent.seed_history_with_event(&stored);
+                        message_count = stored.len();
+                    }
+                }
+            }
+        }
+            drop(agent);
+            Ok::<_, JsonRpcError>((message_count, seed_event, plan))
+        }
+        .await;
+        let (message_count, seed_event, plan) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // A fresh session claimed its slot up front; a replacement never
+                // touched the store, so the live incarnation stays as it was.
+                if unpublished.is_none() {
+                    if let Some(ref hooks) = self.ctx.hooks {
+                        hooks.fire_session_end(&session_id, "rpc").await;
+                    }
+                    self.ctx.sessions.remove(&session_id).await;
+                }
+                return Err(error);
+            }
+        };
+
+        if let Some(mut candidate) = unpublished {
+            candidate.plan = plan.clone();
+            self.ctx
+                .sessions
+                .publish_prepared(session_id.clone(), candidate, expected_generation)
+                .await
+                .map_err(|message| rpc_err(SESSION_BUSY, message))?;
+        } else if !plan.is_empty() {
+            self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
+        }
+        self.forward_seed_event(&session_id, seed_event).await;
+        if !plan.is_empty() {
+            if let Some(n) = plan_replay_notification(&session_id, &plan) {
+                let _ = self.rpc.send_raw(n).await;
+            }
+        }
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -1597,159 +1815,6 @@ impl RpcDispatcher {
                         })),
                     "Trimmed glibc arenas after same-mode session eviction"
                 );
-            }
-        }
-
-        enum AcpSessionNewLoad {
-            Restored(omnesagent_infra::acp_session_store::AcpSessionData),
-            Created,
-            Killed,
-        }
-
-        let mut message_count = 0;
-        match chat_mode {
-            crate::rpc::types::ChatMode::Acp => {
-                // Reuse the data already loaded for cwd recovery on resume so the
-                // store isn't hit twice; otherwise fall through to the restore-
-                // aware load-or-create path below.
-                let loaded = if let Some(data) = preloaded_acp.take() {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
-                } else {
-                    let Some(ref store) = self.ctx.acp_session_store else {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            "ACP session store is not available",
-                        ));
-                    };
-
-                    let store_cloned = store.clone();
-                    let sid = session_id.clone();
-                    let alias = req.agent_alias.clone();
-                    let cwd_owned = cwd.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
-                        match store_cloned.load_session_for_restore(&sid)? {
-                            omnesagent_infra::acp_session_store::AcpSessionRestore::Restorable(
-                                data,
-                            ) => Ok(AcpSessionNewLoad::Restored(data)),
-                            omnesagent_infra::acp_session_store::AcpSessionRestore::Missing => {
-                                store_cloned.create_session_with_interaction_surface(
-                                    &sid,
-                                    &alias,
-                                    &cwd_owned,
-                                    resolved_interaction_surface.map(|surface| surface.as_str()),
-                                )?;
-                                Ok(AcpSessionNewLoad::Created)
-                            }
-                            omnesagent_infra::acp_session_store::AcpSessionRestore::Killed => {
-                                Ok(AcpSessionNewLoad::Killed)
-                            }
-                        }
-                    })
-                    .await
-                };
-                match loaded {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
-                        if data.agent_alias != req.agent_alias {
-                            if let Some(ref hooks) = self.ctx.hooks {
-                                hooks.fire_session_end(&session_id, "rpc").await;
-                            }
-                            self.ctx.sessions.remove(&session_id).await;
-                            return Err(rpc_err(
-                                INVALID_PARAMS,
-                                "ACP session belongs to a different agent",
-                            ));
-                        }
-                        message_count = data.messages.len();
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_conversation_history_with_event(&session_id, data.messages)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
-                        // Restore the durable TodoWrite plan into the fresh
-                        // in-memory session and re-emit it so the resuming /
-                        // reconnecting client's tracker repopulates without a
-                        // model round-trip. Robust against tmux detach, socket
-                        // drop, suspend/resume, and daemon restart.
-                        if let Some(ref store) = self.ctx.acp_session_store {
-                            let store = store.clone();
-                            let sid = session_id.clone();
-                            let plan = tokio::task::spawn_blocking(move || {
-                                store.get_plan(&sid).unwrap_or_default()
-                            })
-                            .await
-                            .unwrap_or_default();
-                            if !plan.is_empty() {
-                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
-                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
-                                    let _ = self.rpc.send_raw(n).await;
-                                }
-                            }
-                        }
-                    }
-                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
-                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                    }
-                    Ok(Err(e)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::omnesagent_log::record!(
-                            WARN,
-                            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
-                                .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
-                            "Failed to load or create ACP session"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to load or create ACP session: {e}"),
-                        ));
-                    }
-                    Err(join) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::omnesagent_log::record!(
-                            WARN,
-                            ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
-                                .with_outcome(::omnesagent_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
-                            "ACP session load task failed"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("ACP session load task failed: {join}"),
-                        ));
-                    }
-                }
-            }
-            crate::rpc::types::ChatMode::Chat => {
-                if let Some(ref backend) = self.ctx.session_backend {
-                    let session_key = format!("rpc_{session_id}");
-                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                    let stored = backend.load(&session_key);
-                    if !stored.is_empty() {
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_history_with_event(&session_id, &stored)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
-                        message_count = stored.len();
-                    }
-                }
             }
         }
 
@@ -2226,7 +2291,7 @@ impl RpcDispatcher {
         );
 
         // Capture live attribution fields and max_context_tokens for the turn span.
-        // Zerocode's context meter field is named `max_context_tokens` and must
+        // Omnescode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
         // max_context_tokens`), not the provider model-window helper (which
         // falls back to 32_000 when `context_window` is unset).
@@ -2627,6 +2692,7 @@ impl RpcDispatcher {
                     model_provider_name,
                     model_name,
                     tool_dispatcher,
+                    config.multimodal.clone(),
                 )
             };
             Some(built)
@@ -2641,19 +2707,27 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        if let Some((model_provider, model_provider_name, model_name, tool_dispatcher)) =
-            built_model_provider
+        if let Some((
+            model_provider,
+            model_provider_name,
+            model_name,
+            tool_dispatcher,
+            multimodal_config,
+        )) = built_model_provider
         {
             self.ctx
                 .sessions
                 .apply_model_provider(
                     &req.session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    tool_dispatcher,
-                    None,
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        tool_dispatcher,
+                        temperature: None,
+                        multimodal_config,
+                    },
                 )
                 .await
                 .then_some(())
@@ -3473,7 +3547,14 @@ impl RpcDispatcher {
                 continue;
             };
 
-            let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
+            let (
+                model_provider,
+                model_provider_name,
+                model_name,
+                tool_dispatcher,
+                temperature,
+                multimodal_config,
+            ) = {
                 let config = ctx.config.read();
                 let Some(model_provider_ref) =
                     resolve_provider_ref(&config, &agent_alias, &overrides)
@@ -3523,6 +3604,7 @@ impl RpcDispatcher {
                             model_name,
                             tool_dispatcher,
                             overrides.temperature.or(provider_temperature),
+                            config.multimodal.clone(),
                         )
                     }
                     Err(e) => {
@@ -3549,11 +3631,14 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    tool_dispatcher,
-                    Some(temperature),
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        tool_dispatcher,
+                        temperature: Some(temperature),
+                        multimodal_config,
+                    },
                 )
                 .await;
         }
@@ -5316,7 +5401,7 @@ fn truncate_memory_previews(
     entries
 }
 
-/// Resolve the max-token ceiling shown on Zerocode's context usage meter.
+/// Resolve the max-token ceiling shown on Omnescode's context usage meter.
 ///
 /// The wire field is named `max_context_tokens` and must track the operator's
 /// runtime-profile budget (`[runtime_profiles.<name>] max_context_tokens`),
@@ -5469,6 +5554,16 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => SessionUpdateEvent::BudgetWarning {
+            session_id: session_id.to_string(),
+            current_usd: *current_usd,
+            limit_usd: *limit_usd,
+            period: *period,
+        },
         TurnEvent::TrajectoryStep { .. }
         | TurnEvent::ContextBudgetUpdate { .. }
         | TurnEvent::GroundingCitation { .. } => return None,
@@ -5518,7 +5613,7 @@ mod tests {
     fn agent_alias_from_model_provider_prop_matches_only_the_bound_provider_field() {
         // The config pane and other `config/set agents.<alias>.model_provider`
         // callers write this path; it must map back to the alias so the live
-        // session refresh fires. The zerocode picker takes the `session/configure`
+        // session refresh fires. The omnescode picker takes the `session/configure`
         // path instead and is not a caller here.
         assert_eq!(
             agent_alias_from_model_provider_prop("agents.fred.model_provider"),
@@ -5604,7 +5699,7 @@ mod tests {
     #[test]
     fn session_initializes_mcp_for_chat_but_not_acp() {
         use crate::rpc::types::ChatMode;
-        // Chat sessions must initialize MCP so the Zerocode TUI sees the same
+        // Chat sessions must initialize MCP so the Omnescode TUI sees the same
         // MCP tools (and the deferred-loading `tool_search`) the gateway
         // already exposes for the agent
         assert!(
@@ -6225,7 +6320,7 @@ mod tests {
     }
 
     // The `sops/trigger-sources` RPC response must carry the full
-    // ordered `SopTriggerSource` walk so authoring surfaces (web + zerocode)
+    // ordered `SopTriggerSource` walk so authoring surfaces (web + omnescode)
     // render the picker from the backend list instead of reconstructing it.
     // Any new trigger source variant appears here automatically; a surface that
     // reconstructs its own list would drift while this guard would not, so the
@@ -8040,6 +8135,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_warning_notification() {
+        let event = TurnEvent::BudgetWarning {
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: omnesagent_api::agent::BudgetWarningPeriod::Day,
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "budget_warning");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["current_usd"], 8.25);
+        assert_eq!(v["params"]["limit_usd"], 10.0);
+        assert_eq!(v["params"]["period"], "day");
+    }
+
+    #[test]
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
@@ -8076,7 +8188,7 @@ mod tests {
         assert_eq!(v["params"]["max_context_tokens"], 32_000);
     }
 
-    /// Regression: Zerocode's context meter must read the runtime-profile
+    /// Regression: Omnescode's context meter must read the runtime-profile
     /// `max_context_tokens` budget, not the provider model-window helper.
     /// The model-window path falls back to 32_000 when `context_window` is
     /// unset, which made the meter ignore a profile set to e.g. 128_000.
@@ -8484,7 +8596,16 @@ mod tests {
         );
 
         let mut risk_profiles = HashMap::new();
-        risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
+        // `session/new` confines a caller-supplied cwd to the agent's allowlist;
+        // the temp install root is this test's sandbox, so grant it as an
+        // allowed root.
+        risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                allowed_roots: vec![tmp.path().to_string_lossy().into_owned()],
+                ..RiskProfileConfig::default()
+            },
+        );
 
         omnesagent_config::schema::Config {
             data_dir: workspace_dir,
@@ -9140,7 +9261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zerocode_code_surface_injects_context_without_changing_authority() {
+    async fn omnescode_code_surface_injects_context_without_changing_authority() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -9159,14 +9280,14 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
-                "session_id": "zerocode-acp",
+                "interaction_surface": "omnescode_code",
+                "session_id": "omnescode-acp",
             }))
             .await
-            .expect("ZeroCode ACP session should succeed");
+            .expect("OmnesCode ACP session should succeed");
 
         let generic = sessions.get_agent("generic-acp").await.unwrap();
-        let surfaced = sessions.get_agent("zerocode-acp").await.unwrap();
+        let surfaced = sessions.get_agent("omnescode-acp").await.unwrap();
         let mut generic_tools = generic
             .lock()
             .await
@@ -9189,18 +9310,18 @@ mod tests {
 
         let prompt = surfaced_guard.system_prompt_for_test().unwrap();
         assert!(prompt.contains("## Interaction Context"));
-        assert!(prompt.contains("Surface: ZeroCode Code (ACP)"));
+        assert!(prompt.contains("Surface: OmnesCode Code (ACP)"));
         assert!(prompt.contains("this description grants no capabilities"));
         drop(surfaced_guard);
 
         assert_eq!(
             acp_store
-                .load_session("zerocode-acp")
+                .load_session("omnescode-acp")
                 .unwrap()
                 .unwrap()
                 .interaction_surface
                 .as_deref(),
-            Some("zerocode_code")
+            Some("omnescode_code")
         );
     }
 
@@ -9216,7 +9337,7 @@ mod tests {
             json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "chat",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "wrong-mode",
             }),
             json!({
@@ -9239,7 +9360,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "interaction_context": {
                     "prompt": "CLIENT_AUTHORED_PROMPT_MUST_NOT_APPEAR",
                     "tools": "grant_everything"
@@ -9266,7 +9387,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "surface-resume",
             }))
             .await
@@ -9288,7 +9409,7 @@ mod tests {
                 .await
                 .system_prompt_for_test()
                 .unwrap()
-                .contains("Surface: ZeroCode Code (ACP)")
+                .contains("Surface: OmnesCode Code (ACP)")
         );
         assert!(sessions.remove("surface-resume").await);
 
@@ -9304,7 +9425,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "surface-mismatch",
             }))
             .await
@@ -9329,7 +9450,7 @@ mod tests {
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
-                "interaction_surface": "zerocode_code",
+                "interaction_surface": "omnescode_code",
                 "session_id": "legacy-surface",
             }))
             .await
@@ -9341,7 +9462,7 @@ mod tests {
                 .unwrap()
                 .interaction_surface
                 .as_deref(),
-            Some("zerocode_code")
+            Some("omnescode_code")
         );
     }
 
@@ -9799,6 +9920,7 @@ mod tests {
         let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
             durable.clone(),
             2,
+            crate::agent::history_trim::history_trim_target(2, 1.0),
             false,
         );
         assert!(active.trimmed);
@@ -10129,6 +10251,50 @@ mod tests {
         assert_eq!(
             resumed["workspace_dir"], original_cwd,
             "resume must keep the retained session's cwd, not default it"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_cwd_outside_agent_allowlist() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // A directory outside every allowlisted root (and outside the per-agent
+        // workspace) must be refused: a caller-supplied cwd becomes the session's
+        // SecurityPolicy workspace root, so accepting it would re-root the
+        // agent's sandbox on demand.
+        let outside = tempfile::TempDir::new().unwrap();
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "cwd": outside.path().to_string_lossy(),
+            }))
+            .await
+            .expect_err("cwd outside the allowlist must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("allowlist"),
+            "rejection must name the allowlist: {}",
+            err.message
+        );
+
+        // The same agent still accepts a cwd inside its allowlisted temp root.
+        let allowed = tmp.path().join("project-dir");
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "cwd": allowed.to_string_lossy(),
+            }))
+            .await
+            .expect("allowlisted cwd must be accepted");
+        assert_eq!(
+            created["workspace_dir"],
+            allowed.to_string_lossy().to_string()
         );
     }
 
@@ -11261,9 +11427,16 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        config
-            .risk_profiles
-            .insert("test-profile".into(), RiskProfileConfig::default());
+        // `session/new` confines a caller-supplied cwd to the agent's allowlist;
+        // the temp install root is this test's sandbox, so grant it as an
+        // allowed root.
+        config.risk_profiles.insert(
+            "test-profile".into(),
+            RiskProfileConfig {
+                allowed_roots: vec![tmp.path().to_string_lossy().into_owned()],
+                ..RiskProfileConfig::default()
+            },
+        );
         config
             .runtime_profiles
             .insert("default".into(), Default::default());
@@ -11665,6 +11838,193 @@ mod tests {
             omnesagent_providers::ConversationMessage::Chat(chat)
                 if chat.content == "new assistant"
         )));
+    }
+
+    #[tokio::test]
+    async fn existing_session_uses_reloaded_history_trim_low_water() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            omnesagent_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(4),
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .runtime_profiles
+            .get_mut("reloadable")
+            .expect("runtime profile exists")
+            .history_trim_low_water = Some(1.0);
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("middle user"),
+            ChatMessage::assistant("middle answer"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new answer"),
+        ]);
+
+        let Some(TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            ..
+        }) = event
+        else {
+            panic!("an existing session must observe the reloaded low-water fraction");
+        };
+        assert_eq!(dropped_messages, 2, "legacy 1.0 refills to the cap of 4");
+        assert_eq!(kept_turns, 2, "legacy 1.0 retains the newest two turns");
+        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        let history = agent.history();
+        assert_eq!(
+            history.len(),
+            6,
+            "synthesized system prompt plus breadcrumb plus the retained body"
+        );
+        assert!(!history.iter().any(|message| matches!(
+            message,
+            omnesagent_providers::ConversationMessage::Chat(chat)
+                if chat.content == "old user" || chat.content == "old answer"
+        )));
+        for retained in ["middle user", "middle answer", "new user", "new answer"] {
+            assert!(
+                history.iter().any(|message| matches!(
+                    message,
+                    omnesagent_providers::ConversationMessage::Chat(chat)
+                        if chat.content == retained
+                )),
+                "fraction 1.0 loaded after construction must retain {retained}"
+            );
+        }
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    omnesagent_providers::ConversationMessage::Chat(chat)
+                        if chat.role == "user" && chat.content == breadcrumb
+                ))
+                .count(),
+            1,
+            "exactly one synthetic breadcrumb accompanies the retained turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_persists_history_trim_low_water_and_trims_existing_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .runtime_profile = "reloadable".into();
+        config.runtime_profiles.insert(
+            "reloadable".into(),
+            omnesagent_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(4),
+                history_trim_low_water: None,
+                ..Default::default()
+            },
+        );
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let set = dispatcher
+            .handle_config_set(&serde_json::json!({
+                "prop": "runtime_profiles.reloadable.history_trim_low_water",
+                "value": 1.0
+            }))
+            .await;
+        assert!(
+            set.is_ok(),
+            "config/set must accept the low-water fraction: {set:?}"
+        );
+
+        let config_path = tmp.path().join("config.toml");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: omnesagent_config::schema::Config = toml::from_str(&disk)
+            .unwrap_or_else(|e| panic!("config must reload after the fraction write: {e}\n{disk}"));
+        assert_eq!(
+            reloaded
+                .runtime_profiles
+                .get("reloadable")
+                .and_then(|profile| profile.history_trim_low_water),
+            Some(1.0),
+            "the RPC write must persist the exact fraction to disk"
+        );
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let mut agent = agent.lock().await;
+        let event = agent.seed_history_with_event(&[
+            ChatMessage::user("old user"),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("middle user"),
+            ChatMessage::assistant("middle answer"),
+            ChatMessage::user("new user"),
+            ChatMessage::assistant("new answer"),
+        ]);
+
+        let Some(TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            ..
+        }) = event
+        else {
+            panic!("an existing session must observe the persisted low-water fraction");
+        };
+        assert_eq!(
+            dropped_messages, 2,
+            "fraction 1.0 written via config/set refills to the cap of 4"
+        );
+        assert_eq!(kept_turns, 2, "fraction 1.0 retains the newest two turns");
+        let history = agent.history();
+        assert_eq!(
+            history.len(),
+            6,
+            "synthesized system prompt plus breadcrumb plus the retained body"
+        );
+        assert!(!history.iter().any(|message| matches!(
+            message,
+            omnesagent_providers::ConversationMessage::Chat(chat)
+                if chat.content == "old user" || chat.content == "old answer"
+        )));
+        for retained in ["middle user", "middle answer", "new user", "new answer"] {
+            assert!(
+                history.iter().any(|message| matches!(
+                    message,
+                    omnesagent_providers::ConversationMessage::Chat(chat)
+                        if chat.content == retained
+                )),
+                "fraction 1.0 persisted via config/set must retain {retained}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12391,6 +12751,29 @@ mod tests {
             .expect("session/new should not exhaust a two-megabyte stack");
     }
 
+    /// `process_line`'s exhaustive `match` sizes its generated state machine
+    /// to the largest inline-awaited branch, regardless of which arm a given
+    /// call actually takes — so a large future added to any one method can
+    /// blow the constrained-stack regression above even though that method
+    /// has nothing to do with `session/new`. Catch a regrowth here on every
+    /// platform instead of only on the Windows-only advisory job where the
+    /// stack overflow actually reproduces. The threshold is a generous
+    /// multiple of the current heap-pinned baseline (a few KB), not a tight
+    /// bound: the intent is to catch a new multi-hundred-KB branch, not to
+    /// force every incidental size change through this test.
+    #[test]
+    fn process_line_future_stays_small_enough_for_a_two_megabyte_stack() {
+        let tmp = tempfile::TempDir::new().expect("temporary test directory");
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, _sessions, _rx) = make_acp_test_dispatcher_with_receiver(config);
+        let fut = dispatcher.process_line("{}");
+        let size = std::mem::size_of_val(&fut);
+        assert!(
+            size < 32 * 1024,
+            "process_line's future grew to {size} bytes; a new or changed handler is now              inlined into this match without Box::pin, which can overflow the 2MB Windows              thread stack this exists to protect (see              process_line_session_new_creates_session_on_two_megabyte_stack). Box::pin the              large new branch the same way ConfigSet, QuickstartApply, and the other handlers              above are"
+        );
+    }
+
     #[tokio::test]
     async fn process_line_routes_success_response_to_pending_caller() {
         let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
@@ -12513,8 +12896,8 @@ mod tests {
     #[tokio::test]
     async fn process_line_drops_malformed_response_frames_without_reply() {
         let invalid_responses = [
-            r#"{"id":"zc-out-0","result":true}"#,
-            r#"{"jsonrpc":"1.0","id":"zc-out-0","result":true}"#,
+            r#"{"id":"oc-out-0","result":true}"#,
+            r#"{"jsonrpc":"1.0","id":"oc-out-0","result":true}"#,
             r#"{"jsonrpc":"2.0","result":true}"#,
             r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,
             r#"{"jsonrpc":"2.0","id":null,"result":true,"error":{"code":-1,"message":"bad"}}"#,
@@ -12637,8 +13020,8 @@ mod tests {
     #[test]
     fn response_id_key_accepts_string_and_numeric_ids() {
         assert_eq!(
-            response_id_key(&json!("zc-out-1")).as_deref(),
-            Some("zc-out-1")
+            response_id_key(&json!("oc-out-1")).as_deref(),
+            Some("oc-out-1")
         );
         assert_eq!(response_id_key(&json!(42)).as_deref(), Some("42"));
         assert_eq!(response_id_key(&Value::Null), None);
@@ -13479,6 +13862,317 @@ mod tests {
             Some("chat-era-turn"),
             "an ACP turn must not stamp its own turn id onto the retained Chat row"
         );
+    }
+
+    // ── upstream #10775: a failed mode replacement preserves the live session ──
+
+    #[tokio::test]
+    async fn session_mode_replacement_construction_failure_preserves_both_modes() {
+        for (original_mode, target_mode) in [("chat", "acp"), ("acp", "chat")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "failed-mode-replacement";
+            let original_params = json!({
+                "agent_alias": "test-agent", "chat_mode": original_mode,
+                "session_id": sid, "keep_siblings": true,
+            });
+            dispatcher
+                .handle_session_new(&original_params)
+                .await
+                .unwrap();
+            let original = sessions.get_agent(sid).await.unwrap();
+            let generation = sessions.get_generation(sid).await.unwrap();
+            let history = vec![omnesagent_api::model_provider::ChatMessage::assistant(
+                "retained live history",
+            )];
+            sessions.seed_history(sid, &history).await;
+            let original_history = serde_json::to_value(original.lock().await.history()).unwrap();
+            chat_backend
+                .append(
+                    &format!("rpc_{sid}"),
+                    &omnesagent_api::model_provider::ChatMessage::assistant("durable Chat history"),
+                )
+                .unwrap();
+            if original_mode == "chat" {
+                acp_store
+                    .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+                    .unwrap();
+            }
+            acp_store
+                .append_turn(
+                    sid,
+                    &[omnesagent_api::model_provider::ConversationMessage::Chat(
+                        omnesagent_api::model_provider::ChatMessage::assistant("durable ACP history"),
+                    )],
+                )
+                .unwrap();
+            let chat_before = chat_backend.load(&format!("rpc_{sid}"));
+            let acp_before = acp_store.load_session(sid).unwrap();
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .agents
+                .get_mut("test-agent")
+                .unwrap()
+                .model_provider = "openai.missing-profile".into();
+            let failure = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": target_mode,
+                    "session_id": sid,
+                }))
+                .await
+                .unwrap_err();
+            assert!(failure.message.contains("Failed to create agent"));
+            assert!(Arc::ptr_eq(
+                &original,
+                &sessions.get_agent(sid).await.unwrap()
+            ));
+            assert_eq!(sessions.get_generation(sid).await, Some(generation));
+            assert_eq!(
+                serde_json::to_value(original.lock().await.history()).unwrap(),
+                original_history
+            );
+            assert_eq!(
+                serde_json::to_value(chat_backend.load(&format!("rpc_{sid}"))).unwrap(),
+                serde_json::to_value(chat_before).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    acp_store
+                        .load_session(sid)
+                        .unwrap()
+                        .map(|data| data.messages)
+                )
+                .unwrap(),
+                serde_json::to_value(acp_before.map(|data| data.messages)).unwrap()
+            );
+            // Recovery: with a valid profile again the same-ID new succeeds. Our
+            // fork has no same-mode adoption (resume_existing), so a legitimate
+            // re-create replaces the incarnation (generation + 1) instead of
+            // preserving it like upstream.
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .agents
+                .get_mut("test-agent")
+                .unwrap()
+                .model_provider = "openai.test-provider".into();
+            dispatcher
+                .handle_session_new(&original_params)
+                .await
+                .unwrap();
+            assert_eq!(sessions.get_generation(sid).await, Some(generation + 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_store_failure_preserves_usable_original() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "test-peer".into());
+        let sid = "late-failed-mode-replacement";
+        let mut agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(omnesagent_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        agent.seed_history(&[omnesagent_api::model_provider::ChatMessage::assistant(
+            "original conversation",
+        )]);
+        sessions
+            .insert(
+                sid.into(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let original = sessions.get_agent(sid).await.unwrap();
+        let generation = sessions.get_generation(sid).await;
+        let before = serde_json::to_value(original.lock().await.history()).unwrap();
+
+        // The candidate Agent builds successfully, then ACP store lookup fails.
+        let error = dispatcher
+            .handle_session_new(&json!({
+                "agent_alias": "test-agent", "chat_mode": "acp", "session_id": sid,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "ACP session store is not available");
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent(sid).await.unwrap()
+        ));
+        assert_eq!(sessions.get_generation(sid).await, generation);
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        );
+        assert_eq!(
+            serde_json::to_value(original.lock().await.history()).unwrap(),
+            before
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failure must not emit replacement notifications"
+        );
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid, "prompt": "continue original conversation",
+            }))
+            .await
+            .expect("the original Agent must still serve the next turn");
+        assert_eq!(result["content"], "ok");
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent(sid).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_preserves_fresh_capacity_rejection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            1,
+            Arc::new(omnesagent_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let chat_backend = Arc::new(
+            omnesagent_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(omnesagent_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(
+                chat_backend.clone()
+                    as Arc<dyn omnesagent_infra::session_backend::SessionBackend>,
+            ),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher
+            .handle_session_new(&json!({
+                "agent_alias": "test-agent", "session_id": "occupant", "chat_mode": "chat",
+            }))
+            .await
+            .unwrap();
+        let original = sessions.get_agent("occupant").await.unwrap();
+        let generation = sessions.get_generation("occupant").await;
+        for mode in ["chat", "acp"] {
+            let sid = format!("rejected-{mode}");
+            let error = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "session_id": sid, "chat_mode": mode,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, SESSION_LIMIT_REACHED);
+            assert!(sessions.get_agent(&sid).await.is_none());
+            assert!(acp_store.load_session(&sid).unwrap().is_none());
+            assert!(
+                !chat_backend
+                    .list_sessions_with_metadata()
+                    .iter()
+                    .any(|row| row.key == format!("rpc_{sid}"))
+            );
+            assert!(Arc::ptr_eq(
+                &original,
+                &sessions.get_agent("occupant").await.unwrap()
+            ));
+            assert_eq!(sessions.get_generation("occupant").await, generation);
+            let error = dispatcher
+                .handle_session_prompt(&json!({
+                    "session_id": sid, "prompt": "must not rehydrate",
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, SESSION_NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_success_restores_target_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "successful-mode-replacement";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[omnesagent_api::model_provider::ConversationMessage::Chat(
+                    omnesagent_api::model_provider::ChatMessage::assistant("ACP history"),
+                )],
+            )
+            .unwrap();
+        let plan = vec![omnesagent_api::plan::PlanEntry {
+            content: "Retained ACP plan".into(),
+            status: omnesagent_api::plan::PlanStatus::InProgress,
+            priority: omnesagent_api::plan::PlanPriority::High,
+            active_form: None,
+        }];
+        acp_store.set_plan(sid, &plan).unwrap();
+        chat_backend
+            .append(
+                &format!("rpc_{sid}"),
+                &omnesagent_api::model_provider::ChatMessage::assistant("Chat history"),
+            )
+            .unwrap();
+        let mut previous = None;
+        for (mode, expected_history) in [
+            ("chat", "Chat history"),
+            ("acp", "ACP history"),
+            ("chat", "Chat history"),
+        ] {
+            let result = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": mode, "session_id": sid,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result["message_count"], 1);
+            let current = sessions.get_agent(sid).await.unwrap();
+            let generation = sessions.get_generation(sid).await.unwrap();
+            if let Some((old_agent, old_generation)) = previous.take() {
+                assert!(!Arc::ptr_eq(&old_agent, &current));
+                assert_eq!(generation, old_generation + 1);
+            }
+            assert!(current.lock().await.history().iter().any(|message| matches!(message,
+                omnesagent_api::model_provider::ConversationMessage::Chat(chat) if chat.content == expected_history)));
+            assert_eq!(
+                sessions.get_plan(sid).await.unwrap().len(),
+                usize::from(mode == "acp")
+            );
+            assert_eq!(sessions.count().await, 1);
+            previous = Some((current, generation));
+        }
     }
 
     #[tokio::test]

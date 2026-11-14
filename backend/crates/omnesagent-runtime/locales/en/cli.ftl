@@ -742,6 +742,11 @@ cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
+cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
+cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
+cli-security-firejail-args-error-not-option = firejail_args rejected: {$arg} is not a Firejail option; write each option as one `--option` or `--option=value` entry
+cli-security-firejail-args-error-conflict = firejail_args rejected: {$name} conflicts with the options OmnesAgent's Firejail wrapper sets
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
@@ -796,6 +801,7 @@ cli-status-max-cost-day = {"  "}Max cost/day:      ${$v}
 cli-status-max-cost-month = {"  "}Max cost/month:    ${$v}
 cli-status-spent-today = {"  "}Spent today:       ${$spent} / ${$limit}
 cli-status-spent-month = {"  "}Spent this month:  ${$spent} / ${$limit}
+cli-status-pricing-unavailable = {"  "}⚠ Pricing unavailable for {$count} model(s) ({$tokens} tokens uncosted): {$models}. Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. Add pricing to the active provider profile or supply a catalog entry.
 cli-status-otp = {"  "}OTP enabled:       {$v}
 cli-status-estop = {"  "}E-stop enabled:    {$v}
 cli-status-peripherals-enabled = {"  "}Enabled:   {$v}
@@ -939,11 +945,15 @@ turn-stream-interrupted = [stream interrupted]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn
-# surfaces (WS, RPC/ZeroCode, ACP).
+# surfaces (WS, RPC/OmnesCode, ACP).
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
+# Safe terminal reply when the complete provider-facing request cannot fit the
+# active model's context window. Carries no numbers: the operator-facing
+# breakdown of what filled the window is logged alongside it.
+turn-context-window-exceeded-error = This request exceeds the selected model's context window. Reduce the request or enabled tools, or choose a model with a larger context window.
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
@@ -962,6 +972,14 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+# Safe reply delivered when the streaming protocol guard withheld the same
+# response text on two attempts that were both rejected as tool-protocol
+# parse issues (a recovered valid tool call is not stopped this way):
+# retrying cannot recover the withheld envelope, so the turn ends instead of
+# spending another model call. Prose released ahead of the envelope may
+# already have reached the user, so the text claims nothing about the rest
+# of the reply.
+cli-agent-error-protocol-guard-withheld = I withheld the tool-protocol-shaped part of this reply, and a retry produced the same text.
 channel-runtime-progress-received = Received
 channel-runtime-progress-planning = Planning
 channel-runtime-progress-waiting-on-model = Waiting on model
@@ -1113,12 +1131,12 @@ cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
 cli-mtls-issued-ca-path = {"  "}CA:   {$path}
 cli-mtls-dropin-line-1 = Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /
-cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and zerocode finds
+cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and omnescode finds
 cli-mtls-dropin-line-3 = {"  "}the material automatically - no --tls-* flags needed.
 cli-mtls-relay-connect-header = Reach this daemon THROUGH its configured relay:
 cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca is the RELAY's CA - copy it from the relay to the client;
 cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert is the DAEMON's CA, already in the bundle.)
-cli-mtls-direct-connect-header = Connect with zerocode (direct):
+cli-mtls-direct-connect-header = Connect with omnescode (direct):
 cli-mtls-revoked-certificate = Revoked certificate {$fingerprint}.
 cli-mtls-revoke-no-active-fingerprint = No active certificate with fingerprint {$fingerprint} (already revoked or never issued).
 cli-mtls-revoked-device-certs = Revoked {$count} active certificate(s) for device '{$device}'.
@@ -1228,3 +1246,5 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+skill-http-request-timeout = HTTP request timed out
+tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.

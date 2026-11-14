@@ -690,11 +690,16 @@ pub async fn run(
                 }
             });
         }
-        let session_backend = omnesagent_infra::make_session_backend(
-            &config.data_dir,
-            &config.channels.session_backend,
+        let session_backend = open_rpc_session_backend(
+            || {
+                omnesagent_infra::make_session_backend(
+                    &config.data_dir,
+                    &config.channels.session_backend,
+                )
+            },
+            RPC_SESSION_STORE_RETRY_DELAY,
         )
-        .ok();
+        .await;
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
@@ -785,7 +790,7 @@ pub async fn run(
             session_backend,
             memory: rpc_memory,
             // Process-global tracker shared with the gateway and channel
-            // supervisor. Without this the RPC/zerocode-TUI turn path has no
+            // supervisor. Without this the RPC/omnescode-TUI turn path has no
             // tracker to record into and model cost is silently dropped
             cost_tracker: crate::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
@@ -1238,6 +1243,53 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
             let _ = tokio::fs::write(&path, data).await;
         }
     })
+}
+
+/// Pause before the RPC plane's one retry of a failed session-store open.
+const RPC_SESSION_STORE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Open the RPC plane's session store, retrying once.
+///
+/// Every `session/*` RPC method refuses without the store, so a failed open
+/// is reported at ERROR instead of being dropped, and retried once in case
+/// another component was creating the same fresh database at that moment.
+async fn open_rpc_session_backend<T>(
+    mut open: impl FnMut() -> std::io::Result<T>,
+    retry_delay: Duration,
+) -> Option<T> {
+    let first = match open() {
+        Ok(backend) => return Some(backend),
+        Err(error) => error,
+    };
+    ::omnesagent_log::record!(
+        ERROR,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({ "error": format!("{first:#}") })),
+        "RPC session store failed to open; retrying once"
+    );
+    tokio::time::sleep(retry_delay).await;
+    match open() {
+        Ok(backend) => {
+            ::omnesagent_log::record!(
+                INFO,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note)
+                    .with_outcome(::omnesagent_log::EventOutcome::Success),
+                "RPC session store opened on retry"
+            );
+            Some(backend)
+        }
+        Err(error) => {
+            ::omnesagent_log::record!(
+                ERROR,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Fail)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{error:#}") })),
+                "RPC session store unavailable after a retry; session RPC methods will refuse until the daemon restarts"
+            );
+            None
+        }
+    }
 }
 
 fn spawn_component_supervisor<F, Fut>(
@@ -2585,6 +2637,39 @@ mod tests {
     use tempfile::TempDir;
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn rpc_session_store_open_is_retried_once_after_a_failure() {
+        let mut calls = 0;
+        let opened = open_rpc_session_backend(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(std::io::Error::other("database is locked"))
+                } else {
+                    Ok(calls)
+                }
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, Some(2));
+    }
+
+    #[tokio::test]
+    async fn rpc_session_store_open_gives_up_after_one_retry() {
+        let mut calls = 0;
+        let opened: Option<()> = open_rpc_session_backend(
+            || {
+                calls += 1;
+                Err(std::io::Error::other("unable to open database file"))
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(opened, None);
+        assert_eq!(calls, 2);
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {

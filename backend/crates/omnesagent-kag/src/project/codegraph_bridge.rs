@@ -148,7 +148,7 @@ pub fn sync_codegraph_db(
     let mut cg_id_to_pk: HashMap<String, i64> = HashMap::with_capacity(cg_nodes.len());
 
     {
-        let mut insert_node_stmt = tx.prepare(
+        let mut insert_node_stmt = tx.prepare_cached(
             r#"
             INSERT INTO graph_nodes (
                 node_id, label, node_type, description, project_id, file_path,
@@ -209,7 +209,7 @@ pub fn sync_codegraph_db(
     // 4. Сохраняем связи в graph_edges
     let mut edges_inserted = 0;
     {
-        let mut insert_edge_stmt = tx.prepare(
+        let mut insert_edge_stmt = tx.prepare_cached(
             r#"
             INSERT INTO graph_edges (
                 source_id, target_id, label, weight, contexts,

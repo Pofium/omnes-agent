@@ -54,7 +54,7 @@ hex = "0.4"
 webpki-roots = "0.26"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 # Client-side enrollment uses local P-256 CSR generation and relay wire helpers
-# so zerocode remains an RPC-only surface and does not link omnesagent-* crates.
+# so omnescode remains an RPC-only surface and does not link omnesagent-* crates.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
 # Wipe the in-memory client private key on drop (it is generated locally, written
 # 0600, and never transmitted).

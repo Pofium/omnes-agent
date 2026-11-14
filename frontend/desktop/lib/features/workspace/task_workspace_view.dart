@@ -2,12 +2,15 @@
 // Features Git Tools status card popover, bottom terminal toggle, multi-project breadcrumbs,
 // git diff chips, and localized Russian assistant prompts.
 
+import 'dart:io';
+
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import 'package:omnes_shared/omnes_shared.dart';
+import 'package:path/path.dart' as p;
 
 import '../../theme/desktop_theme.dart';
 import '../../utils/desktop_backend_manager.dart';
@@ -2059,6 +2062,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
               ),
             ),
 
+          // 1.9 Image attachment previews (thumbnails before sending)
+          _buildImageAttachmentPreviews(),
+
           // 2. Attachment chips if any
           Obx(() {
             if (widget.controller.attachments.isEmpty) return const SizedBox.shrink();
@@ -2109,6 +2115,9 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
           // 2.1 Pending Queued Prompt Bar if any
           _buildQueuedPromptBar(),
 
+          // 2.2 Slash-command suggestion menu
+          _buildSlashCommandMenu(),
+
           // 3. Multi-line Input field
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -2118,7 +2127,15 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
                     (event.logicalKey == LogicalKeyboardKey.enter ||
                      event.logicalKey == LogicalKeyboardKey.numpadEnter) &&
                     !HardwareKeyboard.instance.isShiftPressed) {
-                  widget.controller.sendMessage();
+                  // While the slash-command menu is open, Enter applies the
+                  // top match instead of sending the literal text.
+                  final query = slashCommandQuery(widget.controller.inputController.text);
+                  final matches = query == null ? const <SlashCommand>[] : matchSlashCommands(query);
+                  if (matches.isNotEmpty) {
+                    widget.controller.applySlashCommand(matches.first);
+                  } else {
+                    widget.controller.sendMessage();
+                  }
                   return KeyEventResult.handled;
                 }
                 return KeyEventResult.ignored;
@@ -2307,12 +2324,71 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            _buildBudgetWarningBanner(),
             _buildApprovalsBanner(),
             _buildComposerCard(isHero: false),
           ],
         ),
       ),
     );
+  }
+
+  /// §8.1.1 (#11692): the gateway latches at most one `budget_warning` per turn
+  /// when recorded spend crosses `cost.warn_at_percent`. Shown as a passive
+  /// amber banner above the composer (no action required — the turn keeps
+  /// running); cleared when a new turn starts.
+  Widget _buildBudgetWarningBanner() {
+    return Obx(() {
+      final warning = widget.controller.budgetWarning.value;
+      if (warning == null) return const SizedBox.shrink();
+
+      final isMonthly = warning.period == 'month';
+      final periodLabel = isMonthly
+          ? DesktopI18n.tr('месячный лимит', 'monthly limit')
+          : DesktopI18n.tr('дневной лимит', 'daily limit');
+      final percent = warning.limitUsd > 0
+          ? (warning.currentUsd / warning.limitUsd * 100).clamp(0, 999).toStringAsFixed(0)
+          : '—';
+
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          decoration: BoxDecoration(
+            color: DesktopTheme.statusWarning.withOpacity(0.10),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: DesktopTheme.statusWarning.withOpacity(0.6), width: 1.2),
+          ),
+          child: Row(
+            children: [
+              UiIcon('warning', size: 18, color: DesktopTheme.statusWarning),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text.rich(
+                  TextSpan(
+                    style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary),
+                    children: [
+                      TextSpan(
+                        text: DesktopI18n.tr('Предупреждение о бюджете: ', 'Budget warning: '),
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: DesktopTheme.statusWarning,
+                        ),
+                      ),
+                      TextSpan(
+                        text: '\$${warning.currentUsd.toStringAsFixed(2)} / '
+                            '\$${warning.limitUsd.toStringAsFixed(2)} '
+                            '($percent%) — $periodLabel',
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    });
   }
 
   Widget _buildApprovalsBanner() {
@@ -4938,6 +5014,123 @@ class _DesktopTaskWorkspaceViewState extends State<DesktopTaskWorkspaceView> {
         side: BorderSide(color: DesktopTheme.borderSubtle, width: 1),
       ),
       elevation: 8,
+    );
+  }
+
+  /// Thumbnails of the image attachments waiting to be sent, above the chips.
+  Widget _buildImageAttachmentPreviews() {
+    return Obx(() {
+      final images = widget.controller.attachments
+          .where((a) => imageAttachmentPath(a) != null)
+          .toList(growable: false);
+      if (images.isEmpty) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.only(left: 14, top: 10, right: 14),
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [for (final att in images) _buildImageThumbnail(att)],
+        ),
+      );
+    });
+  }
+
+  /// A single image thumbnail with a remove affordance.
+  Widget _buildImageThumbnail(String attachment) {
+    final raw = imageAttachmentPath(attachment) ?? '';
+    final projectRoot = widget.controller.activeProjectPath.value ?? '';
+    final abs = raw.isEmpty
+        ? ''
+        : (p.isAbsolute(raw) ? raw : p.join(projectRoot, raw));
+    return Stack(
+      children: [
+        Container(
+          width: 72,
+          height: 72,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: DesktopTheme.bgSurfaceElevated,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
+          ),
+          child: abs.isEmpty
+              ? Icon(Icons.image_outlined, size: 20, color: DesktopTheme.textMuted)
+              : Image.file(
+                  File(abs),
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) =>
+                      Icon(Icons.broken_image_outlined, size: 20, color: DesktopTheme.textMuted),
+                ),
+        ),
+        Positioned(
+          top: 2,
+          right: 2,
+          child: InkWell(
+            onTap: () {
+              final idx = widget.controller.attachments.indexOf(attachment);
+              if (idx >= 0) widget.controller.removeAttachment(idx);
+            },
+            child: Container(
+              padding: const EdgeInsets.all(2),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.55),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.close, size: 11, color: Colors.white),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Suggestion menu that opens while the user types a slash command.
+  Widget _buildSlashCommandMenu() {
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: widget.controller.inputController,
+      builder: (context, value, _) {
+        final query = slashCommandQuery(value.text);
+        if (query == null) return const SizedBox.shrink();
+        final matches = matchSlashCommands(query);
+        if (matches.isEmpty) return const SizedBox.shrink();
+        return Padding(
+          padding: const EdgeInsets.only(left: 14, top: 8, right: 14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final cmd in matches)
+                InkWell(
+                  onTap: () => widget.controller.applySlashCommand(cmd),
+                  borderRadius: BorderRadius.circular(6),
+                  child: Container(
+                    margin: const EdgeInsets.only(bottom: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                    decoration: BoxDecoration(
+                      color: DesktopTheme.bgSurfaceElevated,
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.35)),
+                    ),
+                    child: Row(
+                      children: [
+                        Text(
+                          cmd.usage,
+                          style: const TextStyle(fontSize: 12, fontFamily: 'Consolas', color: Color(0xFF00D2FF)),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            DesktopI18n.tr(cmd.ruDescription, cmd.enDescription),
+                            style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
     );
   }
 

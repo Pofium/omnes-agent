@@ -19,6 +19,7 @@ use omnesagent_api::jsonrpc::{
 };
 use omnesagent_api::model_provider::ConversationMessage;
 use omnesagent_api::plan::PlanEntry;
+use omnesagent_config::policy::SecurityPolicy;
 use omnesagent_config::schema::Config;
 use omnesagent_infra::acp_session_store::AcpSessionStore;
 use omnesagent_runtime::agent::agent::{Agent, TurnEvent};
@@ -756,6 +757,30 @@ impl AcpServer {
                 if canon == install_root {
                     config.agent_workspace_dir(&agent_alias)
                 } else {
+                    // Fork-gap guard (#8289): the caller-supplied cwd becomes
+                    // this session's SecurityPolicy workspace root, so an
+                    // unconfined value would let any ACP caller re-root the
+                    // agent's sandbox outside its configured scope. Confine it
+                    // to the agent's workspace allowlist — the per-agent
+                    // workspace plus its risk-profile `allowed_roots` and
+                    // cross-agent grants — and fail closed.
+                    let policy = SecurityPolicy::for_agent(&config, &agent_alias).map_err(|e| {
+                        RpcError {
+                            code: INTERNAL_ERROR,
+                            message: format!("Failed to create agent: {e}"),
+                            data: None,
+                        }
+                    })?;
+                    if !policy.is_resolved_path_allowed(&canon) {
+                        return Err(RpcError {
+                            code: INVALID_PARAMS,
+                            message: format!(
+                                "cwd is outside the agent workspace allowlist: {}",
+                                canon.display()
+                            ),
+                            data: None,
+                        });
+                    }
                     canon
                 }
             }
@@ -2527,6 +2552,22 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
                 }
             }),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            // Closed ACP union again: underscore-prefixed custom method,
+            // safe to ignore by strict ACP clients.
+            method: "_omnesagent/budget_warning",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "currentUsd": current_usd,
+                "limitUsd": limit_usd,
+                "period": period,
+            }),
+        },
         // ACP has no `session/update` shape for usage; the cost tracker records
         // it out-of-band. Keep this helper total even if a caller omits its
         // fast-path filter.
@@ -3148,6 +3189,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_new_rejects_cwd_outside_agent_allowlist() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = make_test_config(cwd.path());
+        // Pin the install root to the temp dir so `install_root_dir()` is a
+        // real, canonicalizable directory; `make_test_config` already grants it
+        // as an allowed root.
+        config.config_path = cwd.path().join("config.toml");
+        let server = AcpServer::new(config, AcpServerConfig::default());
+
+        // A directory outside every allowlisted root (and outside the per-agent
+        // workspace) must be refused: a caller-supplied cwd becomes the
+        // session's SecurityPolicy workspace root, so accepting it would
+        // re-root the agent's sandbox on demand.
+        let outside = tempfile::tempdir().unwrap();
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": outside.path().to_string_lossy(),
+                "agentAlias": "test-agent",
+            }))
+            .await
+            .expect_err("cwd outside the allowlist must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("allowlist"),
+            "rejection must name the allowlist: {}",
+            err.message
+        );
+
+        // The same agent still accepts a cwd inside its allowlisted temp root.
+        let allowed = cwd.path().join("project-dir");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": allowed.to_string_lossy(),
+                "agentAlias": "test-agent",
+            }))
+            .await
+            .expect("allowlisted cwd must be accepted");
+        let expected = std::fs::canonicalize(&allowed).unwrap();
+        assert_eq!(
+            result["workspaceDir"].as_str().unwrap(),
+            expected.to_string_lossy()
+        );
+    }
+
     /// Front-door proof for the CLI stdio surface. The tests above call
     /// `handle_session_new` directly; this one drives the real stdio serve loop
     /// (`serve_reader`, the exact framing loop `run()` uses for `omnesagent acp`)
@@ -3266,9 +3353,15 @@ mod tests {
             },
             ..Default::default()
         };
+        // `session/new` confines a caller-supplied cwd to the agent's workspace
+        // allowlist; the temp install root is this test's sandbox, so grant it
+        // as an allowed root.
         config.risk_profiles.insert(
             "default".to_string(),
-            omnesagent_config::schema::RiskProfileConfig::default(),
+            omnesagent_config::schema::RiskProfileConfig {
+                allowed_roots: vec![cwd.path().to_string_lossy().into_owned()],
+                ..omnesagent_config::schema::RiskProfileConfig::default()
+            },
         );
         config.runtime_profiles.insert(
             "default".to_string(),
@@ -3339,9 +3432,15 @@ mod tests {
             },
             ..Default::default()
         };
+        // `session/new` confines a caller-supplied cwd to the agent's workspace
+        // allowlist; the temp install root is this test's sandbox, so grant it
+        // as an allowed root.
         config.risk_profiles.insert(
             "default".to_string(),
-            omnesagent_config::schema::RiskProfileConfig::default(),
+            omnesagent_config::schema::RiskProfileConfig {
+                allowed_roots: vec![cwd.path().to_string_lossy().into_owned()],
+                ..omnesagent_config::schema::RiskProfileConfig::default()
+            },
         );
         config.agents.insert(
             "test-agent".to_string(),
@@ -3593,9 +3692,15 @@ mod tests {
             },
             ..Default::default()
         };
+        // `session/new` confines a caller-supplied cwd to the agent's workspace
+        // allowlist; the temp install root is this test's sandbox, so grant it
+        // as an allowed root.
         config.risk_profiles.insert(
             "default".to_string(),
-            omnesagent_config::schema::RiskProfileConfig::default(),
+            omnesagent_config::schema::RiskProfileConfig {
+                allowed_roots: vec![cwd.path().to_string_lossy().into_owned()],
+                ..omnesagent_config::schema::RiskProfileConfig::default()
+            },
         );
         config.runtime_profiles.insert(
             "default".to_string(),
@@ -3668,9 +3773,15 @@ mod tests {
             },
             ..Default::default()
         };
+        // `session/new` confines a caller-supplied cwd to the agent's workspace
+        // allowlist; the temp install root is this test's sandbox, so grant it
+        // as an allowed root.
         config.risk_profiles.insert(
             "default".to_string(),
-            omnesagent_config::schema::RiskProfileConfig::default(),
+            omnesagent_config::schema::RiskProfileConfig {
+                allowed_roots: vec![cwd.path().to_string_lossy().into_owned()],
+                ..omnesagent_config::schema::RiskProfileConfig::default()
+            },
         );
         config.runtime_profiles.insert(
             "default".to_string(),
@@ -3722,9 +3833,15 @@ mod tests {
             },
             ..Default::default()
         };
+        // `session/new` confines a caller-supplied cwd to the agent's workspace
+        // allowlist; the temp install root is this test's sandbox, so grant it
+        // as an allowed root.
         config.risk_profiles.insert(
             "default".to_string(),
-            omnesagent_config::schema::RiskProfileConfig::default(),
+            omnesagent_config::schema::RiskProfileConfig {
+                allowed_roots: vec![cwd.path().to_string_lossy().into_owned()],
+                ..omnesagent_config::schema::RiskProfileConfig::default()
+            },
         );
         config.runtime_profiles.insert(
             "default".to_string(),
@@ -5027,9 +5144,15 @@ mod tests {
                 },
             },
         );
+        // `session/new` confines a caller-supplied cwd to the agent's
+        // workspace allowlist; the temp install root is this suite's sandbox,
+        // so grant it as an allowed root.
         cfg.risk_profiles.insert(
             "default".to_string(),
-            omnesagent_config::schema::RiskProfileConfig::default(),
+            omnesagent_config::schema::RiskProfileConfig {
+                allowed_roots: vec![cwd.to_string_lossy().into_owned()],
+                ..omnesagent_config::schema::RiskProfileConfig::default()
+            },
         );
         cfg.runtime_profiles.insert(
             "default".to_string(),

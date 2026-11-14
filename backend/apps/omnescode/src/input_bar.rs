@@ -53,7 +53,7 @@ struct LocalCommandDescriptor {
     aliases: &'static [&'static str],
 }
 
-/// Commands whose identity and execution are owned entirely by ZeroCode.
+/// Commands whose identity and execution are owned entirely by OmnesCode.
 /// Shared command names and aliases are intentionally absent: the daemon
 /// supplies those from `omnesagent-commands` during the RPC handshake.
 const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
@@ -1229,14 +1229,14 @@ impl InputBarState {
                             }
                             self.file_explorer = None;
                             return InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-attached",
+                                "oc-input-attached",
                                 &[("label", &labels.join(", "))],
                             ));
                         }
                         Err(e) => {
                             self.file_explorer = None;
                             return InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-attach-error",
+                                "oc-input-attach-error",
                                 &[("error", &e.to_string())],
                             ));
                         }
@@ -1403,7 +1403,7 @@ impl InputBarState {
             let label = att.label();
             self.add_attachment(att);
             return InputBarAction::StatusMessage(crate::i18n::t_args(
-                "zc-input-attached",
+                "oc-input-attached",
                 &[("label", &label)],
             ));
         }
@@ -1564,12 +1564,12 @@ impl InputBarState {
                                 let label = att.label();
                                 self.add_attachment(att);
                                 InputBarAction::StatusMessage(crate::i18n::t_args(
-                                    "zc-input-attached",
+                                    "oc-input-attached",
                                     &[("label", &label)],
                                 ))
                             }
                             Err(e) => InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-attach-error",
+                                "oc-input-attach-error",
                                 &[("error", &e.to_string())],
                             )),
                         }
@@ -1579,7 +1579,7 @@ impl InputBarState {
                     let atts = &self.pending_attachments;
                     if atts.is_empty() {
                         InputBarAction::StatusMessage(crate::i18n::t(
-                            "zc-input-no-pending-attachments",
+                            "oc-input-no-pending-attachments",
                         ))
                     } else {
                         let i = idx.unwrap_or(atts.len() - 1);
@@ -1587,12 +1587,12 @@ impl InputBarState {
                             let name = atts[i].filename.clone();
                             self.remove_attachment(i);
                             InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-detached",
+                                "oc-input-detached",
                                 &[("name", &name)],
                             ))
                         } else {
                             InputBarAction::StatusMessage(crate::i18n::t_args(
-                                "zc-input-invalid-index",
+                                "oc-input-invalid-index",
                                 &[("index", &i.to_string())],
                             ))
                         }
@@ -1601,7 +1601,7 @@ impl InputBarState {
                 SlashCommand::ListAttachments => {
                     if self.pending_attachments.is_empty() {
                         InputBarAction::StatusMessage(crate::i18n::t(
-                            "zc-input-no-pending-attachments",
+                            "oc-input-no-pending-attachments",
                         ))
                     } else {
                         self.open_attachment_manager();
@@ -1675,7 +1675,7 @@ impl InputBarState {
                 let tmp_path = clipboard::clipboard_temp_path(ext);
                 if let Err(e) = std::fs::write(&tmp_path, &bytes) {
                     return InputBarAction::StatusMessage(crate::i18n::t_args(
-                        "zc-input-clipboard-error",
+                        "oc-input-clipboard-error",
                         &[("error", &e.to_string())],
                     ));
                 }
@@ -1686,14 +1686,14 @@ impl InputBarState {
                         self.clipboard_temps.push(tmp_path);
                         self.add_attachment(att);
                         InputBarAction::StatusMessage(crate::i18n::t_args(
-                            "zc-input-attached",
+                            "oc-input-attached",
                             &[("label", &label)],
                         ))
                     }
                     Err(e) => {
                         self.cleanup_report.merge(remove_clipboard_temp(&tmp_path));
                         InputBarAction::StatusMessage(crate::i18n::t_args(
-                            "zc-input-clipboard-error",
+                            "oc-input-clipboard-error",
                             &[("error", &e.to_string())],
                         ))
                     }
@@ -1755,7 +1755,7 @@ impl InputBarState {
                 let text = text.strip_suffix('\r').unwrap_or(text);
                 self.handle_paste(text)
             }
-            None => InputBarAction::StatusMessage(crate::i18n::t("zc-input-no-clipboard-image")),
+            None => InputBarAction::StatusMessage(crate::i18n::t("oc-input-no-clipboard-image")),
         }
     }
 
@@ -1912,7 +1912,7 @@ impl InputBarState {
                 (String::new(), theme::dim_style())
             } else {
                 (
-                    crate::i18n::t("zc-input-placeholder-chat"),
+                    crate::i18n::t("oc-input-placeholder-chat"),
                     theme::dim_style(),
                 )
             };
@@ -1996,12 +1996,12 @@ impl InputBarState {
         }
 
         let title = crate::i18n::t_args(
-            "zc-input-attachment-manager-title",
+            "oc-input-attachment-manager-title",
             &[("count", &self.pending_attachments.len().to_string())],
         );
         let (navigate_keys, remove_keys, close_keys) = attachment_manager_key_labels();
         let hint = crate::i18n::t_args(
-            "zc-input-attachment-manager-hint",
+            "oc-input-attachment-manager-hint",
             &[
                 ("navigate", &navigate_keys.join("/")),
                 ("remove", &remove_keys.join("/")),
@@ -2158,12 +2158,12 @@ impl crate::widgets::HelpContext for InputBarState {
         if self.attachment_manager.is_some() {
             let (navigate, remove, close) = attachment_manager_key_labels();
             return HelpNode::entries(vec![
-                E::new(navigate, crate::i18n::t("zc-chat-help-navigate")),
-                E::new(remove, crate::i18n::t("zc-input-help-attachment-remove")),
-                E::new(close, crate::i18n::t("zc-chat-help-close")),
+                E::new(navigate, crate::i18n::t("oc-chat-help-navigate")),
+                E::new(remove, crate::i18n::t("oc-input-help-attachment-remove")),
+                E::new(close, crate::i18n::t("oc-chat-help-close")),
                 E::new(
                     vec!["/detach N"],
-                    crate::i18n::t("zc-input-help-attachment-detach"),
+                    crate::i18n::t("oc-input-help-attachment-detach"),
                 ),
             ]);
         }
@@ -2177,15 +2177,15 @@ impl crate::widgets::HelpContext for InputBarState {
             return HelpNode::entries(vec![
                 E::new(
                     vec!["↑", "↓"],
-                    crate::i18n::t("zc-input-help-completions-navigate"),
+                    crate::i18n::t("oc-input-help-completions-navigate"),
                 ),
                 E::new(
                     accept_keys,
-                    crate::i18n::t("zc-input-help-completions-accept"),
+                    crate::i18n::t("oc-input-help-completions-accept"),
                 ),
                 E::new(
                     action_key_labels(Ib::AutocompleteCancel),
-                    crate::i18n::t("zc-input-help-completions-dismiss"),
+                    crate::i18n::t("oc-input-help-completions-dismiss"),
                 ),
             ]);
         }
@@ -2892,7 +2892,7 @@ mod tests {
         let mut bar = input_bar_with_shared_commands();
         bar.insert_text("/detach");
         let action = bar.handle_enter();
-        let expected = crate::i18n::t("zc-input-no-pending-attachments");
+        let expected = crate::i18n::t("oc-input-no-pending-attachments");
         assert!(matches!(action, InputBarAction::StatusMessage(ref m) if *m == expected));
     }
 
@@ -3247,7 +3247,7 @@ mod tests {
         let accept = node
             .entries
             .iter()
-            .find(|e| e.action == crate::i18n::t("zc-input-help-completions-accept"))
+            .find(|e| e.action == crate::i18n::t("oc-input-help-completions-accept"))
             .expect("accept entry present");
         // Labels track the live bindings for Submit + AutocompleteAccept,
         // not hardcoded literals.

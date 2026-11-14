@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use omnesagent_api::platform::is_android;
@@ -64,23 +65,37 @@ pub fn windows_tokio_cmd_shell_command(command: &str) -> tokio::process::Command
 /// Build a PowerShell process (`powershell` 5.x or `pwsh` 7+) that runs
 /// `command` without loading profiles or prompting interactively.
 ///
-/// `interpreter` is the configured shell string used verbatim as the
-/// executable, so a bare name (`powershell`, `pwsh`) resolves via `PATH` while
-/// an absolute path (e.g. a side-by-side `pwsh.exe`) is honoured directly.
+/// `interpreter` is the selected executable. Native Unix command preparation
+/// supplies its canonical path; the Windows helper receives the configured
+/// interpreter string for normal process-spawn resolution.
 ///
 /// `-NoProfile` skips user/host profile scripts for a predictable, faster
 /// startup; `-NonInteractive` prevents the shell from blocking on prompts; and
 /// `-Command` consumes the final argument as script text. Ordinary `arg`
 /// handling keeps the entire script in one process argument and preserves its
 /// internal PowerShell quoting.
-fn tokio_powershell_command(interpreter: &str, command: &str) -> tokio::process::Command {
+fn tokio_powershell_command(
+    interpreter: impl AsRef<OsStr>,
+    command: &str,
+) -> tokio::process::Command {
+    let script = powershell_script_with_utf8_setup(command);
     let mut process = tokio::process::Command::new(interpreter);
     process
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
-        .arg(command);
+        .arg(script);
     process
+}
+
+const POWERSHELL_UTF8_SETUP: &str = "try {\n    $utf8 = [System.Text.UTF8Encoding]::new($false)\n    [Console]::OutputEncoding = $utf8\n    $OutputEncoding = $utf8\n} catch {\n}";
+
+fn powershell_script_with_utf8_setup(command: &str) -> String {
+    if crate::policy::powershell_command_supports_statement_prelude(command) {
+        format!("{POWERSHELL_UTF8_SETUP}\n{command}")
+    } else {
+        command.to_owned()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -117,6 +132,9 @@ pub struct NativeRuntime {
     /// convention — `cmd.exe /C` (default, and for the cross-platform default
     /// `sh`) or PowerShell (`powershell`/`pwsh`).
     shell: String,
+    /// Absolute launcher resolved by the TUI-aware runtime factory, when one
+    /// was supplied. Ambient callers continue resolving at command build time.
+    resolved_shell: Option<PathBuf>,
 }
 
 impl Default for NativeRuntime {
@@ -141,7 +159,20 @@ impl NativeRuntime {
     /// `pwsh` (bare name or absolute path) run through PowerShell; every other
     /// value runs through `cmd.exe /C`.
     pub fn with_shell(shell: String) -> Self {
-        Self { shell }
+        Self {
+            shell,
+            resolved_shell: None,
+        }
+    }
+
+    pub(crate) fn with_shell_and_resolved_path(
+        shell: String,
+        resolved_shell: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            shell,
+            resolved_shell,
+        }
     }
 }
 
@@ -217,6 +248,20 @@ impl RuntimeAdapter for NativeRuntime {
         }
     }
 
+    fn shell_program(&self) -> Option<&OsStr> {
+        #[cfg(not(target_os = "windows"))]
+        if is_android() {
+            return Some(OsStr::new("/system/bin/sh"));
+        }
+
+        #[cfg(target_os = "windows")]
+        if self.shell_dialect() == ShellDialect::WindowsCmd {
+            return Some(OsStr::new(WINDOWS_COMMAND_INTERPRETER));
+        }
+
+        Some(OsStr::new(&self.shell))
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -228,18 +273,37 @@ impl RuntimeAdapter for NativeRuntime {
             // on PATH for spawned processes; use the absolute path when present
             // so the shell can launch (and reach platform tools).
             // User-configured shell is ignored on Android.
-            let shell = if is_android() {
+            let configured_shell = if is_android() {
                 "/system/bin/sh"
             } else {
                 &self.shell
             };
-            let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
-                tokio_powershell_command(shell, command)
+            let shell = if let Some(resolved_shell) = &self.resolved_shell {
+                resolved_shell.clone()
             } else {
-                let mut process = tokio::process::Command::new(shell);
+                crate::platform::resolve_executable(std::ffi::OsStr::new(configured_shell))
+                    .map_err(|error| {
+                        let detail = error.to_string();
+                        anyhow::Error::new(error).context(format!(
+                            "native runtime shell {configured_shell:?} could not be resolved before setting workspace directory: {detail}"
+                        ))
+                    })?
+            };
+            let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
+                tokio_powershell_command(shell.as_os_str(), command)
+            } else {
+                let mut process = tokio::process::Command::new(&shell);
                 process.arg("-c").arg(command);
                 process
             };
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+
+                // Canonicalize the executable, not the identity that selects a
+                // multicall applet or the shell's sh compatibility mode.
+                process.as_std_mut().arg0(configured_shell);
+            }
             process.current_dir(workspace_dir);
             Ok(process)
         }
@@ -254,6 +318,39 @@ impl RuntimeAdapter for NativeRuntime {
             process.current_dir(workspace_dir);
             Ok(process)
         }
+    }
+
+    fn build_shell_command_with_effective_path(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        effective_path: Option<&std::ffi::OsStr>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        #[cfg(not(target_os = "windows"))]
+        if let Some(path) = effective_path {
+            let configured_shell = if is_android() {
+                std::ffi::OsStr::new("/system/bin/sh")
+            } else {
+                std::ffi::OsStr::new(&self.shell)
+            };
+            let resolved_shell = crate::platform::resolve_executable_with_path(
+                configured_shell,
+                std::env::split_paths(path),
+            )
+            .map_err(|error| {
+                let detail = error.to_string();
+                anyhow::Error::new(error).context(format!(
+                    "native runtime shell {configured_shell:?} could not be resolved in the effective child PATH: {detail}"
+                ))
+            })?;
+            return Self::with_shell_and_resolved_path(self.shell.clone(), Some(resolved_shell))
+                .build_shell_command(command, workspace_dir);
+        }
+
+        #[cfg(target_os = "windows")]
+        let _ = effective_path;
+
+        self.build_shell_command(command, workspace_dir)
     }
 }
 
@@ -394,29 +491,225 @@ mod tests {
     #[cfg(all(unix, not(target_os = "android")))]
     fn unix_powershell_shell_uses_safe_invocation_args() {
         use std::ffi::OsStr;
+        use std::os::unix::fs::PermissionsExt;
 
         let script = r#"Write-Output "quoted safe value" | Select-Object -First 1"#;
         let cwd = std::env::temp_dir();
-        let command = NativeRuntime::with_shell("pwsh".into())
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("pwsh");
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = NativeRuntime::with_shell(launcher.to_string_lossy().into_owned())
             .build_shell_command(script, &cwd)
             .unwrap();
         let command = command.as_std();
 
-        assert_eq!(command.get_program(), OsStr::new("pwsh"));
+        assert_eq!(
+            command.get_program(),
+            launcher.canonicalize().unwrap().as_os_str(),
+            "Unix PowerShell launcher should use the canonical configured path"
+        );
         let args: Vec<_> = command.get_args().collect();
         let expected = [
             OsStr::new("-NoProfile"),
             OsStr::new("-NonInteractive"),
             OsStr::new("-Command"),
-            OsStr::new(script),
         ];
-        assert_eq!(args.as_slice(), expected.as_slice());
+        assert_eq!(&args[..3], expected.as_slice());
+        let script_arg = args[3].to_string_lossy();
+        assert!(script_arg.starts_with("try {"));
+        assert!(script_arg.contains("[Console]::OutputEncoding = $utf8"));
+        assert!(script_arg.contains("$OutputEncoding = $utf8"));
+        assert!(script_arg.contains("} catch {\n}"));
+        assert!(script_arg.ends_with(script));
+    }
+
+    #[test]
+    fn powershell_full_scripts_are_passed_through_unchanged() {
+        let command = "# comment\n#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\nparam(\n    [string]$Value = @\"\nThis \" and ) # remain literal\n\"@\n)\nWrite-Output $Value";
+        let cwd = std::env::temp_dir();
+        let process = NativeRuntime::with_shell("pwsh".into())
+            .build_shell_command(command, &cwd)
+            .unwrap();
+        let process = process.as_std();
+        let script = process.get_args().nth(3).unwrap().to_string_lossy();
+
+        assert_eq!(script, command);
+
+        let named_blocks = "begin { Write-Output 'begin' }\nprocess { Write-Output 'process' }\nend { Write-Output 'end' }";
+        assert_eq!(
+            powershell_script_with_utf8_setup(named_blocks),
+            named_blocks
+        );
+    }
+
+    #[tokio::test]
+    async fn powershell_full_scripts_execute_with_native_semantics() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        for (command, expected) in [
+            (
+                "#requires -Version 5.1 # keep; this comment\nusing namespace System.Text # keep; this comment too\n[Console]::Write('声明-ok')",
+                "声明-ok",
+            ),
+            (
+                "param(\n    [string]$Name = '参数-ok' # the comment may contain )\n)\n[Console]::Write($Name)",
+                "参数-ok",
+            ),
+            (
+                "param(\n    [string]$Message = @\"\nHere \" and ) # stay literal\n\"@\n)\n[Console]::Write($Message.Trim())",
+                "Here \" and ) # stay literal",
+            ),
+            (
+                "[CmdletBinding()]\nparam()\n[Console]::Write('attributed-ok')",
+                "attributed-ok",
+            ),
+            (
+                "begin { [Console]::Write('begin-') }\nprocess { [Console]::Write('process-') }\nend { [Console]::Write('end') }",
+                "begin-process-end",
+            ),
+        ] {
+            let output = tokio_powershell_command(interpreter, command)
+                .output()
+                .await
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+
+        let output = tokio_powershell_command(interpreter, "exit 23")
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(23));
+    }
+
+    #[tokio::test]
+    async fn powershell_utf8_setup_failure_does_not_block_a_simple_command() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        let script = powershell_script_with_utf8_setup("Write-Output constrained-ok");
+        let constrained = format!(
+            "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n{script}"
+        );
+        let output = tokio::process::Command::new(interpreter)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(constrained)
+            .output()
+            .await
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "constrained-ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn powershell_command_adaptation_preserves_native_status() {
+        let Some(interpreter) = ["pwsh", "powershell"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .arg("-NoProfile")
+                .arg("-Command")
+                .arg("exit 0")
+                .output()
+                .is_ok()
+        }) else {
+            return;
+        };
+
+        #[cfg(target_os = "windows")]
+        let native_failure = "cmd /c exit 7";
+        #[cfg(not(target_os = "windows"))]
+        let native_failure = "sh -c 'exit 7'";
+
+        for (command, expected_success) in [
+            (native_failure.to_owned(), false),
+            ("[Console]::Write('status-ok')".to_owned(), true),
+            (
+                format!("{native_failure}; [Console]::Write('recovered')"),
+                true,
+            ),
+        ] {
+            let raw_status = tokio::process::Command::new(interpreter)
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(&command)
+                .output()
+                .await
+                .unwrap()
+                .status;
+            let adapted_status = tokio_powershell_command(interpreter, &command)
+                .output()
+                .await
+                .unwrap()
+                .status;
+
+            assert_eq!(raw_status.success(), expected_success, "raw: {command}");
+            assert_eq!(adapted_status.success(), expected_success, "{command}");
+            assert_eq!(adapted_status.code(), raw_status.code(), "{command}");
+        }
     }
 
     #[test]
     fn native_storage_path_contains_omnesagent() {
         let path = NativeRuntime::new().storage_path();
         assert!(path.to_string_lossy().contains("omnesagent"));
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn native_canonical_shell_preserves_requested_argv0() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("sh");
+        let canonical_shell = std::fs::canonicalize("/bin/sh").unwrap();
+        std::os::unix::fs::symlink(&canonical_shell, &launcher).unwrap();
+
+        for requested in ["sh".to_owned(), launcher.to_str().unwrap().to_owned()] {
+            let runtime = NativeRuntime::with_shell(requested.clone());
+            let mut command = runtime
+                .build_shell_command_with_effective_path(
+                    "printf '%s' \"$0\"",
+                    dir.path(),
+                    Some(dir.path().as_os_str()),
+                )
+                .unwrap();
+            assert_eq!(command.as_std().get_program(), canonical_shell.as_os_str());
+            let output = command.output().await.unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, requested.as_bytes());
+        }
     }
 
     #[test]
@@ -599,9 +892,12 @@ mod tests {
         let runtime = NativeRuntime::new();
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        assert!(
-            format!("{cmd:?}").contains("\"sh\""),
-            "default shell should be 'sh', got: {cmd:?}"
+        let expected =
+            crate::platform::resolve_executable(std::ffi::OsStr::new("sh")).unwrap();
+        assert_eq!(
+            cmd.as_std().get_program(),
+            expected.as_os_str(),
+            "platform default 'sh' should use the resolved executable path"
         );
     }
 
@@ -611,41 +907,24 @@ mod tests {
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        assert!(
-            format!("{cmd:?}").contains("\"bash\""),
-            "configured shell should appear in command debug, got: {cmd:?}"
+        assert_eq!(
+            std::path::Path::new(cmd.as_std().get_program()).file_name(),
+            Some(std::ffi::OsStr::new("bash")),
+            "configured shell should resolve to an executable named 'bash'"
         );
     }
 
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn native_with_shell_absolute_path() {
-        let runtime = NativeRuntime::with_shell("/usr/bin/zsh".into());
+        let configured = std::path::Path::new("/bin/sh");
+        let runtime = NativeRuntime::with_shell(configured.to_string_lossy().into_owned());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
-        assert!(
-            format!("{cmd:?}").contains("/usr/bin/zsh"),
-            "absolute path should appear verbatim, got: {cmd:?}"
-        );
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn native_default_and_with_shell_are_different() {
-        let default = NativeRuntime::new();
-        let configured = NativeRuntime::with_shell("bash".into());
-        let cwd = std::env::temp_dir();
-        let default_debug = format!(
-            "{:?}",
-            default.build_shell_command("echo hi", &cwd).unwrap()
-        );
-        let configured_debug = format!(
-            "{:?}",
-            configured.build_shell_command("echo hi", &cwd).unwrap()
-        );
-        assert_ne!(
-            default_debug, configured_debug,
-            "default shell and configured shell should produce different commands"
+        assert_eq!(
+            cmd.as_std().get_program(),
+            configured.canonicalize().unwrap().as_os_str(),
+            "absolute path should be canonicalized before command construction"
         );
     }
 
@@ -766,32 +1045,24 @@ mod tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_powershell_shell_builds_powershell_command() {
+        use std::ffi::OsStr;
+
         let script = r#"Write-Output "quoted safe value" | Select-Object -First 1"#;
         let cwd = std::env::temp_dir();
-        let cmd = NativeRuntime::with_shell("pwsh".into())
+        let command = NativeRuntime::with_shell("pwsh".into())
             .build_shell_command(script, &cwd)
             .unwrap();
-        let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("pwsh"),
-            "PowerShell interpreter should appear, got: {debug}"
-        );
-        assert!(
-            debug.contains("-Command"),
-            "PowerShell invocation must use -Command, got: {debug}"
-        );
-        assert!(
-            debug.contains("quoted safe value"),
-            "PowerShell invocation must contain the script argument, got: {debug}"
-        );
-        assert!(
-            debug.contains("-NoProfile"),
-            "PowerShell invocation should pass -NoProfile, got: {debug}"
-        );
-        assert!(
-            !debug.contains("cmd.exe"),
-            "PowerShell shell must not fall back to cmd.exe, got: {debug}"
-        );
+        let command = command.as_std();
+
+        assert_eq!(command.get_program(), OsStr::new("pwsh"));
+        let args: Vec<_> = command.get_args().collect();
+        let expected = [
+            OsStr::new("-NoProfile"),
+            OsStr::new("-NonInteractive"),
+            OsStr::new("-Command"),
+        ];
+        assert_eq!(&args[..3], expected.as_slice());
+        assert!(args[3].to_string_lossy().ends_with(script));
     }
 
     #[test]

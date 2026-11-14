@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, Result, params};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub const MIGRATION_BASE: &str = r#"
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -31,6 +31,21 @@ CREATE TABLE IF NOT EXISTS project_files (
 );
 CREATE INDEX IF NOT EXISTS idx_project_files_project ON project_files(project_id);
 
+CREATE TABLE IF NOT EXISTS ast_refs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  rel_path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  module TEXT,
+  item TEXT,
+  alias TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ast_refs_proj_path ON ast_refs(project_id, rel_path);
+CREATE INDEX IF NOT EXISTS idx_ast_refs_target_name ON ast_refs(project_id, name);
+
 CREATE TABLE IF NOT EXISTS memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key TEXT UNIQUE NOT NULL,
@@ -50,6 +65,8 @@ CREATE TABLE IF NOT EXISTS memories (
   trust REAL NOT NULL DEFAULT 0.5,
   last_feedback_at TEXT,
   origin TEXT NOT NULL DEFAULT '',
+  valid_until TEXT,
+  bq_mask BLOB,
   deleted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_cat_imp ON memories (category, importance DESC);
@@ -106,9 +123,14 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
   confidence REAL NOT NULL DEFAULT 1.0,
   is_god_node INTEGER NOT NULL DEFAULT 0,
   origin TEXT NOT NULL DEFAULT '',
+  kind_detail TEXT NOT NULL DEFAULT '',
+  subtokens TEXT NOT NULL DEFAULT '',
+  bq_mask BLOB,
   deleted_at TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  last_accessed TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_label ON graph_nodes (label);
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes (node_type);
@@ -198,10 +220,19 @@ CREATE TABLE IF NOT EXISTS ralph_findings (
   verdict_source TEXT,
   embedding BLOB,
   meta TEXT,
+  git_head_sha TEXT,
   created_at TEXT NOT NULL,
   stale_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ralph_findings_proj ON ralph_findings(project_id, verdict);
+
+CREATE TABLE IF NOT EXISTS file_blobs (
+  content_hash TEXT PRIMARY KEY,
+  model_id TEXT NOT NULL,
+  vector_blob BLOB NOT NULL,
+  bq_mask BLOB,
+  created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS ast_changes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,7 +297,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
 /// Применяет миграции схемы SQLite. Гарантирует обратную совместимость и сохранение данных.
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;",
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
     )?;
 
     // Если таблица memories уже существует от старого OmnesAgent, проверяем и добавляем недостающие колонки
@@ -327,6 +358,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         if !table_has_column(conn, "memories", "last_feedback_at") {
             let _ = conn.execute("ALTER TABLE memories ADD COLUMN last_feedback_at TEXT", []);
         }
+        if !table_has_column(conn, "memories", "valid_until") {
+            let _ = conn.execute("ALTER TABLE memories ADD COLUMN valid_until TEXT", []);
+        }
+        if !table_has_column(conn, "memories", "bq_mask") {
+            let _ = conn.execute("ALTER TABLE memories ADD COLUMN bq_mask BLOB", []);
+        }
     }
 
     let rel_exists: bool = conn
@@ -339,6 +376,57 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
     if rel_exists && !table_has_column(conn, "memory_relations", "deleted_at") {
         let _ = conn.execute("ALTER TABLE memory_relations ADD COLUMN deleted_at TEXT", []);
+    }
+
+    // Ф5 (остаток): колонки телеметрии доступа к узлам графа. Добавляются в
+    // существующие базы (созданные до v9) до MIGRATION_BASE, чтобы `CREATE TABLE
+    // IF NOT EXISTS` не перетёр уже живущую таблицу; на свежей базе их создаёт
+    // сам `CREATE TABLE` ниже.
+    let graph_nodes_exists: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='graph_nodes'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if graph_nodes_exists {
+        if !table_has_column(conn, "graph_nodes", "access_count") {
+            let _ = conn.execute(
+                "ALTER TABLE graph_nodes ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+        }
+        if !table_has_column(conn, "graph_nodes", "last_accessed") {
+            let _ = conn.execute("ALTER TABLE graph_nodes ADD COLUMN last_accessed TEXT", []);
+        }
+        if !table_has_column(conn, "graph_nodes", "kind_detail") {
+            let _ = conn.execute(
+                "ALTER TABLE graph_nodes ADD COLUMN kind_detail TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
+        if !table_has_column(conn, "graph_nodes", "subtokens") {
+            let _ = conn.execute(
+                "ALTER TABLE graph_nodes ADD COLUMN subtokens TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
+        if !table_has_column(conn, "graph_nodes", "bq_mask") {
+            let _ = conn.execute("ALTER TABLE graph_nodes ADD COLUMN bq_mask BLOB", []);
+        }
+    }
+
+    let ralph_findings_exists: bool = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ralph_findings'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if ralph_findings_exists && !table_has_column(conn, "ralph_findings", "git_head_sha") {
+        let _ = conn.execute("ALTER TABLE ralph_findings ADD COLUMN git_head_sha TEXT", []);
     }
 
     conn.execute_batch(MIGRATION_BASE)?;
@@ -370,6 +458,68 @@ CREATE TRIGGER IF NOT EXISTS memories_fts_au AFTER UPDATE ON memories BEGIN
 END;
 "#,
         )?;
+    }
+
+    // Ф1.5 / v10 (Ф15): FTS5-индекс графа `graph_nodes(label, description, subtokens)`
+    // для быстрого лексического поиска (BM25 через trigram) по camelCase/snake_case
+    // подтокенам вместо Full Scan `LIKE %query%`.
+    let graph_fts_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='graph_nodes_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let needs_graph_fts_recreate = match graph_fts_sql {
+        None => true,
+        Some(sql) => !sql.contains("subtokens"),
+    };
+
+    if needs_graph_fts_recreate {
+        conn.execute_batch(
+            r#"
+DROP TRIGGER IF EXISTS graph_nodes_fts_ai;
+DROP TRIGGER IF EXISTS graph_nodes_fts_ad;
+DROP TRIGGER IF EXISTS graph_nodes_fts_au;
+DROP TABLE IF EXISTS graph_nodes_fts;
+CREATE VIRTUAL TABLE IF NOT EXISTS graph_nodes_fts USING fts5(
+  label, description, subtokens, content='graph_nodes', content_rowid='id', tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_ai AFTER INSERT ON graph_nodes BEGIN
+  INSERT INTO graph_nodes_fts (rowid, label, description, subtokens)
+    VALUES (new.id, new.label, new.description, new.subtokens);
+END;
+CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_ad AFTER DELETE ON graph_nodes BEGIN
+  INSERT INTO graph_nodes_fts (graph_nodes_fts, rowid, label, description, subtokens)
+    VALUES ('delete', old.id, old.label, old.description, old.subtokens);
+END;
+INSERT INTO graph_nodes_fts (rowid, label, description, subtokens)
+  SELECT id, label, description, subtokens FROM graph_nodes;
+"#,
+        )?;
+    }
+
+    // Ф5 / v10: триггер UPDATE скоупится на индексируемые колонки (включая subtokens),
+    // чтобы обновления телеметрии access_count/last_accessed не переиндексировали FTS.
+    conn.execute_batch(
+        r#"
+DROP TRIGGER IF EXISTS graph_nodes_fts_au;
+CREATE TRIGGER IF NOT EXISTS graph_nodes_fts_au AFTER UPDATE OF label, description, subtokens ON graph_nodes BEGIN
+  INSERT INTO graph_nodes_fts (graph_nodes_fts, rowid, label, description, subtokens)
+    VALUES ('delete', old.id, old.label, old.description, old.subtokens);
+  INSERT INTO graph_nodes_fts (rowid, label, description, subtokens)
+    VALUES (new.id, new.label, new.description, new.subtokens);
+END;
+"#,
+    )?;
+
+    // Ф6.3 (ob2h v2.0 / Ф72b): vec0-индекс графовых эмбеддингов. Best-effort:
+    // регистрирует статически слинкованное расширение sqlite-vec на этом
+    // соединении и создаёт `vec_graph_nodes` (+ разовый backfill). При
+    // недоступности расширения миграция не падает — поиск остаётся на переборе.
+    #[cfg(feature = "vec0")]
+    {
+        let _ = crate::vector::vec0::init(conn);
     }
 
     conn.execute(
@@ -404,6 +554,7 @@ mod tests {
             "kv",
             "projects",
             "project_files",
+            "ast_refs",
             "memories",
             "memory_relations",
             "documents",
@@ -413,6 +564,9 @@ mod tests {
             "dream_runs",
             "memories_fts",
             "chunks_fts",
+            "graph_nodes_fts",
+            "ralph_findings",
+            "file_blobs",
         ] {
             assert!(
                 tables.iter().any(|t| t == expected),
@@ -471,6 +625,37 @@ mod tests {
     }
 
     #[test]
+    fn graph_nodes_fts_triggers_keep_the_index_in_sync() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO graph_nodes (node_id, label, node_type, description, created_at, updated_at)
+             VALUES ('fn:alpha', 'alpha_quantum_lift', 'Function', 'обработчик лифта', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM graph_nodes_fts WHERE graph_nodes_fts MATCH 'quantum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "insert trigger must index label/description");
+
+        conn.execute("DELETE FROM graph_nodes WHERE node_id = 'fn:alpha'", [])
+            .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM graph_nodes_fts WHERE graph_nodes_fts MATCH 'quantum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "delete trigger must unindex the node");
+    }
+
+    #[test]
     fn migrate_upgrades_legacy_memories_table_without_losing_rows() {
         let conn = Connection::open_in_memory().unwrap();
         // Pre-v2 layout: a memories table without any of the columns later
@@ -518,6 +703,154 @@ mod tests {
         assert_eq!(origin, "");
         assert_eq!(namespace, "default");
         assert_eq!(access_count, 0);
+    }
+
+    #[test]
+    fn migrate_adds_access_columns_to_legacy_graph_nodes() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-v9 graph_nodes: everything except the access-telemetry columns.
+        conn.execute_batch(
+            "CREATE TABLE graph_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT UNIQUE NOT NULL,
+                label TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                description TEXT,
+                val INTEGER NOT NULL DEFAULT 1,
+                embedding BLOB,
+                project_id TEXT,
+                file_path TEXT,
+                line_start INTEGER,
+                line_end INTEGER,
+                provenance TEXT NOT NULL DEFAULT 'manual',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                is_god_node INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT '',
+                deleted_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO graph_nodes (node_id, label, node_type, created_at, updated_at)
+            VALUES ('n1', 'legacy node', 'File', 't0', 't0');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn), SCHEMA_VERSION);
+        assert!(table_has_column(&conn, "graph_nodes", "access_count"));
+        assert!(table_has_column(&conn, "graph_nodes", "last_accessed"));
+        let (label, access_count): (String, i64) = conn
+            .query_row(
+                "SELECT label, access_count FROM graph_nodes WHERE node_id = 'n1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(label, "legacy node");
+        assert_eq!(access_count, 0, "existing rows default to zero accesses");
+    }
+
+    #[test]
+    fn graph_nodes_fts_update_trigger_is_scoped_to_indexed_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='graph_nodes_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("UPDATE OF label, description, subtokens"),
+            "access-only updates must not churn the FTS index: {sql}"
+        );
+    }
+
+    #[test]
+    fn schema_v10_columns_and_file_blobs_present() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version(&conn), 10);
+        for (table, col) in [
+            ("memories", "valid_until"),
+            ("memories", "bq_mask"),
+            ("graph_nodes", "kind_detail"),
+            ("graph_nodes", "subtokens"),
+            ("graph_nodes", "bq_mask"),
+            ("ralph_findings", "git_head_sha"),
+        ] {
+            assert!(
+                table_has_column(&conn, table, col),
+                "missing v10 column {table}.{col}"
+            );
+        }
+        let tables = table_names(&conn);
+        assert!(tables.iter().any(|t| t == "file_blobs"));
+
+        // Subtokens are indexed in graph_nodes_fts.
+        conn.execute(
+            "INSERT INTO graph_nodes (node_id, label, node_type, description, kind_detail, subtokens, created_at, updated_at)
+             VALUES ('fn:parse_http', 'parseHTTPHeader', 'Function', '', '', 'parse http header', 't', 't')",
+            [],
+        )
+        .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM graph_nodes_fts WHERE graph_nodes_fts MATCH 'header'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "subtokens must be searchable via graph_nodes_fts");
+    }
+
+    #[test]
+    fn migrate_upgrades_pre_v10_graph_nodes_fts_to_include_subtokens() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE graph_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT UNIQUE NOT NULL,
+                label TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                description TEXT,
+                val INTEGER NOT NULL DEFAULT 1,
+                embedding BLOB,
+                project_id TEXT,
+                file_path TEXT,
+                line_start INTEGER,
+                line_end INTEGER,
+                provenance TEXT NOT NULL DEFAULT 'manual',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                is_god_node INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT '',
+                deleted_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE graph_nodes_fts USING fts5(
+                label, description, content='graph_nodes', content_rowid='id', tokenize='trigram'
+            );
+            INSERT INTO graph_nodes (node_id, label, node_type, description, created_at, updated_at)
+            VALUES ('n1', 'getUserToken', 'Function', '', 't0', 't0');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        conn.execute(
+            "UPDATE graph_nodes SET subtokens = 'get user token' WHERE node_id = 'n1'",
+            [],
+        )
+        .unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM graph_nodes_fts WHERE graph_nodes_fts MATCH 'token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "upgraded graph_nodes_fts must index subtokens");
     }
 
     #[test]

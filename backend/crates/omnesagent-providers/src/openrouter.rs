@@ -13,6 +13,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use omnesagent_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
@@ -22,6 +23,8 @@ pub struct OpenRouterModelProvider {
     timeout_secs: u64,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
+    #[cfg(test)]
+    streaming_base_url: Option<String>,
 }
 
 /// OpenRouter's public aggregator endpoint.
@@ -31,6 +34,8 @@ pub(crate) fn endpoint_url(path: &str) -> String {
     format!("{BASE_URL}/{}", path.trim_start_matches('/'))
 }
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Maximum silence between body reads for OpenRouter SSE streams.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -212,6 +217,8 @@ pub struct OpenRouterBuilder {
     timeout_secs: Option<u64>,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
+    #[cfg(test)]
+    streaming_base_url: Option<String>,
 }
 
 impl OpenRouterBuilder {
@@ -248,6 +255,12 @@ impl OpenRouterBuilder {
         self
     }
 
+    #[cfg(test)]
+    fn streaming_base_url(mut self, base_url: &str) -> Self {
+        self.streaming_base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
     pub fn build(self) -> OpenRouterModelProvider {
         OpenRouterModelProvider {
             alias: self.alias,
@@ -257,6 +270,8 @@ impl OpenRouterBuilder {
                 .unwrap_or(omnesagent_api::model_provider::BASELINE_TIMEOUT_SECS),
             max_tokens: self.max_tokens,
             extra_body: self.extra_body,
+            #[cfg(test)]
+            streaming_base_url: self.streaming_base_url,
         }
     }
 }
@@ -271,6 +286,8 @@ impl OpenRouterModelProvider {
             timeout_secs: None,
             max_tokens: None,
             extra_body: None,
+            #[cfg(test)]
+            streaming_base_url: None,
         }
     }
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -554,6 +571,30 @@ impl OpenRouterModelProvider {
             OPENROUTER_CONNECT_TIMEOUT_SECS,
         )
     }
+
+    /// HTTP client for streaming SSE connections. Streaming responses can
+    /// legitimately outlive the normal request timeout while still making
+    /// progress, so bound only connection setup and idle body reads here.
+    fn streaming_http_client(&self) -> Client {
+        self.streaming_http_client_with_idle_timeout(STREAM_IDLE_TIMEOUT)
+    }
+
+    fn streaming_http_client_with_idle_timeout(&self, idle_timeout: Duration) -> Client {
+        omnesagent_config::schema::build_runtime_proxy_client_with_read_timeout(
+            "model_provider.openrouter",
+            idle_timeout.as_secs(),
+            OPENROUTER_CONNECT_TIMEOUT_SECS,
+        )
+    }
+
+    fn streaming_endpoint_url(&self, path: &str) -> String {
+        #[cfg(test)]
+        if let Some(base_url) = self.streaming_base_url.as_deref() {
+            return format!("{base_url}/{}", path.trim_start_matches('/'));
+        }
+
+        endpoint_url(path)
+    }
 }
 
 #[async_trait]
@@ -817,6 +858,7 @@ impl ModelProvider for OpenRouterModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -897,14 +939,15 @@ impl ModelProvider for OpenRouterModelProvider {
             }
         };
 
-        let client = self.http_client();
+        let client = self.streaming_http_client();
+        let endpoint_url = self.streaming_endpoint_url("chat/completions");
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::omnesagent_spawn::spawn!(async move {
             let response = match client
-                .post(endpoint_url("chat/completions"))
+                .post(endpoint_url)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/omnesagent-labs/omnesagent")
                 .header("X-Title", "OmnesAgent")
@@ -917,7 +960,11 @@ impl ModelProvider for OpenRouterModelProvider {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(if e.is_connect() {
+                            StreamError::ConnectFailed(super::format_error_chain(&e))
+                        } else {
+                            StreamError::Http(super::format_error_chain(&e))
+                        }))
                         .await;
                     return;
                 }
@@ -1058,6 +1105,7 @@ impl ModelProvider for OpenRouterModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -1207,6 +1255,172 @@ mod tests {
             .await
             .expect("stream should yield Final immediately");
         assert!(matches!(first, Ok(StreamEvent::Final)));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_allows_slow_chunks_past_request_timeout() {
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use futures_util::StreamExt as _;
+        use tokio::net::TcpListener;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let stream = futures_util::stream::unfold(0, |state| async move {
+                    match state {
+                        0 => Some((
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}],\"usage\":null}\n\n",
+                            )),
+                            1,
+                        )),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            Some((
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                    b"data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}],\"usage\":null}\n\n",
+                                )),
+                                2,
+                            ))
+                        }
+                        2 => {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            Some((
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: [DONE]\n\n")),
+                                3,
+                            ))
+                        }
+                        _ => None,
+                    }
+                });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OpenRouter streaming test server");
+        let addr = listener
+            .local_addr()
+            .expect("OpenRouter streaming test address");
+        let server = omnesagent_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve OpenRouter streaming test");
+        });
+
+        let provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .timeout_secs(1)
+            .streaming_base_url(&format!("http://{addr}"))
+            .build();
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let request = crate::traits::ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let mut stream = provider.stream_chat(
+            request,
+            "anthropic/claude-haiku-4-5",
+            Some(0.0),
+            crate::traits::StreamOptions::new(true),
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream should yield the first SSE event")
+            .expect("stream should yield at least one event")
+            .expect("first SSE event should be readable");
+        match first {
+            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "first"),
+            event => panic!("expected first text delta, got {event:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .expect("stream should remain open past the request timeout")
+            .expect("stream should yield the second SSE event")
+            .expect("second SSE event should be readable");
+        match second {
+            StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
+            event => panic!("expected second text delta, got {event:?}"),
+        }
+
+        let final_event = stream.next().await.expect("stream should yield Final");
+        assert!(matches!(final_event, Ok(StreamEvent::Final)));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn streaming_client_times_out_when_response_body_is_silent() {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OpenRouter idle-timeout test server");
+        let addr = listener
+            .local_addr()
+            .expect("OpenRouter idle-timeout test address");
+        let server = omnesagent_spawn::spawn!(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("accept OpenRouter idle-timeout test request");
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n7\r\ninitial\r\n",
+                )
+                .await
+                .expect("write initial OpenRouter idle-timeout test chunk");
+            socket
+                .flush()
+                .await
+                .expect("flush initial OpenRouter idle-timeout test chunk");
+            futures_util::future::pending::<()>().await;
+        });
+
+        let provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let response = provider
+            .streaming_http_client_with_idle_timeout(Duration::from_secs(1))
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("silent streaming request should receive headers");
+        let mut body = response.bytes_stream();
+        assert_eq!(
+            body.next()
+                .await
+                .expect("initial stream chunk")
+                .expect("initial stream chunk should be readable"),
+            axum::body::Bytes::from_static(b"initial")
+        );
+        let result = tokio::time::timeout(Duration::from_secs(3), body.next())
+            .await
+            .expect("silent stream should hit the idle timeout")
+            .expect("silent stream should yield a timeout error");
+        assert!(
+            result.is_err(),
+            "silent stream should fail after idle timeout"
+        );
+
+        server.abort();
     }
 
     #[test]
@@ -1825,6 +2039,7 @@ mod tests {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                cache_creation_input_tokens: None,
             })
             .expect("usage should be Some");
         assert_eq!(usage.input_tokens, Some(25000));
@@ -1845,6 +2060,7 @@ mod tests {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                cache_creation_input_tokens: None,
             })
             .expect("usage should be Some");
         assert!(

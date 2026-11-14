@@ -1,6 +1,7 @@
 //! macOS sandbox-exec (Seatbelt) sandbox backend.
 
 use crate::security::traits::Sandbox;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -79,13 +80,8 @@ impl Drop for SeatbeltSandbox {
     }
 }
 
-impl Sandbox for SeatbeltSandbox {
-    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
-        let program = cmd.get_program().to_string_lossy().to_string();
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+impl SeatbeltSandbox {
+    fn wrap_invocation(&self, cmd: &mut Command, invocation: &[OsString]) -> std::io::Result<()> {
         let current_dir = cmd.get_current_dir().map(Path::to_path_buf);
 
         // Use the same fixed system binary checked by availability detection.
@@ -94,14 +90,29 @@ impl Sandbox for SeatbeltSandbox {
         let mut sandbox_cmd = Command::new(SANDBOX_EXEC_PATH);
         sandbox_cmd.arg("-f");
         sandbox_cmd.arg(&self.policy_path);
-        sandbox_cmd.arg(&program);
-        sandbox_cmd.args(&args);
+        sandbox_cmd.args(invocation);
         if let Some(current_dir) = current_dir {
             sandbox_cmd.current_dir(current_dir);
         }
 
         *cmd = sandbox_cmd;
         Ok(())
+    }
+}
+
+impl Sandbox for SeatbeltSandbox {
+    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        let invocation = super::shell_identity::invocation(cmd, None)?;
+        self.wrap_invocation(cmd, &invocation)
+    }
+
+    fn wrap_shell_command(
+        &self,
+        cmd: &mut Command,
+        shell_program: Option<&OsStr>,
+    ) -> std::io::Result<()> {
+        let invocation = super::shell_identity::invocation(cmd, shell_program)?;
+        self.wrap_invocation(cmd, &invocation)
     }
 
     fn is_available(&self) -> bool {
@@ -513,5 +524,30 @@ mod tests {
         let open = policy.chars().filter(|c| *c == '(').count();
         let close = policy.chars().filter(|c| *c == ')').count();
         assert_eq!(open, close, "parentheses must be balanced in .sb policy");
+    }
+
+    #[test]
+    fn seatbelt_shell_identity_survives_replacing_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = SeatbeltSandbox {
+            policy_dir: dir.path().to_path_buf(),
+            policy_path: dir.path().join("test.sb"),
+        };
+        let mut cmd = Command::new("/bin/bash");
+        cmd.args(["-c", "printf '%s' \"$0\""])
+            .current_dir(dir.path());
+        let invocation =
+            crate::security::shell_identity::invocation(&cmd, Some(OsStr::new("sh"))).unwrap();
+        sandbox.wrap_invocation(&mut cmd, &invocation).unwrap();
+        assert_eq!(cmd.get_program(), SANDBOX_EXEC_PATH);
+        assert!(
+            cmd.get_args().collect::<Vec<_>>().ends_with(
+                &invocation
+                    .iter()
+                    .map(OsString::as_os_str)
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(cmd.get_current_dir(), Some(dir.path()));
     }
 }

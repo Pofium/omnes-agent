@@ -85,7 +85,7 @@ if [[ -f "$ROOT_CARGO" ]]; then
     if (!$done && s/^version = "[^"]+"/version = "'"$VERSION"'"/) { $done = 1 }
   ' "$ROOT_CARGO"
   # [workspace.dependencies] path-dep version pins. Covers both crates/ and
-  # apps/ path deps (e.g. apps/zerocode) so every in-tree member tracks the
+  # apps/ path deps (e.g. apps/omnescode) so every in-tree member tracks the
   # workspace version; a missed apps/ pin leaves the lockfile unresolvable and
   # breaks `cargo metadata` mid-bump.
   perl -pi -e '

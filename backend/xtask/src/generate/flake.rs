@@ -1,7 +1,7 @@
 //! Nix flake renderer. The flake is the one packaged surface that rebuilds from
 //! source per-user, so it must expose feature selection (overridable), not a
 //! fixed set. We generate a sentinel-delimited zone defining the omnesagent +
-//! zerocode packages with the canonical Dist feature list as the default
+//! omnescode packages with the canonical Dist feature list as the default
 
 use super::spec::{self, Selection};
 use std::path::Path;
@@ -17,7 +17,7 @@ const ZONE: &str = "flake-packages";
 
 /// Render the generated package-definition zone body: a Rust package builder
 /// with the Dist feature list as default buildFeatures (overridable), exposing
-/// omnesagent, zerocode, and default. Indented to sit inside the per-system `in {`
+/// omnesagent, omnescode, and default. Indented to sit inside the per-system `in {`
 /// block of the flake.
 pub fn render_zone(root: &Path) -> anyhow::Result<String> {
     let version = spec::resolve_version(root)?;

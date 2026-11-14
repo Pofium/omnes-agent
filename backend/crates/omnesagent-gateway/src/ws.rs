@@ -29,6 +29,18 @@ use omnesagent_runtime::sop::approval::{
 /// channel-side default on `TelegramConfig::approval_timeout_secs`.
 const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 
+fn gateway_steering_input(content: String) -> omnesagent_runtime::agent::SteeringInput {
+    omnesagent_runtime::agent::SteeringInput::new(content).with_ingress(omnesagent_api::ingress::IngressContext {
+        message_id: None,
+        source_class: omnesagent_api::ingress::SourceClass::External,
+        sender: None,
+        transport: omnesagent_api::ingress::Transport::Gateway,
+        trust: omnesagent_api::ingress::TrustClass::Untrusted,
+        origin: omnesagent_api::ingress::TurnOrigin::Interactive,
+    })
+}
+
+
 /// Single ingress identity for gateway WebSocket turns.
 ///
 /// This name is used in three places that MUST agree:
@@ -891,7 +903,50 @@ fn resolve_ws_session_cwd(
             ))
         })?;
     }
-    resolve_session_cwd(requested_cwd, &agent_workspace)
+    let resolved = resolve_session_cwd(requested_cwd, &agent_workspace)?;
+    // Fork-gap guard (#8289): a caller-supplied cwd becomes this session's
+    // SecurityPolicy workspace root, so an unconfined value would let any
+    // WebSocket caller re-root the agent's sandbox outside its configured
+    // scope. Confine it to the agent's workspace allowlist — the per-agent
+    // workspace plus its risk-profile `allowed_roots` and cross-agent grants —
+    // and fail closed. Only an explicit value is checked: the default
+    // (per-agent workspace) is already the canonical boundary.
+    if requested_cwd.is_some() {
+        let policy = omnesagent_config::policy::SecurityPolicy::for_agent(config, agent_alias)
+            .map_err(|e| {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "agent": agent_alias,
+                            "cwd": resolved.display().to_string(),
+                            "error": format!("{}", e),
+                        })),
+                    "ws session cwd policy resolution rejected"
+                );
+                anyhow::Error::msg(format!(
+                    "failed to resolve agent security policy for {agent_alias}: {e}"
+                ))
+            })?;
+        if !policy.is_resolved_path_allowed(&resolved) {
+            ::omnesagent_log::record!(
+                WARN,
+                ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                    .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "agent": agent_alias,
+                        "cwd": resolved.display().to_string(),
+                    })),
+                "ws session cwd outside agent workspace allowlist"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "cwd is outside the agent workspace allowlist: {}",
+                resolved.display()
+            )));
+        }
+    }
+    Ok(resolved)
 }
 
 fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) -> &'static str {
@@ -1039,7 +1094,7 @@ async fn process_chat_message(
 
     // Resolve context budget for this agent. Wire field is named
     // `max_context_tokens` and must track the runtime-profile budget
-    // (same source Zerocode's context meter uses), not the provider
+    // (same source Omnescode's context meter uses), not the provider
     // model-window helper which falls back to 32_000 when unset.
     let max_context_tokens = {
         let cfg = state.config.read();
@@ -1074,7 +1129,7 @@ async fn process_chat_message(
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<omnesagent_runtime::agent::SteeringInput>(32);
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
@@ -1208,7 +1263,7 @@ async fn process_chat_message(
                                 let _ = sender.send(Message::Text(err.to_string().into())).await;
                                 continue;
                             }
-                            match steering_tx.try_send(content) {
+                            match steering_tx.try_send(gateway_steering_input(content)) {
                                 Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     let err = serde_json::json!({
@@ -1323,6 +1378,16 @@ async fn process_chat_message(
                             kept_turns,
                             reason,
                         } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
+                        TurnEvent::BudgetWarning {
+                            current_usd,
+                            limit_usd,
+                            period,
+                        } => serde_json::json!({
+                            "type": "budget_warning",
+                            "current_usd": current_usd,
+                            "limit_usd": limit_usd,
+                            "period": period,
+                        }),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
                             "entries": entries,
@@ -2454,6 +2519,53 @@ data: {\"type\":\"message_stop\"}\n\n",
             .expect_err("missing cwd should be rejected");
 
         assert!(err.to_string().contains("cwd is not a usable directory"));
+    }
+
+    #[test]
+    fn resolve_ws_session_cwd_confines_requested_cwd_to_agent_allowlist() {
+        use tempfile::TempDir;
+        use omnesagent_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let granted = tmp.path().join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                allowed_roots: vec![granted.to_string_lossy().into_owned()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "web".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        // An explicit cwd inside the configured allowed root is honored exactly.
+        let resolved =
+            resolve_ws_session_cwd(Some(granted.to_str().unwrap()), &config, "web").unwrap();
+        assert_eq!(resolved, granted.canonicalize().unwrap());
+
+        // A directory outside the per-agent workspace and every allowed root is
+        // refused: an explicit cwd becomes this session's SecurityPolicy
+        // workspace root, so accepting it would let a WebSocket caller re-root
+        // the agent's sandbox on demand.
+        let outside = TempDir::new().unwrap();
+        let err = resolve_ws_session_cwd(Some(outside.path().to_str().unwrap()), &config, "web")
+            .expect_err("cwd outside the allowlist must be rejected");
+        assert!(
+            err.to_string().contains("allowlist"),
+            "rejection must name the allowlist: {err}"
+        );
     }
 
     #[test]

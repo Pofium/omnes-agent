@@ -1,3 +1,5 @@
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_retry_stop_notice_stdio;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 #[cfg(feature = "agent-runtime")]
@@ -5,6 +7,7 @@ mod config_dir_locale_regression;
 mod config_patch_cli;
 mod config_persistence;
 mod config_schema;
+mod cost_status_cli;
 #[cfg(feature = "agent-runtime")]
 mod cron_delivery_cli;
 mod cron_help_examples;

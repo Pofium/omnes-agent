@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use omnesagent_api::agent::TurnEvent;
-use omnesagent_config::schema::PacingConfig;
+use omnesagent_config::schema::{MultimodalConfig, PacingConfig};
 use omnesagent_providers::{ChatMessage, ModelProvider};
 use omnesagent_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
 
@@ -20,6 +20,7 @@ pub(crate) async fn finish_after_max_iterations(
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
+    multimodal_config: &MultimodalConfig,
     pacing: &PacingConfig,
     cancellation_token: Option<&CancellationToken>,
     max_iterations: usize,
@@ -81,7 +82,32 @@ pub(crate) async fn finish_after_max_iterations(
             .to_string(),
     );
     let summary_prompt_mirror = summary_prompt.clone();
+
+    // The summary may see the turn's images, so the accumulated history goes
+    // through the same multimodal normalizer an in-loop request does (size,
+    // MIME and image-cap limits all apply) instead of being sent verbatim.
+    // Preparing before the summary prompt is appended keeps the trailing
+    // tool results the latest tool-result run, so their markers normalize
+    // exactly as an in-loop dispatch would. A provider that cannot see
+    // images degrades to text-only exactly like the in-loop rule, minus the
+    // vision-fallback resolution: handing validated inline images to a
+    // provider that rejects them would turn the graceful exit into a hard
+    // request failure.
+    let degrade_strip_images = !model_provider.capabilities_for_model(model).vision
+        && omnesagent_providers::multimodal::count_image_markers(history) > 0;
+    let mut request_messages = match super::prepare_messages_for_iteration(
+        history,
+        multimodal_config,
+        degrade_strip_images,
+        None,
+    )
+    .await
+    {
+        Ok(prepared) => prepared.messages,
+        Err(error) => return Err(error),
+    };
     history.push(summary_prompt);
+    request_messages.push(summary_prompt_mirror.clone());
 
     enum SummaryCall {
         Cancelled,
@@ -90,7 +116,7 @@ pub(crate) async fn finish_after_max_iterations(
     }
     let summary_call = {
         let summary_request = omnesagent_providers::ChatRequest {
-            messages: history,
+            messages: &request_messages,
             tools: None, // No tools — force a text response
             thinking: omnesagent_api::NATIVE_THINKING_OVERRIDE
                 .try_with(Clone::clone)
@@ -250,9 +276,9 @@ mod graceful_summary_metering_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use omnesagent_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use omnesagent_api::model_provider::{
-        ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion,
+        ChatRequest, ChatResponse, ProviderCapabilities, SemanticEmptyTerminalCompletion,
     };
-    use omnesagent_config::schema::{CostConfig, PacingConfig};
+    use omnesagent_config::schema::{CostConfig, MultimodalConfig, PacingConfig};
     use omnesagent_providers::traits::TokenUsage;
     use omnesagent_providers::{ChatMessage, ModelProvider};
 
@@ -289,6 +315,7 @@ mod graceful_summary_metering_tests {
                     input_tokens: Some(100),
                     output_tokens: Some(20),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -312,12 +339,14 @@ mod graceful_summary_metering_tests {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default(); // GracefulSummary
+        let multimodal_config = MultimodalConfig::default();
         finish_after_max_iterations(
             provider,
             &mut history,
             "custom",
             "test-model",
             None,
+            &multimodal_config,
             &pacing,
             None,
             2,
@@ -425,6 +454,7 @@ mod graceful_summary_metering_tests {
                     input_tokens: Some(100),
                     output_tokens: Some(20),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: Some("internal reasoning".to_string()),
             })
@@ -473,13 +503,23 @@ mod graceful_summary_metering_tests {
     }
 
     /// Provider stub that records the exact messages it was dispatched, so a
-    /// test can assert on what actually reached the provider.
+    /// test can assert on what actually reached the provider. `vision` lets a
+    /// test decide whether the provider can see images, which the summary
+    /// path consults exactly like the in-loop path.
     struct CapturingProvider {
         seen: Arc<std::sync::Mutex<Vec<String>>>,
+        vision: bool,
     }
 
     #[async_trait]
     impl ModelProvider for CapturingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: self.vision,
+                ..Default::default()
+            }
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -521,16 +561,18 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    // The graceful-summary path dispatches the accumulated history directly
-    // through `run_model_query`, which does NOT run
-    // `prepare_messages_for_provider`. A tool-result `[AUDIO:/path]` in that
-    // history must be stripped before it reaches the provider, or the raw
-    // filesystem path leaks and is hallucinated over on the max-iteration exit.
+    // The graceful-summary path now prepares the accumulated history through
+    // the full multimodal normalizer before dispatch, and the dispatch seam
+    // still strips loadable audio markers as a fail-closed backstop. A
+    // tool-result audio marker in the history must never reach the provider
+    // as a raw filesystem path the model would hallucinate over; this pins
+    // the combined contract on the max-iteration exit.
     #[tokio::test]
     async fn graceful_summary_strips_tool_audio_marker_before_dispatch() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
+            vision: false,
         };
         // A properly paired assistant tool_call + native tool-result JSON blob,
         // so the orphaned-tool-message sweep in finish_after_max_iterations keeps
@@ -546,6 +588,7 @@ mod graceful_summary_metering_tests {
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
 
         let out = finish_after_max_iterations(
             &provider,
@@ -553,6 +596,7 @@ mod graceful_summary_metering_tests {
             "custom",
             "test-model",
             None,
+            &multimodal_config,
             &pacing,
             None,
             2,
@@ -572,8 +616,303 @@ mod graceful_summary_metering_tests {
             "raw audio path reached the provider on the max-iteration path: {captured}"
         );
         assert!(
-            captured.contains("[media attachment]"),
+            captured.contains(omnesagent_providers::multimodal::MEDIA_PLACEHOLDER),
             "audio marker should be replaced with a placeholder: {captured}"
+        );
+    }
+
+    // The summary request is prepared like an in-loop request, so a
+    // tool-result image marker whose file is not an interpretable image is
+    // dropped by the normalizer with a model-facing note: the raw path never
+    // reaches the provider, and the model is told the image could not be
+    // loaded rather than being handed a path to hallucinate over.
+    #[tokio::test]
+    async fn graceful_summary_drops_unloadable_tool_image_marker() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bogus_image = temp.path().join("shot.txt");
+        std::fs::write(&bogus_image, b"not an image").expect("write text bytes");
+        let marker = format!("[{}:{}]", "IMAGE", bogus_image.display());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+        };
+        // A properly paired assistant tool_call + native tool-result JSON
+        // blob, so the orphan sweep keeps the exchange intact and the marker
+        // reaches the summary preparation as a latest-run tool result.
+        let mut history = vec![
+            ChatMessage::user("call the tool and describe the screenshot"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_img"}]}"#),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("{marker} shot"),
+                    "tool_call_id": "toolu_img",
+                })
+                .to_string(),
+            ),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-img-drop",
+            &knobs,
+            None,
+            None,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains(&bogus_image.display().to_string()),
+            "raw image path reached the provider on the max-iteration path: {captured}"
+        );
+        assert!(
+            !captured.contains(&marker),
+            "the unloadable image marker must be dropped, not forwarded: {captured}"
+        );
+        assert!(
+            captured.contains("could not be loaded"),
+            "the normalizer's skipped-image note must reach the model: {captured}"
+        );
+    }
+
+    // A loadable local image and an already-inline data URI both reach the
+    // summary request as validated inline markers: the file is read,
+    // MIME-checked and inlined by the normalizer, and the inline marker
+    // passes through byte-identical. This pins the normalize decision for
+    // the summary path: the summary may see the turn's images.
+    #[tokio::test]
+    async fn graceful_summary_normalizes_local_and_inline_tool_image_markers() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let png_path = temp.path().join("shot.png");
+        std::fs::write(
+            &png_path,
+            STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
+        )
+        .expect("write PNG fixture");
+        let inline_uri = format!("data:image/png;base64,{PNG_B64}");
+        let inline_marker = format!("[{}:{}]", "IMAGE", inline_uri);
+        let local_marker = format!("[{}:{}]", "IMAGE", png_path.display());
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+        };
+        let mut history = vec![
+            ChatMessage::user("call the tool and describe both screenshots"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_two"}]}"#),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": format!("{local_marker} and {inline_marker}"),
+                    "tool_call_id": "toolu_two",
+                })
+                .to_string(),
+            ),
+        ];
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-img-inline",
+            &knobs,
+            None,
+            None,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            !captured.contains(&png_path.display().to_string()),
+            "the local path must be inlined, not forwarded: {captured}"
+        );
+        assert!(
+            !captured.contains(&local_marker),
+            "the path-form marker must be replaced by its inline form: {captured}"
+        );
+        assert_eq!(
+            captured.matches(&inline_marker).count(),
+            2,
+            "both images must arrive as the same byte-identical inline marker: {captured}"
+        );
+    }
+
+    // The graceful summary replays history through the metered one-shot seam,
+    // whose sanitizers used to rewrite each message as a whole string — so a
+    // marker inside an assistant envelope's signed thinking text was replaced
+    // while its signature stayed, which Anthropic rejects on replay. The
+    // envelope (signed thinking included) must reach the provider
+    // byte-for-byte, so the assistant entry is built with the production
+    // `build_native_assistant_history` builder the adapters parse back.
+    #[tokio::test]
+    async fn graceful_summary_replays_signed_thinking_unmodified() {
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_replay"}}"#);
+        let assistant_content = super::super::parse_response::build_native_assistant_history(
+            "",
+            &[omnesagent_api::model_provider::ToolCall {
+                id: "toolu_think".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            Some(&reasoning),
+        );
+        let mut history = vec![
+            ChatMessage::user("run the tool"),
+            ChatMessage::assistant(assistant_content.clone()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_think",
+                })
+                .to_string(),
+            ),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: true,
+        };
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-signed-thinking",
+            &knobs,
+            None,
+            None,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&assistant_content),
+            "the assistant envelope (signed thinking included) must reach the provider byte-for-byte: {captured}"
+        );
+        assert!(
+            !captured.contains(omnesagent_providers::multimodal::MEDIA_PLACEHOLDER),
+            "nothing in this history is a deliverable marker outside the thinking, so a placeholder anywhere means the reasoning was touched: {captured}"
+        );
+    }
+
+    // Degrade twin of the signed-thinking replay: `vision: false` is what a
+    // reliable wrapper reports whenever any fallback lacks vision — even
+    // when the primary that receives the request verifies thinking
+    // signatures — so the summary's text-only degrade path must keep the
+    // envelope byte-identical too, not just the one-shot seam. The history
+    // carries a path-form marker in the user turn so the summary actually
+    // takes the degrade branch; the placeholder in the captured request is
+    // the probe that it ran.
+    #[tokio::test]
+    async fn graceful_summary_degrade_replays_signed_thinking_unmodified() {
+        let user_marker = format!("[{}:{}]", "IMAGE", "/tmp/degrade.png");
+        let marker = format!("[{}:{}]", "IMAGE", "/tmp/shot.png");
+        let reasoning =
+            format!(r#"{{"thinking":"check {marker} before answering","signature":"sig_replay"}}"#);
+        let assistant_content = super::super::parse_response::build_native_assistant_history(
+            "",
+            &[omnesagent_api::model_provider::ToolCall {
+                id: "toolu_think".into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            Some(&reasoning),
+        );
+        let mut history = vec![
+            ChatMessage::user(format!("run the tool on {user_marker}")),
+            ChatMessage::assistant(assistant_content.clone()),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "content": "done",
+                    "tool_call_id": "toolu_think",
+                })
+                .to_string(),
+            ),
+        ];
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            seen: Arc::clone(&seen),
+            vision: false,
+        };
+        let pacing = PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        let multimodal_config = MultimodalConfig::default();
+
+        let out = finish_after_max_iterations(
+            &provider,
+            &mut history,
+            "custom",
+            "test-model",
+            None,
+            &multimodal_config,
+            &pacing,
+            None,
+            2,
+            String::new(),
+            "trace-req-signed-thinking-degrade",
+            &knobs,
+            None,
+            None,
+        )
+        .await
+        .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let captured = seen.lock().unwrap().join("\n");
+        assert!(
+            captured.contains(&assistant_content),
+            "the assistant envelope (signed thinking included) must survive the degrade path byte-for-byte: {captured}"
+        );
+        assert!(
+            captured.contains(omnesagent_providers::multimodal::MEDIA_PLACEHOLDER),
+            "the user-turn marker must be replaced, proving the degrade branch ran: {captured}"
         );
     }
 
@@ -587,6 +926,7 @@ mod graceful_summary_metering_tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = CapturingProvider {
             seen: Arc::clone(&seen),
+            vision: false,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 

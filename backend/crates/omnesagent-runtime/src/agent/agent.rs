@@ -7,11 +7,14 @@ use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
+use crate::security::ingress::{IngressPolicy, steering_policy};
+use omnesagent_api::ingress::IngressDecision;
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use omnesagent_config::schema::Config;
@@ -336,10 +339,13 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: omnesagent_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history cap from canonical config at use time.
-    /// Daemon-backed sessions capture the shared live config handle so reloads
-    /// affect existing sessions without duplicating config-derived state.
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Resolves the structured-history trim policy from canonical config at
+    /// use time: the effective cap and the low-water fraction, as one pair.
+    /// Daemon-backed sessions capture the shared live config handle so
+    /// reloads affect existing sessions without duplicating config-derived
+    /// state. Both halves resolve together so a reload cannot mix revisions.
+    structured_history_limits_resolver:
+        Option<Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>>,
     multimodal_config: omnesagent_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -452,9 +458,25 @@ pub struct StreamedTurnError {
     pub new_messages: Vec<ConversationMessage>,
 }
 
+/// Closes a lent steering receiver when dropped, so every exit from a
+/// steered turn (including the turn future being dropped) refuses later
+/// senders instead of accepting messages nobody will read.
+struct CloseSteeringOnExit<'a>(Option<&'a mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>);
+
+impl Drop for CloseSteeringOnExit<'_> {
+    fn drop(&mut self) {
+        if let Some(rx) = self.0.as_deref_mut() {
+            rx.close();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<omnesagent_config::schema::Config>>,
+    /// Live shared config used by tools whose security policy must reflect the
+    /// next dispatch even when model/provider state remains generation-pinned.
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<omnesagent_config::schema::Config>>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -520,7 +542,8 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<omnesagent_config::schema::AliasedAgentConfig>,
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_limits_resolver:
+        Option<Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>>,
     multimodal_config: Option<omnesagent_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -574,7 +597,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_cap_resolver: None,
+            structured_history_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
@@ -666,17 +689,26 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_cap_resolver(
+    fn structured_history_limits_resolver(
         mut self,
-        resolver: Arc<dyn Fn() -> usize + Send + Sync>,
+        resolver: Arc<dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync>,
     ) -> Self {
-        self.structured_history_cap_resolver = Some(resolver);
+        self.structured_history_limits_resolver = Some(resolver);
         self
     }
 
+    /// Test convenience pinning the structured cap. The low-water fraction
+    /// stays at the crate default inside the pinned resolver; tests that
+    /// need a specific fraction must drive it through a runtime profile and
+    /// the live resolver path instead.
     #[cfg(test)]
     fn structured_max_history_messages(self, max: usize) -> Self {
-        self.structured_history_cap_resolver(Arc::new(move || max))
+        self.structured_history_limits_resolver(Arc::new(move || {
+            crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: max,
+                low_water: omnesagent_config::schema::DEFAULT_HISTORY_TRIM_LOW_WATER,
+            }
+        }))
     }
 
     pub fn multimodal_config(
@@ -958,7 +990,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_cap_resolver: self.structured_history_cap_resolver,
+            structured_history_limits_resolver: self.structured_history_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             model_provider_name: self
@@ -1065,6 +1097,113 @@ impl Agent {
             format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
         format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+    }
+
+    /// Judge one steering message's sender now. A refused message is logged
+    /// and must be dropped. An admitted one applies its sender's current tool
+    /// posture at once, so the round it steers runs with no more than that
+    /// sender holds; narrowing only removes tools, so a later re-check that
+    /// applies it again is harmless.
+    fn admit_steering_input(&mut self, input: &crate::agent::SteeringInput, turn_id: &str) -> bool {
+        match input.admit() {
+            crate::agent::SteeringAdmission::Refused(reason) => {
+                ::omnesagent_log::record!(
+                    WARN,
+                    ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+                        .with_category(::omnesagent_log::EventCategory::Agent)
+                        .with_outcome(::omnesagent_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "turn_id": turn_id,
+                            "reason": reason,
+                        })),
+                    "steering message dropped: its sender may no longer steer this turn"
+                );
+                false
+            }
+            crate::agent::SteeringAdmission::Admitted(posture) => {
+                if let Some(ceiling) = &posture.tool_ceiling {
+                    self.tools.retain(|tool| ceiling.iter().any(|name| name == tool.name()));
+                }
+                true
+            }
+        }
+    }
+
+    /// Take every pending steering message through its memory write and
+    /// enrichment, in arrival order. Each message is judged immediately
+    /// before its own write, not when its batch was drained: an earlier
+    /// message's write can yield, and a sender revoked meanwhile must not
+    /// reach memory or the model. Messages that arrive during those writes
+    /// are taken in the same pass. The results keep their checks, because the
+    /// caller must judge them once more after the last write
+    /// ([`Self::readmit_prepared_steering`]).
+    async fn prepare_steering(
+        &mut self,
+        steering_rx: &mut Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+        turn_id: &str,
+    ) -> Vec<(crate::agent::SteeringInput, ChatMessage)> {
+        let mut prepared = Vec::new();
+        loop {
+            let batch = crate::agent::turn::drain_steering_messages(steering_rx);
+            if batch.is_empty() {
+                return prepared;
+            }
+            for input in batch {
+                match steering_policy(input.text(), input.ingress(), &IngressPolicy::default()) {
+                    IngressDecision::Drop { .. } => continue,
+                    IngressDecision::Loop | IngressDecision::Annotate { .. } => {}
+                    IngressDecision::Gate { .. } => {
+                        // SOP diversion is not wired yet; preserve Loop behavior.
+                    }
+                }
+                if !self.admit_steering_input(&input, turn_id) {
+                    continue;
+                }
+                // Mirror the enrichment logic from append_streamed_user_message_to_history
+                // but route through the round's messages instead of self.history/new_msgs.
+                if self.auto_save {
+                    let store_start = std::time::Instant::now();
+                    let store_result = self
+                        .memory
+                        .store(
+                            "user_msg",
+                            input.text(),
+                            MemoryCategory::Conversation,
+                            self.memory_session_id.as_deref(),
+                        )
+                        .await;
+                    self.observer.record_event(&ObserverEvent::MemoryStore {
+                        category: MemoryCategory::Conversation.to_string(),
+                        backend: self.memory.name().to_string(),
+                        duration: store_start.elapsed(),
+                        success: store_result.is_ok(),
+                        channel: Some(self.channel_name.clone()),
+                        agent_alias: self.observer_agent_alias(),
+                        turn_id: Some(turn_id.to_string()),
+                    });
+                }
+                let enriched = self.enrich_user_message(input.text());
+                prepared.push((input, ChatMessage::user(enriched)));
+            }
+        }
+    }
+
+    /// Judge prepared steering once more, after every write
+    /// [`Self::prepare_steering`] awaited, and return the messages whose
+    /// senders may still steer. The caller consumes them with no await in
+    /// between, so this is the check the steered round runs under.
+    fn readmit_prepared_steering(
+        &mut self,
+        prepared: Vec<(crate::agent::SteeringInput, ChatMessage)>,
+        turn_id: &str,
+    ) -> Vec<ChatMessage> {
+        let mut admitted = Vec::with_capacity(prepared.len());
+        for (input, message) in prepared {
+            if self.admit_steering_input(&input, turn_id) {
+                admitted.push(message);
+            }
+        }
+        admitted
     }
 
     pub fn set_channel_name(&mut self, name: String) {
@@ -1271,6 +1410,11 @@ impl Agent {
         self.temperature
     }
 
+    #[cfg(test)]
+    pub fn multimodal_config_for_test(&self) -> &omnesagent_config::schema::MultimodalConfig {
+        &self.multimodal_config
+    }
+
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
     }
@@ -1281,6 +1425,17 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    /// Refreshes the `[multimodal]` policy snapshot alongside a live provider
+    /// swap. The provider boundary carries its own clone of the same policy,
+    /// so both must move together or the runtime preparation pass and the
+    /// provider boundary disagree after a refresh.
+    pub fn set_multimodal_config(
+        &mut self,
+        config: omnesagent_config::schema::MultimodalConfig,
+    ) {
+        self.multimodal_config = config;
     }
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
@@ -1563,8 +1718,13 @@ impl Agent {
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
-        let runtime: Arc<dyn platform::RuntimeAdapter> =
-            Arc::from(platform::create_runtime(&config.runtime)?);
+        let tui_path = tui_env
+            .as_ref()
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let runtime: Arc<dyn platform::RuntimeAdapter> = Arc::from(
+            platform::create_runtime_with_path(&config.runtime, tui_path)?,
+        );
         // Per-agent workspace becomes the SecurityPolicy boundary
         // (file_read/write/edit + shell tool jail to the agent's own
         // dir). The session-cwd override still wins so ACP sessions
@@ -1811,18 +1971,28 @@ impl Agent {
             ApprovalManager::for_non_interactive(risk_profile)
         };
 
-        let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
-                let cap_agent_alias = agent_alias.to_string();
-                Arc::new(move || {
-                    cap_config
-                        .read()
-                        .effective_structured_max_history_messages(&cap_agent_alias)
-                })
-            } else {
-                let max = config.effective_structured_max_history_messages(agent_alias);
-                Arc::new(move || max)
+        let structured_history_limits_resolver: Arc<
+            dyn Fn() -> crate::agent::history_trim::HistoryTrimLimits + Send + Sync,
+        > = if let Some(cap_config) = live_config.clone() {
+            let cap_agent_alias = agent_alias.to_string();
+            // One read guard covers both halves: the cap and the low-water
+            // fraction are one trim decision and must come from one config
+            // revision even under a concurrent profile edit.
+            Arc::new(move || {
+                let config = cap_config.read();
+                crate::agent::history_trim::HistoryTrimLimits {
+                    max_messages: config
+                        .effective_structured_max_history_messages(&cap_agent_alias),
+                    low_water: config.effective_history_trim_low_water(&cap_agent_alias),
+                }
+            })
+        } else {
+            let limits = crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: config.effective_structured_max_history_messages(agent_alias),
+                low_water: config.effective_history_trim_low_water(agent_alias),
             };
+            Arc::new(move || limits)
+        };
 
         let builder = Agent::builder();
         #[cfg(test)]
@@ -1847,7 +2017,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_cap_resolver(structured_history_cap_resolver)
+            .structured_history_limits_resolver(structured_history_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
@@ -1879,6 +2049,7 @@ impl Agent {
             .approval_manager(Some(Arc::new(approval_manager)))
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(std::sync::Arc::new(config.clone())),
+                live_config,
             })
             .build()?;
 
@@ -1896,18 +2067,22 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max = self
-            .structured_history_cap_resolver
-            .as_ref()
-            .map_or(self.config.resolved.max_history_messages, |resolve| {
-                resolve()
-            });
+        let limits = self.structured_history_limits_resolver.as_ref().map_or(
+            crate::agent::history_trim::HistoryTrimLimits {
+                max_messages: self.config.resolved.max_history_messages,
+                low_water: self.config.resolved.history_trim_low_water,
+            },
+            |resolve| resolve(),
+        );
+        let max = limits.max_messages;
         if self.history.len() <= max {
             return None;
         }
+        let target = crate::agent::history_trim::history_trim_target(max, limits.low_water);
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
             max,
+            target,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
@@ -1944,6 +2119,7 @@ impl Agent {
                     .with_outcome(::omnesagent_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "max_history_messages": max,
+                        "trim_target": target,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -2006,7 +2182,7 @@ impl Agent {
     /// consumers of the final text, e.g. the gateway web UI's `done` frame)
     /// and streamed as a trailing [`TurnEvent::Chunk`] (rendered by streaming
     /// consumers that discard the final text on a clean finish, e.g. the
-    /// ZeroCode TUI).
+    /// OmnesCode TUI).
     async fn append_model_fallback_notice(
         response: String,
         fallback: Option<&omnesagent_providers::reliable::ProviderFallbackInfo>,
@@ -2199,16 +2375,8 @@ impl Agent {
                     .and_then(|r| r.api_key.as_deref());
                 let api_key = route_api_key.or(default_api_key);
 
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        omnesagent_providers::provider_runtime_options_for_alias(
-                            full_config.as_ref(),
-                            family,
-                            alias,
-                        )
-                    })
-                    .unwrap_or_default();
+                let runtime_options =
+                    switch_runtime_options(full_config.as_ref(), &new_model_provider);
 
                 omnesagent_providers::create_routed_model_provider_with_options(
                     full_config.as_ref(),
@@ -2525,6 +2693,7 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
             draft_reasoning: omnesagent_config::schema::StreamReasoningMode::Status,
+            yield_to_steering: false,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -2617,11 +2786,14 @@ impl Agent {
                     // `provider_switch_config`; with `None` (test builder) a
                     // cross-agent step FAILS CLOSED rather than inheriting
                     // this turn's context.
-                    sop_reassembly: self
-                        .provider_switch_config
-                        .as_ref()
-                        .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                    sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                        c.config.as_deref().map(|config| {
+                            crate::agent::turn::SopStepReassembly {
+                                config,
+                                live_config: c.live_config.clone(),
+                            }
+                        })
+                    }),
                 }),
             ),
         );
@@ -2730,12 +2902,40 @@ impl Agent {
             .map_err(|err| err.error)
     }
 
+    /// Run one streamed turn that can take steering messages mid-turn.
+    ///
+    /// The steering receiver is closed on every exit: success, error,
+    /// cancellation, a response-cache hit, and the returned future being
+    /// dropped. The caller usually lends the receiver (&mut) and keeps it
+    /// alive after the turn, so without the close a late 	ry_send would
+    /// get Ok and the message would never be read. Closed, the sender sees
+    /// Closed and can send the text as an ordinary prompt instead.
     pub async fn turn_streamed_with_steering_state(
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
-        mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        let mut steering = CloseSteeringOnExit(steering_rx);
+        self.turn_streamed_with_steering_body(
+            user_message,
+            event_tx,
+            cancel_token,
+            steering.0.as_deref_mut(),
+        )
+        .await
+    }
+
+    /// Body of [Self::turn_streamed_with_steering_state]. The successful
+    /// finish closes the receiver itself before its last drain; every other
+    /// exit relies on the wrapper's guard.
+    async fn turn_streamed_with_steering_body(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
@@ -2900,6 +3100,9 @@ impl Agent {
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
             draft_reasoning: omnesagent_config::schema::StreamReasoningMode::Status,
+            // This wrapper judges and writes steering itself; the loop only
+            // stops after a tool round when a message is waiting.
+            yield_to_steering: true,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -2918,6 +3121,13 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+
+        // Steering prepared and judged at the end of a round, consumed at the
+        // top of the next with no await in between.
+        let mut steered_continuation: Option<Vec<ChatMessage>> = None;
+        // Provider-reported usage handed over by a run that yielded to
+        // steering, so the resumed run keeps the same token calibration.
+        let mut carried_reported_usage: Option<crate::agent::turn::ReportedRequestUsage> = None;
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
@@ -2947,40 +3157,31 @@ impl Agent {
                 Vec::new()
             };
 
-            // Steering drain: each accepted mid-turn message becomes its own
+            // Steering drain: each admitted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
-            for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
-                // Mirror the enrichment logic from append_streamed_user_message_to_history
-                // but route through round_added instead of self.history/new_msgs.
-                if self.auto_save {
-                    let store_start = std::time::Instant::now();
-                    let store_result = self
-                        .memory
-                        .store(
-                            "user_msg",
-                            &steering_message,
-                            MemoryCategory::Conversation,
-                            self.memory_session_id.as_deref(),
-                        )
-                        .await;
-                    self.observer.record_event(&ObserverEvent::MemoryStore {
-                        category: MemoryCategory::Conversation.to_string(),
-                        backend: self.memory.name().to_string(),
-                        duration: store_start.elapsed(),
-                        success: store_result.is_ok(),
-                        channel: Some(self.channel_name.clone()),
-                        agent_alias: self.observer_agent_alias(),
-                        turn_id: Some(turn_id.clone()),
-                    });
+            // A round started by steering consumes what the previous round
+            // prepared and judged, with no await since. Any other round
+            // prepares what is pending now and judges it after the writes
+            // that preparation awaited.
+            let steering_messages = match steered_continuation.take() {
+                Some(prepared) => prepared,
+                None => {
+                    let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                    self.readmit_prepared_steering(pending, &turn_id)
                 }
-                let enriched = self.enrich_user_message(&steering_message);
-                round_added.push(ChatMessage::user(enriched));
-            }
+            };
+            round_added.extend(steering_messages);
+            let initial_ingress_subject = if round == 0 {
+                crate::agent::turn::InitialIngressSubject::Original(user_message)
+            } else {
+                crate::agent::turn::InitialIngressSubject::AlreadyAdmitted
+            };
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                    crate::agent::turn::run_tool_call_loop_with_initial_ingress(
+                        crate::agent::loop_::ToolLoop {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -3039,7 +3240,7 @@ impl Agent {
                             .as_ref()
                             .map(crate::agent::tool_receipts::ReceiptScope::collector),
                         event_tx: Some(event_tx.clone()),
-                        steering: None,
+                        steering: steering_rx.as_deref_mut(),
                         new_messages_out: Some(&mut round_added),
                         image_cache: Some(&mut self.image_cache),
                         // Direct embedded Agent::turn call; source/transport/
@@ -3060,14 +3261,20 @@ impl Agent {
                         // only via `provider_switch_config`; with `None`
                         // (test builder) a cross-agent step FAILS CLOSED
                         // rather than inheriting this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
-                    }),
+                        sop_reassembly: self.provider_switch_config.as_ref().and_then(|c| {
+                            c.config.as_deref().map(|config| {
+                                crate::agent::turn::SopStepReassembly {
+                                    config,
+                                    live_config: c.live_config.clone(),
+                                }
+                            })
+                        }),
+                    },
+                    initial_ingress_subject,
+                    carried_reported_usage.take(),
                 ),
-            );
+            ),
+        );
             // Scope the provider-fallback task-local around the round so the
             // resilient wrapper's requested-vs-served record is visible here,
             // then read it immediately. Box before adding the prompt scope so
@@ -3125,6 +3332,36 @@ impl Agent {
             }
 
             match loop_result {
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::agent::turn::SteeringPending>()
+                        .is_some() =>
+                {
+                    // The loop stopped after a tool round because steering is
+                    // waiting. The round's messages are replayed above; commit
+                    // its text, then judge the steering exactly as at the end
+                    // of a round, so it reaches the model at the next step
+                    // instead of after the final answer. A cancelled turn
+                    // prepares nothing; the next round's top records the
+                    // interruption.
+                    if let Ok(pending) = error.downcast::<crate::agent::turn::SteeringPending>() {
+                        committed_response.push_str(&pending.display_text);
+                        carried_reported_usage = pending.reported_usage;
+                    }
+                    let notice = self.trim_history(Some(&turn_id));
+                    forward_history_trim_notice(&event_tx, notice).await;
+                    let cancelled = cancel_token
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    if !cancelled {
+                        let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                        let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                        if !admitted.is_empty() {
+                            steered_continuation = Some(admitted);
+                        }
+                    }
+                    continue;
+                }
                 Ok(response) => {
                     // Commit-before-drain: this round's assistant output is in
                     // history/new_msgs (replay above) and committed_response
@@ -3133,10 +3370,45 @@ impl Agent {
                     let notice = self.trim_history(Some(&turn_id));
                     forward_history_trim_notice(&event_tx, notice).await;
 
-                    let has_more_steering =
-                        steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
-                    if has_more_steering {
-                        continue;
+                    // Pending steering is prepared here, where it decides
+                    // whether another round runs. Each message is judged
+                    // before its own memory write and all of them again after
+                    // the last write, so a sender revoked during an earlier
+                    // message's write is refused, and steering whose senders
+                    // were all refused starts no round. The survivors are
+                    // consumed at the top of the next round with no await in
+                    // between. A cancelled turn prepares nothing: the next
+                    // round's top records the interruption if steering is
+                    // pending, and no cancelled message is written to memory.
+                    let cancelled = cancel_token
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
+                    if !cancelled {
+                        let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                        let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                        if !admitted.is_empty() {
+                            steered_continuation = Some(admitted);
+                            continue;
+                        }
+                        // About to finish. Close first, then drain once
+                        // more: a sender whose message landed after the
+                        // drain above got `Ok` from `try_send`, and
+                        // without this the turn would end and drop it.
+                        // Anything that slipped in before the close still
+                        // gets its round; a later sender sees `Closed` and
+                        // can fall back to an ordinary prompt.
+                        if let Some(rx) = steering_rx.as_deref_mut() {
+                            rx.close();
+                        }
+                        let pending = self.prepare_steering(&mut steering_rx, &turn_id).await;
+                        let admitted = self.readmit_prepared_steering(pending, &turn_id);
+                        if !admitted.is_empty() {
+                            steered_continuation = Some(admitted);
+                            continue;
+                        }
+                    }
+                    if let Some(rx) = steering_rx.as_deref_mut() {
+                        rx.close();
                     }
 
                     // Cache put only when the turn was a single tool-free
@@ -3310,6 +3582,30 @@ impl Agent {
 
         listen_handle.abort();
         Ok(())
+    }
+}
+
+/// Runtime options for the provider a live model switch rebuilds.
+///
+/// Dotted aliases resolve their entry through `provider_runtime_options_for_alias`;
+/// a bare family reference has no entry, and must take the config-owned
+/// `[multimodal]` policy through `provider_runtime_options_for_bare_family`
+/// rather than `ModelProviderRuntimeOptions::default()`. The default embeds
+/// `max_images = 4` / `max_image_size_mb = 5`, so a bare-family switch built
+/// on defaults would re-normalize already-prepared history under narrower
+/// caps than the operator configured and silently drop images.
+///
+/// A free function so a regression can pin the switch path's options
+/// directly — the rebuilt provider box is opaque to the runtime's tests.
+fn switch_runtime_options(
+    config: &omnesagent_config::schema::Config,
+    new_model_provider: &str,
+) -> omnesagent_providers::ModelProviderRuntimeOptions {
+    match new_model_provider.split_once('.') {
+        Some((family, alias)) => {
+            omnesagent_providers::provider_runtime_options_for_alias(config, family, alias)
+        }
+        None => omnesagent_providers::provider_runtime_options_for_bare_family(config),
     }
 }
 
@@ -3702,6 +3998,7 @@ mod tests {
                             input_tokens: Some(13),
                             output_tokens: Some(7),
                             cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
                         },
                     )),
                     Ok(omnesagent_providers::traits::StreamEvent::Final),
@@ -3832,7 +4129,7 @@ mod tests {
         }
         assert!(
             chunk_carried_notice,
-            "the notice must also be streamed for delta-only consumers (ZeroCode)"
+            "the notice must also be streamed for delta-only consumers (OmnesCode)"
         );
     }
 
@@ -5325,7 +5622,7 @@ mod tests {
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
 
             agent
-                .turn_streamed_with_steering_state("hi from zerocode", event_tx, None, None)
+                .turn_streamed_with_steering_state("hi from omnescode", event_tx, None, None)
                 .await
                 .expect("streamed Agent turn should succeed");
 
@@ -5348,7 +5645,7 @@ mod tests {
             );
             assert!(
                 user.content.starts_with("[CURRENT DATE & TIME:")
-                    && user.content.ends_with("\n\nhi from zerocode"),
+                    && user.content.ends_with("\n\nhi from omnescode"),
                 "provider must receive the labeled envelope and original text: {}",
                 user.content
             );
@@ -5626,7 +5923,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
 
             // The vision provider will fail to connect to localhost:9, but the
             // prompt rebuild and provider-visible transcript happen before the
@@ -5674,7 +5971,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
 
             let result = agent.turn_streamed(msg, event_tx, None).await;
@@ -6052,6 +6349,7 @@ mod tests {
             input_tokens: Some(1_000_000),
             output_tokens: Some(1_000_000),
             cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
         };
 
         let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -6816,7 +7114,7 @@ mod tests {
         agent.history().iter().any(|m| match m {
             ConversationMessage::ToolResults(results) => results
                 .iter()
-                .any(|r| r.content.contains("[receipt: zc-receipt-")),
+                .any(|r| r.content.contains("[receipt: oc-receipt-")),
             _ => false,
         })
     }
@@ -6909,7 +7207,7 @@ mod tests {
             .await
             .expect("streamed turn should succeed");
         assert!(
-            response.contains("---\nTool receipts:") && response.contains("zc-receipt-"),
+            response.contains("---\nTool receipts:") && response.contains("oc-receipt-"),
             "show_in_response must append the Tool receipts block to the reply, got: {response}"
         );
     }
@@ -7277,9 +7575,17 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("agent-turn.png");
+        // A real 1x1 PNG: content validation drops undecodable bytes, so a
+        // bare signature would be skipped before reaching the provider.
         std::fs::write(
             &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
         )
         .expect("write fixture");
 
@@ -7332,9 +7638,17 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("agent-stream.png");
+        // A real 1x1 PNG: content validation drops undecodable bytes, so a
+        // bare signature would be skipped before reaching the provider.
         std::fs::write(
             &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
         )
         .expect("write fixture");
 
@@ -7671,7 +7985,7 @@ mod tests {
         seed_old_trim_test_turn(&mut agent);
 
         let error = agent
-            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]")
+            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]")
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
@@ -7701,7 +8015,7 @@ mod tests {
 
         let error = agent
             .turn_streamed(
-                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
                 event_tx,
                 None,
             )
@@ -7839,6 +8153,14 @@ mod tests {
         );
         assert_eq!(event.omnesagent.get("channel"), None);
         assert_eq!(event.trace_id.as_deref(), Some("trim-test-turn"));
+        assert_eq!(
+            event
+                .attributes
+                .get("trim_target")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "cap 2 with the default 0.7 fraction floors to a target of 1"
+        );
         assert!(event.attributes.get("agent_alias").is_none());
         assert!(event.attributes.get("channel").is_none());
         assert!(event.attributes.get("turn_id").is_none());
@@ -8388,6 +8710,7 @@ mod tests {
                     usage: Some(omnesagent_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -9794,11 +10117,15 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        // The receiver comes back out of the task alive, as it does for the
+        // gateway (which lends `&mut`): only an explicit close, not a drop,
+        // can make the late send below fail.
         let handle = omnesagent_spawn::spawn!(async move {
-            agent
+            let result = agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
-                .await
+                .await;
+            (result, steering_rx)
         });
 
         loop {
@@ -9814,11 +10141,18 @@ mod tests {
             }
         }
 
-        let outcome = handle
-            .await
-            .expect("turn task should finish")
-            .expect("steered turn should succeed");
+        let (outcome, _live_steering_rx) = handle.await.expect("turn task should finish");
+        let outcome = outcome.expect("steered turn should succeed");
         assert_eq!(outcome.response, "draftfinal");
+        // The turn has ended: a late steer must be refused visibly rather
+        // than accepted into a receiver nobody will drain again.
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a finished turn must close its steering channel"
+        );
 
         let new_chat_messages: Vec<_> = outcome
             .new_messages
@@ -9889,6 +10223,132 @@ mod tests {
         );
     }
 
+    /// Steering sent while a tool runs reaches the model at the very next
+    /// step of the same turn, after that tool's result, not after the model's
+    /// final answer.
+    #[tokio::test]
+    async fn steering_sent_during_a_tool_reaches_the_next_step() {
+        // Sends once, during the first tool call only.
+        struct SteerDuringTool {
+            tx: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+        }
+        #[async_trait]
+        impl Tool for SteerDuringTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+                let tx = self.tx.lock().take();
+                if let Some(tx) = tx {
+                    tx.send("steer-now".into())
+                        .await
+                        .expect("the running turn must accept steering");
+                }
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "tool-out".into(),
+                    error: None,
+                })
+            }
+        }
+        omnesagent_api::mock_tool_attribution!(SteerDuringTool);
+
+        let tool_step = |id: &str| omnesagent_providers::ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![omnesagent_providers::ToolCall {
+                id: id.into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            usage: None,
+            reasoning_content: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = Box::new(TranscriptCaptureModelProvider {
+            alias: "steer-step".into(),
+            // Two tool steps, then an answer: if steering waited for the
+            // final answer, neither the second nor third call would see it.
+            responses: Mutex::new(vec![
+                tool_step("call-1"),
+                tool_step("call-2"),
+                omnesagent_providers::ChatResponse {
+                    text: Some("final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+            seen_messages: seen.clone(),
+        });
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SteerDuringTool {
+                    tx: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(Arc::from(
+                omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                    .expect("memory creation should succeed with valid config"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(256);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent.turn_streamed_with_steering_state(
+                "start",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn must finish")
+        .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "final");
+
+        let seen = seen.lock();
+        let second_call = seen.get(1).expect("the turn must make a second model call");
+        let steer_at = second_call
+            .iter()
+            .position(|m| m.role == "user" && m.content.ends_with("]\n\nsteer-now"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the step after the tool must see the steering message: {:?}",
+                    second_call
+                        .iter()
+                        .map(|m| (&m.role, &m.content))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let tool_result_at = second_call
+            .iter()
+            .position(|m| m.role == "tool" || m.content.contains("tool-out"))
+            .expect("the step after the tool must see its output");
+        assert!(
+            steer_at > tool_result_at,
+            "steering must come after the tool result, not preempt it"
+        );
+    }
+
     #[tokio::test]
     async fn turn_streamed_with_steering_error_returns_committed_partial_output() {
         let memory_cfg = omnesagent_config::schema::MemoryConfig {
@@ -9922,11 +10382,12 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
-        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
         let handle = omnesagent_spawn::spawn!(async move {
-            agent
+            let result = agent
                 .turn_streamed_with_steering_state("first", event_tx, None, Some(&mut steering_rx))
-                .await
+                .await;
+            (result, steering_rx)
         });
 
         loop {
@@ -9942,10 +10403,15 @@ mod tests {
             }
         }
 
-        let err = handle
-            .await
-            .expect("turn task should finish")
-            .expect_err("second provider call should fail");
+        let (outcome, _live_steering_rx) = handle.await.expect("turn task should finish");
+        let err = outcome.expect_err("second provider call should fail");
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a turn that ends on a provider error must close its steering channel"
+        );
         assert_eq!(err.committed_response, "draft");
         assert!(
             err.new_messages.iter().any(|msg| {
@@ -9958,6 +10424,487 @@ mod tests {
                 matches!(msg, ConversationMessage::Chat(message) if message.role == "user" && message.content.contains("second"))
             }),
             "accepted steering user message should still be returned after continuation failure"
+        );
+    }
+
+    fn assert_steering_closed(
+        steering_tx: &tokio::sync::mpsc::Sender<crate::agent::SteeringInput>,
+        exit: &str,
+    ) {
+        assert!(
+            matches!(
+                steering_tx.try_send("late".into()),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            ),
+            "a turn that ends by {exit} must close its steering channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_when_cancelled() {
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let calls = AtomicUsize::new(0);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(StreamingSteeringModelProvider {
+                seen_messages: Arc::new(Mutex::new(Vec::new())),
+                call_count: calls,
+                fail_on_call: None,
+                fail_chat_on_call: None,
+                fail_after_delta_on_call: None,
+                delay_chat_on_call: None,
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let err = agent
+            .turn_streamed_with_steering_state(
+                "first",
+                event_tx,
+                Some(cancel),
+                Some(&mut steering_rx),
+            )
+            .await
+            .expect_err("a cancelled turn must return an error");
+        assert!(
+            err.error
+                .downcast_ref::<crate::agent::loop_::ToolLoopCancelled>()
+                .is_some(),
+            "the turn must end on the cancellation path, got: {}",
+            err.error
+        );
+        // `steering_rx` is still alive here; only an explicit close fails the send.
+        assert_steering_closed(&steering_tx, "cancellation");
+        drop(steering_rx);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_on_response_cache_hit() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            omnesagent_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let mut first = context_recovery_cache_agent(
+            tmp.path(),
+            cache.clone(),
+            first_calls.clone(),
+            "cached answer",
+            false,
+        );
+        let mut second = context_recovery_cache_agent(
+            tmp.path(),
+            cache,
+            second_calls.clone(),
+            "fresh answer",
+            false,
+        );
+
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (warm_tx, mut warm_rx) = tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let warmed = first
+            .turn_streamed_with_steering_state("same request", event_tx_a, None, Some(&mut warm_rx))
+            .await
+            .expect("first turn should reach the provider and fill the cache");
+        assert_eq!(warmed.response, "cached answer");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        drop(warm_tx);
+
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let hit = second
+            .turn_streamed_with_steering_state(
+                "same request",
+                event_tx_b,
+                None,
+                Some(&mut steering_rx),
+            )
+            .await
+            .expect("cache hit should succeed");
+        assert_eq!(
+            hit.response, "cached answer",
+            "the second turn must be served from the response cache"
+        );
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "a cache hit must not reach the provider"
+        );
+        assert_steering_closed(&steering_tx, "a response-cache hit");
+        drop(steering_rx);
+    }
+
+    struct GatedFinalCompletionProvider {
+        calls: Arc<AtomicUsize>,
+        started: tokio::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedFinalCompletionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("root-final".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<omnesagent_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started
+                .send(())
+                .await
+                .expect("final-completion test should still be observing the provider");
+            self.release.notified().await;
+            Ok(omnesagent_providers::ChatResponse {
+                text: Some("root-final".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::omnesagent_api::attribution::Attributable for GatedFinalCompletionProvider {
+        fn role(&self) -> ::omnesagent_api::attribution::Role {
+            ::omnesagent_api::attribution::Role::Provider(
+                ::omnesagent_api::attribution::ProviderKind::Model(
+                    ::omnesagent_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GatedFinalCompletionProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_with_steering_closes_channel_when_turn_future_is_dropped() {
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(GatedFinalCompletionProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                started: started_tx,
+                release: Arc::new(tokio::sync::Notify::new()),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        {
+            let mut turn = Box::pin(agent.turn_streamed_with_steering_state(
+                "first",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ));
+            tokio::select! {
+                _ = &mut turn => panic!("the gated provider must hold the turn open"),
+                started = started_rx.recv() => {
+                    started.expect("provider should signal that the turn is in flight");
+                }
+            }
+            steering_tx
+                .try_send("while the turn runs".into())
+                .expect("a turn in flight must accept steering");
+            // Dropping `turn` here abandons it mid-provider-call, as a caller
+            // racing the turn against a disconnect would.
+        }
+        assert_steering_closed(&steering_tx, "its future being dropped");
+        drop(steering_rx);
+    }
+
+    fn steering_context(
+        message_id: &str,
+        sender: &str,
+        transport: omnesagent_api::ingress::Transport,
+    ) -> omnesagent_api::ingress::IngressContext {
+        omnesagent_api::ingress::IngressContext {
+            message_id: Some(message_id.to_string()),
+            source_class: omnesagent_api::ingress::SourceClass::External,
+            sender: Some(sender.to_string()),
+            transport,
+            trust: omnesagent_api::ingress::TrustClass::Untrusted,
+            origin: omnesagent_api::ingress::TurnOrigin::Interactive,
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_admission_keeps_per_injection_context() {
+        let observations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer = Arc::new(CapturingObserver::default());
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: Arc::new(Mutex::new(Vec::new())),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer.clone())
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .auto_save(true)
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let first_context =
+            steering_context("rpc-1", "actor-a", omnesagent_api::ingress::Transport::Rpc);
+        let second_context = steering_context(
+            "gateway-2",
+            "actor-b",
+            omnesagent_api::ingress::Transport::Gateway,
+        );
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::new("accepted-a").with_ingress(first_context.clone()),
+            )
+            .await
+            .expect("first steering message should enqueue");
+        steering_tx
+            .send(
+                crate::agent::SteeringInput::with_admission(
+                    "drop-me",
+                    Box::new(|| {
+                        crate::agent::SteeringAdmission::Admitted(crate::agent::SteeringPosture {
+                            tool_ceiling: Some(Vec::new()),
+                            disable_principal_unaware_nested_tools: false,
+                        })
+                    }),
+                )
+                .with_ingress(second_context.clone()),
+            )
+            .await
+            .expect("second steering message should enqueue");
+        steering_tx
+            .send(crate::agent::SteeringInput::new("legacy".to_string()))
+            .await
+            .expect("legacy steering message should enqueue");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let outcome = crate::security::ingress::with_test_policy_probe(
+            observations.clone(),
+            Some("drop-me".to_string()),
+            agent.turn_streamed_with_steering_state(
+                "original",
+                event_tx,
+                None,
+                Some(&mut steering_rx),
+            ),
+        )
+        .await
+        .expect("steered turn should succeed");
+
+        assert_eq!(
+            agent.tool_names(),
+            ["echo"],
+            "provenance-dropped steering must not narrow the session's tools"
+        );
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["accepted-a", "drop-me", "legacy", "original"],
+            "the wrapper must admit each injection, then the loop must admit only the original user"
+        );
+        assert_eq!(observations[0].ingress, Some(first_context));
+        assert_eq!(observations[1].ingress, Some(second_context));
+        assert!(observations[2].ingress.is_none());
+        assert_eq!(
+            observations[3].ingress,
+            Some(omnesagent_api::ingress::IngressContext::agent_direct())
+        );
+
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("original"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .any(|content| content.contains("accepted-a"))
+        );
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-me")),
+            "a dropped injection must not reach transcript history"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_steering_drop_only_after_round_does_not_replay_model() {
+        let observations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let model_provider = Box::new(StreamingSteeringModelProvider {
+            seen_messages: seen_messages.clone(),
+            call_count: AtomicUsize::new(0),
+            fail_on_call: None,
+            fail_chat_on_call: None,
+            fail_after_delta_on_call: None,
+            delay_chat_on_call: None,
+        });
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+        agent.config.resolved.max_tool_iterations = 2;
+
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel(4);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let probe_observations = observations.clone();
+        let handle = omnesagent_spawn::spawn!(async move {
+            crate::security::ingress::with_test_policy_probe(
+                probe_observations,
+                Some("drop-late".to_string()),
+                agent.turn_streamed_with_steering_state(
+                    "original",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await
+        });
+
+        loop {
+            match event_rx.recv().await.expect("turn event should arrive") {
+                TurnEvent::Chunk { delta } if delta == "draft" => {
+                    steering_tx
+                        .send(crate::agent::SteeringInput::new("drop-late".to_string()))
+                        .await
+                        .expect("late steering message should enqueue");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let outcome = handle
+            .await
+            .expect("turn task should finish")
+            .expect("steered turn should succeed");
+        assert_eq!(outcome.response, "draft");
+        assert_eq!(
+            seen_messages.lock().len(),
+            1,
+            "a late injection dropped at the wrapper must not trigger another model request"
+        );
+
+        let observations = observations.lock().clone();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["original", "drop-late"]
+        );
+        let user_messages: Vec<_> = outcome
+            .new_messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "user" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .all(|content| !content.contains("drop-late")),
+            "a late dropped injection must not reach transcript history"
         );
     }
 
@@ -10813,6 +11760,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn register_skill_tools_deny_all_allowlist_denies_skill_tools() {
+        // Deny-all (the runtime `Some(vec![])` produced by
+        // `deny_all_tools = true`) applies to skill-defined tools as well as
+        // built-ins and MCP. A nonempty allowlist still leaves skill tools
+        // visible (see register_skill_tools_allowlist_does_not_hide_skills).
+        let security = Arc::new(crate::security::SecurityPolicy {
+            allowed_tools: Some(vec![]),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        let skills = vec![
+            make_skill("deploy", &["run"]),
+            crate::skills::Skill {
+                name: "weather".to_string(),
+                description: "weather skill".to_string(),
+                description_localizations: Default::default(),
+                version: "0.1.0".to_string(),
+                author: None,
+                tags: vec![],
+                tools: vec![crate::skills::SkillTool {
+                    name: "get_weather".to_string(),
+                    description: "http weather".to_string(),
+                    kind: "http".to_string(),
+                    command: String::new(),
+                    args: std::collections::HashMap::new(),
+                    target: Some("https://example.invalid/weather".to_string()),
+                    locked_args: std::collections::HashMap::new(),
+                    timeout_secs: None,
+                }],
+                prompts: vec![],
+                slash_options: Vec::new(),
+                always: false,
+                location: None,
+            },
+        ];
+        tools::register_skill_tools(&mut tools, &skills, security);
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"deploy__run"),
+            "deny-all must hide shell skill tools, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("weather")),
+            "deny-all must hide HTTP skill tools, got {names:?}"
+        );
+    }
+
     fn observer_event_turn_id(event: &ObserverEvent) -> Option<&str> {
         match event {
             ObserverEvent::AgentStart { turn_id, .. }
@@ -11017,6 +12014,7 @@ mod tests {
                     usage: Some(omnesagent_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
@@ -11103,6 +12101,7 @@ mod tests {
                     usage: Some(omnesagent_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
@@ -11207,6 +12206,7 @@ mod tests {
                     usage: Some(omnesagent_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -11308,6 +12308,7 @@ mod tests {
                     usage: Some(omnesagent_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -11579,6 +12580,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 omnesagent_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -11606,6 +12608,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 omnesagent_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
@@ -11642,6 +12645,7 @@ mod tests {
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -11657,6 +12661,31 @@ mod tests {
             "switch must succeed when a model_routes entry matches the target"
         );
         assert_eq!(agent.model_provider_name, "ollama");
+    }
+
+    #[test]
+    fn model_switch_options_carry_the_configured_policy_for_bare_families() {
+        // A live switch to a bare family rebuilds the provider from the
+        // config. Building it on `ModelProviderRuntimeOptions::default()`
+        // reset the provider boundary to `max_images = 4` /
+        // `max_image_size_mb = 5`, so a request the operator had configured
+        // for 8 images was re-trimmed to 4 after the switch. The switch path
+        // must resolve the config-owned policy for bare families, the same
+        // way dotted aliases resolve theirs.
+        let mut config = omnesagent_config::schema::Config::default();
+        config.multimodal.max_images = 8;
+        config.multimodal.max_image_size_mb = 10;
+
+        let options = switch_runtime_options(&config, "ollama");
+
+        assert_eq!(
+            options.multimodal.max_images, 8,
+            "a bare-family switch must carry the configured max_images, not the default 4"
+        );
+        assert_eq!(
+            options.multimodal.max_image_size_mb, 10,
+            "a bare-family switch must carry the configured max_image_size_mb, not the default 5"
+        );
     }
 
     /// Streamed mock whose first call emits a tool call (queuing a model
@@ -11809,6 +12838,122 @@ mod tests {
         }
     }
 
+    /// A tool that queues a model switch and, in the same call, a steering
+    /// message. The switch must still apply: steering waits for the switched
+    /// provider instead of resuming on the old one.
+    struct SwitchAndSteerTool {
+        steer: Mutex<Option<tokio::sync::mpsc::Sender<crate::agent::SteeringInput>>>,
+    }
+
+    #[async_trait]
+    impl Tool for SwitchAndSteerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a model switch and a steering message"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            let state = crate::agent::turn::current_model_switch_state()?;
+            *state.lock().unwrap() = Some(("ollama".to_string(), "llama3".to_string()));
+            let steer = self.steer.lock().take();
+            if let Some(steer) = steer {
+                steer
+                    .send("steer-during-switch".into())
+                    .await
+                    .expect("the running turn must accept steering");
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
+    omnesagent_api::mock_tool_attribution!(SwitchAndSteerTool);
+
+    #[test]
+    fn steering_in_the_same_batch_as_a_model_switch_keeps_the_switch() {
+        let initial_calls = Arc::new(Mutex::new(0usize));
+        let provider = Box::new(StreamSwitchTriggerProvider {
+            call_count: Arc::clone(&initial_calls),
+        });
+        let memory_cfg = omnesagent_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            omnesagent_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation"),
+        );
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(std::sync::Arc::new(omnesagent_config::schema::Config {
+                reliability: omnesagent_config::schema::ReliabilityConfig {
+                    provider_retries: 0,
+                    provider_backoff_ms: 0,
+                    ..omnesagent_config::schema::ReliabilityConfig::default()
+                },
+                ..omnesagent_config::schema::Config::default()
+            })),
+            live_config: None,
+        };
+        let (steering_tx, mut steering_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::SteeringInput>(4);
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SwitchAndSteerTool {
+                    steer: Mutex::new(Some(steering_tx)),
+                })],
+            ))
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("openai".to_string())
+            .model_name("gpt-4o-mini".to_string())
+            .provider_switch_config(switch_cfg)
+            .build()
+            .expect("agent builder");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+            // The switched provider has no live server, so the turn errors
+            // after the switch; the timeout only guards against a hang.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.turn_streamed_with_steering_state(
+                    "please switch the model",
+                    event_tx,
+                    None,
+                    Some(&mut steering_rx),
+                ),
+            )
+            .await;
+        });
+
+        assert_eq!(
+            (
+                agent.model_provider_name.as_str(),
+                agent.model_name.as_str()
+            ),
+            ("ollama", "llama3"),
+            "steering in the same batch must not drop the requested model switch"
+        );
+        assert_eq!(
+            *initial_calls.lock(),
+            1,
+            "the steered round must not go back to the original provider"
+        );
+    }
+
     #[test]
     fn turn_streamed_applies_pending_model_switch_for_next_call() {
         let initial_calls = Arc::new(Mutex::new(0usize));
@@ -11836,6 +12981,7 @@ mod tests {
                 },
                 ..omnesagent_config::schema::Config::default()
             })),
+            live_config: None,
         };
         let agent_config = omnesagent_config::schema::AliasedAgentConfig {
             resolved: omnesagent_config::schema::ResolvedRuntime {
@@ -12302,4 +13448,6 @@ mod approval_route_tests {
             "no originator to inherit; gate applies the non-interactive auto-deny"
         );
     }
+
+
 }

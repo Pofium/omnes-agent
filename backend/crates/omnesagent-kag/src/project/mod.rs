@@ -2,20 +2,29 @@
 
 pub mod watcher;
 pub mod codegraph_bridge;
+pub mod cochange;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use chrono::Utc;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 pub use watcher::ProjectWatcher;
 pub use codegraph_bridge::{sync_codegraph_db, CodeGraphSyncResult};
+pub use cochange::{
+    extract_cochange_pairs_from_log, extract_cochanges_from_git_repo, sync_cochange_edges,
+};
 use crate::ast::{AstCodeExtractor, AstScanResult};
 use crate::models::ProjectRecord;
 use crate::vector::similarity::top_k;
+
+/// Версия AST-экстрактора. При изменении алгоритмов извлечения узлов/рёбер
+/// инкрементальные данные устаревают — gate в `scan_project` форсит полный
+/// рескан. Порт ob2h `AST_EXTRACTOR_VERSION` (`2ad9027`).
+pub const AST_EXTRACTOR_VERSION: &str = "3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectStats {
@@ -98,25 +107,76 @@ impl ProjectService {
         Ok(crate::graph::GraphAnalytics::generate_project_report(&conn, project_id)?)
     }
 
-    /// Векторизация узлов графа проекта без эмбеддингов
+    /// Векторизация узлов графа проекта без эмбеддингов.
+    ///
+    /// Ф6.2: при несовпадении отпечатка векторного пространства (смена модели)
+    /// запись запрещена — возвращается ошибка, требуется
+    /// [`Self::reindex_project_embeddings`].
     pub async fn embed_unembedded_nodes(&self, project_id: &str) -> anyhow::Result<usize> {
+        self.embed_project_nodes(project_id, true).await
+    }
+
+    /// Ф6.2: полная переиндексация эмбеддингов узлов проекта — пересчитывает
+    /// векторы всех живых узлов активным провайдером и фиксирует его отпечаток.
+    /// Применяется после смены модели, когда [`Self::embed_unembedded_nodes`]
+    /// отклоняет запись из-за несовпадения пространства.
+    pub async fn reindex_project_embeddings(&self, project_id: &str) -> anyhow::Result<usize> {
+        self.embed_project_nodes(project_id, false).await
+    }
+
+    /// Общая реализация векторизации узлов проекта.
+    /// `only_missing = true` — только узлы без эмбеддинга (обычный путь);
+    /// `false` — переиндексация всех живых узлов (reindex).
+    async fn embed_project_nodes(
+        &self,
+        project_id: &str,
+        only_missing: bool,
+    ) -> anyhow::Result<usize> {
         let embedder = match &self.embedder {
             Some(e) => e.clone(),
             None => return Ok(0),
         };
 
+        // Ф6.2: отпечаток активного пространства. Обычная запись запрещена при
+        // смене модели (Mismatch) — это исключает смешивание пространств;
+        // переиндексация его допускает и перезапишет отпечаток.
+        let current = crate::embedding::fingerprint::EmbeddingFingerprint::of(embedder.as_ref());
+        if only_missing {
+            let status = {
+                let conn = self.conn.lock();
+                crate::embedding::fingerprint::check(&conn, &current)?
+            };
+            if let crate::embedding::fingerprint::FingerprintStatus::Mismatch { stored } = &status {
+                anyhow::bail!(
+                    "смена модели эмбеддингов: сохранён отпечаток {} ({}), активен {} ({}); \
+                     выполните reindex_project_embeddings",
+                    stored.key(),
+                    stored.model_id,
+                    current.key(),
+                    current.model_id
+                );
+            }
+        }
+
         let nodes: Vec<RawNodeTuple> = {
             let conn = self.conn.lock();
-            let mut stmt = conn.prepare(
+            // Обычный путь ограничен батчем 500 (повторные вызовы дочерпывают);
+            // переиндексация охватывает все живые узлы проекта.
+            let (missing_clause, limit_clause) = if only_missing {
+                ("AND embedding IS NULL", "LIMIT 500")
+            } else {
+                ("", "")
+            };
+            let mut stmt = conn.prepare(&format!(
                 r#"
                 SELECT id, node_type, label, file_path, description
                 FROM graph_nodes
                 WHERE project_id = ?1
-                  AND embedding IS NULL
+                  {missing_clause}
                   AND (deleted_at IS NULL OR deleted_at = '')
-                LIMIT 500
+                {limit_clause}
                 "#,
-            )?;
+            ))?;
             let rows = stmt.query_map(params![project_id], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -162,10 +222,19 @@ impl ProjectService {
                         "UPDATE graph_nodes SET embedding = ?1 WHERE id = ?2",
                         params![blob, pk],
                     )?;
+                    // Ф6.3: держим vec0-KNN-индекс в согласии с эмбеддингами.
+                    #[cfg(feature = "vec0")]
+                    crate::vector::vec0::sync_node(&tx, *pk, &blob)?;
                 }
                 tx.commit()?;
             }
             total_embedded += chunk.len();
+        }
+
+        // Ф6.2: фиксируем отпечаток пространства после успешной записи.
+        {
+            let conn = self.conn.lock();
+            crate::embedding::fingerprint::store(&conn, &current)?;
         }
 
         if total_embedded > 0 {
@@ -392,6 +461,7 @@ impl ProjectService {
 
     /// Сканирует кодовую базу проекта через AST и обновляет граф знаний.
     pub fn scan_project(&self, project_id: &str, custom_path: Option<&str>, incremental: bool) -> anyhow::Result<AstScanResult> {
+        let mut incremental = incremental;
         let project = self.get_project(project_id)?
             .ok_or_else(|| anyhow::anyhow!("Проект с ID '{}' не найден", project_id))?;
 
@@ -403,6 +473,28 @@ impl ProjectService {
         }
 
         info!("Начало AST-сканирования проекта '{}' (incremental={}) по пути: {}", project_id, incremental, scan_path);
+
+        // Смена версии экстрактора делает инкрементальные узлы устаревшими →
+        // один раз принудительно пересканируем проект целиком. (Порт ob2h `2ad9027`.)
+        let version_key = format!("ast_extractor_version:{project_id}");
+        if incremental {
+            let stored: Option<String> = {
+                let conn = self.conn.lock();
+                conn.query_row(
+                    "SELECT value FROM kv WHERE key = ?1",
+                    params![version_key],
+                    |row| row.get(0),
+                )
+                .optional()?
+            };
+            if stored.as_deref() != Some(AST_EXTRACTOR_VERSION) {
+                info!(
+                    "Версия AST-экстрактора изменилась ({:?} → {}); полный рескан проекта '{}'",
+                    stored, AST_EXTRACTOR_VERSION, project_id
+                );
+                incremental = false;
+            }
+        }
 
         let known_hashes = if incremental {
             self.get_known_files(project_id)?
@@ -423,10 +515,107 @@ impl ProjectService {
             Vec::new()
         };
 
-        // Type-pass: резолв простых вызовов (Rust/Python) по импортам и same-file
+        // Для инкрементального скана подгружаем существующие символы и ast_refs
+        // неизменённых файлов: иначе type-pass не видит их и теряет межфайловые
+        // CALLS/IMPORTS при правке одного файла (порт ob2h `0c79b95`).
+        if incremental && (!scan_res.file_meta.is_empty() || !deleted_files.is_empty()) {
+            let conn = self.conn.lock();
+            let prefix = format!("{project_id}:");
+
+            // Узлы неизменённых файлов (node_id в БД хранится со scoped-префиксом).
+            let mut stmt = conn.prepare(
+                "SELECT node_id, label, node_type, description, file_path, line_start, line_end, kind_detail, subtokens \
+                 FROM graph_nodes WHERE project_id = ?1 AND provenance = 'ast'",
+            )?;
+            let rows = stmt.query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)? as usize,
+                    r.get::<_, i64>(6)? as usize,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                ))
+            })?;
+            for (node_id, label, node_type, description, file_path, line_start, line_end, kind_detail, subtokens_str) in
+                rows.flatten()
+            {
+                let Some(file_path) = file_path else { continue };
+                if scan_res.file_meta.contains_key(&file_path) || deleted_files.contains(&file_path)
+                {
+                    continue;
+                }
+                let subtokens = subtokens_str.unwrap_or_default();
+                scan_res.nodes.push(crate::ast::AstNode {
+                    node_id: node_id.strip_prefix(&prefix).unwrap_or(&node_id).to_string(),
+                    label,
+                    node_type,
+                    description: description.unwrap_or_default(),
+                    file_path,
+                    line_start,
+                    line_end,
+                    kind_detail: kind_detail.unwrap_or_default(),
+                    subtokens,
+                    ..Default::default()
+                });
+            }
+
+            // Сохранённые места вызовов и импорты неизменённых файлов.
+            let mut stmt_refs = conn.prepare(
+                "SELECT rel_path, line, kind, name, module, item, alias \
+                 FROM ast_refs WHERE project_id = ?1",
+            )?;
+            let ref_rows = stmt_refs.query_map(params![project_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })?;
+            for (rel_path, line, kind, name, module, item, alias) in ref_rows.flatten() {
+                if scan_res.file_meta.contains_key(&rel_path) || deleted_files.contains(&rel_path) {
+                    continue;
+                }
+                if kind == "call" {
+                    scan_res.call_sites.push(crate::ast::CallSite {
+                        rel_path,
+                        line,
+                        name,
+                    });
+                } else if kind == "import" {
+                    scan_res.imports.push(crate::ast::ImportRef {
+                        rel_path,
+                        module: module.unwrap_or_default(),
+                        item,
+                        alias,
+                    });
+                }
+            }
+        }
+
+        // Type-pass, шаг 1: резолв импортов `file: → module:` в реальные файлы проекта
+        let resolved_imports = crate::ast::resolve_imports(&mut scan_res);
+        if resolved_imports > 0 {
+            info!("Type-pass: резолвлено {resolved_imports} импортов (IMPORTS, provenance=RESOLVED)");
+        }
+
+        // Type-pass, шаг 2: резолв простых вызовов (Rust/Python) по импортам и same-file
         let resolved_calls = crate::ast::resolve_calls(&mut scan_res);
         if resolved_calls > 0 {
             info!("Type-pass: резолвлено {resolved_calls} вызовов (CALLS, provenance=RESOLVED)");
+        }
+
+        // Ф51.3 (порт ob2h): слияние внешних импортов с pkg:-узлами
+        let merged = crate::ast::consolidate_external_imports(&mut scan_res);
+        if merged > 0 {
+            info!("Manifests: слито {merged} внешних импортов в pkg:-узлы");
         }
 
         if incremental && scan_res.files_scanned == 0 && deleted_files.is_empty() {
@@ -492,10 +681,10 @@ impl ProjectService {
         let mut node_id_to_pk = std::collections::HashMap::new();
 
         {
-            let mut insert_stmt = tx.prepare(
+            let mut insert_stmt = tx.prepare_cached(
                 r#"
-                INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, file_path, line_start, line_end, provenance, confidence, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ast', 1.0, ?9, ?9)
+                INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, file_path, line_start, line_end, provenance, confidence, kind_detail, subtokens, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ast', 1.0, ?9, ?10, ?11, ?11)
                 ON CONFLICT(node_id) DO UPDATE SET
                     label = excluded.label,
                     node_type = excluded.node_type,
@@ -504,6 +693,8 @@ impl ProjectService {
                     file_path = excluded.file_path,
                     line_start = excluded.line_start,
                     line_end = excluded.line_end,
+                    kind_detail = excluded.kind_detail,
+                    subtokens = excluded.subtokens,
                     updated_at = excluded.updated_at
                 RETURNING id
                 "#,
@@ -511,6 +702,11 @@ impl ProjectService {
 
             for n in &scan_res.nodes {
                 let scoped_node_id = format!("{}:{}", project_id, n.node_id);
+                let subtokens_val = if n.subtokens.is_empty() {
+                    None
+                } else {
+                    Some(n.subtokens.clone())
+                };
                 if let Ok(pk) = insert_stmt.query_row(
                     params![
                         scoped_node_id,
@@ -521,6 +717,8 @@ impl ProjectService {
                         n.file_path,
                         n.line_start as i64,
                         n.line_end as i64,
+                        n.kind_detail,
+                        subtokens_val,
                         now
                     ],
                     |r| r.get::<_, i64>(0),
@@ -530,9 +728,11 @@ impl ProjectService {
             }
         }
 
-        // Вставка рёбер
+        // Вставка рёбер. Цели рёбер, которых нет среди узлов скана (внешние
+        // модули, `pkg:`-пакеты, `route:`-заглушки), авто-создаются по префиксу
+        // node_id (порт ob2h, ADR-AST-6) — иначе ребро теряется.
         {
-            let mut insert_edge_stmt = tx.prepare(
+            let mut insert_edge_stmt = tx.prepare_cached(
                 r#"
                 INSERT INTO graph_edges (source_id, target_id, label, weight, contexts, project_id, provenance, confidence, created_at, updated_at)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?8)
@@ -544,24 +744,144 @@ impl ProjectService {
                     updated_at = excluded.updated_at
                 "#,
             )?;
+            let mut select_node_stmt =
+                tx.prepare_cached("SELECT id FROM graph_nodes WHERE node_id = ?1")?;
+            let mut insert_node_stmt = tx.prepare_cached(
+                r#"
+                INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, provenance, confidence, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, 'ast', 1.0, ?6, ?6)
+                ON CONFLICT(node_id) DO NOTHING
+                "#,
+            )?;
 
             for e in &scan_res.edges {
-                if let (Some(&src_pk), Some(&dst_pk)) = (node_id_to_pk.get(&e.source_node_id), node_id_to_pk.get(&e.target_node_id)) {
-                    let ctx_json = serde_json::to_string(&vec![e.context.clone()]).unwrap_or_default();
-                    let prov = if e.provenance.is_empty() { "ast" } else { &e.provenance };
-                    let _ = insert_edge_stmt.execute(params![
-                        src_pk,
-                        dst_pk,
-                        e.label,
-                        e.weight,
-                        ctx_json,
+                // Источник — уже сохранённый узел (текущего скана или прошлых).
+                let src_pk = match node_id_to_pk.get(&e.source_node_id) {
+                    Some(&pk) => pk,
+                    None => {
+                        let scoped = format!("{}:{}", project_id, e.source_node_id);
+                        match select_node_stmt
+                            .query_row(params![scoped], |r| r.get::<_, i64>(0))
+                            .optional()?
+                        {
+                            Some(pk) => pk,
+                            None => continue,
+                        }
+                    }
+                };
+                // Цель — узел скана, существующий узел или авто-созданная заглушка.
+                let dst_pk = match node_id_to_pk.get(&e.target_node_id) {
+                    Some(&pk) => pk,
+                    None => {
+                        let scoped = format!("{}:{}", project_id, e.target_node_id);
+                        match select_node_stmt
+                            .query_row(params![scoped], |r| r.get::<_, i64>(0))
+                            .optional()?
+                        {
+                            Some(pk) => pk,
+                            None => {
+                                let (auto_type, auto_label) =
+                                    crate::ast::node_type_for_prefix(&e.target_node_id)
+                                        .unwrap_or(("ExternalModule", e.target_node_id.clone()));
+                                insert_node_stmt.execute(params![
+                                    scoped,
+                                    auto_label,
+                                    auto_type,
+                                    format!("Внешний модуль/зависимость: {}", e.target_node_id),
+                                    project_id,
+                                    now,
+                                ])?;
+                                select_node_stmt.query_row(params![scoped], |r| r.get::<_, i64>(0))?
+                            }
+                        }
+                    }
+                };
+
+                let ctx_json = serde_json::to_string(&vec![e.context.clone()]).unwrap_or_default();
+                let prov = if e.provenance.is_empty() { "ast" } else { &e.provenance };
+                let _ = insert_edge_stmt.execute(params![
+                    src_pk,
+                    dst_pk,
+                    e.label,
+                    e.weight,
+                    ctx_json,
+                    project_id,
+                    prov,
+                    now
+                ]);
+            }
+        }
+
+        // Сохраняем ast_refs (вызовы/импорты) для перерезолва на следующем
+        // инкрементальном скане (порт ob2h `0c79b95`).
+        if !incremental {
+            tx.execute(
+                "DELETE FROM ast_refs WHERE project_id = ?1",
+                params![project_id],
+            )?;
+        } else {
+            for del_rel in &deleted_files {
+                tx.execute(
+                    "DELETE FROM ast_refs WHERE project_id = ?1 AND rel_path = ?2",
+                    params![project_id, del_rel],
+                )?;
+            }
+            for rel_path in scan_res.file_meta.keys() {
+                tx.execute(
+                    "DELETE FROM ast_refs WHERE project_id = ?1 AND rel_path = ?2",
+                    params![project_id, rel_path],
+                )?;
+            }
+        }
+
+        {
+            let mut insert_ref = tx.prepare_cached(
+                r#"
+                INSERT INTO ast_refs (project_id, rel_path, line, kind, name, module, item, alias, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )?;
+            for site in &scan_res.call_sites {
+                if !incremental || scan_res.file_meta.contains_key(&site.rel_path) {
+                    insert_ref.execute(params![
                         project_id,
-                        prov,
+                        site.rel_path,
+                        site.line as i64,
+                        "call",
+                        site.name,
+                        None::<String>,
+                        None::<String>,
+                        None::<String>,
                         now
-                    ]);
+                    ])?;
+                }
+            }
+            for imp in &scan_res.imports {
+                if !incremental || scan_res.file_meta.contains_key(&imp.rel_path) {
+                    insert_ref.execute(params![
+                        project_id,
+                        imp.rel_path,
+                        0i64,
+                        "import",
+                        imp.item.as_deref().unwrap_or(&imp.module),
+                        Some(&imp.module),
+                        imp.item.as_deref(),
+                        imp.alias.as_deref(),
+                        now
+                    ])?;
                 }
             }
         }
+
+        // Фиксируем версию экстрактора вместе с результатами скана (атомарно),
+        // чтобы при следующем инкрементале не переиспользовать устаревшие узлы.
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+            params![
+                format!("ast_extractor_version:{project_id}"),
+                AST_EXTRACTOR_VERSION
+            ],
+        )?;
 
         // Обновляем время сканирования
         tx.execute(
@@ -570,6 +890,9 @@ impl ProjectService {
         )?;
 
         tx.commit()?;
+        // Освобождаем guard транзакции до повторного lock для codegraph-синка:
+        // parking_lot::Mutex не реентрантный, иначе самодеадлок.
+        drop(conn);
 
         // Гибридная синергия: если в корне проекта присутствует .codegraph/codegraph.db,
         // автоматически импортируем подробные символы и связи в граф KAG
@@ -583,7 +906,26 @@ impl ProjectService {
             }
         }
 
-        // Обновляем God Nodes с учетом объединенного графа (AST + CodeGraph)
+        // Обнаружение связей совместных изменений (Temporal Coupling / Co-Change) из истории git
+        if let Ok(cochange_pairs) = cochange::extract_cochanges_from_git_repo(
+            path_obj,
+            cochange::DEFAULT_COMMIT_LIMIT,
+            cochange::DEFAULT_MIN_CO_COMMITS,
+            cochange::DEFAULT_MAX_FILES_PER_COMMIT,
+        ) {
+            if !cochange_pairs.is_empty() {
+                if let Ok(synced) = cochange::sync_cochange_edges(&conn_ref, project_id, &cochange_pairs) {
+                    if synced > 0 {
+                        info!(
+                            "Git Co-Change: синхронизировано {} рёбер CO_CHANGES_WITH для проекта '{}'",
+                            synced, project_id
+                        );
+                    }
+                }
+            }
+        }
+
+        // Обновляем God Nodes с учетом объединенного графа (AST + CodeGraph + Co-Change)
         let _ = crate::graph::GraphAnalytics::update_god_nodes(&conn_ref, project_id);
         drop(conn_ref);
 
@@ -1019,4 +1361,89 @@ pub fn detect_manifest_metadata(root: &Path) -> (String, Vec<String>, Option<Str
         }
 
     (name, tech_stack, description)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedding::FakeEmbedding;
+    use crate::embedding::fingerprint::{self, EmbeddingFingerprint};
+    use crate::schema::migrate;
+
+    fn setup() -> ProjectService {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        migrate(&conn.lock()).unwrap();
+        let svc = ProjectService::new_with_embedder(conn, Some(Arc::new(FakeEmbedding::new(384))));
+        svc.register_project("p1", "Proj", "C:/tmp/proj", None, None)
+            .unwrap();
+        svc
+    }
+
+    fn insert_node(svc: &ProjectService, node_id: &str) {
+        let conn = svc.conn.lock();
+        conn.execute(
+            "INSERT INTO graph_nodes (node_id, label, node_type, project_id, created_at, updated_at) \
+             VALUES (?1, ?1, 'Function', 'p1', 't', 't')",
+            params![node_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn embed_tracks_fingerprint_and_reindex_recovers_from_model_change() {
+        let svc = setup();
+        insert_node(&svc, "fn:a");
+
+        // Первый прогон: отпечатка нет -> запись проходит и фиксируется.
+        assert_eq!(svc.embed_unembedded_nodes("p1").await.unwrap(), 1);
+        let stored = {
+            let conn = svc.conn.lock();
+            fingerprint::load(&conn).expect("fingerprint stored after embed")
+        };
+        assert_eq!(stored, EmbeddingFingerprint::full("fake", "fake", "fp32", 384, "v1"));
+
+        // Смена модели (другой отпечаток): обычная запись запрещена — смешивание
+        // пространств не допускается.
+        {
+            let conn = svc.conn.lock();
+            fingerprint::store(&conn, &EmbeddingFingerprint::new("other-model", 384)).unwrap();
+        }
+        let err = svc
+            .embed_unembedded_nodes("p1")
+            .await
+            .expect_err("mismatch must forbid writes");
+        assert!(
+            err.to_string().contains("reindex_project_embeddings"),
+            "error must point to the reindex procedure: {err}"
+        );
+
+        // Переиндексация разрешает и перезаписывает отпечаток.
+        assert_eq!(
+            svc.reindex_project_embeddings("p1").await.unwrap(),
+            1,
+            "reindex re-embeds all live nodes"
+        );
+        let conn = svc.conn.lock();
+        assert_eq!(
+            fingerprint::load(&conn),
+            Some(EmbeddingFingerprint::full("fake", "fake", "fp32", 384, "v1"))
+        );
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT embedding FROM graph_nodes WHERE node_id = 'fn:a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(blob.is_some_and(|b| !b.is_empty()), "node re-embedded");
+    }
+
+    #[tokio::test]
+    async fn embed_without_embedder_is_a_noop() {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        migrate(&conn.lock()).unwrap();
+        let svc = ProjectService::new(conn);
+        assert_eq!(svc.embed_unembedded_nodes("p1").await.unwrap(), 0);
+        assert_eq!(svc.reindex_project_embeddings("p1").await.unwrap(), 0);
+    }
 }

@@ -249,7 +249,12 @@ pub fn field_table(
         }
         let resolved = resolve(prop_schema, defs);
         let is_secret = resolved.get("x-secret").and_then(Value::as_bool) == Some(true);
-        let ty = if is_secret {
+        // A secret `HashMap<String, String>` (MCP `env`/`headers`, …) is set
+        // one entry at a time; the bare map path is not settable.
+        let is_secret_map = is_secret && is_object_schema(resolved);
+        let ty = if is_secret_map {
+            "secret map".to_owned()
+        } else if is_secret {
             "secret".to_owned()
         } else {
             type_label(resolved, defs)
@@ -263,7 +268,12 @@ pub fn field_table(
         };
         let secret_mark = if is_secret { " 🔑" } else { "" };
         let full_path = format!("{prefix}.{key}");
-        let set_cmd = if is_secret {
+        let set_cmd = if is_secret_map {
+            format!(
+                "omnesagent config set {full_path}.<KEY>    # masked input, stored encrypted\n\
+                 omnesagent config set {full_path}.<KEY> \"\"    # empty value removes the entry"
+            )
+        } else if is_secret {
             format!("omnesagent config set {full_path}    # masked input, stored encrypted")
         } else {
             format!("omnesagent config set {full_path} <value>")
@@ -290,7 +300,7 @@ pub fn field_table(
                 "<div class=\"os-tabs-src\">\n\n",
                 "#### Gateway dashboard\n\n",
                 "Open [`/config/{section}`](http://127.0.0.1:42617/config/{section}) and set the `{full_path}` field.\n\n",
-                "#### zerocode\n\n",
+                "#### omnescode\n\n",
                 "In the **Config** pane, set the `{full_path}` field.\n\n",
                 "#### omnesagent config\n\n",
                 "```sh\n{set_cmd}\n```\n\n",
@@ -314,6 +324,16 @@ pub fn field_table(
     }
 
     format!("<div class=\"cfg-fields\">\n\n{rows}</div>\n")
+}
+
+/// Whether a resolved property schema describes a JSON object (a map), for
+/// both `"type": "object"` and nullable `"type": ["object", "null"]`.
+fn is_object_schema(resolved: &Value) -> bool {
+    match resolved.get("type") {
+        Some(Value::String(t)) => t == "object",
+        Some(Value::Array(types)) => types.iter().any(|t| t == "object"),
+        _ => false,
+    }
 }
 
 /// Plain Markdown field table (no accordion), used when no config prefix is

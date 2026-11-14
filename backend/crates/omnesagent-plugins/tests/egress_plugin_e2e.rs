@@ -1,7 +1,7 @@
 //! End-to-end proof of the plugin egress boundary.
 //!
 //! Every test here drives a **real WASM component** through a **real
-//! `wasi:http` call** into OmnesAgent's hooks. Nothing is stubbed: the deny path
+//! `wasi:http` call** into omnesagent's hooks. Nothing is stubbed: the deny path
 //! is the same code the shipped host runs, and the allow path really opens a
 //! TCP connection to a listener in this process.
 //!
@@ -12,6 +12,8 @@
 //! is loudly broken.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
+
+mod support;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -27,6 +29,8 @@ use omnesagent_plugins::egress::{EgressHostService, EgressPolicy, EgressPolicyRe
 use omnesagent_plugins::instance::PluginInstanceScope;
 use omnesagent_plugins::services::PluginHostServices;
 use omnesagent_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::{admit_fixture, state_service};
 
 // ── fixture provisioning ──────────────────────────────────────────
 
@@ -101,7 +105,9 @@ async fn probe(url: &str, follow: bool, egress: Option<EgressHostService>) -> St
         description: None,
         author: None,
         wasm_path: Some("egress-fixture.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
+        provides: None,
         permissions: vec![PluginPermission::HttpClient],
         config_schema: None,
         signature: None,
@@ -123,13 +129,14 @@ async fn probe(url: &str, follow: bool, egress: Option<EgressHostService>) -> St
     // would hand the guest.
     let services = {
         let manifest = manifest.clone();
-        PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&manifest, scope, None)
-        }))
+        PluginHostServices::new(
+            PluginConfigResolver::new(move |scope| resolve_plugin_config(&manifest, scope, None)),
+            state_service(),
+        )
     };
 
     let mut plugin = omnesagent_plugins::runtime::create_plugin_with_egress(
-        &fixture(),
+        &admit_fixture(&fixture(), &manifest),
         &scope,
         &services,
         limits(),

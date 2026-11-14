@@ -1101,7 +1101,7 @@ mod tests {
     fn runs_survive_reopen() {
         // Durability: a run written by one instance is visible to a fresh
         // instance opening the same file (the restart-resume guarantee).
-        let path = std::env::temp_dir().join(format!("zc-sop-durable-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("oc-sop-durable-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let a = SqliteRunStore::open(&path).unwrap();

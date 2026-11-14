@@ -43,10 +43,10 @@ pub use execution::{
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
-pub(crate) use outcome::StreamCancelledAfterOutput;
+pub(crate) use outcome::{ReportedRequestUsage, SteeringPending, StreamCancelledAfterOutput};
 pub use outcome::{
-    ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
-    is_tool_loop_cancelled,
+    ContextWindowExceeded, ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled,
+    context_window_exceeded_from_error, is_model_switch_requested, is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 pub use outcome::{
@@ -61,13 +61,16 @@ pub(crate) use parse_response::{
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
-    ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
+    ProviderCallOutcome, announce_budget_warning, announce_llm_request, call_provider,
+    enforce_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
     CollectedResults, check_identical_output_abort, collect_tool_results,
 };
-pub use steering::drain_steering_messages;
+pub use steering::{
+    SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture, drain_steering_messages,
+};
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
@@ -78,7 +81,7 @@ use crate::agent::tool_execution::{
     ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
 };
-use crate::security::ingress::{IngressPolicy, ingress_policy};
+use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -193,6 +196,53 @@ fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool
         .is_ok()
 }
 
+/// The uncalibrated estimate of a request and its shares, carried into the
+/// capacity refusal so the operator can see what filled the window:
+/// `(raw_estimated_tokens, system_tokens, tool_schema_tokens)`. All three are
+/// in raw-estimate units.
+type RequestShares = (usize, usize, usize);
+
+/// Refuse a request the active model's own capacity cannot hold, carrying the
+/// estimate and its shares so the operator log can say what filled the window
+/// instead of a bare refusal.
+fn context_window_exceeded_error(
+    (provider_name, model): (&str, &str),
+    model_context_window: usize,
+    estimated_tokens: usize,
+    (raw_estimated_tokens, system_tokens, tool_schema_tokens): RequestShares,
+) -> anyhow::Error {
+    let span = ::omnesagent_log::info_span!(
+        target: "omnesagent_log_internal_scope",
+        "omnesagent_scope",
+        model = %model,
+        model_provider = %provider_name,
+    );
+    let _guard = span.entered();
+    ::omnesagent_log::record!(
+        WARN,
+        ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Reject)
+            .with_category(::omnesagent_log::EventCategory::Agent)
+            .with_outcome(::omnesagent_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "estimated_tokens": estimated_tokens,
+                "model_context_window": model_context_window,
+                "raw_estimated_tokens": raw_estimated_tokens,
+                "system_tokens": system_tokens,
+                "tool_schema_tokens": tool_schema_tokens,
+                "error_key": "context_window_exceeded",
+            })),
+        "Provider-facing request exceeds the active model context window"
+    );
+    outcome::ContextWindowExceeded {
+        estimated_tokens,
+        model_context_window,
+        raw_estimated_tokens,
+        system_tokens,
+        tool_schema_tokens,
+    }
+    .into()
+}
+
 pub struct ToolLoop<'a> {
     /// The resolved per-agent execution context: model binding, gated tool
     /// registry, approval, observability, and resolved runtime knobs. Stable
@@ -208,7 +258,7 @@ pub struct ToolLoop<'a> {
     pub channel: Option<&'a dyn Channel>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
-    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
+    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<SteeringInput>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
     pub image_cache: Option<&'a mut omnesagent_providers::multimodal::LocalImageCache>,
     pub ingress: IngressContext,
@@ -380,7 +430,30 @@ impl<'a> TurnState<'a> {
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+/// The Agent wrapper admits steering before history insertion. Admit only
+/// the original user message, or skip admission on subsequent rounds.
+pub(crate) enum InitialIngressSubject<'a> {
+    Original(&'a str),
+    AlreadyAdmitted,
+}
+
+pub(crate) async fn run_tool_call_loop_with_initial_ingress(
+    p: ToolLoop<'_>,
+    subject: InitialIngressSubject<'_>,
+    reported_usage: Option<ReportedRequestUsage>,
+) -> Result<String> {
+    run_tool_call_loop_impl(p, Some(subject), reported_usage).await
+}
+
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    run_tool_call_loop_impl(p, None, None).await
+}
+
+async fn run_tool_call_loop_impl<'a>(
+    mut p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -444,18 +517,33 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
+    // The active model's context window, resolved on demand from provider
+    // config rather than duplicated into this bundle; configless paths fall
+    // back to the documented unconfigured default.
+    let model_context_window = config.map_or(
+        omnesagent_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+        |cfg| cfg.effective_model_context_window(agent_alias.unwrap_or_default()),
+    );
+
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
-    let p1_text = turn_state
-        .history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
-    match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
+    let p1_text = match &initial_ingress {
+        Some(InitialIngressSubject::Original(text)) => Some(*text),
+        Some(InitialIngressSubject::AlreadyAdmitted) => None,
+        None => Some(
+            turn_state
+                .history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map_or("", |m| m.content.as_str()),
+        ),
+    };
+    if let Some(p1_text) = p1_text {
+        match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
         // DEFAULT — the only arm reachable under the default policy. Proceed
         // into the loop exactly as today.
         IngressDecision::Loop => {}
@@ -474,13 +562,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 &[("reason", reason.as_str())],
             ));
         }
+        }
     }
 
     // Per-turn tool-output compression (Triage Router wiring): the intent
     // classified from the triggering user message narrows the model-family
     // policy, instead of every tool result being compressed by family
     // defaults regardless of conversational context.
-    let triage_decision = crate::agent::orchestrator::classify_message(p1_text);
+    let triage_text = p1_text.unwrap_or("");
+    let triage_decision = crate::agent::orchestrator::classify_message(triage_text);
     let compression_policy = crate::agent::orchestrator::narrow_by_family(
         crate::agent::orchestrator::compression_policy_for_intent(triage_decision.intent),
         omnesagent_compression::ModelFamily::detect_from_name(&model),
@@ -498,10 +588,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 payload_json: serde_json::json!({
                     "decision": "loop",
                     "intent": triage_decision.intent.as_str(),
-                    "query_preview": if p1_text.len() > 100 { &p1_text[..100] } else { p1_text },
+                    "query_preview": if triage_text.len() > 100 { &triage_text[..100] } else { triage_text },
                 })
                 .to_string(),
-                tokens_used: (p1_text.len() + 3) / 4,
+                tokens_used: (triage_text.len() + 3) / 4,
                 duration_us: 15_000,
                 created_at: chrono::Utc::now().to_rfc3339(),
             })
@@ -637,6 +727,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Text withheld by the streaming text guard on a previous attempt,
+    // stored with its trailing whitespace trimmed. A repeat that is
+    // identical up to trailing whitespace means the model produced the same
+    // protocol-shaped prose again; another retry would suppress it again,
+    // so the turn ends with a notice instead of spending more provider
+    // calls.
+    let mut last_guard_suppressed_text: Option<String> = None;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
     let mut auto_continue_rounds: usize = 0;
 
@@ -672,26 +769,70 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
         std::collections::HashMap::new();
 
+    // Usage describes the completed request, not a prediction of the next
+    // hook-selected model, schemas, or prepared messages.
+    let mut pending_reported_usage: Option<ReportedRequestUsage> = seed_reported_usage;
+    // One `BudgetWarning` per turn at most (see `announce_budget_warning`).
+    let mut budget_warning_sent = false;
+
     for iteration in 0..max_iterations {
-        for steering_message in drain_steering_messages(&mut steering) {
-            match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
-                // DEFAULT — append the injection to history exactly as today.
-                IngressDecision::Loop => {}
-                // Phase 3: frame as untrusted data; proceed as Loop until
-                // framing exists (behavior-identical).
-                IngressDecision::Annotate { .. } => {}
-                // Phase 2: divert this injection into the SOP run rather than
-                // history. Not reachable under the default policy.
-                IngressDecision::Gate { .. } => {
-                    // TODO(PR C): route this steering message into the gated
-                    // SOP run instead of appending it to history.
+        if knobs.yield_to_steering {
+            // The caller judges steering; this loop only hands control back
+            // once a tool round has finished and a message is waiting. A
+            // model switch queued by that round goes first: the switch check
+            // below returns it, the caller applies it, and the steering is
+            // taken at the top of the caller's next round on the new model.
+            let switch_pending = model_switch_callback.as_ref().is_some_and(|callback| {
+                callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|(p, m)| p != provider_name || m != model)
+            });
+            if iteration > 0
+                && !switch_pending
+                && steering.as_deref().is_some_and(|rx| !rx.is_empty())
+            {
+                return Err(SteeringPending {
+                    display_text: accumulated_display_text,
+                    reported_usage: pending_reported_usage.take(),
                 }
-                // Not reachable under the default policy; drop the injection
-                // (do not append it) when it is.
-                IngressDecision::Drop { .. } => continue,
+                .into());
             }
-            let msg = ChatMessage::user(steering_message);
-            turn_state.push_dual(msg);
+        } else {
+            for steering_input in drain_steering_messages(&mut steering) {
+                // This loop cannot narrow its registry mid-run, so it admits only
+                // a sender that is still authorized and whose posture narrows
+                // nothing; anything else is dropped rather than run with more
+                // than the sender now holds.
+                match steering_input.admit() {
+                    SteeringAdmission::Admitted(posture)
+                        if posture == SteeringPosture::default() => {}
+                    _ => continue,
+                }
+                match steering_policy(
+                    steering_input.text(),
+                    steering_input.ingress(),
+                    &ingress_policy_cfg,
+                ) {
+                    // DEFAULT — append the injection to history exactly as today.
+                    IngressDecision::Loop => {}
+                    // Phase 3: frame as untrusted data; proceed as Loop until
+                    // framing exists (behavior-identical).
+                    IngressDecision::Annotate { .. } => {}
+                    // Phase 2: divert this injection into the SOP run rather than
+                    // history. Not reachable under the default policy.
+                    IngressDecision::Gate { .. } => {
+                        // TODO(PR C): route this steering message into the gated
+                        // SOP run instead of appending it to history.
+                    }
+                    // Not reachable under the default policy; drop the injection
+                    // (do not append it) when it is.
+                    IngressDecision::Drop { .. } => continue,
+                }
+                let msg = ChatMessage::user(steering_input.into_text());
+                turn_state.push_dual(msg);
+            }
         }
 
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -916,7 +1057,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
         // state, and a rejected turn never reaches the provider — announcing
         // first would claim the agent is waiting on a model that is never
-        // called.
+        // called. The warning goes first so a turn that is about to be
+        // stopped by the hard limit is never the first sign of trouble.
+        announce_budget_warning(event_tx.as_ref(), &mut budget_warning_sent);
         enforce_tool_loop_budget()?;
 
         if strict_tool_parsing
@@ -1105,6 +1248,38 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     ));
                     turn_state.push_dual(msg);
                 }
+                // The provider refused the request over the active model's own
+                // capacity and in-loop recovery could not make it fit. Attach
+                // the typed refusal so the operator journal can say what filled
+                // the window; the provider's own text stays the outer message
+                // for transports that only read the top-level string.
+                if omnesagent_providers::reliable::is_context_window_exceeded(&e) {
+                    let tool_schema_tokens = if use_native_tools {
+                        crate::agent::history::estimate_tool_schema_tokens(tool_specs)
+                    } else {
+                        0
+                    };
+                    let raw_estimated_tokens =
+                        crate::agent::history::estimate_history_tokens(&provider_request_messages)
+                            .saturating_add(tool_schema_tokens);
+                    // The provider confirmed the request does not fit; never
+                    // report an estimate that appears to fit.
+                    let estimated_tokens =
+                        raw_estimated_tokens.max(model_context_window.saturating_add(1));
+                    return Err(context_window_exceeded_error(
+                        (active_model_provider_name, provider_request_model),
+                        model_context_window,
+                        estimated_tokens,
+                        (
+                            raw_estimated_tokens,
+                            crate::agent::history::estimate_system_floor_tokens(
+                                &provider_request_messages,
+                            ),
+                            tool_schema_tokens,
+                        ),
+                    )
+                    .context(format!("{e:#}")));
+                }
                 return Err(e);
             }
         };
@@ -1150,6 +1325,34 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     })),
                 "tool_call_parse_feedback_details"
             );
+
+            if protocol_suppressed {
+                // Trailing whitespace is not a semantic difference: the same
+                // suppressed envelope with or without a final newline is
+                // still the same reply, so compare trimmed ends and store
+                // the trimmed form. The delivered text is not rewritten.
+                let suppressed_text = response_text.trim_end().to_string();
+                if last_guard_suppressed_text.as_deref() == Some(suppressed_text.as_str()) {
+                    // The guard withheld the same text twice: retrying cannot
+                    // recover prose the guard keeps suppressing, so end the
+                    // turn with a notice instead of another provider call.
+                    let notice = crate::i18n::get_required_cli_string(
+                        "cli-agent-error-protocol-guard-withheld",
+                    );
+                    accumulated_display_text.push_str(&notice);
+                    // The notice is synthesized here, never streamed live: an
+                    // event consumer that already flushed streamed prose
+                    // would otherwise hide it, like the malformed fallback.
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &notice).await;
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(StreamDelta::Text(notice.to_string())).await;
+                    }
+                    let msg = ChatMessage::assistant(notice.to_string());
+                    turn_state.push_dual(msg);
+                    return Ok(accumulated_display_text);
+                }
+                last_guard_suppressed_text = Some(suppressed_text);
+            }
 
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol
@@ -1323,8 +1526,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
-            // `protocol_suppressed` withholds the whole turn; the empty-remainder
-            // skip below handles the guard-passed case where the live stream already forwarded every byte.
+            // `protocol_suppressed` withholds from the suppressed candidate onward; the prose
+            // ahead of it is already delivered, and the empty-remainder skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
                 && let Some(ref tx) = on_delta
@@ -1344,10 +1547,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
         let PreparedToolCalls {
             mut ordered_results,
             executable_indices,
@@ -1364,6 +1563,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             knobs.dedup_enabled,
         )
         .await?;
+
+        // Hooks and preparation may rewrite tool names or arguments. Decide
+        // parallel eligibility from the final executable calls so policy is
+        // applied to what the runtime will actually dispatch.
+        let allow_parallel_execution =
+            parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let execution_result =
@@ -1578,7 +1783,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 image_cache.as_deref_mut(),
                 agent_alias,
                 parent_agent_alias,
-                sop_reassembly,
+                sop_reassembly.clone(),
                 &mut sop_exec_cache,
             ))
             .await?;
@@ -1603,6 +1808,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         provider_name,
         model,
         temperature,
+        multimodal_config,
         pacing,
         cancellation_token.as_ref(),
         max_iterations,
@@ -1720,9 +1926,10 @@ fn sop_step_excluded_tools(
 /// at every depth — no separate baseline field is needed: a depth >= 2 step
 /// naming the outer agent compares against the re-assembled child's alias and
 /// re-assembles correctly instead of inheriting the child's scope.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a omnesagent_config::schema::Config,
+    pub live_config: Option<Arc<parking_lot::RwLock<omnesagent_config::schema::Config>>>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -1793,6 +2000,7 @@ pub(crate) struct OwnedAgentExecution {
 /// drain and re-assembles only on an alias change.
 pub(crate) async fn assemble_owned_execution(
     config: &omnesagent_config::schema::Config,
+    live_config: Option<Arc<parking_lot::RwLock<omnesagent_config::schema::Config>>>,
     alias: &str,
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
@@ -1859,7 +2067,7 @@ pub(crate) async fn assemble_owned_execution(
         None,
         Some(sop_engine),
         sop_audit,
-        None,
+        live_config,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -2091,10 +2299,11 @@ async fn drive_live_sop_actions(
                     if needs_reassembly {
                         let alias =
                             step_alias.expect("needs_reassembly implies a step agent alias");
-                        if let Some(reassembly) = sop_reassembly {
+                        if let Some(reassembly) = sop_reassembly.as_ref() {
                             if !exec_cache.contains_key(alias) {
                                 match assemble_owned_execution(
                                     reassembly.config,
+                                    reassembly.live_config.clone(),
                                     alias,
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
@@ -2209,6 +2418,7 @@ async fn drive_live_sop_actions(
                                 o.agent.resolved.effective_context_budget(),
                                 o.agent.resolved.tool_call_dedup_exempt.as_slice(),
                                 &sop_reassembly
+                                    .as_ref()
                                     .expect("owned implies a reassembly handle")
                                     .config
                                     .pacing,
@@ -2271,6 +2481,7 @@ async fn drive_live_sop_actions(
                             match build_owned_step_system_prompt(
                                 o,
                                 sop_reassembly
+                                    .as_ref()
                                     .expect("owned implies a reassembly handle")
                                     .config,
                                 step_alias.expect("needs_reassembly implies a step agent alias"),
@@ -2388,7 +2599,7 @@ async fn drive_live_sop_actions(
                                         parent_agent_alias
                                     },
                                     turn_id: &nested_turn_id,
-                                    sop_reassembly,
+                                    sop_reassembly: sop_reassembly.clone(),
                                 })),
                             )
                             .await;
@@ -2936,12 +3147,14 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None)
-            .await
-            .expect("reader assembles");
-        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None)
-            .await
-            .expect("writer assembles");
+        let reader =
+            assemble_owned_execution(&config, None, "reader", Arc::clone(&engine), None, None)
+                .await
+                .expect("reader assembles");
+        let writer =
+            assemble_owned_execution(&config, None, "writer", Arc::clone(&engine), None, None)
+                .await
+                .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -2961,6 +3174,110 @@ mod sop_step_reassembly_tests {
         // With no parent approval manager the child is non-interactive
         // (auto-deny), matching the headless driver.
         assert!(reader.approval.is_non_interactive());
+    }
+
+    #[tokio::test]
+    async fn reassembled_step_file_download_observes_live_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use omnesagent_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use omnesagent_config::schema::{
+            AliasedAgentConfig, Config, FileDownloadConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            file_download: FileDownloadConfig {
+                url: Some(format!("{}/download", server.uri())),
+                allowed_private_hosts: vec!["127.0.0.1".into()],
+                ..FileDownloadConfig::default()
+            },
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "stepper".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["file_download".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+
+        let owned = assemble_owned_execution(
+            &config,
+            Some(Arc::clone(&live_config)),
+            "stepper",
+            Arc::clone(&engine),
+            None,
+            None,
+        )
+        .await
+        .expect("stepper assembles");
+        let file_download = owned
+            .tools_registry
+            .iter()
+            .find(|tool| tool.name() == "file_download")
+            .expect("file_download must be registered for the step agent");
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        let first = file_download
+            .execute(args.clone())
+            .await
+            .expect("first run");
+        assert!(first.success, "allowlisted local endpoint should pass");
+
+        live_config
+            .write()
+            .file_download
+            .allowed_private_hosts
+            .clear();
+
+        let second = file_download.execute(args).await.expect("second run");
+        assert!(
+            !second.success,
+            "same reassembled step tool must observe live allowlist revocation"
+        );
+        assert!(
+            second
+                .error
+                .unwrap_or_default()
+                .contains("file_download.allowed_private_hosts")
+        );
     }
 
     /// A parent approval manager with a live back-channel survives delegation:
@@ -3020,6 +3337,7 @@ mod sop_step_reassembly_tests {
         );
         let owned = assemble_owned_execution(
             &config,
+            None,
             "restricted",
             Arc::clone(&engine),
             None,
@@ -3492,7 +3810,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = omnesagent_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3589,7 +3910,10 @@ mod sop_step_reassembly_tests {
 
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = omnesagent_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3682,7 +4006,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_stamps_effective_identity_with_parent_correlation() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = omnesagent_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3741,7 +4068,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_keeps_shared_history_and_identity() {
         let (engine, run_id, action) = start_single_cross_agent_step("outer");
         let config = omnesagent_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -3792,7 +4122,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_output_reaches_parent_capture_once() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = omnesagent_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -3844,7 +4177,10 @@ mod sop_step_reassembly_tests {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         // Bare config: no "stepper" agent exists, so assembly must fail.
         let config = omnesagent_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
         let parent_tools =
@@ -4040,7 +4376,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_model_switch_never_leaks_into_parent_loop() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = omnesagent_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let mut exec_cache = std::collections::HashMap::new();
         let mut stepper_agent = omnesagent_config::schema::AliasedAgentConfig::default();

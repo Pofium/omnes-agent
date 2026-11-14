@@ -1,0 +1,10 @@
+CREATE TABLE teams (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  team_id INTEGER,
+  FOREIGN KEY (team_id) REFERENCES teams(id)
+);

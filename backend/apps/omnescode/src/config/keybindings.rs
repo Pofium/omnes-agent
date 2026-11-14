@@ -203,7 +203,7 @@ fn default_chords_for(action_key: &str) -> Vec<Chord> {
     all_defaults().get(action_key).cloned().unwrap_or_default()
 }
 
-/// Registry of named presets. Walked by the zerocode tab's preset picker.
+/// Registry of named presets. Walked by the omnescode tab's preset picker.
 pub const KEY_PRESETS: &[(&str, KeyPreset)] = &[
     (
         DEFAULT_PRESET_NAME,

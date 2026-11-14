@@ -81,7 +81,7 @@ tower = { optional = true, version = "0.5", default-features = false, features =
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.10"
 which = "8.0"
 zeroize = { version = "1.8", features = ["alloc"] }
 omnesagent-macros.workspace = true

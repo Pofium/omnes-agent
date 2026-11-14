@@ -7,9 +7,11 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use omnesagent_api::tool::{Tool, ToolResult};
+use omnesagent_config::schema::MemoryConfig;
 use omnesagent_kag::bench::{
     evaluate_gate_decision, parse_golden_jsonl, BenchSummary, GateVerdict, QUICK_CASES,
 };
@@ -25,11 +27,23 @@ const DREAM_ACTIONS: &[&str] = &[
 /// running nightly regression bench-gates, and restoring workspace checkpoints.
 pub struct DreamTool {
     conn: Arc<Mutex<Connection>>,
+    /// Workspace root that owns `memory/brain.db`, where the consolidation
+    /// pass reads and writes. Recorded runs (`dream_runs`) live on `conn`.
+    workspace_dir: PathBuf,
+    memory_config: MemoryConfig,
 }
 
 impl DreamTool {
-    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
-        Self { conn }
+    pub fn new(
+        conn: Arc<Mutex<Connection>>,
+        workspace_dir: impl Into<PathBuf>,
+        memory_config: MemoryConfig,
+    ) -> Self {
+        Self {
+            conn,
+            workspace_dir: workspace_dir.into(),
+            memory_config,
+        }
     }
 }
 
@@ -97,30 +111,68 @@ impl Tool for DreamTool {
                     .get("trigger")
                     .and_then(|v| v.as_str())
                     .unwrap_or("manual");
-                let now = chrono::Utc::now().to_rfc3339();
+                let started = chrono::Utc::now().to_rfc3339();
 
-                let run_id = {
-                    let conn = self.conn.lock();
-                    conn.execute(
-                        "INSERT INTO dream_runs (started_at, finished_at, status, trigger, phase_log, stats) \
-                         VALUES (?1, ?2, 'completed', ?3, ?4, ?5)",
-                        rusqlite::params![
-                            now,
-                            now,
-                            trigger,
-                            "Phase 1: Memory synthesis\nPhase 2: Entity linking\nPhase 3: Snapshot recorded",
-                            json!({"consolidated_memories": 0, "status": "ok"}).to_string()
-                        ],
-                    )?;
-                    conn.last_insert_rowid()
-                };
+                // Real consolidation: collapse near-duplicate Core memories
+                // within each agent/namespace/tenant scope (Ф6.4 "Dream" analog).
+                let report = omnesagent_memory::dream::consolidate_now(
+                    &self.memory_config,
+                    &self.workspace_dir,
+                );
+                let finished = chrono::Utc::now().to_rfc3339();
 
-                Ok(ToolResult::ok(json!({
-                    "status": "success",
-                    "dream_run_id": run_id,
-                    "trigger": trigger,
-                    "message": "Dream consolidation cycle executed successfully."
-                })))
+                match report {
+                    Ok(report) => {
+                        let phase_log = format!(
+                            "Phase 1: Core scan ({} entries)\nPhase 2: Scope grouping ({} scopes)\nPhase 3: Duplicate collapse ({} superseded)",
+                            report.scanned, report.scopes, report.superseded
+                        );
+                        let stats = json!({
+                            "consolidated_memories": report.superseded,
+                            "scanned": report.scanned,
+                            "scopes": report.scopes,
+                            "status": "ok",
+                        });
+
+                        let run_id = {
+                            let conn = self.conn.lock();
+                            conn.execute(
+                                "INSERT INTO dream_runs (started_at, finished_at, status, trigger, phase_log, stats) \
+                                 VALUES (?1, ?2, 'completed', ?3, ?4, ?5)",
+                                rusqlite::params![
+                                    started,
+                                    finished,
+                                    trigger,
+                                    phase_log,
+                                    stats.to_string()
+                                ],
+                            )?;
+                            conn.last_insert_rowid()
+                        };
+
+                        Ok(ToolResult::ok(json!({
+                            "status": "success",
+                            "dream_run_id": run_id,
+                            "trigger": trigger,
+                            "consolidated_memories": report.superseded,
+                            "scanned": report.scanned,
+                            "scopes": report.scopes,
+                            "message": "Dream consolidation cycle executed successfully."
+                        })))
+                    }
+                    Err(e) => {
+                        let stats = json!({"status": "error", "error": e.to_string()});
+                        {
+                            let conn = self.conn.lock();
+                            let _ = conn.execute(
+                                "INSERT INTO dream_runs (started_at, finished_at, status, trigger, phase_log, stats) \
+                                 VALUES (?1, ?2, 'failed', ?3, 'consolidation aborted', ?4)",
+                                rusqlite::params![started, finished, trigger, stats.to_string()],
+                            );
+                        }
+                        Err(e.context("dream_run consolidation failed"))
+                    }
+                }
             }
             "dream_status" => {
                 let conn = self.conn.lock();
@@ -188,6 +240,10 @@ impl Tool for DreamTool {
                     mrr: cur_mrr,
                     p95_ms: 25.0,
                     empty_count: 0,
+                    // Ф11.3 observational strict/any-hit metrics are not supplied
+                    // through the tool contract; only the gating recall@5/MRR apply.
+                    recall_all5: None,
+                    any_hit5: None,
                 };
 
                 // Read previous baseline metrics if present in dream_runs
@@ -245,6 +301,7 @@ impl Tool for DreamTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omnesagent_memory::Memory;
 
     fn create_test_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
@@ -265,7 +322,12 @@ mod tests {
     #[tokio::test]
     async fn test_dream_bench_gate_lifecycle_and_rollback() {
         let db = create_test_db();
-        let tool = DreamTool::new(db.clone());
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tool = DreamTool::new(
+            db.clone(),
+            workspace.path(),
+            omnesagent_config::schema::MemoryConfig::default(),
+        );
 
         // 1. Initial run: establishes baseline
         let res1 = tool.execute(json!({
@@ -309,5 +371,64 @@ mod tests {
         let v_t: serde_json::Value = serde_json::from_str(res_timeout.output.as_str()).unwrap();
         assert_eq!(v_t["verdict"]["outcome"], "timeout");
         assert_eq!(v_t["verdict"]["restored_to"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_dream_run_consolidates_and_records_real_stats() {
+        let workspace = tempfile::TempDir::new().unwrap();
+
+        // Seed brain.db with two near-duplicate Core memories in the same scope.
+        {
+            let mem = omnesagent_memory::SqliteMemory::new("sqlite", workspace.path()).unwrap();
+            mem.store(
+                "fact_new",
+                "alpha beta gamma delta",
+                omnesagent_memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+            mem.store(
+                "fact_old",
+                "alpha beta gamma",
+                omnesagent_memory::MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let db = create_test_db();
+        let config = omnesagent_config::schema::MemoryConfig {
+            dream_enabled: true,
+            dedup_jaccard_threshold: 0.5,
+            ..omnesagent_config::schema::MemoryConfig::default()
+        };
+        let tool = DreamTool::new(db.clone(), workspace.path(), config);
+
+        let res = tool
+            .execute(json!({"action": "dream_run", "trigger": "nightly"}))
+            .await
+            .expect("dream_run should succeed");
+        let value: serde_json::Value = serde_json::from_str(res.output.as_str()).unwrap();
+        assert_eq!(value["status"], "success");
+        assert_eq!(value["consolidated_memories"], 1);
+        assert_eq!(value["scanned"], 2);
+        assert_eq!(value["scopes"], 1);
+
+        // The run is recorded with the real consolidated count, not a zero stub.
+        let conn = db.lock();
+        let (status, stats): (String, String) = conn
+            .query_row(
+                "SELECT status, stats FROM dream_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert!(
+            stats.contains("\"consolidated_memories\":1"),
+            "dream_runs must record the real consolidated count; got {stats}"
+        );
     }
 }

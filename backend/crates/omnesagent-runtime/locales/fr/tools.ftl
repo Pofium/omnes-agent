@@ -62,8 +62,11 @@ tool-file-download-error-move = Échec du déplacement du fichier téléchargé 
 tool-file-download-success = { $written } octets téléchargés vers { $dest_path } ({ $status })
 tool-file-read = Lire le contenu du fichier avec les numéros de ligne. Prise en charge de la lecture partielle via offset et limite. Les fichiers binaires et images sont rejetés (utilisez l'outil image_info pour les images). Définissez encoding="base64" pour renvoyer les octets bruts encodés en base64 (pour les fichiers binaires tels que .pdf/.xlsx/.docx) ; offset/limit sont ignorés dans ce mode.
 tool-file-write = Écrire le contenu dans un fichier de l'espace de travail
-tool-git-operations = Effectue des opérations Git structurées (état, diff, journal, branche, engagement, ajouter, checkout, stash). Fournit une sortie JSON analysée et s'intègre à la politique de sécurité pour les contrôles d'autonomie.
+tool-git-operations = Effectue des opérations Git structurées (état, diff, journal, branche, engagement, ajouter, checkout, stash, worktree). Fournit une sortie JSON analysée et s'intègre à la politique de sécurité pour les contrôles d'autonomie.
 tool-git-operations-error-not-in-repo = Pas dans un dépôt Git à '{ $path }'. Choisissez un chemin dans un arbre de travail Git, passez 'path' pour un sous-répertoire du dépôt, ou initialisez un dépôt avant d'exécuter git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = Aucun dépôt Git n'est accessible dans les racines autorisées pour '{ $path }'. Choisissez un chemin dans un dépôt couvert par la racine autorisée applicable, ou initialisez un dépôt avant d'exécuter git_operations.
+tool-git-operations-error-repository-not-authorized = Les métadonnées du dépôt Git à '{ $path }' ne sont pas autorisées pour cette opération. Choisissez un dépôt couvert par la racine autorisée applicable.
+tool-git-operations-error-path-not-authorized = Le chemin Git '{ $path }' n'est pas autorisé pour cette opération. Choisissez un chemin couvert par la racine autorisée applicable.
 tool-git-forge-error-requires-field = { $resource }.{ $action } nécessite '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } nécessite 'number'.
 tool-git-forge-error-issue-close-reason = issue.close 'reason' doit être 'completed' ou 'not_planned'.
@@ -96,7 +99,7 @@ tool-project-intel = Intelligence de livraison de projet : générer des rapport
 tool-proxy-config = Gérer les paramètres du proxy OmnesAgent (portée : environment | omnesagent | services), y compris l'application des variables d'environnement de l'environnement d'exécution et du processus.
 tool-pushover = Envoyer une notification Pushover à votre appareil. Nécessite PUSHOVER_TOKEN et PUSHOVER_USER_KEY dans le fichier .env.
 tool-schedule = Gérer les tâches planifiées en mode shell uniquement. Actions : create/add/once/list/get/cancel/remove/pause/resume. AVERTISSEMENT : Cet outil crée des jobs shell dont la sortie est uniquement enregistrée et n’est envoyée à aucun canal. Pour envoyer un message planifié à Discord/Telegram/Slack/Matrix, utilisez l’outil cron_add avec job_type='agent' et une configuration de livraison comme {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
-tool-screenshot = Capture une capture d'écran de l'écran actuel. Renvoie le chemin du fichier et les données PNG encodées en base64.
+tool-screenshot = Capture une capture d'écran de l'écran actuel. Renvoie le chemin du fichier enregistré.
 tool-security-ops = Outil de services de sécurité pour les services de cybersécurité gérés. Actions : triage_alert (classification/priorisation des alertes), run_playbook (exécution des étapes de réponse aux incidents), parse_vulnerability (analyse des résultats de scan), generate_report (création de rapports de posture de sécurité), list_playbooks (liste des playbooks disponibles), alert_stats (résumé des métriques d'alerte).
 tool-shell = Exécuter une commande shell dans le répertoire de l'espace de travail
 tool-sop-advance = Signaler le résultat de l'étape actuelle du SOP et passer à l'étape suivante. Fournissez l'identifiant d'exécution, si l'étape a réussi ou échoué, et un bref résumé de la sortie.

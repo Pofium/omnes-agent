@@ -1,7 +1,7 @@
 //! Host-owned logical endpoints for plugin traffic.
 //!
 //! A channel plugin may describe the platform payload it received, but only the
-//! host selects the OmnesAgent route that owns that payload. The endpoint keeps
+//! host selects the omnesagent route that owns that payload. The endpoint keeps
 //! the channel type alongside the admitted instance scope while deriving the
 //! alias from that scope, so routing identity cannot drift across two fields.
 

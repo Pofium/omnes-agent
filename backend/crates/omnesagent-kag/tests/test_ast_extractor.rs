@@ -1,7 +1,170 @@
 //! Тесты AST-парсера кода (Rust, Python, TS/JS, SQL, PHP, Dart, Java, C#, C/C++, Kotlin,
 //! Swift, Ruby, Vue/Svelte, Scala, Lua, Elixir, Shell) — зеркало tests ob2h.
 
-use omnesagent_kag::ast::{AstCodeExtractor, AstScanResult};
+use omnesagent_kag::ast::{AstCodeExtractor, AstEdge, AstScanResult, resolve_calls, resolve_imports};
+
+/// Вспомогательная функция: сканируемый файл проекта + его хеш.
+fn seed_file(scan: &mut AstScanResult, rel_path: &str) {
+    scan.file_hashes
+        .insert(rel_path.to_string(), "hash".to_string());
+}
+
+/// Вспомогательная функция: IMPORTS-ребро `file:<src> → module:<target>`.
+fn import_edge(src: &str, module: &str) -> AstEdge {
+    AstEdge {
+        source_node_id: format!("file:{}", src),
+        target_node_id: format!("module:{}", module),
+        label: "IMPORTS".to_string(),
+        weight: 1.0,
+        context: String::new(),
+        provenance: "EXTRACTED".to_string(),
+    }
+}
+
+#[test]
+fn test_resolve_imports_rust_crate_and_super() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "src/main.rs");
+    seed_file(&mut scan, "src/db.rs"); // crate::db
+    seed_file(&mut scan, "src/handlers.rs"); // super::handlers (из crate::api)
+    seed_file(&mut scan, "src/api/mod.rs");
+
+    // crate::db::Database → src/db.rs
+    scan.edges.push(import_edge("src/main.rs", "crate::db::Database"));
+    // super::handlers из src/api/mod.rs (модуль crate::api) → crate::handlers → src/handlers.rs
+    scan.edges.push(import_edge("src/api/mod.rs", "super::handlers"));
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 2, "оба внутренних импорта должны резолвиться");
+    let targets: Vec<String> = scan
+        .edges
+        .iter()
+        .filter(|e| e.label == "IMPORTS")
+        .map(|e| e.target_node_id.clone())
+        .collect();
+    assert!(targets.contains(&"file:src/db.rs".to_string()));
+    assert!(targets.contains(&"file:src/handlers.rs".to_string()));
+}
+
+#[test]
+fn test_resolve_imports_ts_relative_and_alias() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "frontend/src/app.ts");
+    seed_file(&mut scan, "frontend/src/util/format.ts");
+    seed_file(&mut scan, "frontend/src/components/Button.tsx");
+
+    // относительный `./util/format` → frontend/src/util/format.ts
+    scan.edges
+        .push(import_edge("frontend/src/app.ts", "./util/format"));
+    // Vite-алиас `@/components/Button` → frontend/src/components/Button.tsx
+    scan.edges
+        .push(import_edge("frontend/src/app.ts", "@/components/Button"));
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 2);
+    let targets: Vec<String> = scan
+        .edges
+        .iter()
+        .filter(|e| e.label == "IMPORTS")
+        .map(|e| e.target_node_id.clone())
+        .collect();
+    assert!(targets.contains(&"file:frontend/src/util/format.ts".to_string()));
+    assert!(targets.contains(&"file:frontend/src/components/Button.tsx".to_string()));
+}
+
+#[test]
+fn test_resolve_imports_python_and_external_stays() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "app/vector.py");
+    seed_file(&mut scan, "backend/app/services/email.py");
+
+    // `import json, os as system, app.services.email` в одном стейтменте (Python):
+    // внешние json/os остаются module:, внутренний app.services.email → файл проекта.
+    scan.edges.push(import_edge(
+        "app/vector.py",
+        "json, os as system, app.services.email",
+    ));
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 1, "только app.services.email — внутренний модуль");
+    let targets: Vec<String> = scan
+        .edges
+        .iter()
+        .filter(|e| e.label == "IMPORTS")
+        .map(|e| e.target_node_id.clone())
+        .collect();
+    assert!(targets.contains(&"file:backend/app/services/email.py".to_string()));
+    assert!(targets.contains(&"module:json".to_string()));
+    assert!(targets.contains(&"module:os".to_string()));
+    assert!(
+        scan.edges
+            .iter()
+            .filter(|e| e.target_node_id == "file:backend/app/services/email.py")
+            .all(|e| e.context == "import app.services.email"),
+        "контекст ребра должен фиксировать импортируемый модуль"
+    );
+}
+
+#[test]
+fn test_resolve_imports_leaves_non_module_targets() {
+    let mut scan = AstScanResult::default();
+    seed_file(&mut scan, "src/main.rs");
+
+    // Не-IMPORTS-ребро и уже резолвнутый импорт не должны меняться.
+    scan.edges.push(AstEdge {
+        source_node_id: "file:src/main.rs".to_string(),
+        target_node_id: "file:src/db.rs".to_string(),
+        label: "CALLS".to_string(),
+        weight: 1.0,
+        context: "typepass:import:src/db.rs".to_string(),
+        provenance: "RESOLVED".to_string(),
+    });
+
+    let resolved = resolve_imports(&mut scan);
+
+    assert_eq!(resolved, 0);
+    assert_eq!(scan.edges.len(), 1);
+    assert_eq!(scan.edges[0].target_node_id, "file:src/db.rs");
+}
+
+#[test]
+fn test_ts_function_body_bounds_multi_line() {
+    let extractor = AstCodeExtractor::new();
+    let ts_code = r#"export function outer(): number {
+    const inner = () => {
+        return 1;
+    };
+    return inner();
+}
+
+export const arrow = (x: number) => x + 1;
+"#;
+
+    let mut res = AstScanResult::default();
+    extractor.parse_file("src/util.ts", ts_code, &mut res);
+
+    let outer = res
+        .nodes
+        .iter()
+        .find(|n| n.label == "outer")
+        .expect("функция outer должна быть найдена");
+    assert_eq!(outer.line_start, 1);
+    assert_eq!(
+        outer.line_end, 6,
+        "тело outer должно заканчиваться на закрывающей `}}` (6 строка)"
+    );
+
+    // expression-body стрелка: конец тела — не выдумываем, минимум = строка объявления
+    let arrow = res
+        .nodes
+        .iter()
+        .find(|n| n.label == "arrow")
+        .expect("стрелка arrow должна быть найдена");
+    assert!(arrow.line_end >= arrow.line_start);
+}
 
 #[test]
 fn test_parse_rust_code() {
@@ -63,6 +226,90 @@ fn test_parse_python_code() {
     let edge_labels: Vec<String> = res.edges.iter().map(|e| e.label.clone()).collect();
     assert!(edge_labels.contains(&"IMPORTS".to_string()));
     assert!(edge_labels.contains(&"INHERITS".to_string()));
+}
+
+/// Ф43 (порт ob2h `2ad9027`): многострочные `def` и многострочные route-декораторы.
+#[test]
+fn test_python_multiline_signature_and_route() {
+    let extractor = AstCodeExtractor::new();
+    let code = r#"from fastapi import APIRouter
+router = APIRouter()
+
+@router.post(
+    "/ask",
+    status_code=200,
+)
+async def ask_kag(
+    self,
+    query: str,
+    limit: int = 5,
+) -> dict:
+    result = self._run(query)
+    return result
+
+def helper(
+    a: int,
+) -> int:
+    return a
+"#;
+
+    let mut res = AstScanResult::default();
+    extractor.parse_file("app/api/chat.py", code, &mut res);
+
+    let find = |label: &str| {
+        res.nodes
+            .iter()
+            .find(|n| n.label == label)
+            .unwrap_or_else(|| panic!("нет узла {label}"))
+    };
+
+    let ask = find("ask_kag");
+    assert_eq!(
+        (ask.line_start, ask.line_end),
+        (8, 14),
+        "границы тела при многострочной сигнатуре"
+    );
+    let help = find("helper");
+    assert_eq!(
+        (help.line_start, help.line_end),
+        (16, 19),
+        "тело после многострочной сигнатуры"
+    );
+
+    let route = res
+        .edges
+        .iter()
+        .find(|e| e.label == "ROUTE")
+        .expect("ROUTE для многострочного декоратора");
+    assert_eq!(route.source_node_id, "fn:app/api/chat.py:ask_kag");
+    assert_eq!(route.target_node_id, "route:POST /ask");
+}
+
+/// Ф43 (порт ob2h `2ad9027`): `self.method()` / `cls.method()` резолвятся в метод
+/// того же файла, произвольный receiver остаётся AMBIGUOUS.
+#[test]
+fn test_self_method_call_resolved() {
+    let extractor = AstCodeExtractor::new();
+    let code = "class Store:\n    def run(self):\n        self.helper()\n\n    def helper(self):\n        return 1\n";
+
+    let mut res = AstScanResult::default();
+    extractor.parse_file("app/store.py", code, &mut res);
+
+    let added = resolve_calls(&mut res);
+    assert!(
+        added >= 1,
+        "self.helper() должен резолвиться в same-file метод helper"
+    );
+    let calls: Vec<String> = res
+        .edges
+        .iter()
+        .filter(|e| e.label == "CALLS" && e.provenance == "RESOLVED")
+        .map(|e| format!("{} -> {}", e.source_node_id, e.target_node_id))
+        .collect();
+    assert!(
+        calls.iter().any(|c| c.ends_with("helper")),
+        "ожидалось CALLS-ребро на helper, получено: {calls:?}"
+    );
 }
 
 #[test]

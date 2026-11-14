@@ -3,7 +3,7 @@ name = "omnesagent-sop-graph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Pure serde projection types for the OmnesAgent SOP Blueprint graph, shared by the runtime, gateway schema, and the zerocode TUI so every surface reads one wire shape."
+description = "Pure serde projection types for the OmnesAgent SOP Blueprint graph, shared by the runtime, gateway schema, and the omnescode TUI so every surface reads one wire shape."
 publish = false
 
 [dependencies]

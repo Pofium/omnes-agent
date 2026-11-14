@@ -637,7 +637,7 @@ impl ChromeStatus {
         let mut text = format!(
             " v{} {}:{}",
             status.server_version,
-            crate::i18n::t("zc-chrome-summary-sessions"),
+            crate::i18n::t("oc-chrome-summary-sessions"),
             status.active_sessions
         );
         text.push_str(&process_stats_summary(self.health.as_ref()));
@@ -649,14 +649,14 @@ impl ChromeStatus {
 impl Mode {
     fn fluent_key(self) -> &'static str {
         match self {
-            Mode::Dashboard => "zc-pane-dashboard",
-            Mode::Config => "zc-pane-config",
-            Mode::Doctor => "zc-pane-doctor",
-            Mode::Acp => "zc-pane-code",
-            Mode::Chat => "zc-pane-chat",
-            Mode::Logs => "zc-pane-logs",
-            Mode::Quickstart => "zc-pane-quickstart",
-            Mode::Sop => "zc-pane-sop",
+            Mode::Dashboard => "oc-pane-dashboard",
+            Mode::Config => "oc-pane-config",
+            Mode::Doctor => "oc-pane-doctor",
+            Mode::Acp => "oc-pane-code",
+            Mode::Chat => "oc-pane-chat",
+            Mode::Logs => "oc-pane-logs",
+            Mode::Quickstart => "oc-pane-quickstart",
+            Mode::Sop => "oc-pane-sop",
         }
     }
 
@@ -1283,7 +1283,7 @@ pub async fn run(
                             if let Some(status) = dispatch_state
                                 .run_rpc_dispatch(|| async {
                                     match rpc.config_reload().await {
-                                        Ok(_) => crate::i18n::t("zc-app-reload-status-signalled"),
+                                        Ok(_) => crate::i18n::t("oc-app-reload-status-signalled"),
                                         Err(e) => format!("Reload requested ({e})"),
                                     }
                                 })
@@ -1570,18 +1570,18 @@ fn global_help_entries() -> Vec<HelpEntry> {
         .into_iter()
         .chain(action_key_labels(GlobalAction::PaneNavRight));
     vec![
-        HelpEntry::new(cycle_keys, crate::i18n::t("zc-app-help-cycle-mode")),
+        HelpEntry::new(cycle_keys, crate::i18n::t("oc-app-help-cycle-mode")),
         HelpEntry::new(
             action_key_labels(GlobalAction::Help),
-            crate::i18n::t("zc-app-help-help"),
+            crate::i18n::t("oc-app-help-help"),
         ),
         HelpEntry::new(
             action_key_labels(GlobalAction::ReloadDaemon),
-            crate::i18n::t("zc-app-help-reload"),
+            crate::i18n::t("oc-app-help-reload"),
         ),
         HelpEntry::new(
             action_key_labels(GlobalAction::Quit),
-            crate::i18n::t("zc-app-help-quit"),
+            crate::i18n::t("oc-app-help-quit"),
         ),
         HelpEntry::spacer(),
     ]
@@ -1862,8 +1862,8 @@ fn draw_status_bar(
 }
 
 fn process_stats_summary(health: Option<&serde_json::Value>) -> String {
-    let cpu_label = crate::i18n::t("zc-chrome-summary-cpu");
-    let loading_label = crate::i18n::t("zc-chrome-summary-loading");
+    let cpu_label = crate::i18n::t("oc-chrome-summary-cpu");
+    let loading_label = crate::i18n::t("oc-chrome-summary-loading");
     let Some(h) = health else {
         return format!(" {cpu_label}:{loading_label}");
     };
@@ -1879,7 +1879,7 @@ fn process_stats_summary(health: Option<&serde_json::Value>) -> String {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         let rss_str = format_bytes(rss);
-        let ram_label = crate::i18n::t("zc-chrome-summary-ram");
+        let ram_label = crate::i18n::t("oc-chrome-summary-ram");
         if total > 0 {
             let pct = (rss as f64 / total as f64) * 100.0;
             parts.push(format!(" {ram_label}:{rss_str}({pct:.0}%)"));
@@ -2016,7 +2016,7 @@ fn help_control_hint() -> String {
     let down = action_key_labels(SearchBoxAction::Down).join("/");
     let cancel = action_key_labels(SearchBoxAction::Cancel).join("/");
     crate::i18n::t_args(
-        "zc-app-help-controls",
+        "oc-app-help-controls",
         &[("up", &up), ("down", &down), ("cancel", &cancel)],
     )
 }
@@ -2052,9 +2052,9 @@ fn draw_help_modal(
         .max()
         .unwrap_or(0);
 
-    let title = format!(" {} ", crate::i18n::t("zc-app-keybindings-title"));
-    let filter_label = crate::i18n::t("zc-app-help-filter-label");
-    let filter_placeholder = crate::i18n::t("zc-app-help-filter-placeholder");
+    let title = format!(" {} ", crate::i18n::t("oc-app-keybindings-title"));
+    let filter_label = crate::i18n::t("oc-app-help-filter-label");
+    let filter_placeholder = crate::i18n::t("oc-app-help-filter-placeholder");
     let filter_display = if state.query.is_empty() {
         filter_placeholder.as_str()
     } else {
@@ -2119,7 +2119,7 @@ fn draw_help_modal(
 
     if flat.is_empty() {
         text_lines.push(Line::from(Span::styled(
-            crate::i18n::t("zc-app-help-no-matches"),
+            crate::i18n::t("oc-app-help-no-matches"),
             theme::dim_style(),
         )));
     }
@@ -2175,37 +2175,37 @@ fn draw_help_modal(
 fn draw_reload_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
     let body_lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-line-1"),
+            crate::i18n::t("oc-app-reload-line-1"),
             theme::body_style(),
         )),
         Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-line-2"),
+            crate::i18n::t("oc-app-reload-line-2"),
             theme::body_style(),
         )),
         Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-line-3"),
-            theme::body_style(),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-bullet-gateway"),
-            theme::body_style(),
-        )),
-        Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-bullet-channels"),
-            theme::body_style(),
-        )),
-        Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-bullet-mcp"),
-            theme::body_style(),
-        )),
-        Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-bullet-provider"),
+            crate::i18n::t("oc-app-reload-line-3"),
             theme::body_style(),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            crate::i18n::t("zc-app-reload-socket-note"),
+            crate::i18n::t("oc-app-reload-bullet-gateway"),
+            theme::body_style(),
+        )),
+        Line::from(Span::styled(
+            crate::i18n::t("oc-app-reload-bullet-channels"),
+            theme::body_style(),
+        )),
+        Line::from(Span::styled(
+            crate::i18n::t("oc-app-reload-bullet-mcp"),
+            theme::body_style(),
+        )),
+        Line::from(Span::styled(
+            crate::i18n::t("oc-app-reload-bullet-provider"),
+            theme::body_style(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            crate::i18n::t("oc-app-reload-socket-note"),
             theme::dim_style(),
         )),
     ];
@@ -2248,7 +2248,7 @@ fn draw_reload_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(Span::styled(
             crate::i18n::t_args(
-                "zc-app-reload-confirm-row",
+                "oc-app-reload-confirm-row",
                 &[("confirm_chord", "Enter / y"), ("cancel_chord", "Esc / n")],
             ),
             theme::dim_style(),
@@ -2261,12 +2261,12 @@ fn draw_reload_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
 fn draw_quit_confirm_modal(frame: &mut ratatui::Frame, area: Rect) {
     let body_lines: Vec<Line> = vec![
         Line::from(Span::styled(
-            crate::i18n::t("zc-app-quit-prompt"),
+            crate::i18n::t("oc-app-quit-prompt"),
             theme::heading_style(),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            crate::i18n::t("zc-app-quit-explainer"),
+            crate::i18n::t("oc-app-quit-explainer"),
             theme::dim_style(),
         )),
     ];
@@ -2723,16 +2723,16 @@ mod tests {
 
     #[test]
     fn chrome_process_summary_shows_cpu_loading_without_health() {
-        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
-        let loading = crate::i18n::t("zc-chrome-summary-loading");
+        let cpu = crate::i18n::t("oc-chrome-summary-cpu");
+        let loading = crate::i18n::t("oc-chrome-summary-loading");
 
         assert_eq!(process_stats_summary(None), format!(" {cpu}:{loading}"));
     }
 
     #[test]
     fn chrome_process_summary_shows_ram_and_cpu_values() {
-        let ram = crate::i18n::t("zc-chrome-summary-ram");
-        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
+        let ram = crate::i18n::t("oc-chrome-summary-ram");
+        let cpu = crate::i18n::t("oc-chrome-summary-cpu");
         let health = serde_json::json!({
             "process": {
                 "rss_bytes": 1_048_576_u64,
@@ -2749,9 +2749,9 @@ mod tests {
 
     #[test]
     fn chrome_process_summary_keeps_cpu_loading_until_sample_exists() {
-        let ram = crate::i18n::t("zc-chrome-summary-ram");
-        let cpu = crate::i18n::t("zc-chrome-summary-cpu");
-        let loading = crate::i18n::t("zc-chrome-summary-loading");
+        let ram = crate::i18n::t("oc-chrome-summary-ram");
+        let cpu = crate::i18n::t("oc-chrome-summary-cpu");
+        let loading = crate::i18n::t("oc-chrome-summary-loading");
         let health = serde_json::json!({
             "process": {
                 "rss_bytes": 1_048_576_u64,
@@ -3096,7 +3096,7 @@ mod tests {
         let entries = global_help_entries();
         let help = entries
             .iter()
-            .find(|entry| entry.action == crate::i18n::t("zc-app-help-help"))
+            .find(|entry| entry.action == crate::i18n::t("oc-app-help-help"))
             .expect("global Help section should include its own opening binding");
         let expected = action_key_labels(GlobalAction::Help);
 
@@ -3307,7 +3307,7 @@ mod tests {
         assert_eq!(filtered.entries.len(), 1);
         assert_eq!(
             filtered.entries[0].action,
-            crate::i18n::t("zc-app-help-reload")
+            crate::i18n::t("oc-app-help-reload")
         );
     }
 
@@ -3426,7 +3426,7 @@ mod tests {
             .next()
             .expect("cancel action should have a binding");
         assert_eq!(state.scroll, 6);
-        assert!(rendered.contains(&crate::i18n::t("zc-app-help-filter-label")));
+        assert!(rendered.contains(&crate::i18n::t("oc-app-help-filter-label")));
         assert!(rendered.contains(&cancel));
         assert!(!rendered.contains("Action 0"));
         assert!(rendered.contains("Action 9"));

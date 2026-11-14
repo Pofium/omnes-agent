@@ -7,6 +7,7 @@ pub mod graph;
 pub mod models;
 pub mod project;
 pub mod schema;
+pub mod telemetry;
 pub mod vector;
 
 pub use ast::{AstCodeExtractor, AstEdge, AstNode, AstScanResult};
@@ -19,9 +20,10 @@ pub use embedding::{default_embedding_provider, EmbeddingProvider, FakeEmbedding
 #[cfg(feature = "candle")]
 pub use embedding::LocalBertEmbedding;
 pub use graph::{
-    build_repo_map, latest_hint, personalized_pagerank, warn_block, AffectedNode, BlastHint,
-    CallLink, CallPathResult, CircularDependency, ComponentMetrics, DeadSymbol, Dir, GodNodeInfo,
-    GraphAnalytics, GraphReasonResult, GraphSearchResult, GraphService, GraphStats, ImpactReport,
+    build_repo_map, latest_hint, personalized_pagerank, personalized_pagerank_weighted,
+    usage_weight, warn_block, AffectedNode, BlastHint, CallLink, CallPathResult,
+    CircularDependency, ComponentMetrics, DeadSymbol, Dir, GodNodeInfo, GraphAnalytics,
+    GraphReasonResult, GraphSearchResult, GraphService, GraphStats, ImpactReport, NodeUsage,
     NodeWithNeighbors, PprEdge, PprGraph, ProjectReport, RiskLevel, SymbolRef, Zone, ZonesReport,
 };
 pub use models::{
@@ -33,4 +35,5 @@ pub use project::{
     ScoredProjectNode,
 };
 pub use schema::{migrate, SCHEMA_VERSION};
+pub use telemetry::{AccessTelemetry, ACCESS_FLUSH_INTERVAL};
 pub use vector::{cosine, deserialize, normalize, rrf_merge, serialize, top_k, RankedItem};

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:http/http.dart' as http;
@@ -99,15 +100,12 @@ class _WebAuthGateState extends State<WebAuthGate> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(10),
-                child: Image.asset('assets/Logo/app_launcher.png', width: 44, height: 44),
-              ),
+              SvgPicture.asset('assets/Logo/OA_icon.svg', width: 44, height: 44),
               const SizedBox(height: 16),
               const SizedBox(
                 width: 22,
                 height: 22,
-                child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00D2FF)),
+                child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFFF6B00)),
               ),
             ],
           ),

@@ -24,8 +24,8 @@ use omnesagent_hardware::util::serial_open_baud;
 #[cfg(unix)]
 use omnesagent_hardware::util::should_open_serial_nonexclusive;
 
-const PTY_FIRMWARE_PATH: &str = "/tmp/zc-sim-firmware";
-const PTY_HOST_PATH: &str = "/tmp/zc-sim-esp32";
+const PTY_FIRMWARE_PATH: &str = "/tmp/oc-sim-firmware";
+const PTY_HOST_PATH: &str = "/tmp/oc-sim-esp32";
 // 0.0.0.0 so docker port mapping can reach it. Outside the container the
 // docker-compose mapping `127.0.0.1:8080:8080` keeps the demo loopback-only.
 const HTTP_BIND: &str = "0.0.0.0:8080";

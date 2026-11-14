@@ -46,5 +46,5 @@ omnesagent-tls = { workspace = true }
 tempfile = "3.26"
 # `test-util` enables tokio's paused-clock test runtime so the refusal-write
 # budget regression asserts instantly instead of sleeping out the real budget.
-# Test-only: it does not reach the shipped binary. Mirrors apps/zerocode.
+# Test-only: it does not reach the shipped binary. Mirrors apps/omnescode.
 tokio = { version = "1.50", default-features = false, features = ["test-util"] }

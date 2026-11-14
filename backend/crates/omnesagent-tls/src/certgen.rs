@@ -674,7 +674,7 @@ mod tests {
         // The client half (generate_client_csr) round-trips with the daemon half
         // (sign_csr): a freshly generated P-256 CSR signs into a usable leaf.
         let (ca_cert, ca_key) = crate::testing::gen_ca();
-        let (csr, key_pem) = generate_client_csr("zerocode").unwrap();
+        let (csr, key_pem) = generate_client_csr("omnescode").unwrap();
         assert!(csr.contains("CERTIFICATE REQUEST"));
         assert!(key_pem.contains("PRIVATE KEY"));
         let leaf = sign_csr(&ca_cert, &ca_key, "dev-xyz", &csr).unwrap();

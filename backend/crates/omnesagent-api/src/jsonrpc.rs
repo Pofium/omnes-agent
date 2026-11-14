@@ -16,7 +16,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// Both peers may use this prefix, so correlation is directional rather than
 /// globally unique across the socket.
-pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
+pub const OUTBOUND_ID_PREFIX: &str = "oc-out-";
 
 // ── Wire field name constants ────────────────────────────────────
 // Used when parsing raw `Value` frames (e.g. in the client read loop).
@@ -585,26 +585,26 @@ mod tests {
 
     #[test]
     fn frame_parses_success_response() {
-        let json = r#"{"jsonrpc":"2.0","id":"zc-out-5","result":{"answer":42}}"#;
+        let json = r#"{"jsonrpc":"2.0","id":"oc-out-5","result":{"answer":42}}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
         let JsonRpcFrame::Response { id, result } = frame else {
             panic!("expected response");
         };
-        assert_eq!(id, json!("zc-out-5"));
+        assert_eq!(id, json!("oc-out-5"));
         assert_eq!(result.unwrap(), json!({"answer": 42}));
     }
 
     #[test]
     fn frame_parses_error_response() {
         let json =
-            r#"{"jsonrpc":"2.0","id":"zc-out-3","error":{"code":-32601,"message":"not found"}}"#;
+            r#"{"jsonrpc":"2.0","id":"oc-out-3","error":{"code":-32601,"message":"not found"}}"#;
         let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
 
         let JsonRpcFrame::Response { id, result } = frame else {
             panic!("expected response");
         };
-        assert_eq!(id, json!("zc-out-3"));
+        assert_eq!(id, json!("oc-out-3"));
         assert_eq!(result.unwrap_err().code, -32601);
     }
 
@@ -730,7 +730,7 @@ mod tests {
             (
                 json!({
                     "jsonrpc":"2.0",
-                    "id":"zc-out-0",
+                    "id":"oc-out-0",
                     "result":true,
                     "error":{"code":-1,"message":"bad"}
                 }),
@@ -738,12 +738,12 @@ mod tests {
                 None,
             ),
             (
-                json!({"id":"zc-out-0","result":true}),
+                json!({"id":"oc-out-0","result":true}),
                 JsonRpcFrameErrorKind::Response,
                 None,
             ),
             (
-                json!({"jsonrpc":"1.0","id":"zc-out-0","result":true}),
+                json!({"jsonrpc":"1.0","id":"oc-out-0","result":true}),
                 JsonRpcFrameErrorKind::Response,
                 None,
             ),

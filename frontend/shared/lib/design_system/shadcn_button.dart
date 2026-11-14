@@ -45,7 +45,7 @@ class ShadcnButton extends StatelessWidget {
     switch (variant) {
       case ShadcnButtonVariant.primary:
         bg = ShadcnColors.primary;
-        fg = const Color(0xFF09090B);
+        fg = const Color(0xFF111827);
         border = null;
         break;
       case ShadcnButtonVariant.secondary:

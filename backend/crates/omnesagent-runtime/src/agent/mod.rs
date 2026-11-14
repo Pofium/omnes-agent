@@ -28,7 +28,8 @@ pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
 pub use turn::{
-    is_semantic_empty_terminal_completion,
+    ContextWindowExceeded, SteeringAdmission, SteeringAdmit, SteeringInput, SteeringPosture,
+    context_window_exceeded_from_error, is_semantic_empty_terminal_completion,
     redact::{is_credential_key, scrub_credentials_value},
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
@@ -73,4 +74,4 @@ mod tests;
 pub use agent::{Agent, AgentBuilder, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
 pub use context_budget::{AgentExecutionMode, ContextBudgetProfiler, ContextBudgetSnapshot};
 #[allow(unused_imports)]
-pub use loop_::{process_message, run};
+pub use loop_::{process_message, process_message_with_live_config, run};

@@ -93,7 +93,7 @@ pub enum ElicitationResponse {
 // These helpers build the JSON Schema payload for the `requested_schema`
 // field of an `elicitation/create` request. They live here (not in any
 // single channel impl) so every channel that speaks elicitation/create
-// — the ACP channel and Zerocode's RPC channel both qualify — gets the
+// — the ACP channel and Omnescode's RPC channel both qualify — gets the
 // exact same on-the-wire shape from one source. Adding a third channel
 // (gateway WS, future plugin) must call these helpers, not roll its own.
 

@@ -116,6 +116,9 @@ fn apply_rate_sheet_pricing(config: &Config, provider_type: &str, slot: &mut Has
         if let Some(cached) = rates.cached_input_per_mtok {
             slot.insert(format!("{model_id}.cached_input"), cached);
         }
+        if let Some(write) = rates.cache_write_per_mtok {
+            slot.insert(format!("{model_id}.cache_write"), write);
+        }
     }
 }
 
@@ -189,25 +192,29 @@ tokio::task_local! {
 }
 
 fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates {
-    let try_lookup = |key: &str| -> Option<ModelRates> {
+    let try_lookup = |key: &str| -> ModelRates {
         let input = pricing.get(&format!("{key}.input")).copied();
         let output = pricing.get(&format!("{key}.output")).copied();
         let cached = pricing.get(&format!("{key}.cached_input")).copied();
+        let write = pricing.get(&format!("{key}.cache_write")).copied();
         let flat = pricing.get(key).copied();
-        if input.is_none() && output.is_none() && cached.is_none() && flat.is_none() {
-            None
-        } else {
-            Some(ModelRates {
-                input_per_mtok: input.or(flat),
-                output_per_mtok: output.or(flat),
-                cached_input_per_mtok: cached,
-            })
+        ModelRates {
+            input_per_mtok: input.or(flat),
+            output_per_mtok: output.or(flat),
+            cached_input_per_mtok: cached,
+            cache_write_per_mtok: write,
         }
     };
 
+    // Merge candidates from most-specific to least-specific. A model-key
+    // entry may contain only the write rate while the suffix entry carries
+    // the other dimensions; stopping at the first non-empty entry would lose
+    // those fallback rates.
     omnesagent_providers::pricing::model_id_candidates(model)
-        .find_map(try_lookup)
-        .unwrap_or_default()
+        .map(try_lookup)
+        .fold(ModelRates::default(), |resolved, candidate| {
+            resolved.or(candidate)
+        })
 }
 
 fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates> {
@@ -309,6 +316,22 @@ fn record_tool_loop_cost_usage_inner(
     usage: &omnesagent_providers::traits::TokenUsage,
     updates_context_window_fill: bool,
 ) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_inner_with_live(
+        model_provider_name,
+        model,
+        usage,
+        updates_context_window_fill,
+        None,
+    )
+}
+
+fn record_tool_loop_cost_usage_inner_with_live(
+    model_provider_name: &str,
+    model: &str,
+    usage: &omnesagent_providers::traits::TokenUsage,
+    updates_context_window_fill: bool,
+    live_override: Option<ModelRates>,
+) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
     let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
@@ -329,9 +352,11 @@ fn record_tool_loop_cost_usage_inner(
     // Live-price FALLBACK fills only the dimensions config left unset; never
     // fetches on this path (reads a cached snapshot, empty unless a provider
     // opted into `live_pricing`).
-    let live = (!config_rates.is_complete())
-        .then(|| live_pricing_for(model_provider_name, model))
-        .flatten();
+    let live = live_override.or_else(|| {
+        (!config_rates.is_complete() || config_rates.cache_write_per_mtok.is_none())
+            .then(|| live_pricing_for(model_provider_name, model))
+            .flatten()
+    });
     // `mut` so the global-catalog fallback below can still fill rates config and
     // the live snapshot both left unset.
     let (mut input_rate, mut output_rate, mut cached_rate) =
@@ -354,13 +379,21 @@ fn record_tool_loop_cost_usage_inner(
         false
     };
 
-    let cost_usage = CostTokenUsage::new_with_cache(
+    let cache_creation_input_tokens = usage.cache_creation_input_tokens.unwrap_or(0);
+    let write_rate = config_rates
+        .cache_write_per_mtok
+        .or_else(|| live.and_then(|l| l.cache_write_per_mtok))
+        .unwrap_or(0.0);
+
+    let cost_usage = CostTokenUsage::new_with_cache_write(
         model,
         input_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens,
         output_tokens,
         input_rate,
         cached_rate,
+        write_rate,
         output_rate,
     );
 
@@ -401,14 +434,48 @@ fn record_tool_loop_cost_usage_inner(
         }
     }
 
+    // The session key scoped around this turn is the chat conversation the
+    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
+    let conversation_id = omnesagent_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
     if let Some(tracker) = &ctx.tracker
-        && let Err(error) =
-            tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
+        && let Err(error) = tracker.record_usage_attributed(
+            cost_usage.clone(),
+            ctx.agent_alias.as_deref(),
+            None,
+            conversation_id,
+        )
     {
         ::omnesagent_log::record!(WARN, ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note).with_category(::omnesagent_log::EventCategory::Provider).with_outcome(::omnesagent_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
 
     Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// A model with token usage whose ledger records explicitly report that one
+/// or more token-bearing pricing dimensions were unavailable.
+pub struct UnpricedModel {
+    pub model: String,
+    pub unpriced_tokens: u64,
+}
+
+/// Return per-model unpriced token subsets from the ledger-derived summary,
+/// sorted by model id for stable output (upstream #9939).
+pub fn unpriced_models_in_summary(
+    by_model: &HashMap<String, omnesagent_config::cost::ModelStats>,
+) -> Vec<UnpricedModel> {
+    let mut out: Vec<UnpricedModel> = by_model
+        .values()
+        .filter(|m| m.unpriced_tokens > 0)
+        .map(|m| UnpricedModel {
+            model: m.model.clone(),
+            unpriced_tokens: m.unpriced_tokens,
+        })
+        .collect();
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    out
 }
 
 /// Insert `(model_provider, model)` into `seen`. Returns `true` on first sighting,
@@ -613,6 +680,7 @@ mod tests {
                     input_tokens: Some(1_000_000),
                     output_tokens: Some(0),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -631,6 +699,7 @@ mod tests {
             input_per_mtok: Some(99.0),
             output_per_mtok: Some(15.0),
             cached_input_per_mtok: Some(1.5),
+            ..ModelRates::default()
         });
         assert_eq!(merge_config_and_live_rates(config, live), (5.0, 15.0, 1.5));
     }
@@ -650,11 +719,13 @@ mod tests {
                     input_per_mtok: Some(0.0),
                     output_per_mtok: Some(0.0),
                     cached_input_per_mtok: None,
+                    ..ModelRates::default()
                 },
                 Some(ModelRates {
                     input_per_mtok: Some(3.0),
                     output_per_mtok: Some(9.0),
                     cached_input_per_mtok: Some(0.3),
+                    ..ModelRates::default()
                 })
             ),
             (0.0, 0.0, 0.3)
@@ -696,6 +767,68 @@ mod tests {
             missing_pricing_first_sighting(&seen, "minimax", "MiniMax-M2.7"),
             "different model under same model_provider is a distinct pair"
         );
+    }
+
+    fn model_stats(
+        model: &str,
+        total_tokens: u64,
+        cost_usd: f64,
+        unpriced_tokens: u64,
+    ) -> omnesagent_config::cost::ModelStats {
+        omnesagent_config::cost::ModelStats {
+            model: model.to_string(),
+            cost_usd,
+            input_tokens: total_tokens,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens,
+            unpriced_tokens,
+            request_count: 1,
+        }
+    }
+
+    #[test]
+    fn unpriced_models_use_recorded_provenance_not_aggregate_cost() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "claude-haiku-4-5-20251001".to_string(),
+            model_stats("claude-haiku-4-5-20251001", 9420, 0.0, 9420),
+        );
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        by_model.insert("mixed".to_string(), model_stats("mixed", 3000, 0.05, 700));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        assert_eq!(unpriced.len(), 2);
+        assert_eq!(unpriced[0].model, "claude-haiku-4-5-20251001");
+        assert_eq!(unpriced[0].unpriced_tokens, 9420);
+        assert_eq!(unpriced[1].model, "mixed");
+        assert_eq!(unpriced[1].unpriced_tokens, 700);
+    }
+
+    /// Output is sorted by model id for stable, deterministic status output.
+    #[test]
+    fn unpriced_models_are_sorted_by_id() {
+        let mut by_model = HashMap::new();
+        by_model.insert("zeta".to_string(), model_stats("zeta", 10, 0.0, 10));
+        by_model.insert("alpha".to_string(), model_stats("alpha", 20, 0.0, 20));
+        by_model.insert("mike".to_string(), model_stats("mike", 30, 0.0, 30));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        let ids: Vec<&str> = unpriced.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mike", "zeta"]);
+    }
+
+    #[test]
+    fn genuinely_free_model_does_not_warn() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        assert!(unpriced_models_in_summary(&by_model).is_empty());
     }
 
     #[test]
@@ -840,6 +973,18 @@ mod tests {
         map
     }
 
+    fn pricing_with_cache_write(
+        model: &str,
+        input: f64,
+        cached_input: f64,
+        cache_write: f64,
+        output: f64,
+    ) -> HashMap<String, f64> {
+        let mut map = pricing_with_cache(model, input, cached_input, output);
+        map.insert(format!("{model}.cache_write"), cache_write);
+        map
+    }
+
     #[test]
     fn build_model_provider_pricing_prefers_rate_sheet_over_legacy_alias_pricing() {
         let mut config = Config::default();
@@ -859,6 +1004,7 @@ mod tests {
                 input_per_mtok: Some(0.14),
                 output_per_mtok: Some(0.28),
                 cached_input_per_mtok: Some(0.0028),
+                cache_write_per_mtok: None,
             },
         );
 
@@ -943,6 +1089,7 @@ mod tests {
                 input_per_mtok: Some(0.14),
                 output_per_mtok: Some(0.28),
                 cached_input_per_mtok: Some(0.0028),
+                cache_write_per_mtok: None,
             },
         );
 
@@ -1021,6 +1168,7 @@ mod tests {
             input_tokens: Some(5_000),
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
+            cache_creation_input_tokens: None,
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1042,6 +1190,61 @@ mod tests {
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cached_input_tokens, 4_000);
         assert_eq!(record.usage.billable_input_tokens(), 1_000);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_attributes_records_to_the_chat_session() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                omnesagent_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "deepseek".to_string(),
+                pricing_with_cache("deepseek-chat", 0.27, 0.027, 1.10),
+            )])),
+        );
+        let usage = omnesagent_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+            cache_creation_input_tokens: None,
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for session in ["chat-session-a", "chat-session-b"] {
+            let ctx = ctx.clone();
+            let usage = usage.clone();
+            let session = session.to_string();
+            runtime.block_on(omnesagent_api::TOOL_LOOP_SESSION_KEY.scope(
+                Some(session),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+                        .expect("cost usage");
+                }),
+            ));
+        }
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let mut conversation_ids = Vec::new();
+        for line in stored.lines() {
+            let record: omnesagent_config::cost::types::CostRecord =
+                serde_json::from_str(line).unwrap();
+            assert_eq!(record.session_id, tracker.session_id());
+            conversation_ids.push(record.conversation_id.expect("conversation id"));
+        }
+        conversation_ids.sort();
+        assert_eq!(
+            conversation_ids,
+            vec!["chat-session-a".to_string(), "chat-session-b".to_string()],
+            "two chat sessions on one daemon must stay separable in the ledger"
+        );
     }
 
     #[test]
@@ -1068,6 +1271,7 @@ mod tests {
             input_tokens: Some(5_000),
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
+            cache_creation_input_tokens: Some(1_000),
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1099,11 +1303,13 @@ mod tests {
             input_tokens: Some(80),
             output_tokens: Some(5),
             cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
         };
         let accepted = omnesagent_providers::traits::TokenUsage {
             input_tokens: Some(80),
             output_tokens: Some(7),
             cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(TOOL_LOOP_TURN_USAGE.scope(

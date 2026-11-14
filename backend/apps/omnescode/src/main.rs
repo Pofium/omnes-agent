@@ -53,7 +53,7 @@ mod todo_tracker;
 mod turn_status;
 mod widgets;
 mod wire;
-mod zerocode_pane;
+mod omnescode_pane;
 
 const DAEMON_CONNECT_INTERVAL: Duration = Duration::from_millis(50);
 const SPAWNED_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,7 +88,7 @@ impl ShutdownSignals {
 
 #[derive(Parser)]
 #[command(
-    name = "zerocode",
+    name = "omnescode",
     about = "Interactive TUI config manager for OmnesAgent",
     version,
     long_version = concat!(
@@ -321,7 +321,7 @@ impl WssRoute {
     }
 }
 
-/// Where zerocode should connect.
+/// Where omnescode should connect.
 #[derive(Clone)]
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
@@ -538,7 +538,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("zerocode: {}", format_startup_error(&e));
+            eprintln!("omnescode: {}", format_startup_error(&e));
             ExitCode::FAILURE
         }
     }
@@ -547,7 +547,7 @@ async fn main() -> ExitCode {
 fn format_startup_error(err: &anyhow::Error) -> String {
     if let Some(mismatch) = err.downcast_ref::<client::DaemonVersionMismatch>() {
         return i18n::t_args(
-            "zc-error-daemon-version-mismatch",
+            "oc-error-daemon-version-mismatch",
             &[
                 ("client_version", mismatch.client_version()),
                 ("server_version", mismatch.server_version()),
@@ -556,13 +556,13 @@ fn format_startup_error(err: &anyhow::Error) -> String {
     }
     if let Some(timeout) = err.downcast_ref::<client::DaemonInitializeTimeout>() {
         return i18n::t_args(
-            "zc-error-daemon-initialize-timeout",
+            "oc-error-daemon-initialize-timeout",
             &[("seconds", &timeout.timeout_seconds().to_string())],
         );
     }
     if let Some(startup) = err.downcast_ref::<SpawnedDaemonStartupFailure>() {
         return i18n::t_args(
-            "zc-error-spawned-daemon-startup",
+            "oc-error-spawned-daemon-startup",
             &[("details", startup.details())],
         );
     }
@@ -778,13 +778,13 @@ async fn run() -> anyhow::Result<()> {
     let loaded_config = match config::ensure_and_load(&local_config_dir) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("zerocode: config load failed ({e:#}); starting with defaults");
-            config::ZerocodeConfig::default()
+            eprintln!("omnescode: config load failed ({e:#}); starting with defaults");
+            config::OmnescodeConfig::default()
         }
     };
     let active_theme = loaded_config.resolve_theme().unwrap_or_else(|e| {
         let path = config::config_path(&local_config_dir);
-        eprintln!("zerocode: {e:#}");
+        eprintln!("omnescode: {e:#}");
         eprintln!(
             "  fix: remove the entire [theme] section from {} to restore the default theme",
             path.display()
@@ -806,7 +806,7 @@ async fn run() -> anyhow::Result<()> {
         Ok(_) => {}
         Err(e) => {
             let path = config::config_path(&local_config_dir);
-            eprintln!("zerocode: invalid keybindings: {e:#}");
+            eprintln!("omnescode: invalid keybindings: {e:#}");
             eprintln!(
                 "  fix: remove the entire [keybindings] section from {} to restore default keybindings",
                 path.display()
@@ -868,7 +868,7 @@ async fn run() -> anyhow::Result<()> {
         let cfg_wss = &loaded_config.connection.wss;
         let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
         // The cached enrollment profile supplies the relay coordinates so a bare
-        // `zerocode` after enrollment still reaches the daemon through its relay.
+        // `omnescode` after enrollment still reaches the daemon through its relay.
         // Enrollment above may have published a new generation, so recover and
         // re-read here too rather than reusing the pre-enrollment facts. A
         // recovery that cannot reassemble the generation aborts the run instead
@@ -1017,7 +1017,7 @@ async fn run() -> anyhow::Result<()> {
                     anyhow::bail!(
                         "could not connect to the daemon's WSS plane ({e:#}). That plane is \
                          mutually authenticated and this client has no certificate. Enroll first:\n  \
-                         zerocode --enroll --connect <host>:<port>\n(running interactively against \
+                         omnescode --enroll --connect <host>:<port>\n(running interactively against \
                          --connect enrolls automatically)."
                     );
                 }
@@ -1133,7 +1133,7 @@ fn ephemeral_daemon_command(
     configure_ephemeral_daemon_command(&mut cmd, config_dir, socket);
 
     // Lower the daemon's log level to DEBUG when spawned ephemerally by
-    // zerocode so that the Logs pane can show debug events without any
+    // omnescode so that the Logs pane can show debug events without any
     // manual RUST_LOG override. Third-party crates stay at WARN to avoid
     // noise. Honour an existing RUST_LOG if the user set one themselves.
     if std::env::var_os("RUST_LOG").is_none() {
@@ -1200,7 +1200,7 @@ impl SpawnedDaemon {
         let collector_capture = Arc::clone(&capture_stderr);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let stderr_collector = match std::thread::Builder::new()
-            .name("zerocode-daemon-stderr".to_owned())
+            .name("omnescode-daemon-stderr".to_owned())
             .spawn(move || {
                 let mut chunk = [0_u8; 1024];
                 while let Ok(read) = stderr_pipe.read(&mut chunk) {
@@ -1514,7 +1514,7 @@ mod connection_tests {
 
     fn spawned_daemon_helper_command(mode: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new(
-            std::env::current_exe().expect("current zerocode test binary path"),
+            std::env::current_exe().expect("current omnescode test binary path"),
         );
         cmd.args([
             "connection_tests::spawned_daemon_subprocess_helper",
@@ -1522,7 +1522,7 @@ mod connection_tests {
             "--ignored",
             "--nocapture",
         ])
-        .env("ZEROCODE_SPAWNED_DAEMON_HELPER", mode);
+        .env("OMNESCODE_SPAWNED_DAEMON_HELPER", mode);
         cmd
     }
 
@@ -1660,7 +1660,7 @@ mod connection_tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         let pid_path = temp.path().join("daemon.pid");
         let mut owner = spawned_daemon_helper_command("signal-owner");
-        owner.env("ZEROCODE_SIGNAL_OWNER_PID_PATH", &pid_path);
+        owner.env("OMNESCODE_SIGNAL_OWNER_PID_PATH", &pid_path);
         let mut owner = owner.spawn().expect("spawn signal owner");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let daemon_pid = loop {
@@ -1720,7 +1720,7 @@ mod connection_tests {
         let temp = tempfile::tempdir().expect("create prompt temp dir");
         let mut owner = spawned_daemon_helper_command("insecure-tls-prompt-owner");
         owner
-            .env("ZEROCODE_INSECURE_PROMPT_CONFIG_DIR", temp.path())
+            .env("OMNESCODE_INSECURE_PROMPT_CONFIG_DIR", temp.path())
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut owner = owner.spawn().expect("spawn insecure-TLS prompt owner");
@@ -1885,8 +1885,8 @@ mod connection_tests {
         let restored_path = temp.path().join("restored");
         let mut owner_command = spawned_daemon_helper_command("terminal-owner");
         owner_command
-            .env("ZEROCODE_TERMINAL_OWNER_READY_PATH", &ready_path)
-            .env("ZEROCODE_TERMINAL_OWNER_RESTORED_PATH", &restored_path)
+            .env("OMNESCODE_TERMINAL_OWNER_READY_PATH", &ready_path)
+            .env("OMNESCODE_TERMINAL_OWNER_RESTORED_PATH", &restored_path)
             .stdin(duplicate_stdio(slave_fd))
             .stdout(duplicate_stdio(slave_fd))
             .stderr(duplicate_stdio(slave_fd));
@@ -1965,7 +1965,7 @@ mod connection_tests {
     #[test]
     #[ignore = "subprocess helper for spawned-daemon lifecycle tests"]
     fn spawned_daemon_subprocess_helper() {
-        match std::env::var("ZEROCODE_SPAWNED_DAEMON_HELPER").as_deref() {
+        match std::env::var("OMNESCODE_SPAWNED_DAEMON_HELPER").as_deref() {
             Ok("sleep") => std::thread::sleep(Duration::from_secs(60)),
             Ok("sleep-short") => std::thread::sleep(Duration::from_secs(3)),
             Ok("stderr") => {
@@ -2023,7 +2023,7 @@ mod connection_tests {
                         ShutdownSignals::new().expect("install Unix shutdown handlers");
                     let mut daemon = SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep"))
                         .expect("spawn owned daemon helper");
-                    let pid_path = std::env::var_os("ZEROCODE_SIGNAL_OWNER_PID_PATH")
+                    let pid_path = std::env::var_os("OMNESCODE_SIGNAL_OWNER_PID_PATH")
                         .expect("signal owner pid path");
                     std::fs::write(pid_path, daemon.id().to_string())
                         .expect("publish owned daemon pid");
@@ -2034,7 +2034,7 @@ mod connection_tests {
             }
             #[cfg(unix)]
             Ok("insecure-tls-prompt-owner") => {
-                let config_dir = std::env::var_os("ZEROCODE_INSECURE_PROMPT_CONFIG_DIR")
+                let config_dir = std::env::var_os("OMNESCODE_INSECURE_PROMPT_CONFIG_DIR")
                     .expect("insecure prompt config dir");
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -2060,13 +2060,13 @@ mod connection_tests {
                     let mut terminal =
                         config_manager::init_terminal().expect("initialize terminal");
                     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
-                    let ready_path = std::env::var_os("ZEROCODE_TERMINAL_OWNER_READY_PATH")
+                    let ready_path = std::env::var_os("OMNESCODE_TERMINAL_OWNER_READY_PATH")
                         .expect("terminal owner ready path");
                     std::fs::write(ready_path, b"ready").expect("publish terminal readiness");
                     shutdown_signals.recv().await;
                     TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
                     config_manager::restore_terminal(&mut terminal).expect("restore terminal");
-                    let restored_path = std::env::var_os("ZEROCODE_TERMINAL_OWNER_RESTORED_PATH")
+                    let restored_path = std::env::var_os("OMNESCODE_TERMINAL_OWNER_RESTORED_PATH")
                         .expect("terminal owner restored path");
                     std::fs::write(restored_path, b"restored")
                         .expect("publish terminal restoration");
@@ -2158,7 +2158,7 @@ mod connection_tests {
     #[test]
     fn explicit_relay_enroll_uses_relay_route() {
         let cli = Cli::parse_from([
-            "zerocode",
+            "omnescode",
             "--enroll",
             "--relay",
             "relay.example:9783",
@@ -2171,7 +2171,7 @@ mod connection_tests {
     #[test]
     fn explicit_enroll_host_keeps_direct_enrollment() {
         let cli = Cli::parse_from([
-            "zerocode",
+            "omnescode",
             "--enroll",
             "--relay",
             "relay.example:9783",
@@ -2185,7 +2185,7 @@ mod connection_tests {
 
     #[test]
     fn relay_only_config_enroll_uses_relay_route() {
-        let cli = Cli::parse_from(["zerocode", "--enroll"]);
+        let cli = Cli::parse_from(["omnescode", "--enroll"]);
         let cfg = WssSection {
             relay_url: Some("relay.example:9783".to_string()),
             relay_node: Some("node-abc".to_string()),

@@ -54,7 +54,7 @@ class _OnboardingGateScreenState extends State<OnboardingGateScreen> {
                     offset: const Offset(0, 10),
                   ),
                   BoxShadow(
-                    color: const Color(0xFF00D2FF).withOpacity(0.08),
+                    color: const Color(0xFFFF6B00).withOpacity(0.08),
                     blurRadius: 40,
                     spreadRadius: 2,
                   ),
