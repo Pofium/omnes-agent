@@ -14,36 +14,43 @@ class DesktopThemeController extends GetxController {
 }
 
 class DesktopTheme {
-  // Dark Palette (DESIGN_DESKTOP.md Dark)
-  static const Color bgCanvasDark = Color(0xFF16181D);
-  static const Color bgSurfaceDark = Color(0xFF1B1D22);
-  static const Color bgSurfaceElevatedDark = Color(0xFF20242D);
-  static const Color bgSidebarDark = Color(0xFF141619);
+  // Typography Triad (OmnesProducts v1.1 §06)
+  static const String fontHeading = 'Montserrat';
+  static const String fontBody = 'Segoe UI';
+  static const String fontMono = 'JetBrains Mono';
 
-  static const Color borderSubtleDark = Color(0xFF22262E);
-  static const Color borderMediumDark = Color(0xFF2C323E);
-  static const Color borderFocusDark = Color(0xFF00D2FF);
+  // Dark Palette (60% Dark Charcoal base around #111827)
+  static const Color bgCanvasDark = Color(0xFF111827);
+  static const Color bgSurfaceDark = Color(0xFF161E2E);
+  static const Color bgSurfaceElevatedDark = Color(0xFF1F2937);
+  static const Color bgSidebarDark = Color(0xFF0D1117);
 
-  static const Color textPrimaryDark = Color(0xFFFFFFFF);
+  static const Color borderSubtleDark = Color(0xFF232C3D);
+  static const Color borderMediumDark = Color(0xFF334155);
+  static const Color borderFocusDark = Color(0xFFFF6B00);
+
+  static const Color textPrimaryDark = Color(0xFFF4F5F7);
   static const Color textSecondaryDark = Color(0xFFCBD5E1);
-  static const Color textMutedDark = Color(0xFF8B949E);
+  static const Color textMutedDark = Color(0xFF94A3B8);
 
-  // Light Palette (DESIGN_DESKTOP.md Light lines 98-111)
+  // Light Palette (30% Off-White / Paper neutral around #F4F5F7)
   static const Color bgCanvasLight = Color(0xFFFFFFFF);
-  static const Color bgSurfaceLight = Color(0xFFF8FAFC);
+  static const Color bgSurfaceLight = Color(0xFFFAFBFC);
   static const Color bgSurfaceElevatedLight = Color(0xFFFFFFFF);
-  static const Color bgSidebarLight = Color(0xFFF1F5F9);
+  static const Color bgSidebarLight = Color(0xFFF4F5F7);
 
-  static const Color borderSubtleLight = Color(0xFFE2E8F0);
-  static const Color borderMediumLight = Color(0xFFCBD5E1);
-  static const Color borderFocusLight = Color(0xFF0284C7);
+  static const Color borderSubtleLight = Color(0xFFD8DCE3);
+  static const Color borderMediumLight = Color(0xFF9AA3B2);
+  static const Color borderFocusLight = Color(0xFFE05E00);
 
-  static const Color textPrimaryLight = Color(0xFF0F172A);
-  static const Color textSecondaryLight = Color(0xFF475569);
-  static const Color textMutedLight = Color(0xFF64748B);
+  static const Color textPrimaryLight = Color(0xFF111827);
+  static const Color textSecondaryLight = Color(0xFF1E293B);
+  static const Color textMutedLight = Color(0xFF5B6472);
 
-  // Brand Accents
-  static const Color accentCyan = Color(0xFF00D2FF);
+  // Brand Accents (<=10% Brand Orange #FF6B00; secondary code blue preserved)
+  static const Color accentBrand = Color(0xFFFF6B00);
+  static const Color accentBrandDark = Color(0xFFE05E00);
+  static const Color accentCyan = Color(0xFFFF6B00);
   static const Color accentSky = Color(0xFF38BDF8);
   static const Color accentSapphire = Color(0xFF0284C7);
   static const Color accentBlue = Color(0xFF2563EB);
@@ -78,27 +85,53 @@ class DesktopTheme {
       isDark ? textSecondaryDark : textSecondaryLight;
   static Color get textMuted => isDark ? textMutedDark : textMutedLight;
 
-  // Button styling (shadcn/ui style: solid black in light mode, elevated surface in dark mode)
-  static Color get btnPrimaryBg => isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A);
-  static Color get btnPrimaryFg => Colors.white;
+  // Button styling (Dark: charcoal #1F2937, solid #FF6B00 reserved for main CTA)
+  static Color get btnPrimaryBg =>
+      isDark ? const Color(0xFF1F2937) : const Color(0xFF111827);
+  static Color get btnPrimaryFg => const Color(0xFFF4F5F7);
+  static Color get btnCtaBg => isDark ? accentBrand : accentBrandDark;
+  static Color get btnSecondaryBg =>
+      isDark ? const Color(0xFF18202F) : const Color(0xFFE5E7EB);
+  static Color get btnSecondaryFg =>
+      isDark ? const Color(0xFFF4F5F7) : const Color(0xFF111827);
+
+  static const TextTheme _brandTextTheme = TextTheme(
+    displayLarge: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    displayMedium: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    displaySmall: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    headlineLarge: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    headlineMedium: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    headlineSmall: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    titleLarge: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    titleMedium: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    titleSmall: TextStyle(fontFamily: fontHeading, fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif']),
+    bodyLarge: TextStyle(fontFamily: fontBody, fontFamilyFallback: ['Inter', 'Segoe UI', 'sans-serif']),
+    bodyMedium: TextStyle(fontFamily: fontBody, fontFamilyFallback: ['Inter', 'Segoe UI', 'sans-serif']),
+    bodySmall: TextStyle(fontFamily: fontBody, fontFamilyFallback: ['Inter', 'Segoe UI', 'sans-serif']),
+    labelLarge: TextStyle(fontFamily: fontBody, fontFamilyFallback: ['Inter', 'Segoe UI', 'sans-serif']),
+    labelMedium: TextStyle(fontFamily: fontBody, fontFamilyFallback: ['Inter', 'Segoe UI', 'sans-serif']),
+    labelSmall: TextStyle(fontFamily: fontBody, fontFamilyFallback: ['Inter', 'Segoe UI', 'sans-serif']),
+  );
 
   static ThemeData get darkTheme {
     return ThemeData(
       brightness: Brightness.dark,
       scaffoldBackgroundColor: bgCanvasDark,
-      primaryColor: accentCyan,
+      primaryColor: accentBrand,
       colorScheme: const ColorScheme.dark(
-        primary: accentCyan,
+        primary: accentBrand,
         secondary: accentSky,
         surface: bgSurfaceDark,
         error: statusError,
       ),
-      fontFamily: 'Segoe UI',
+      fontFamily: fontBody,
+      fontFamilyFallback: const ['Inter', 'Segoe UI', 'Roboto', 'sans-serif'],
+      textTheme: _brandTextTheme,
       dividerColor: borderSubtleDark,
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFF282D37),
-          foregroundColor: Colors.white,
+          backgroundColor: const Color(0xFF1F2937),
+          foregroundColor: const Color(0xFFF4F5F7),
           elevation: 0,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
           textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
@@ -128,19 +161,21 @@ class DesktopTheme {
     return ThemeData(
       brightness: Brightness.light,
       scaffoldBackgroundColor: bgCanvasLight,
-      primaryColor: const Color(0xFF0F172A),
+      primaryColor: const Color(0xFF111827),
       colorScheme: const ColorScheme.light(
-        primary: Color(0xFF0F172A),
+        primary: accentBrandDark,
         secondary: accentSky,
         surface: bgSurfaceLight,
         error: statusError,
       ),
-      fontFamily: 'Segoe UI',
+      fontFamily: fontBody,
+      fontFamilyFallback: const ['Inter', 'Segoe UI', 'Roboto', 'sans-serif'],
+      textTheme: _brandTextTheme,
       dividerColor: borderSubtleLight,
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFF0F172A),
-          foregroundColor: Colors.white,
+          backgroundColor: const Color(0xFF111827),
+          foregroundColor: const Color(0xFFF4F5F7),
           elevation: 0,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
           textStyle: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),

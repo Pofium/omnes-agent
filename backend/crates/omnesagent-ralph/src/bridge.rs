@@ -8,7 +8,7 @@
 //! credential guard that never forwards secret-classified content (Ф2.5, ADR-O5).
 
 use crate::debt::DebtLedger;
-use crate::journal::{FindingRecord, Journal, JournalError};
+use crate::journal::{FindingRecord, IterationRecord, Journal, JournalError};
 use crate::openspec::OpenSpecWorkspace;
 use async_trait::async_trait;
 use omnesagent_config::ralph::{BridgePushScope, Ob2hBridgeConfig};
@@ -27,12 +27,20 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tokens that mark a finding as carrying classified credential content. Mirrors
 /// the secret-bearing variants of `CredentialSurfaceClass` plus the
-/// `#[credential_class]` attribute name and the PEM private-key envelope.
+/// `#[credential_class]` attribute name, the PEM private-key envelope, and the
+/// Ф69.1 / Ф11.1 redaction token prefixes (ADR-O11).
 const CREDENTIAL_MARKERS: &[&str] = &[
     "credential_class",
     "encrypted_secret",
     "external_auth_store",
     "-----BEGIN ",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "ghu_",
+    "Bearer ",
+    "OB2H_",
 ];
 
 #[derive(Debug, Error)]
@@ -64,6 +72,12 @@ pub struct BridgeReport {
     pub skipped: usize,
     /// `memory_save` calls that failed (counted per project target).
     pub failed: usize,
+    /// `lesson_save` calls that ob2h acknowledged (Ф8.2, ADR-O8).
+    pub lessons_published: usize,
+    /// Findings excluded from lesson publication by scope or the credential guard.
+    pub lessons_skipped: usize,
+    /// `lesson_save` calls that failed (counted per project target).
+    pub lessons_failed: usize,
 }
 
 /// Whether a finding may be forwarded under `scope` and the credential guard.
@@ -502,6 +516,201 @@ impl Ob2hBridge {
         Ok(report)
     }
 
+    /// Publish archived findings as procedural lessons (Ф8.2, ADR-O8).
+    ///
+    /// One `lesson_save` per selected finding per project target. A disabled
+    /// bridge or a `push_lessons = false` config is a no-op; individual failures
+    /// are counted, never propagated (fail-open, ADR-O3). ob2h deduplicates by
+    /// fingerprint, so re-publishing an unchanged finding reinforces the lesson
+    /// instead of creating a duplicate.
+    pub async fn publish_lessons(
+        &self,
+        findings: &[FindingRecord],
+        feature_slug: &str,
+    ) -> Result<BridgeReport, BridgeError> {
+        if !self.config.enabled || !self.config.push_lessons {
+            return Ok(BridgeReport::default());
+        }
+
+        let selected: Vec<&FindingRecord> = findings
+            .iter()
+            .filter(|finding| is_publishable(finding, self.config.push_scope))
+            .collect();
+
+        let mut report = BridgeReport {
+            lessons_skipped: findings.len() - selected.len(),
+            ..BridgeReport::default()
+        };
+        if selected.is_empty() {
+            return Ok(report);
+        }
+
+        let targets: Vec<Option<&str>> = if self.config.projects.is_empty() {
+            vec![None]
+        } else {
+            self.config
+                .projects
+                .iter()
+                .map(|project| Some(project.as_str()))
+                .collect()
+        };
+
+        let mut transport = (self.factory)();
+        self.round_trip(transport.initialize()).await?;
+
+        for finding in &selected {
+            for target in &targets {
+                let mut arguments = json!({
+                    "content": finding.content,
+                    "context": lesson_context(finding),
+                    "tags": ["ralph", feature_slug],
+                    "source": "manual",
+                });
+                if let Some(project) = target {
+                    arguments["project"] = json!(project);
+                }
+                match self
+                    .round_trip(transport.call_tool("lesson_save", arguments))
+                    .await
+                {
+                    Ok(_) => report.lessons_published += 1,
+                    Err(_) => report.lessons_failed += 1,
+                }
+            }
+        }
+
+        transport.shutdown().await;
+        Ok(report)
+    }
+
+    /// Recall procedural lessons relevant to the next iteration (Ф8.3, ADR-O8).
+    ///
+    /// Returns the lesson text wrapped in a `<lessons>` block, or `None` when the
+    /// lessons loop is disabled or ob2h returned nothing. Fail-open by design:
+    /// callers treat an `Err` (timeout, unreachable ob2h) as "no lessons this
+    /// iteration" and continue the cycle.
+    pub async fn recall_lessons(
+        &self,
+        query: &str,
+        min_confidence: f64,
+        limit: usize,
+    ) -> Result<Option<String>, BridgeError> {
+        if !self.config.enabled || !self.config.push_lessons {
+            return Ok(None);
+        }
+
+        let mut arguments = json!({
+            "query": query,
+            "limit": limit,
+            "min_confidence": min_confidence,
+        });
+        if let Some(project) = self.config.projects.first() {
+            arguments["project"] = json!(project);
+        }
+
+        let mut transport = (self.factory)();
+        self.round_trip(transport.initialize()).await?;
+        let result = self
+            .round_trip(transport.call_tool("lesson_recall", arguments))
+            .await;
+        transport.shutdown().await;
+
+        let text = result?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(format!("<lessons>\n{trimmed}\n</lessons>")))
+        }
+    }
+
+    /// Ingest the run journal and save a session recap so that published facts
+    /// carry provenance (Ф10.1, ADR-O9).
+    ///
+    /// `session_ingest` is position-idempotent, so re-archiving a run does not
+    /// duplicate messages; `session_recap(save = true)` then records the single
+    /// fact that `memory_verify` can trace back to the daily log. A disabled
+    /// bridge or a `recap_on_archive = false` config is a no-op; failures are
+    /// counted, never propagated (fail-open).
+    pub async fn recap_after_archive(
+        &self,
+        repo_root: &Path,
+        slug: &str,
+        run_id: &str,
+    ) -> Result<BridgeReport, BridgeError> {
+        if !self.config.enabled || !self.config.recap_on_archive {
+            return Ok(BridgeReport::default());
+        }
+
+        let journal_path = OpenSpecWorkspace::new(repo_root, slug).journal_path();
+        let iterations = Journal::read_iterations(&journal_path)?;
+        // Credential guard (ADR-O5/O11): never forward secret-classified text to
+        // ob2h, even transitively through journal messages.
+        let messages: Vec<Value> = build_journal_messages(&iterations)
+            .into_iter()
+            .filter(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(|content| !carries_credential_class(content))
+                    .unwrap_or(true)
+            })
+            .collect();
+        if messages.is_empty() {
+            return Ok(BridgeReport::default());
+        }
+
+        let session_id = format!("ralph-{run_id}");
+        let targets: Vec<Option<&str>> = if self.config.projects.is_empty() {
+            vec![None]
+        } else {
+            self.config
+                .projects
+                .iter()
+                .map(|project| Some(project.as_str()))
+                .collect()
+        };
+
+        let mut transport = (self.factory)();
+        self.round_trip(transport.initialize()).await?;
+
+        let mut report = BridgeReport::default();
+        for target in &targets {
+            let mut ingest = json!({
+                "messages": messages,
+                "session_id": session_id,
+                "author": "omnesagent-ralph",
+                "source": "ralph",
+            });
+            if let Some(project) = target {
+                ingest["project_id"] = json!(project);
+            }
+            if self
+                .round_trip(transport.call_tool("session_ingest", ingest))
+                .await
+                .is_err()
+            {
+                report.failed += 1;
+                continue;
+            }
+
+            let mut recap = json!({ "session_id": session_id, "save": true });
+            if let Some(project) = target {
+                recap["project_id"] = json!(project);
+            }
+            match self
+                .round_trip(transport.call_tool("session_recap", recap))
+                .await
+            {
+                Ok(_) => report.published += 1,
+                Err(_) => report.failed += 1,
+            }
+        }
+
+        transport.shutdown().await;
+        Ok(report)
+    }
+
     /// Bound a single transport operation by `request_timeout`.
     async fn round_trip<F, T>(&self, future: F) -> Result<T, BridgeError>
     where
@@ -525,9 +734,66 @@ fn parse_run_id(reply: &str) -> Option<String> {
     }
 }
 
+/// Compose the `context` anchor for a lesson derived from `finding` (ADR-O8).
+///
+/// The lesson `content` is the finding itself (what to do / what to avoid); the
+/// context anchors it to the originating task and the symbols the finding
+/// touched, so `lesson_recall` can rank it against a future task's scope.
+fn lesson_context(finding: &FindingRecord) -> String {
+    if finding.symbols.is_empty() {
+        format!("task={}", finding.task)
+    } else {
+        format!("task={} symbols={}", finding.task, finding.symbols.join(","))
+    }
+}
+
+/// Flatten journal iterations into `session_ingest` user/assistant pairs (Ф10.1).
+///
+/// Each iteration contributes a `user` message (the hypothesis and plan Ralph
+/// set out to execute) followed by an `assistant` message (what was done, any
+/// errors, and the resulting verdict). The mapping is deterministic, so the same
+/// journal yields the same message positions on every archive — which is what
+/// makes `session_ingest` position-idempotent.
+fn build_journal_messages(iterations: &[IterationRecord]) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(iterations.len() * 2);
+    for iteration in iterations {
+        let mut request = format!(
+            "[{} #{}] {}",
+            iteration.task, iteration.n, iteration.hypothesis
+        );
+        if !iteration.plan.is_empty() {
+            request.push_str("\nplan:\n");
+            for step in &iteration.plan {
+                request.push_str("- ");
+                request.push_str(step);
+                request.push('\n');
+            }
+        }
+        let mut outcome = iteration.result.what_done.clone();
+        if !iteration.result.errors.is_empty() {
+            outcome.push_str("\nerrors: ");
+            outcome.push_str(&iteration.result.errors.join("; "));
+        }
+        outcome.push_str(&format!(
+            "\nverdict: {} (tests {}/{} passed)",
+            iteration.verdict,
+            iteration.tests_summary.passed,
+            iteration.tests_summary.passed + iteration.tests_summary.failed
+        ));
+
+        if carries_credential_class(&request) || carries_credential_class(&outcome) {
+            continue;
+        }
+        messages.push(json!({ "role": "user", "content": request }));
+        messages.push(json!({ "role": "assistant", "content": outcome }));
+    }
+    messages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::{ExecutionResult, JournalEntry, TestsSummary};
     use chrono::Utc;
     use std::sync::Mutex;
 
@@ -538,6 +804,7 @@ mod tests {
             content: content.to_string(),
             verdict: verdict.to_string(),
             symbols: Vec::new(),
+            git_head_sha: None,
             at: Utc::now(),
         }
     }
@@ -807,9 +1074,310 @@ mod tests {
             .unwrap();
 
         assert_eq!(report, BridgeReport {
-            published: 0,
             skipped: 1,
-            failed: 0,
+            ..BridgeReport::default()
         });
+    }
+
+    // --- Ф8.5 / Ф10.5: lessons and recap mock coverage -----------------------
+
+    fn iteration(n: usize, hypothesis: &str, what_done: &str, verdict: &str) -> IterationRecord {
+        IterationRecord {
+            task: "T-1".to_string(),
+            n,
+            hypothesis: hypothesis.to_string(),
+            plan: vec!["do the thing".to_string()],
+            result: ExecutionResult {
+                what_done: what_done.to_string(),
+                errors: Vec::new(),
+                self_assessment: String::new(),
+            },
+            tests_summary: TestsSummary {
+                passed: 1,
+                failed: 0,
+                failed_tests: Vec::new(),
+                fingerprint: "sha256:x".to_string(),
+                exit_code: 0,
+            },
+            verdict: verdict.to_string(),
+            verdict_source: "auto_tests".to_string(),
+            ladder_rung: "stdlib".to_string(),
+            markers: Vec::new(),
+            ast_changes: Vec::new(),
+            git_before: None,
+            git_after: None,
+            tokens_used: 0,
+            duration_ms: 0,
+            at: Utc::now(),
+        }
+    }
+
+    fn lesson_config() -> Ob2hBridgeConfig {
+        Ob2hBridgeConfig {
+            enabled: true,
+            projects: vec!["omnes-agent".to_string()],
+            push_scope: BridgePushScope::Verified,
+            push_lessons: true,
+            ..Ob2hBridgeConfig::default()
+        }
+    }
+
+    #[test]
+    fn lesson_context_anchors_task_and_symbols() {
+        let mut record = finding("f1", "verified", "prefer ok_or_else over unwrap");
+        assert_eq!(lesson_context(&record), "task=T-1");
+        record.symbols = vec!["fn:parse".to_string(), "fn:write".to_string()];
+        assert_eq!(lesson_context(&record), "task=T-1 symbols=fn:parse,fn:write");
+    }
+
+    #[tokio::test]
+    async fn publish_lessons_sends_one_lesson_save_per_verified_finding() {
+        let (saved, mock) = MockTransport::recording();
+        let bridge =
+            Ob2hBridge::with_factory(lesson_config(), Duration::from_secs(1), factory_for(mock));
+
+        let report = bridge
+            .publish_lessons(
+                &[
+                    finding("f1", "verified", "use ok_or_else"),
+                    finding("f2", "failed", "bad idea"),
+                ],
+                "feat",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.lessons_published, 1);
+        assert_eq!(report.lessons_skipped, 1);
+        assert_eq!(report.lessons_failed, 0);
+
+        let saved = saved.lock().unwrap();
+        assert_eq!(saved.len(), 1, "one lesson_save per verified finding");
+        assert_eq!(saved[0]["content"], "use ok_or_else");
+        assert_eq!(saved[0]["context"], "task=T-1");
+        assert_eq!(saved[0]["tags"][0], "ralph");
+        assert_eq!(saved[0]["tags"][1], "feat");
+        assert_eq!(saved[0]["source"], "manual");
+        assert_eq!(saved[0]["project"], "omnes-agent");
+    }
+
+    #[tokio::test]
+    async fn publish_lessons_respects_credential_guard() {
+        let (saved, mock) = MockTransport::recording();
+        let bridge =
+            Ob2hBridge::with_factory(lesson_config(), Duration::from_secs(1), factory_for(mock));
+
+        let report = bridge
+            .publish_lessons(
+                &[finding("f1", "verified", "token = encrypted_secret: abc")],
+                "feat",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.lessons_published, 0);
+        assert_eq!(report.lessons_skipped, 1);
+        assert!(saved.lock().unwrap().is_empty(), "nothing may reach ob2h");
+    }
+
+    #[tokio::test]
+    async fn publish_lessons_drops_api_key_and_token_patterns() {
+        let (saved, mock) = MockTransport::recording();
+        let bridge =
+            Ob2hBridge::with_factory(lesson_config(), Duration::from_secs(1), factory_for(mock));
+
+        let report = bridge
+            .publish_lessons(
+                &[
+                    finding("f1", "verified", "OpenAI key sk-1234567890abcdef1234567890"),
+                    finding("f2", "verified", "GitHub token ghp_1234567890abcdef1234567890"),
+                    finding("f3", "verified", "Header Bearer supersecrettoken"),
+                    finding("f4", "verified", "Env OB2H_AUTH_TOKEN=xyz"),
+                    finding("f5", "verified", "safe pattern ok"),
+                ],
+                "feat",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.lessons_published, 1);
+        assert_eq!(report.lessons_skipped, 4);
+        let saved = saved.lock().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0]["content"], "safe pattern ok");
+    }
+
+    #[tokio::test]
+    async fn publish_lessons_is_noop_when_push_lessons_disabled() {
+        let (saved, mock) = MockTransport::recording();
+        let config = Ob2hBridgeConfig {
+            enabled: true,
+            projects: vec!["omnes-agent".to_string()],
+            ..Ob2hBridgeConfig::default()
+        };
+        let bridge = Ob2hBridge::with_factory(config, Duration::from_secs(1), factory_for(mock));
+
+        let report = bridge
+            .publish_lessons(&[finding("f1", "verified", "x")], "feat")
+            .await
+            .unwrap();
+
+        assert_eq!(report, BridgeReport::default());
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_lessons_wraps_text_in_lessons_block() {
+        let (_, mock) = MockTransport::recording();
+        let bridge =
+            Ob2hBridge::with_factory(lesson_config(), Duration::from_secs(1), factory_for(mock));
+
+        let block = bridge.recall_lessons("task T-1", 0.2, 5).await.unwrap();
+
+        assert_eq!(block, Some("<lessons>\nsaved\n</lessons>".to_string()));
+    }
+
+    #[tokio::test]
+    async fn recall_lessons_is_noop_when_disabled() {
+        let bridge = Ob2hBridge::from_config(Ob2hBridgeConfig::default());
+        assert_eq!(bridge.recall_lessons("q", 0.2, 5).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn recall_lessons_fails_open_on_timeout() {
+        let bridge = Ob2hBridge::with_factory(
+            lesson_config(),
+            Duration::from_millis(50),
+            factory_for(MockTransport::hanging()),
+        );
+
+        let err = bridge.recall_lessons("q", 0.2, 5).await.unwrap_err();
+        assert!(matches!(err, BridgeError::Timeout(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn recap_after_archive_ingests_then_recaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = OpenSpecWorkspace::new(dir.path(), "feat");
+        workspace.init().unwrap();
+        Journal::append(
+            &workspace.journal_path(),
+            &JournalEntry::Iteration(iteration(1, "try approach A", "applied A", "verified")),
+        )
+        .unwrap();
+
+        let (saved, mock) = MockTransport::recording();
+        let config = Ob2hBridgeConfig {
+            enabled: true,
+            projects: vec!["omnes-agent".to_string()],
+            recap_on_archive: true,
+            ..Ob2hBridgeConfig::default()
+        };
+        let bridge = Ob2hBridge::with_factory(config, Duration::from_secs(1), factory_for(mock));
+
+        let report = bridge
+            .recap_after_archive(dir.path(), "feat", "run_1")
+            .await
+            .unwrap();
+
+        assert_eq!(report.published, 1);
+        assert_eq!(report.failed, 0);
+
+        let saved = saved.lock().unwrap();
+        let ingest = saved
+            .iter()
+            .find(|a| a.get("messages").is_some())
+            .expect("session_ingest called");
+        assert_eq!(ingest["session_id"], "ralph-run_1");
+        assert_eq!(ingest["author"], "omnesagent-ralph");
+        assert_eq!(ingest["source"], "ralph");
+        assert_eq!(ingest["project_id"], "omnes-agent");
+        assert_eq!(ingest["messages"][0]["role"], "user");
+        assert_eq!(ingest["messages"][1]["role"], "assistant");
+
+        let recap = saved
+            .iter()
+            .find(|a| a.get("save").is_some())
+            .expect("session_recap called");
+        assert_eq!(recap["session_id"], "ralph-run_1");
+        assert_eq!(recap["save"], true);
+    }
+
+    #[tokio::test]
+    async fn recap_after_archive_drops_credential_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = OpenSpecWorkspace::new(dir.path(), "feat");
+        workspace.init().unwrap();
+        Journal::append(
+            &workspace.journal_path(),
+            &JournalEntry::Iteration(iteration(
+                1,
+                "rotate pin encrypted_secret: deadbeef",
+                "done",
+                "verified",
+            )),
+        )
+        .unwrap();
+
+        let (saved, mock) = MockTransport::recording();
+        let config = Ob2hBridgeConfig {
+            enabled: true,
+            projects: vec!["omnes-agent".to_string()],
+            recap_on_archive: true,
+            ..Ob2hBridgeConfig::default()
+        };
+        let bridge = Ob2hBridge::with_factory(config, Duration::from_secs(1), factory_for(mock));
+
+        let report = bridge
+            .recap_after_archive(dir.path(), "feat", "run_1")
+            .await
+            .unwrap();
+
+        assert_eq!(report, BridgeReport::default());
+        assert!(saved.lock().unwrap().is_empty(), "nothing may reach ob2h");
+    }
+
+    #[tokio::test]
+    async fn recap_after_archive_drops_api_keys_and_bearer_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = OpenSpecWorkspace::new(dir.path(), "feat");
+        workspace.init().unwrap();
+        Journal::append(
+            &workspace.journal_path(),
+            &JournalEntry::Iteration(iteration(
+                1,
+                "set Authorization: Bearer secret_live_token",
+                "attempt with sk-proj-1234567890abcdef",
+                "verified",
+            )),
+        )
+        .unwrap();
+
+        let (saved, mock) = MockTransport::recording();
+        let config = Ob2hBridgeConfig {
+            enabled: true,
+            projects: vec!["omnes-agent".to_string()],
+            recap_on_archive: true,
+            ..Ob2hBridgeConfig::default()
+        };
+        let bridge = Ob2hBridge::with_factory(config, Duration::from_secs(1), factory_for(mock));
+
+        let report = bridge
+            .recap_after_archive(dir.path(), "feat", "run_1")
+            .await
+            .unwrap();
+
+        assert_eq!(report, BridgeReport::default());
+        assert!(saved.lock().unwrap().is_empty(), "no secret-bearing messages forwarded");
+    }
+
+    #[tokio::test]
+    async fn recap_after_archive_is_noop_by_default() {
+        let bridge = Ob2hBridge::from_config(Ob2hBridgeConfig::default());
+        let report = bridge
+            .recap_after_archive(Path::new("."), "no-such-slug", "run_1")
+            .await
+            .unwrap();
+        assert_eq!(report, BridgeReport::default());
     }
 }

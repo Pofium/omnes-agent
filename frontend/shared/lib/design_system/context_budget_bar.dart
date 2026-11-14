@@ -118,7 +118,7 @@ class ContextBudgetBar extends StatelessWidget {
                   if (histFlex > 0)
                     Expanded(
                       flex: histFlex,
-                      child: Container(color: const Color(0xFF00E5FF)), // Dialog
+                      child: Container(color: const Color(0xFFFF6B00)), // Dialog
                     ),
                   if (toolFlex > 0)
                     Expanded(
@@ -144,7 +144,7 @@ class ContextBudgetBar extends StatelessWidget {
               _buildLegendItem('Промпт', const Color(0xFF38BDF8), budget.systemTokens),
               _buildLegendItem('KAG AST', const Color(0xFFA855F7), budget.kagAstTokens),
               _buildLegendItem('Память', const Color(0xFFF59E0B), budget.memoryTokens),
-              _buildLegendItem('История', const Color(0xFF00E5FF), budget.dialogHistoryTokens),
+              _buildLegendItem('История', const Color(0xFFFF6B00), budget.dialogHistoryTokens),
               _buildLegendItem('Инструменты', const Color(0xFF10B981), budget.toolOutputsTokens),
             ],
           ),

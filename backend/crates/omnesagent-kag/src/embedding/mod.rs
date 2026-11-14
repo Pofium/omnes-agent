@@ -1,5 +1,6 @@
 //! Провайдеры векторных представлений (Embeddings).
 
+pub mod chunker;
 pub mod fake;
 pub mod fingerprint;
 #[cfg(feature = "candle")]
@@ -12,9 +13,29 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use chunker::{chunk_file_ast, CodeChunk};
 pub use fake::FakeEmbedding;
 #[cfg(feature = "candle")]
 pub use local_bert::LocalBertEmbedding;
+
+/// Санитайзер текста перед векторизацией (удаление секретов, приватных ключей).
+pub fn sanitize_text(text: &str) -> String {
+    let mut out = text.to_string();
+    if out.contains("BEGIN PRIVATE KEY")
+        || out.contains("BEGIN RSA PRIVATE KEY")
+        || out.contains("BEGIN OPENSSH PRIVATE KEY")
+    {
+        if let Some(start) = out.find("-----BEGIN") {
+            if let Some(end_prefix) = out[start..].find("-----END") {
+                let abs_end_prefix = start + end_prefix;
+                if let Some(end_line) = out[abs_end_prefix..].find('\n') {
+                    out.replace_range(start..abs_end_prefix + end_line, "[REDACTED_PRIVATE_KEY]");
+                }
+            }
+        }
+    }
+    out
+}
 
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
@@ -29,6 +50,51 @@ pub trait EmbeddingProvider: Send + Sync {
     /// возвращать его, чтобы исключить смешивание разных пространств.
     fn model_id(&self) -> &str {
         "unknown"
+    }
+
+    /// Название бэкенда (candle, onnx, fake).
+    fn backend(&self) -> &str {
+        "candle"
+    }
+
+    /// Тип квантования (fp32, int8, bq).
+    fn quant(&self) -> &str {
+        "fp32"
+    }
+
+    /// Версия схемы префиксов/чанкера.
+    fn prefix_version(&self) -> &str {
+        "v1"
+    }
+
+    /// Асимметричный префикс поискового запроса (например "query: ").
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+
+    /// Асимметричный префикс индексируемого документа (например "passage: ").
+    fn document_prefix(&self) -> &str {
+        ""
+    }
+
+    /// Векторизация поискового запроса с авто-подстановкой `query_prefix` и санитайзингом.
+    async fn embed_query(&self, query: &str) -> anyhow::Result<Vec<f32>> {
+        let text = format!("{}{}", self.query_prefix(), sanitize_text(query));
+        let results = self.embed(&[text]).await?;
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("embed_query: empty response"))
+    }
+
+    /// Векторизация списка документов с авто-подстановкой `document_prefix` и санитайзингом.
+    async fn embed_documents(&self, docs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let pfx = self.document_prefix();
+        let prepared: Vec<String> = docs
+            .iter()
+            .map(|d| format!("{}{}", pfx, sanitize_text(d)))
+            .collect();
+        self.embed(&prepared).await
     }
 }
 
@@ -134,6 +200,26 @@ impl EmbeddingProvider for CachedEmbeddingProvider {
 
     fn model_id(&self) -> &str {
         self.inner.model_id()
+    }
+
+    fn backend(&self) -> &str {
+        self.inner.backend()
+    }
+
+    fn quant(&self) -> &str {
+        self.inner.quant()
+    }
+
+    fn prefix_version(&self) -> &str {
+        self.inner.prefix_version()
+    }
+
+    fn query_prefix(&self) -> &str {
+        self.inner.query_prefix()
+    }
+
+    fn document_prefix(&self) -> &str {
+        self.inner.document_prefix()
     }
 }
 

@@ -113,3 +113,48 @@ cd backend/crates/omnesagent-kag/tests/golden
     ob2h-команда возвращает ошибку.
 - **Вывод:** направление подтверждено, реализация форка — расширенная (auto + fail-open).
   Отдельных доработок Ф1.8 не требует.
+
+## 7. Паритет-матрица v1.9.9 — Memory Lifecycle Pack (Приложение C)
+
+Дополнение к Приложению B базовой спеки (`PLAN_OB2H_INTEGRATION_2026-11-06.md`).
+План-источник: `PLAN_OB2H_INTEGRATION_V1.9.9_2026-11-14.md`.
+
+| Возможность ob2h | Версия | omnesagent | Статус / фаза |
+|---|---|---|---|
+| Lessons (confidence/reinforce/decay) | 1.9.9 | потребление через MCP (ADR-O7); близнец не дублирует | Ф8 |
+| Slots (budget/pinned/scope, `<agent_slots>`) | 1.9.9 | потребление через MCP; инъекция в `memory_context` | Ф9 |
+| Timeline / session_recap (инкрементальный курсор) | 1.9.9 | recap-путь моста при архивации run | Ф10.1 |
+| Провенанс `memory_verify` | 1.9.9 | правило verify-before-use; recap-путь фактов | Ф10.2 |
+| Аудит-леджер + `reason` у forget | 1.9.9 | правило reason; `memory_audit` отчёты | Ф10.3 |
+| Скрабинг паттернов при захвате (Ф69.1) | 1.9.9 | `omnesagent-memory::redact` — паритет паттернов | Ф11.1 |
+| Bench recall-all@k / any-hit@k (Ф69.2) | 1.9.9 | `omnesagent-kag::bench` — порт метрик (наблюдение) | Ф11.3 |
+| Viewer egui + `viewer_open` | 1.9.9 | privileged-классификация + правила скилла | Ф12 |
+| Dream slot-рефлекс (`OB2H_DREAM_SLOTS`) | 1.9.9 | n/a — сторона ob2h, default off | не-цель |
+| Синк lessons/slots в дельта-бандлах | 1.9.9 | n/a — ADR-K6, форк не участвует | не-цель |
+
+**Метрики близнеца (Ф11.3):** `recall_all_at_k`/`any_hit_at_k` добавлены в
+`omnesagent-kag::bench` и выводятся в `BenchSummary` (`recall_all5`/`any_hit5`,
+LongMemEval strict = все ключи в top-k). Пороги `GateVerdict`
+(`RECALL_DROP_LIMIT`/`MRR_DROP_LIMIT`) не меняются — метрики наблюдательные (ADR-O11).
+
+## 9. Паритет с ob2h v2.0 (Polyglot AST & Vector Pipeline)
+
+План-источник: `PLAN_OB2H_V2_AND_REBRAND_2026-11-14.md`.
+
+| Возможность ob2h v2.0 | omnesagent | Статус реализации |
+|---|---|---|
+| Схема БД v10 (`file_blobs`, `valid_until`, `bq_mask`, `subtokens`) | `omnesagent-kag::schema`, `omnesagent-memory::sqlite` | Реализовано (версия схемы 10, PRAGMA busy_timeout=5000, BEGIN IMMEDIATE) |
+| TreeSitter LRU-64 + Chained calls & Macro token_tree | `omnesagent-kag::ast::treesitter` | Реализовано (LRU-64, цепочки вызовов, macro heuristics) |
+| Generated File Stubbing | `omnesagent-kag::ast` | Реализовано (FileStub для *.g.dart, *.freezed.dart, *.pb.rs) |
+| AST-aware Chunker | `omnesagent-kag::embedding::chunker` | Реализовано (`// File: ... \| Scope: ...`, blake3) |
+| Mean-Centered Binary Quantization (BQ) & Two-stage search | `omnesagent-kag::vector::bq` | Реализовано (1-бит центрированное квантование, 48 байт/384 dim, popcnt Hamming) |
+| Multilingual E5 Small & Асимметричные префиксы | `omnesagent-kag::embedding` | Реализовано (`query: ` / `passage: `, micro-batch 32) |
+| EmbeddingFingerprint (5 полей) | `omnesagent-kag::embedding::fingerprint` | Реализовано (`model_id`, `backend`, `quant`, `dim`, `prefix_version`) |
+| Git Co-Change / Temporal Coupling | `omnesagent-kag::project::cochange` | Реализовано (`CO_CHANGES_WITH`, `provenance='GIT_HISTORY'`, min 3 коммита) |
+| AffectedTests & Blast Radius | `omnesagent-kag::graph::analytics` | Реализовано (decay $0.85^{\text{depth}}$, `affected_tests`) |
+| U-PPR v2.0 & In-degree penalty | `omnesagent-kag::graph::pagerank` | Реализовано (In-degree penalty, $\lambda_{\text{code}}=0$, `mute_node`) |
+| Elbow Cutoff для Repo-map | `omnesagent-kag::graph::repomap` | Реализовано ($S_i < 0.15 S_{\text{max}}$ или спад $> 50\%$) |
+| Dream 2.0 Conflict Taxonomy | `omnesagent-memory::conflict` | Реализовано (Temporal, Correction, Coexistence, cycle prevention) |
+| Ralph Git-HEAD freshness | `omnesagent-ralph::journal` | Реализовано (`git_head_sha`, `is_fresh`) |
+| Tool Intent Grouping ob2h v2 | `omnesagent-runtime::agent::orchestrator::tool_group` | Реализовано (`knowledge_reconcile`, `memory_feedback` как mutating) |
+

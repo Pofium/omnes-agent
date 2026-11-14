@@ -26,6 +26,15 @@ pub struct AffectedNode {
     pub is_god_node: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedTest {
+    pub node_id: String,
+    pub label: String,
+    pub file_path: Option<String>,
+    pub depth: usize,
+    pub confidence: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RiskLevel {
     Low,
@@ -50,6 +59,8 @@ pub struct ImpactReport {
     pub target_type: Option<String>,
     pub max_depth: usize,
     pub affected_nodes: Vec<AffectedNode>,
+    #[serde(default)]
+    pub affected_tests: Vec<AffectedTest>,
     pub risk_level: RiskLevel,
     pub risk_factors: Vec<String>,
     pub markdown_summary: String,
@@ -353,6 +364,17 @@ impl GraphAnalytics {
         symbol_or_path: &str,
         max_depth: usize,
     ) -> Result<ImpactReport> {
+        Self::analyze_impact_with_confidence(conn, project_id, symbol_or_path, max_depth, None)
+    }
+
+    /// Анализ радиуса изменений с фильтрацией по минимальной уверенности тестов.
+    pub fn analyze_impact_with_confidence(
+        conn: &Connection,
+        project_id: &str,
+        symbol_or_path: &str,
+        max_depth: usize,
+        min_confidence: Option<f64>,
+    ) -> Result<ImpactReport> {
         let max_depth = max_depth.clamp(1, 10);
 
         // 1. Поиск целевого узла
@@ -396,6 +418,7 @@ impl GraphAnalytics {
                         target_type: None,
                         max_depth,
                         affected_nodes: Vec::new(),
+                        affected_tests: Vec::new(),
                         risk_level: RiskLevel::Low,
                         risk_factors: vec!["Символ не найден в графе проекта.".to_string()],
                         markdown_summary: format!(
@@ -414,10 +437,11 @@ impl GraphAnalytics {
         queue.push_back((target_pk, 0));
 
         let mut affected_nodes: Vec<AffectedNode> = Vec::new();
+        let mut affected_tests: Vec<AffectedTest> = Vec::new();
 
         let mut in_edge_stmt = conn.prepare(
             r#"
-            SELECT e.source_id, e.label, n.node_id, n.label, n.node_type, n.file_path, n.is_god_node
+            SELECT e.source_id, e.label, n.node_id, n.label, n.node_type, n.file_path, n.is_god_node, n.kind_detail
             FROM graph_edges e
             JOIN graph_nodes n ON n.id = e.source_id
             WHERE e.target_id = ?1
@@ -440,14 +464,45 @@ impl GraphAnalytics {
                     r.get::<_, String>(4)?,
                     r.get::<_, Option<String>>(5)?,
                     r.get::<_, i64>(6).unwrap_or(0) == 1,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             })?;
 
             for r in rows {
-                let (src_pk, edge_lbl, n_id, n_lbl, n_type, f_path, is_god) = r?;
+                let (src_pk, edge_lbl, n_id, n_lbl, n_type, f_path, is_god, n_kind_detail) = r?;
                 if !visited.contains(&src_pk) {
                     visited.insert(src_pk);
                     let next_depth = current_depth + 1;
+
+                    // Детектируем тесты по kind_detail == "test", имени символа или пути к файлу
+                    let is_test = n_kind_detail.as_deref() == Some("test")
+                        || crate::ast::is_test_symbol(&n_lbl, f_path.as_deref().unwrap_or(""))
+                        || f_path.as_deref().map_or(false, |fp| {
+                            let lower = fp.to_lowercase();
+                            lower.contains("/test")
+                                || lower.contains("\\test")
+                                || lower.ends_with("_test.rs")
+                                || lower.ends_with("_test.go")
+                                || lower.ends_with(".test.ts")
+                                || lower.ends_with(".test.js")
+                                || lower.ends_with(".spec.ts")
+                                || lower.ends_with(".spec.js")
+                                || lower.ends_with("_test.dart")
+                        });
+
+                    if is_test {
+                        let conf = 0.85_f64.powi(next_depth as i32);
+                        if !affected_tests.iter().any(|t| t.node_id == n_id) {
+                            affected_tests.push(AffectedTest {
+                                node_id: n_id.clone(),
+                                label: n_lbl.clone(),
+                                file_path: f_path.clone(),
+                                depth: next_depth,
+                                confidence: conf,
+                            });
+                        }
+                    }
+
                     affected_nodes.push(AffectedNode {
                         id: src_pk,
                         node_id: n_id,
@@ -462,6 +517,15 @@ impl GraphAnalytics {
                 }
             }
         }
+
+        if let Some(min_conf) = min_confidence {
+            affected_tests.retain(|t| t.confidence >= min_conf);
+        }
+        affected_tests.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // 3. Вычисление факторов риска
         let mut risk_factors = Vec::new();
@@ -573,12 +637,25 @@ impl GraphAnalytics {
             }
         }
 
+        if !affected_tests.is_empty() {
+            md.push_str("\n### 🧪 Затронутые тесты (Recommended Tests to Run):\n");
+            for t in &affected_tests {
+                let loc = t.file_path.as_deref().unwrap_or("-");
+                md.push_str(&format!(
+                    "- `{}` ({}) [глубина: {}, уверенность: {:.0}%]\n",
+                    t.label, loc, t.depth, t.confidence * 100.0
+                ));
+            }
+            md.push('\n');
+        }
+
         Ok(ImpactReport {
             target_symbol: target_label,
             target_file,
             target_type: Some(target_type),
             max_depth,
             affected_nodes,
+            affected_tests,
             risk_level,
             risk_factors,
             markdown_summary: md,
@@ -1116,5 +1193,50 @@ mod tests {
         let with_task = GraphAnalytics::build_project_context(&conn, "p1", Some("hub")).unwrap();
         assert!(with_task.contains("Relevant Subsystems for Task 'hub'"));
         assert!(with_task.contains("hub.rs"));
+    }
+
+    #[test]
+    fn impact_detects_affected_tests_and_applies_confidence_decay() {
+        let conn = setup_in_memory();
+        // Insert test node 9: kind_detail = 'test', calls hub.rs
+        conn.execute(
+            "INSERT INTO graph_nodes (id, node_id, label, node_type, file_path, project_id, kind_detail, provenance, confidence, created_at, updated_at) \
+             VALUES (9, 'n9', 'test_hub_service', 'Function', 'tests/hub_test.rs', 'p1', 'test', 'ast', 1.0, 't', 't')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO graph_edges (source_id, target_id, label, project_id, created_at, updated_at) \
+             VALUES (9, 1, 'CALLS', 'p1', 't', 't')",
+            [],
+        ).unwrap();
+
+        // Also insert indirect test node 10 that calls mid.rs (depth 2 from hub.rs)
+        conn.execute(
+            "INSERT INTO graph_nodes (id, node_id, label, node_type, file_path, project_id, kind_detail, provenance, confidence, created_at, updated_at) \
+             VALUES (10, 'n10', 'test_mid_service', 'Function', 'tests/mid_test.rs', 'p1', 'test', 'ast', 1.0, 't', 't')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO graph_edges (source_id, target_id, label, project_id, created_at, updated_at) \
+             VALUES (10, 2, 'CALLS', 'p1', 't', 't')",
+            [],
+        ).unwrap();
+
+        let report = GraphAnalytics::analyze_impact(&conn, "p1", "hub.rs", 3).unwrap();
+        assert_eq!(report.affected_tests.len(), 2);
+        let t1 = report.affected_tests.iter().find(|t| t.label == "test_hub_service").unwrap();
+        assert_eq!(t1.depth, 1);
+        assert!((t1.confidence - 0.85).abs() < 1e-6);
+
+        let t2 = report.affected_tests.iter().find(|t| t.label == "test_mid_service").unwrap();
+        assert_eq!(t2.depth, 2);
+        assert!((t2.confidence - (0.85 * 0.85)).abs() < 1e-6);
+
+        assert!(report.markdown_summary.contains("🧪 Затронутые тесты"));
+
+        // min_confidence filter
+        let filtered = GraphAnalytics::analyze_impact_with_confidence(&conn, "p1", "hub.rs", 3, Some(0.8)).unwrap();
+        assert_eq!(filtered.affected_tests.len(), 1);
+        assert_eq!(filtered.affected_tests[0].label, "test_hub_service");
     }
 }

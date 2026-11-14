@@ -116,7 +116,7 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF090D16),
+      backgroundColor: const Color(0xFF0D1117),
       body: AnimatedBuilder(
         animation: Listenable.merge([_pulseController, _exitController]),
         builder: (context, child) {
@@ -136,8 +136,8 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
                   center: Alignment.center,
                   radius: 0.9,
                   colors: [
-                    Color(0xFF131D31),
-                    Color(0xFF090D16),
+                    Color(0xFF1F2937),
+                    Color(0xFF0D1117),
                   ],
                 ),
               ),
@@ -165,12 +165,12 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
                             shape: BoxShape.circle,
                             boxShadow: [
                               BoxShadow(
-                                color: const Color(0xFF00D2FF).withOpacity(glow * 0.5),
+                                color: const Color(0xFFFF6B00).withOpacity(glow * 0.45),
                                 blurRadius: 40 * glow,
                                 spreadRadius: 8 * glow,
                               ),
                               BoxShadow(
-                                color: const Color(0xFF38BDF8).withOpacity(glow * 0.25),
+                                color: const Color(0xFFE05E00).withOpacity(glow * 0.22),
                                 blurRadius: 70 * glow,
                                 spreadRadius: 15 * glow,
                               ),
@@ -191,21 +191,22 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
                         const Text(
                           'OMNESAGENT',
                           style: TextStyle(
-                            fontFamily: 'Segoe UI',
+                            fontFamily: 'Montserrat',
                             fontSize: 22,
                             fontWeight: FontWeight.w800,
                             letterSpacing: 6,
-                            color: Colors.white,
+                            color: Color(0xFFF4F5F7),
                           ),
                         ),
                         const SizedBox(height: 6),
                         Text(
                           'AUTONOMOUS DEVELOPMENT ENVIRONMENT',
                           style: TextStyle(
+                            fontFamily: 'Montserrat',
                             fontSize: 10,
                             fontWeight: FontWeight.w600,
                             letterSpacing: 2.5,
-                            color: const Color(0xFF00D2FF).withOpacity(0.85),
+                            color: const Color(0xFFFF6B00).withOpacity(0.9),
                           ),
                         ),
                         const SizedBox(height: 28),
@@ -217,8 +218,8 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
                           child: ClipRRect(
                             borderRadius: BorderRadius.circular(2),
                             child: const LinearProgressIndicator(
-                              backgroundColor: Color(0xFF1E293B),
-                              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF00D2FF)),
+                              backgroundColor: Color(0xFF1F2937),
+                              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFFFF6B00)),
                             ),
                           ),
                         ),
@@ -229,8 +230,9 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
                           _statusText,
                           style: const TextStyle(
                             fontSize: 11,
-                            color: Color(0xFF64748B),
-                            fontFamily: 'Consolas',
+                            color: Color(0xFF8B95A5),
+                            fontFamily: 'JetBrains Mono',
+                            fontFamilyFallback: ['Consolas', 'monospace'],
                           ),
                         ),
                       ],
@@ -245,7 +247,7 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
                       style: TextStyle(
                         fontSize: 10,
                         letterSpacing: 1.5,
-                        color: const Color(0xFF475569).withOpacity(0.7),
+                        color: const Color(0xFF5B6472).withOpacity(0.85),
                         fontWeight: FontWeight.w600,
                       ),
                     ),
@@ -260,12 +262,12 @@ class _DesktopSplashScreenState extends State<DesktopSplashScreen>
   }
 }
 
-/// Декоративная кибер-сетка для фона
+/// Декоративная сетка для фона
 class _CyberGridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = const Color(0xFF00D2FF).withOpacity(0.025)
+      ..color = const Color(0xFFFF6B00).withOpacity(0.022)
       ..strokeWidth = 1.0;
 
     const step = 48.0;

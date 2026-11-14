@@ -2,6 +2,7 @@
 
 pub mod watcher;
 pub mod codegraph_bridge;
+pub mod cochange;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +14,9 @@ use tracing::info;
 
 pub use watcher::ProjectWatcher;
 pub use codegraph_bridge::{sync_codegraph_db, CodeGraphSyncResult};
+pub use cochange::{
+    extract_cochange_pairs_from_log, extract_cochanges_from_git_repo, sync_cochange_edges,
+};
 use crate::ast::{AstCodeExtractor, AstScanResult};
 use crate::models::ProjectRecord;
 use crate::vector::similarity::top_k;
@@ -20,7 +24,7 @@ use crate::vector::similarity::top_k;
 /// Версия AST-экстрактора. При изменении алгоритмов извлечения узлов/рёбер
 /// инкрементальные данные устаревают — gate в `scan_project` форсит полный
 /// рескан. Порт ob2h `AST_EXTRACTOR_VERSION` (`2ad9027`).
-pub const AST_EXTRACTOR_VERSION: &str = "1";
+pub const AST_EXTRACTOR_VERSION: &str = "3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectStats {
@@ -520,7 +524,7 @@ impl ProjectService {
 
             // Узлы неизменённых файлов (node_id в БД хранится со scoped-префиксом).
             let mut stmt = conn.prepare(
-                "SELECT node_id, label, node_type, description, file_path, line_start, line_end \
+                "SELECT node_id, label, node_type, description, file_path, line_start, line_end, kind_detail, subtokens \
                  FROM graph_nodes WHERE project_id = ?1 AND provenance = 'ast'",
             )?;
             let rows = stmt.query_map(params![project_id], |r| {
@@ -532,9 +536,11 @@ impl ProjectService {
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, i64>(5)? as usize,
                     r.get::<_, i64>(6)? as usize,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })?;
-            for (node_id, label, node_type, description, file_path, line_start, line_end) in
+            for (node_id, label, node_type, description, file_path, line_start, line_end, kind_detail, subtokens_str) in
                 rows.flatten()
             {
                 let Some(file_path) = file_path else { continue };
@@ -542,6 +548,7 @@ impl ProjectService {
                 {
                     continue;
                 }
+                let subtokens = subtokens_str.unwrap_or_default();
                 scan_res.nodes.push(crate::ast::AstNode {
                     node_id: node_id.strip_prefix(&prefix).unwrap_or(&node_id).to_string(),
                     label,
@@ -550,6 +557,9 @@ impl ProjectService {
                     file_path,
                     line_start,
                     line_end,
+                    kind_detail: kind_detail.unwrap_or_default(),
+                    subtokens,
+                    ..Default::default()
                 });
             }
 
@@ -673,8 +683,8 @@ impl ProjectService {
         {
             let mut insert_stmt = tx.prepare_cached(
                 r#"
-                INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, file_path, line_start, line_end, provenance, confidence, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ast', 1.0, ?9, ?9)
+                INSERT INTO graph_nodes (node_id, label, node_type, description, project_id, file_path, line_start, line_end, provenance, confidence, kind_detail, subtokens, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ast', 1.0, ?9, ?10, ?11, ?11)
                 ON CONFLICT(node_id) DO UPDATE SET
                     label = excluded.label,
                     node_type = excluded.node_type,
@@ -683,6 +693,8 @@ impl ProjectService {
                     file_path = excluded.file_path,
                     line_start = excluded.line_start,
                     line_end = excluded.line_end,
+                    kind_detail = excluded.kind_detail,
+                    subtokens = excluded.subtokens,
                     updated_at = excluded.updated_at
                 RETURNING id
                 "#,
@@ -690,6 +702,11 @@ impl ProjectService {
 
             for n in &scan_res.nodes {
                 let scoped_node_id = format!("{}:{}", project_id, n.node_id);
+                let subtokens_val = if n.subtokens.is_empty() {
+                    None
+                } else {
+                    Some(n.subtokens.clone())
+                };
                 if let Ok(pk) = insert_stmt.query_row(
                     params![
                         scoped_node_id,
@@ -700,6 +717,8 @@ impl ProjectService {
                         n.file_path,
                         n.line_start as i64,
                         n.line_end as i64,
+                        n.kind_detail,
+                        subtokens_val,
                         now
                     ],
                     |r| r.get::<_, i64>(0),
@@ -887,7 +906,26 @@ impl ProjectService {
             }
         }
 
-        // Обновляем God Nodes с учетом объединенного графа (AST + CodeGraph)
+        // Обнаружение связей совместных изменений (Temporal Coupling / Co-Change) из истории git
+        if let Ok(cochange_pairs) = cochange::extract_cochanges_from_git_repo(
+            path_obj,
+            cochange::DEFAULT_COMMIT_LIMIT,
+            cochange::DEFAULT_MIN_CO_COMMITS,
+            cochange::DEFAULT_MAX_FILES_PER_COMMIT,
+        ) {
+            if !cochange_pairs.is_empty() {
+                if let Ok(synced) = cochange::sync_cochange_edges(&conn_ref, project_id, &cochange_pairs) {
+                    if synced > 0 {
+                        info!(
+                            "Git Co-Change: синхронизировано {} рёбер CO_CHANGES_WITH для проекта '{}'",
+                            synced, project_id
+                        );
+                    }
+                }
+            }
+        }
+
+        // Обновляем God Nodes с учетом объединенного графа (AST + CodeGraph + Co-Change)
         let _ = crate::graph::GraphAnalytics::update_god_nodes(&conn_ref, project_id);
         drop(conn_ref);
 
@@ -1362,7 +1400,7 @@ mod tests {
             let conn = svc.conn.lock();
             fingerprint::load(&conn).expect("fingerprint stored after embed")
         };
-        assert_eq!(stored, EmbeddingFingerprint::new("fake", 384));
+        assert_eq!(stored, EmbeddingFingerprint::full("fake", "fake", "fp32", 384, "v1"));
 
         // Смена модели (другой отпечаток): обычная запись запрещена — смешивание
         // пространств не допускается.
@@ -1388,7 +1426,7 @@ mod tests {
         let conn = svc.conn.lock();
         assert_eq!(
             fingerprint::load(&conn),
-            Some(EmbeddingFingerprint::new("fake", 384))
+            Some(EmbeddingFingerprint::full("fake", "fake", "fp32", 384, "v1"))
         );
         let blob: Option<Vec<u8>> = conn
             .query_row(

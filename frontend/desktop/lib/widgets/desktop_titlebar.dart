@@ -1,6 +1,7 @@
 // Desktop TitleBar with Daemon Status, Active Model Selector, and Command Palette Trigger.
 
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import '../theme/desktop_theme.dart';
@@ -35,20 +36,27 @@ class DesktopTitleBar extends StatelessWidget {
             width: 26,
             height: 26,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(6),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: DesktopTheme.isDark
+                    ? const Color(0xFFF4F5F7).withOpacity(0.24)
+                    : DesktopTheme.borderSubtle,
+                width: 1,
+              ),
               boxShadow: [
                 BoxShadow(
-                  color: const Color(0xFF00D2FF).withOpacity(0.35),
-                  blurRadius: 10,
-                  offset: const Offset(0, 2),
+                  color: DesktopTheme.accentBrand.withOpacity(0.18),
+                  blurRadius: 8,
+                  offset: const Offset(0, 1),
                 ),
               ],
             ),
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: Image.asset(
-                'assets/Logo/app_launcher.png',
-                fit: BoxFit.cover,
+            child: ClipOval(
+              child: SvgPicture.asset(
+                'assets/Logo/OA_icon.svg',
+                width: 26,
+                height: 26,
+                fit: BoxFit.contain,
               ),
             ),
           ),
@@ -56,27 +64,30 @@ class DesktopTitleBar extends StatelessWidget {
           Text(
             'OmnesAgent',
             style: TextStyle(
+              fontFamily: DesktopTheme.fontHeading,
+              fontFamilyFallback: const ['Segoe UI', 'Inter', 'sans-serif'],
               color: DesktopTheme.textPrimary,
               fontWeight: FontWeight.bold,
               fontSize: 14,
-              letterSpacing: 0.5,
+              letterSpacing: 0.4,
             ),
           ),
           const SizedBox(width: 6),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
             decoration: BoxDecoration(
-              color: DesktopTheme.accentSky.withOpacity(0.12),
+              color: DesktopTheme.accentBrand.withOpacity(0.12),
               borderRadius: BorderRadius.circular(4),
               border: Border.all(
-                color: DesktopTheme.accentSky.withOpacity(0.3),
+                color: DesktopTheme.accentBrand.withOpacity(0.35),
                 width: 0.8,
               ),
             ),
             child: const Text(
               'DESKTOP',
               style: TextStyle(
-                color: DesktopTheme.accentSky,
+                fontFamily: DesktopTheme.fontHeading,
+                color: DesktopTheme.accentBrand,
                 fontSize: 10,
                 fontWeight: FontWeight.w700,
                 letterSpacing: 0.6,
@@ -103,7 +114,8 @@ class DesktopTitleBar extends StatelessWidget {
                   style: TextStyle(
                     color: DesktopTheme.textSecondary,
                     fontSize: 12,
-                    fontFamily: 'Consolas',
+                    fontFamily: DesktopTheme.fontMono,
+                    fontFamilyFallback: const ['Consolas', 'monospace'],
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -122,7 +134,8 @@ class DesktopTitleBar extends StatelessWidget {
                         'main*',
                         style: TextStyle(
                           fontSize: 10,
-                          fontFamily: 'Consolas',
+                          fontFamily: DesktopTheme.fontMono,
+                          fontFamilyFallback: ['Consolas', 'monospace'],
                           fontWeight: FontWeight.bold,
                           color: DesktopTheme.accentSky,
                         ),

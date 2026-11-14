@@ -22,6 +22,10 @@ use super::EmbeddingProvider;
 #[cfg(feature = "candle")]
 use crate::vector::normalize;
 
+pub const E5_MODEL_ID: &str = "intfloat/multilingual-e5-small";
+pub const MINILM_MODEL_ID: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
+pub const MICRO_BATCH_SIZE: usize = 32;
+
 #[cfg(feature = "candle")]
 pub struct LocalBertEmbedding {
     model: Mutex<BertModel>,
@@ -36,7 +40,9 @@ pub struct LocalBertEmbedding {
 impl LocalBertEmbedding {
     pub fn new(model_id: &str) -> anyhow::Result<Self> {
         let repo_id = if model_id.is_empty() || model_id == "local" {
-            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            MINILM_MODEL_ID
+        } else if model_id == "e5" {
+            E5_MODEL_ID
         } else {
             model_id
         };
@@ -83,31 +89,33 @@ impl EmbeddingProvider for LocalBertEmbedding {
 
         let mut results = Vec::with_capacity(texts.len());
 
-        for text in texts {
-            let encoding = self
-                .tokenizer
-                .encode(text.as_str(), true)
-                .map_err(|e| anyhow::anyhow!("Tokenization error: {e}"))?;
+        for batch in texts.chunks(MICRO_BATCH_SIZE) {
+            for text in batch {
+                let encoding = self
+                    .tokenizer
+                    .encode(text.as_str(), true)
+                    .map_err(|e| anyhow::anyhow!("Tokenization error: {e}"))?;
 
-            let tokens = encoding.get_ids();
-            let token_type_ids = encoding.get_type_ids();
+                let tokens = encoding.get_ids();
+                let token_type_ids = encoding.get_type_ids();
 
-            let token_ids_tensor = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-            let token_type_ids_tensor = Tensor::new(token_type_ids, &self.device)?.unsqueeze(0)?;
+                let token_ids_tensor = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
+                let token_type_ids_tensor = Tensor::new(token_type_ids, &self.device)?.unsqueeze(0)?;
 
-            let embeddings = {
-                let model = self.model.lock().map_err(|e| anyhow::anyhow!("Mutex lock error: {e}"))?;
-                let output = model.forward(&token_ids_tensor, &token_type_ids_tensor, None)?;
-                
-                // Mean pooling over sequence dimension
-                let (_n_sentence, n_tokens, _hidden_size) = output.dims3()?;
-                let sum = output.sum(1)?;
-                let mean = (sum / (n_tokens as f64))?;
-                mean.squeeze(0)?
-            };
+                let embeddings = {
+                    let model = self.model.lock().map_err(|e| anyhow::anyhow!("Mutex lock error: {e}"))?;
+                    let output = model.forward(&token_ids_tensor, &token_type_ids_tensor, None)?;
+                    
+                    // Mean pooling over sequence dimension
+                    let (_n_sentence, n_tokens, _hidden_size) = output.dims3()?;
+                    let sum = output.sum(1)?;
+                    let mean = (sum / (n_tokens as f64))?;
+                    mean.squeeze(0)?
+                };
 
-            let vec: Vec<f32> = embeddings.to_vec1()?;
-            results.push(normalize(&vec));
+                let vec: Vec<f32> = embeddings.to_vec1()?;
+                results.push(normalize(&vec));
+            }
         }
 
         Ok(results)
@@ -119,5 +127,29 @@ impl EmbeddingProvider for LocalBertEmbedding {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn query_prefix(&self) -> &str {
+        if self.model_id.contains("e5") {
+            "query: "
+        } else {
+            ""
+        }
+    }
+
+    fn document_prefix(&self) -> &str {
+        if self.model_id.contains("e5") {
+            "passage: "
+        } else {
+            ""
+        }
+    }
+
+    fn prefix_version(&self) -> &str {
+        if self.model_id.contains("e5") {
+            "e5_v1"
+        } else {
+            "v1"
+        }
     }
 }

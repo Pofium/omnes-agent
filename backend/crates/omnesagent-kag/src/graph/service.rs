@@ -59,6 +59,8 @@ pub struct EdgeWithLabels {
 pub struct GraphSearchResult {
     pub nodes: Vec<NodeWithNeighbors>,
     pub edges: Vec<EdgeWithLabels>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,15 +98,15 @@ fn apply_graph_access_batch(
     batch: &[(String, i64)],
     now: &str,
 ) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
     for (node_id, count) in batch {
-        tx.execute(
+        conn.execute(
             "UPDATE graph_nodes SET access_count = COALESCE(access_count, 0) + ?1, \
              last_accessed = ?2 WHERE node_id = ?3",
             params![count, now, node_id],
         )?;
     }
-    tx.commit()?;
+    conn.execute_batch("COMMIT")?;
     Ok(())
 }
 
@@ -201,6 +203,13 @@ impl GraphService {
                         SELECT n.id, n.label, n.description
                         FROM graph_nodes n
                         WHERE (n.deleted_at IS NULL OR n.deleted_at = '')
+                          AND (n.valid_until IS NULL OR n.valid_until = '' OR n.valid_until > datetime('now'))
+                          AND n.id NOT IN (
+                            SELECT target_id FROM graph_edges WHERE label = 'SUPERSEDES' AND (deleted_at IS NULL OR deleted_at = '')
+                          )
+                          AND n.id NOT IN (
+                            SELECT source_id FROM graph_edges WHERE label = 'SUPERSEDED' AND (deleted_at IS NULL OR deleted_at = '')
+                          )
                           AND (?2 IS NULL OR n.project_id = ?2)
                           AND n.id IN (
                             SELECT rowid FROM graph_nodes_fts
@@ -228,6 +237,12 @@ impl GraphService {
                             SELECT id, label, description
                             FROM graph_nodes
                             WHERE (deleted_at IS NULL OR deleted_at = '')
+                              AND id NOT IN (
+                                SELECT target_id FROM graph_edges WHERE label = 'SUPERSEDES' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
+                              AND id NOT IN (
+                                SELECT source_id FROM graph_edges WHERE label = 'SUPERSEDED' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
                               AND (?1 IS NULL OR project_id = ?1)
                             "#,
                         )?;
@@ -262,62 +277,71 @@ impl GraphService {
             }
         }
 
-        // 2. Векторный скоринг. Ф6.3: при активном vec0-индексе и совпадении
-        //    размерности — KNN + точный SIMD-rescore шортлиста; иначе прежний
-        //    полный перебор по всем блобам (тот же результат, без индекса).
-        if let Ok(q_embs) = self.embedder.embed(&[query.to_string()]).await
-            && let Some(q_vec) = q_embs.first()
-        {
-            let vec0_hits: Vec<(i64, f32)> = {
-                #[cfg(feature = "vec0")]
-                {
-                    let conn = self.conn.lock();
-                    crate::vector::vec0::knn_rescore(&conn, q_vec, limit, project_id_filter)
-                        .unwrap_or_default()
-                }
-                #[cfg(not(feature = "vec0"))]
-                {
-                    Vec::new()
-                }
-            };
-
-            let vector_hits = if vec0_hits.is_empty() {
-                let candidates = {
-                    let conn = self.conn.lock();
-                    let mut stmt = conn.prepare(
-                        r#"
-                        SELECT id, embedding 
-                        FROM graph_nodes 
-                        WHERE embedding IS NOT NULL 
-                          AND (deleted_at IS NULL OR deleted_at = '')
-                          AND (?1 IS NULL OR project_id = ?1)
-                        "#,
-                    )?;
-                    let rows = stmt.query_map(params![project_id_filter], |row| {
-                        let id: i64 = row.get(0)?;
-                        let blob: Vec<u8> = row.get(1)?;
-                        Ok((id, blob))
-                    })?;
-                    let mut list = Vec::new();
-                    for r in rows.flatten() {
-                        list.push(r);
+        // 2. Векторный скоринг с защитой Stale-While-Revalidate (degraded_mode)
+        let mut degraded_mode = None;
+        match self.embedder.embed_query(query).await {
+            Ok(q_vec) => {
+                let vec0_hits: Vec<(i64, f32)> = {
+                    #[cfg(feature = "vec0")]
+                    {
+                        let conn = self.conn.lock();
+                        crate::vector::vec0::knn_rescore(&conn, &q_vec, limit, project_id_filter)
+                            .unwrap_or_default()
                     }
-                    list
+                    #[cfg(not(feature = "vec0"))]
+                    {
+                        Vec::new()
+                    }
                 };
 
-                let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
-                    .iter()
-                    .map(|(id, b)| (*id, Some(b.as_slice())))
-                    .collect();
+                let vector_hits = if vec0_hits.is_empty() {
+                    let candidates = {
+                        let conn = self.conn.lock();
+                        let mut stmt = conn.prepare(
+                            r#"
+                            SELECT id, embedding 
+                            FROM graph_nodes 
+                            WHERE embedding IS NOT NULL 
+                              AND (deleted_at IS NULL OR deleted_at = '')
+                              AND id NOT IN (
+                                SELECT target_id FROM graph_edges WHERE label = 'SUPERSEDES' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
+                              AND id NOT IN (
+                                SELECT source_id FROM graph_edges WHERE label = 'SUPERSEDED' AND (deleted_at IS NULL OR deleted_at = '')
+                              )
+                              AND (?1 IS NULL OR project_id = ?1)
+                            "#,
+                        )?;
+                        let rows = stmt.query_map(params![project_id_filter], |row| {
+                            let id: i64 = row.get(0)?;
+                            let blob: Vec<u8> = row.get(1)?;
+                            Ok((id, blob))
+                        })?;
+                        let mut list = Vec::new();
+                        for r in rows.flatten() {
+                            list.push(r);
+                        }
+                        list
+                    };
 
-                top_k(q_vec, &cand_refs, limit, 0.0)
-            } else {
-                vec0_hits
-            };
+                    let cand_refs: Vec<(i64, Option<&[u8]>)> = candidates
+                        .iter()
+                        .map(|(id, b)| (*id, Some(b.as_slice())))
+                        .collect();
 
-            for (nid, vscore) in vector_hits {
-                let entry = scored.entry(nid).or_insert(0.0);
-                *entry += (vscore as f64) * 10.0;
+                    top_k(&q_vec, &cand_refs, limit, 0.0)
+                } else {
+                    vec0_hits
+                };
+
+                for (nid, vscore) in vector_hits {
+                    let entry = scored.entry(nid).or_insert(0.0);
+                    *entry += (vscore as f64) * 10.0;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Векторный поиск недоступен ({e}), переход в degraded_mode");
+                degraded_mode = Some("warming_up_embeddings".to_string());
             }
         }
 
@@ -448,6 +472,7 @@ impl GraphService {
         Ok(GraphSearchResult {
             nodes: nodes_map.into_values().collect(),
             edges,
+            degraded_mode,
         })
     }
 

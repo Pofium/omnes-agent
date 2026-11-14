@@ -78,7 +78,22 @@ pub struct FindingRecord {
     pub content: String,
     pub verdict: String, // verified | failed | unconfirmed | stale
     pub symbols: Vec<String>,
+    #[serde(default)]
+    pub git_head_sha: Option<String>,
     pub at: DateTime<Utc>,
+}
+
+impl FindingRecord {
+    /// Проверяет свежесть вывода против текущего git HEAD SHA.
+    pub fn is_fresh(&self, current_head: Option<&str>) -> bool {
+        if self.verdict == "stale" {
+            return false;
+        }
+        match (&self.git_head_sha, current_head) {
+            (Some(saved), Some(current)) => saved == current,
+            _ => true,
+        }
+    }
 }
 
 /// Envelope for records written to `journal.jsonl`.
@@ -251,6 +266,7 @@ mod tests {
             content: format!("finding {id}"),
             verdict: verdict.to_string(),
             symbols: symbols.iter().map(|s| s.to_string()).collect(),
+            git_head_sha: None,
             at: Utc::now(),
         }
     }

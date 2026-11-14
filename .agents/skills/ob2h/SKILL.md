@@ -75,6 +75,56 @@ OB2H (OmnesBot to Harness) — локальный «мозг» и граф зн�
   в CodeExploration остаётся лишь `secrets_status`.
 - Значения сейфа **не попадают** в память, RAG-чанки, граф знаний и tool-логи.
 
+## 🎓 Уроки (Lessons) — процедурный опыт (ADR-O7/O8)
+
+- `lesson_save(content, context, confidence?, project, tags?, source?)` — **процедурный опыт**
+  («что делать / чего избегать / когда применимо»). Это не факт: факты и решения идут
+  через `memory_save`.
+- `lesson_recall(query, limit?, min_confidence?, project?)` — вызывай **перед нетривиальным
+  решением**; `query` = текст задачи + затронутые символы. В цикле Ralph это делает
+  `omnesagent-ralph` (Ф8.3) автоматически.
+- `lesson_list(...)` — обзор уроков проекта.
+- Повторный `lesson_save` того же текста = **reinforce** (ob2h дедуп по fingerprint), а не
+  дубль. Не плоди перефразировки одного урока.
+- Секреты и `#[credential_class]`-контент в уроки **не писать** (ADR-O5/O11).
+- Decay-кандидаты дрима **не удалять автоматически** (ADR-11 ob2h); удаление — явная команда.
+- Уроки живут только в ob2h (ADR-O7): в `omnesagent-memory` таблицы lessons **не создаются**.
+
+## 🧰 Слоты (Slots) — кросс-сессийный буфер проекта (ADR-O7)
+
+- `slot_list` / `slot_get` — read-класс; `slot_create` / `slot_append` / `slot_replace` /
+  `slot_delete` — write-класс (EngineeringTask/SystemAdmin).
+- Seed-дефолты: `pending_items`, `session_guidance`, `project_context`, `user_rules`,
+  `self_notes`.
+- **413 при `slot_append`** → компакция через `slot_replace` (прочитать → сжать → заменить);
+  сообщай владельцу фактические размеры.
+- Инъекция в `memory_context` — блок `<agent_slots>`; бюджет `OB2H_SLOTS_MAX_CHARS=1500`,
+  pinned по алфавиту; `project`-слот **затеняет** `global`.
+- **Запрет split-brain:** не копируй содержимое слотов в память форка и наоборот.
+- Секреты/credential-контент в слоты не писать (ADR-O5/O11).
+
+## 🕰️ Хронология, рекап, провенанс, аудит (ADR-O9)
+
+- `memory_timeline(anchor?, before?, after?)` — «что происходило вокруг даты/события X»;
+  якорь = ISO-дата или подстрока диалога; без якоря — хвост лога.
+- **Провенанс:** перед использованием критичного факта из ob2h — `memory_verify`; в отчёт
+  владельцу включай `citations`/`citation_count`. `provenance: none` — честный результат, не
+  ошибка. Ограничение контракта: прямой `memory_save` провенанса не даёт (нет `meta`/`source_ids`);
+  прослеживаемость — только через цепочку `session_ingest` → `session_recap(save=true)`.
+- **Governance:** `memory_forget` вызывай **только с `reason`**; `memory_audit(operation?, limit?)`
+  — read-only отчёт операций (actor=agent виден) для владельца.
+
+## 🖥️ Viewer (ADR-O10)
+
+- «Показать память владельцу» → `viewer_open` — **privileged**-инструмент (спавн процесса):
+  доступен интенциям EngineeringTask/SystemAdmin, **никогда** не в CodeExploration.
+- Окно detached и переживает сессию агента; повторный вызов → `already_running`. Если harness
+  форка убивает job-дерево (breakaway не проходит) — фолбэк: CLI `ob2h viewer`.
+- Headless/SSH — окно недоступно: сообщи честно, не выдумывай успех и не паникуй.
+- **PIN в чате не запрашивать никогда.** Вкладка «Секреты» — только локальный ввод в окне;
+  значения секретов не пересказывать в чат даже после раскрытия во viewer.
+- Просмотр read-only: вкладки памяти/графа/сессий не пишут в БД.
+
 ## 🚀 Сценарии использования в Antigravity IDE
 
 1. **Перед рефакторингом или крупными изменениями**:

@@ -23,7 +23,7 @@ void main() async {
     size: Size(1360, 860),
     minimumSize: Size(1024, 640),
     center: true,
-    backgroundColor: Color(0xFF090D16),
+    backgroundColor: Color(0xFF0D1117),
     skipTaskbar: false,
     titleBarStyle: TitleBarStyle.normal,
     title: 'OmnesAgent Desktop ADE',

@@ -15,9 +15,25 @@
 //! [`extract`] возвращает `None`, и вызывающий код отступает на regex-экстрактор.
 
 use super::{AstEdge, AstNode, CallSite, ImportRef};
+use lru::LruCache;
+use regex::Regex;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 use tree_sitter::{Language, Node, Parser};
+
+static TREE_CACHE: LazyLock<Mutex<LruCache<String, (String, tree_sitter::Tree)>>> = LazyLock::new(|| {
+    Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap()))
+});
+
+static RUST_MACRO_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\("#).unwrap()
+});
+
+static SFC_SCRIPT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?s)<script[^>]*>(.*?)</script>"#).unwrap()
+});
 
 /// Провенанс ребра (ob2h v2.0): извлечено напрямую из дерева разбора.
 pub const PROVENANCE_SYNTAX: &str = "SYNTAX";
@@ -122,24 +138,143 @@ pub struct TsExtraction {
 
 /// Поддерживается ли файл tree-sitter экстрактором.
 pub fn supports(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    if lower.ends_with(".vue") || lower.ends_with(".svelte") {
+        return true;
+    }
+    if super::is_generated_stub_file(rel_path, "") {
+        return true;
+    }
     TsLanguage::from_path(rel_path).is_some()
 }
 
+fn compute_input_edit(old_str: &str, new_str: &str) -> Option<tree_sitter::InputEdit> {
+    if old_str == new_str {
+        return None;
+    }
+    let prefix_len = old_str.bytes().zip(new_str.bytes()).take_while(|(a, b)| a == b).count();
+    let old_rem = &old_str[prefix_len..];
+    let new_rem = &new_str[prefix_len..];
+    let suffix_len = old_rem.bytes().rev().zip(new_rem.bytes().rev()).take_while(|(a, b)| a == b).count();
+
+    let start_byte = prefix_len;
+    let old_end_byte = old_str.len().saturating_sub(suffix_len);
+    let new_end_byte = new_str.len().saturating_sub(suffix_len);
+
+    let start_position = byte_to_point(old_str, start_byte);
+    let old_end_position = byte_to_point(old_str, old_end_byte);
+    let new_end_position = byte_to_point(new_str, new_end_byte);
+
+    Some(tree_sitter::InputEdit {
+        start_byte,
+        old_end_byte,
+        new_end_byte,
+        start_position,
+        old_end_position,
+        new_end_position,
+    })
+}
+
+fn byte_to_point(s: &str, byte_idx: usize) -> tree_sitter::Point {
+    let prefix = &s[..byte_idx.min(s.len())];
+    let row = prefix.matches('\n').count();
+    let col = prefix.rfind('\n').map(|pos| prefix.len() - pos - 1).unwrap_or(prefix.len());
+    tree_sitter::Point { row, column: col }
+}
+
 /// Разобрать `content` и извлечь определения и импорты.
-///
-/// Возвращает `None`, когда язык не поддержан, разбор не удался, либо доля
-/// ERROR/MISSING-узлов превышает [`FALLBACK_ERROR_RATIO`] — тогда вызывающий
-/// код должен отступить на regex-экстрактор.
 pub fn extract(rel_path: &str, content: &str) -> Option<TsExtraction> {
+    if super::is_generated_stub_file(rel_path, content) {
+        let file_node_id = format!("file:{}", rel_path);
+        let label = rel_path.to_string();
+        return Some(TsExtraction {
+            nodes: vec![AstNode {
+                node_id: file_node_id,
+                label: label.clone(),
+                node_type: "FileStub".to_string(),
+                description: format!("Сгенерированный stub-файл: {}", rel_path),
+                file_path: rel_path.to_string(),
+                line_start: 1,
+                line_end: content.lines().count().max(1),
+                kind_detail: "generated_stub".to_string(),
+                subtokens: super::split_subtokens(&label),
+            }],
+            edges: Vec::new(),
+            call_sites: Vec::new(),
+            imports: Vec::new(),
+        });
+    }
+
+    let lower = rel_path.to_ascii_lowercase();
+    if lower.ends_with(".vue") || lower.ends_with(".svelte") {
+        return extract_sfc(rel_path, content);
+    }
+
     let lang = TsLanguage::from_path(rel_path)?;
+    extract_with_lang(rel_path, content, lang, 0)
+}
+
+fn extract_sfc(rel_path: &str, content: &str) -> Option<TsExtraction> {
+    let mut combined = TsExtraction {
+        nodes: Vec::new(),
+        edges: Vec::new(),
+        call_sites: Vec::new(),
+        imports: Vec::new(),
+    };
+    let mut found = false;
+    for cap in SFC_SCRIPT_RE.captures_iter(content) {
+        let Some(m) = cap.get(1) else { continue };
+        let offset = content[..m.start()].matches('\n').count();
+        if let Some(sub) = extract_with_lang(rel_path, m.as_str(), TsLanguage::TypeScript, offset) {
+            combined.nodes.extend(sub.nodes);
+            combined.edges.extend(sub.edges);
+            combined.call_sites.extend(sub.call_sites);
+            combined.imports.extend(sub.imports);
+            found = true;
+        }
+    }
+    if found {
+        Some(combined)
+    } else {
+        None
+    }
+}
+
+fn extract_with_lang(rel_path: &str, content: &str, lang: TsLanguage, line_offset: usize) -> Option<TsExtraction> {
     let mut parser = Parser::new();
     parser.set_language(&lang.grammar()).ok()?;
-    let tree = parser.parse(content, None)?;
+
+    let cache_key = format!("{}:{}", rel_path, line_offset);
+    let mut old_tree_opt = None;
+    if let Ok(mut lock) = TREE_CACHE.lock() {
+        if let Some((old_content, mut tree)) = lock.pop(&cache_key) {
+            if old_content == content {
+                let root = tree.root_node();
+                let res = if should_fallback(root) {
+                    None
+                } else {
+                    Some(collect_with_offset(rel_path, content.as_bytes(), root, lang, line_offset))
+                };
+                lock.put(cache_key, (content.to_string(), tree));
+                return res;
+            } else if let Some(edit) = compute_input_edit(&old_content, content) {
+                tree.edit(&edit);
+                old_tree_opt = Some(tree);
+            }
+        }
+    }
+
+    let tree = parser.parse(content, old_tree_opt.as_ref())?;
     let root = tree.root_node();
     if should_fallback(root) {
         return None;
     }
-    Some(collect(rel_path, content.as_bytes(), root, lang))
+
+    if let Ok(mut lock) = TREE_CACHE.lock() {
+        lock.put(cache_key, (content.to_string(), tree.clone()));
+    }
+
+    Some(collect_with_offset(rel_path, content.as_bytes(), root, lang, line_offset))
 }
 
 /// Доля узлов дерева, являющихся ERROR или MISSING.
@@ -160,8 +295,34 @@ fn should_fallback(root: Node) -> bool {
     missing_error_ratio(root) > FALLBACK_ERROR_RATIO
 }
 
+fn is_rust_test_node(node: Node, src: &[u8]) -> bool {
+    let mut cursor = node.prev_sibling();
+    while let Some(prev) = cursor {
+        if prev.kind() == "attribute_item" {
+            let txt = text(prev, src);
+            if txt.contains("test") {
+                return true;
+            }
+            cursor = prev.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
 /// Собрать узлы/рёбра из дерева разбора.
 fn collect(rel_path: &str, src: &[u8], root: Node, lang: TsLanguage) -> TsExtraction {
+    collect_with_offset(rel_path, src, root, lang, 0)
+}
+
+fn collect_with_offset(
+    rel_path: &str,
+    src: &[u8],
+    root: Node,
+    lang: TsLanguage,
+    line_offset: usize,
+) -> TsExtraction {
     let file_node_id = format!("file:{}", rel_path);
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -174,14 +335,21 @@ fn collect(rel_path: &str, src: &[u8], root: Node, lang: TsLanguage) -> TsExtrac
             if let Some(name) = node_name(node, lang, src) {
                 let node_id = format!("{}:{}:{}", prefix, rel_path, name);
                 if seen.insert(node_id.clone()) {
+                    let is_test = super::is_test_symbol(name, rel_path)
+                        || (lang == TsLanguage::Rust && is_rust_test_node(node, src));
+                    let kind_detail = if is_test { "test".to_string() } else { String::new() };
+                    let subtokens = super::split_subtokens(name);
+
                     nodes.push(AstNode {
                         node_id: node_id.clone(),
                         label: name.to_string(),
                         node_type: node_type.to_string(),
                         description: format!("{} `{}` в {}", node_type, name, rel_path),
                         file_path: rel_path.to_string(),
-                        line_start: node.start_position().row + 1,
-                        line_end: node.end_position().row + 1,
+                        line_start: node.start_position().row + 1 + line_offset,
+                        line_end: node.end_position().row + 1 + line_offset,
+                        kind_detail,
+                        subtokens,
                     });
                     edges.push(AstEdge {
                         source_node_id: file_node_id.clone(),
@@ -224,9 +392,28 @@ fn collect(rel_path: &str, src: &[u8], root: Node, lang: TsLanguage) -> TsExtrac
         if let Some(name) = call_callee(node, lang, src) {
             call_sites.push(CallSite {
                 rel_path: rel_path.to_string(),
-                line: node.start_position().row + 1,
+                line: node.start_position().row + 1 + line_offset,
                 name: name.to_string(),
             });
+        }
+        if node.kind() == "macro_invocation" && lang == TsLanguage::Rust {
+            if let Some(token_tree) = node.child_by_field_name("token_tree") {
+                let tree_bytes = &src[token_tree.start_byte()..token_tree.end_byte()];
+                if let Ok(tree_str) = std::str::from_utf8(tree_bytes) {
+                    for cap in RUST_MACRO_CALL_RE.captures_iter(tree_str) {
+                        if let Some(m) = cap.get(1) {
+                            let fn_name = m.as_str();
+                            if !matches!(fn_name, "println" | "format" | "vec" | "info" | "error" | "warn" | "debug" | "trace" | "write" | "writeln" | "panic" | "assert" | "assert_eq") {
+                                call_sites.push(CallSite {
+                                    rel_path: rel_path.to_string(),
+                                    line: token_tree.start_position().row + 1 + line_offset,
+                                    name: fn_name.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
         let refs = import_refs(node, lang, rel_path, src);
         if !refs.is_empty() {
@@ -840,12 +1027,11 @@ fn call_callee<'a>(node: Node, lang: TsLanguage, src: &'a [u8]) -> Option<&'a st
             let f = node.child_by_field_name("function")?;
             match f.kind() {
                 "identifier" => text_opt(f, src),
-                // self.m()/cls.m() → метод того же файла; произвольный
-                // receiver — AMBIGUOUS.
+                // self.m()/cls.m() → метод того же файла; chained .m() → метод; произвольный receiver — AMBIGUOUS.
                 "attribute" => {
                     let obj = f.child_by_field_name("object")?;
                     let obj_text = text(obj, src);
-                    if obj_text == "self" || obj_text == "cls" {
+                    if obj_text == "self" || obj_text == "cls" || obj.kind() == "call" || obj.kind() == "await" {
                         f.child_by_field_name("attribute").and_then(|n| text_opt(n, src))
                     } else {
                         None
@@ -861,10 +1047,11 @@ fn call_callee<'a>(node: Node, lang: TsLanguage, src: &'a [u8]) -> Option<&'a st
             let f = node.child_by_field_name("function")?;
             match f.kind() {
                 "identifier" => text_opt(f, src),
-                // this.m() → метод того же класса; прочее — AMBIGUOUS.
+                // this.m() → метод того же класса; chained .m() → метод; прочее — AMBIGUOUS.
                 "member_expression" => {
                     let obj = f.child_by_field_name("object")?;
-                    if text(obj, src) == "this" {
+                    let obj_t = text(obj, src);
+                    if obj_t == "this" || obj.kind() == "call_expression" || obj.kind() == "await_expression" {
                         f.child_by_field_name("property").and_then(|n| text_opt(n, src))
                     } else {
                         None
@@ -893,7 +1080,7 @@ fn call_callee<'a>(node: Node, lang: TsLanguage, src: &'a [u8]) -> Option<&'a st
 }
 
 /// Rust: callee call_expression — идентификатор, scoped/generic функция либо
-/// `self./Self.`-метод. Макросы (`macro_invocation`) не рассматриваем.
+/// `self./Self.`-метод или chained вызов (`builder.foo().bar()`).
 fn rust_callee<'a>(f: Node, src: &'a [u8]) -> Option<&'a str> {
     match f.kind() {
         "identifier" => text_opt(f, src),
@@ -904,7 +1091,7 @@ fn rust_callee<'a>(f: Node, src: &'a [u8]) -> Option<&'a str> {
         "field_expression" => {
             let val = f.child_by_field_name("value")?;
             let val_text = text(val, src);
-            if val_text == "self" || val_text == "Self" {
+            if val_text == "self" || val_text == "Self" || val.kind() == "call_expression" || val.kind() == "await_expression" {
                 f.child_by_field_name("field").and_then(|n| text_opt(n, src))
             } else {
                 None

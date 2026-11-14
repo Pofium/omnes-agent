@@ -88,6 +88,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -115,6 +116,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -142,6 +144,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -185,6 +188,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -210,6 +214,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -235,6 +240,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -280,6 +286,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -313,6 +320,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
                     out.edges.push(AstEdge {
                         source_node_id: file_node_id.to_string(),
@@ -371,6 +379,7 @@ impl IacExtractor {
                             file_path: rel_path.to_string(),
                             line_start: idx + 1,
                             line_end: idx + 1,
+                            ..Default::default()
                         });
 
                         out.edges.push(AstEdge {
@@ -462,6 +471,7 @@ impl IacExtractor {
                         file_path: rel_path.to_string(),
                         line_start: line_kind,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {

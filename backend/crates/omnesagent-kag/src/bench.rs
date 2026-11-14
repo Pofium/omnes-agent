@@ -73,6 +73,22 @@ pub fn mrr(ranked: &[String], expected: &HashSet<String>) -> f64 {
     0.0
 }
 
+/// recall-all@k (Ф11.3, parity with ob2h Ф69.2, LongMemEval strict): every
+/// expected key of the case appears in the top-k. For a single-key case this is
+/// equivalent to "found / not found".
+pub fn recall_all_at_k(ranked: &[String], expected: &HashSet<String>, k: usize) -> bool {
+    !expected.is_empty()
+        && expected
+            .iter()
+            .all(|key| ranked.iter().take(k).any(|ranked_key| ranked_key == key))
+}
+
+/// any-hit@k (Ф11.3, parity with ob2h Ф69.2): at least one expected key appears
+/// in the top-k.
+pub fn any_hit_at_k(ranked: &[String], expected: &HashSet<String>, k: usize) -> bool {
+    ranked.iter().take(k).any(|key| expected.contains(key))
+}
+
 /// Nearest-rank percentile calculation (p in range [0, 100]).
 pub fn percentile(durations_ms: &mut [f64], p: f64) -> f64 {
     if durations_ms.is_empty() {
@@ -107,6 +123,13 @@ pub struct BenchSummary {
     pub mrr: f64,
     pub p95_ms: f64,
     pub empty_count: usize,
+    /// Ф11.3 (ADR-O11): fraction of cases with *all* expected keys in the top-5
+    /// (LongMemEval strict). Purely observational — it does not gate rollback.
+    #[serde(default)]
+    pub recall_all5: Option<f64>,
+    /// Ф11.3: fraction of cases with at least one expected key in the top-5.
+    #[serde(default)]
+    pub any_hit5: Option<f64>,
 }
 
 /// Compute evaluation metrics given a slice of golden cases and pre-ranked results.
@@ -123,6 +146,8 @@ pub fn evaluate_ranked_results(
             mrr: 0.0,
             p95_ms: 0.0,
             empty_count: 0,
+            recall_all5: None,
+            any_hit5: None,
         };
     }
 
@@ -131,6 +156,8 @@ pub fn evaluate_ranked_results(
     let mut sum_recall10 = 0.0;
     let mut sum_mrr = 0.0;
     let mut empty_count = 0;
+    let mut recall_all5_hits = 0usize;
+    let mut any_hit5_hits = 0usize;
 
     for i in 0..n {
         let case = &cases[i];
@@ -142,6 +169,12 @@ pub fn evaluate_ranked_results(
         sum_recall5 += recall_at_k(ranked, &expected, 5);
         sum_recall10 += recall_at_k(ranked, &expected, 10);
         sum_mrr += mrr(ranked, &expected);
+        if recall_all_at_k(ranked, &expected, 5) {
+            recall_all5_hits += 1;
+        }
+        if any_hit_at_k(ranked, &expected, 5) {
+            any_hit5_hits += 1;
+        }
     }
 
     let mut durs = durations_ms.to_vec();
@@ -154,6 +187,8 @@ pub fn evaluate_ranked_results(
         mrr: sum_mrr / n as f64,
         p95_ms: p95,
         empty_count,
+        recall_all5: Some(recall_all5_hits as f64 / n as f64),
+        any_hit5: Some(any_hit5_hits as f64 / n as f64),
     }
 }
 
@@ -328,6 +363,95 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_all_at_k_strict_semantics() {
+        let ranked = vec![
+            "doc1".to_string(),
+            "doc2".to_string(),
+            "doc3".to_string(),
+        ];
+
+        let mut both = HashSet::new();
+        both.insert("doc1".to_string());
+        both.insert("doc3".to_string());
+        // Both expected keys are within top-3 -> strict hit.
+        assert!(recall_all_at_k(&ranked, &both, 3));
+        // Top-2 only exposes doc1 -> not all keys present.
+        assert!(!recall_all_at_k(&ranked, &both, 2));
+
+        let mut one = HashSet::new();
+        one.insert("doc2".to_string());
+        // Single-key case behaves as found / not found.
+        assert!(recall_all_at_k(&ranked, &one, 5));
+
+        // Empty expected set is never a strict hit.
+        assert!(!recall_all_at_k(&ranked, &HashSet::new(), 5));
+    }
+
+    #[test]
+    fn test_any_hit_at_k_semantics() {
+        let ranked = vec![
+            "doc1".to_string(),
+            "doc2".to_string(),
+            "doc3".to_string(),
+        ];
+
+        let mut both = HashSet::new();
+        both.insert("doc1".to_string());
+        both.insert("doc3".to_string());
+        // At least one expected key in top-1 -> any-hit.
+        assert!(any_hit_at_k(&ranked, &both, 1));
+
+        let mut missing = HashSet::new();
+        missing.insert("doc9".to_string());
+        assert!(!any_hit_at_k(&ranked, &missing, 3));
+
+        // Empty expected set never produces a hit.
+        assert!(!any_hit_at_k(&ranked, &HashSet::new(), 3));
+    }
+
+    #[test]
+    fn test_evaluate_ranked_results_populates_strict_metrics() {
+        let cases = vec![
+            GoldenCase {
+                query: "q1".to_string(),
+                expect_keys: vec!["doc1".to_string(), "doc2".to_string()],
+                note: String::new(),
+            },
+            GoldenCase {
+                query: "q2".to_string(),
+                expect_keys: vec!["doc9".to_string()],
+                note: String::new(),
+            },
+        ];
+        // Case 1: both keys present in top-5 -> strict hit and any-hit.
+        // Case 2: only doc1 is retrieved but doc9 is expected -> no hit.
+        let ranked = vec![
+            vec![
+                "doc1".to_string(),
+                "doc2".to_string(),
+                "doc3".to_string(),
+            ],
+            vec!["doc1".to_string()],
+        ];
+        let durations = vec![10.0, 20.0];
+
+        let summary = evaluate_ranked_results(&cases, &ranked, &durations);
+        assert_eq!(summary.cases, 2);
+        // Case 1 satisfies recall-all@5, case 2 does not -> 0.5.
+        assert_eq!(summary.recall_all5, Some(0.5));
+        // Case 1 has at least one key, case 2 has none -> 0.5.
+        assert_eq!(summary.any_hit5, Some(0.5));
+    }
+
+    #[test]
+    fn test_evaluate_ranked_results_empty_inputs_yield_none_metrics() {
+        let summary = evaluate_ranked_results(&[], &[], &[]);
+        assert_eq!(summary.cases, 0);
+        assert_eq!(summary.recall_all5, None);
+        assert_eq!(summary.any_hit5, None);
+    }
+
+    #[test]
     fn test_is_degradation_thresholds() {
         let baseline = (0.80, 0.70);
 
@@ -357,6 +481,8 @@ mod tests {
             mrr: 0.78,
             p95_ms: 45.0,
             empty_count: 0,
+            recall_all5: None,
+            any_hit5: None,
         };
 
         // First run (no baseline)
@@ -377,6 +503,8 @@ mod tests {
             mrr: 0.55,    // dropped from 0.77 (>15%)
             p95_ms: 50.0,
             empty_count: 2,
+            recall_all5: None,
+            any_hit5: None,
         };
         let v3 = evaluate_gate_decision(
             &summary_degraded,

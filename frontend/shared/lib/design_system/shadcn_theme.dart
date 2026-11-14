@@ -1,8 +1,12 @@
-// ShadcnTheme — Global dark cyber theme for Flutter MaterialApp
+// ShadcnTheme — Global OmnesProducts v1.1 dark theme for Flutter MaterialApp
 import 'package:flutter/material.dart';
 import 'shadcn_colors.dart';
 
 class ShadcnTheme {
+  static const String fontHeading = 'Montserrat';
+  static const String fontBody = 'Segoe UI';
+  static const String fontMono = 'JetBrains Mono';
+
   static ThemeData get darkTheme {
     return ThemeData(
       brightness: Brightness.dark,
@@ -10,12 +14,14 @@ class ShadcnTheme {
       primaryColor: ShadcnColors.primary,
       cardColor: ShadcnColors.card,
       dividerColor: ShadcnColors.border,
+      fontFamily: fontBody,
+      fontFamilyFallback: const ['Inter', 'Segoe UI', 'Roboto', 'sans-serif'],
       colorScheme: const ColorScheme.dark(
         primary: ShadcnColors.primary,
         secondary: ShadcnColors.primaryMuted,
         surface: ShadcnColors.card,
         error: ShadcnColors.destructive,
-        onPrimary: Color(0xFF09090B),
+        onPrimary: ShadcnColors.foreground,
         onSurface: ShadcnColors.foreground,
         onError: Colors.white,
       ),
@@ -26,10 +32,12 @@ class ShadcnTheme {
         scrolledUnderElevation: 0,
         iconTheme: IconThemeData(color: ShadcnColors.foreground),
         titleTextStyle: TextStyle(
+          fontFamily: fontHeading,
+          fontFamilyFallback: ['Segoe UI', 'Inter', 'sans-serif'],
           color: ShadcnColors.foreground,
           fontSize: 17,
           fontWeight: FontWeight.w600,
-          letterSpacing: 0.2,
+          letterSpacing: 0.3,
         ),
       ),
       dialogTheme: DialogTheme(

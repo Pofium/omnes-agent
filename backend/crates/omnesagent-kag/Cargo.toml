@@ -10,6 +10,7 @@ publish = false
 omnesagent-log.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
+blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 ignore = "0.4"

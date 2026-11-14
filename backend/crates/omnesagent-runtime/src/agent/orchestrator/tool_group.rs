@@ -186,6 +186,26 @@ pub fn is_read_only_tool(name: &str) -> bool {
         || lower.starts_with("ob2h__memory_context")
         || lower.starts_with("ob2h__omnes_stats")
         || lower.starts_with("ob2h__secrets_status")
+        // ob2h v1.9.9 (Ф7.2): seven new read-only lifecycle tools plus the ten
+        // read-only names deferred from Ф0.6. `secrets_get` intentionally stays
+        // write-class (the Ф4.1 decision is not revisited).
+        || lower.starts_with("ob2h__lesson_recall")
+        || lower.starts_with("ob2h__lesson_list")
+        || lower.starts_with("ob2h__slot_list")
+        || lower.starts_with("ob2h__slot_get")
+        || lower.starts_with("ob2h__memory_timeline")
+        || lower.starts_with("ob2h__memory_verify")
+        || lower.starts_with("ob2h__memory_audit")
+        || lower.starts_with("ob2h__project_scan_status")
+        || lower.starts_with("ob2h__project_call_path")
+        || lower.starts_with("ob2h__project_graph_search")
+        || lower.starts_with("ob2h__ast_diff")
+        || lower.starts_with("ob2h__ast_history")
+        || lower.starts_with("ob2h__dream_log")
+        || lower.starts_with("ob2h__dream_status")
+        || lower.starts_with("ob2h__ralph_context")
+        || lower.starts_with("ob2h__ralph_report")
+        || lower.starts_with("ob2h__session_log")
         || lower.starts_with("codegraph_")
         || lower.starts_with("searxng_")
         || lower == "web_search"
@@ -242,6 +262,25 @@ mod tests {
             "ob2h__memory_context",
             "ob2h__omnes_stats",
             "ob2h__secrets_status",
+            // ob2h v1.9.9 read-only lifecycle tools (Ф7.2).
+            "ob2h__lesson_recall",
+            "ob2h__lesson_list",
+            "ob2h__slot_list",
+            "ob2h__slot_get",
+            "ob2h__memory_timeline",
+            "ob2h__memory_verify",
+            "ob2h__memory_audit",
+            // Ф0.6 follow-up read-only names.
+            "ob2h__project_scan_status",
+            "ob2h__project_call_path",
+            "ob2h__project_graph_search",
+            "ob2h__ast_diff",
+            "ob2h__ast_history",
+            "ob2h__dream_log",
+            "ob2h__dream_status",
+            "ob2h__ralph_context",
+            "ob2h__ralph_report",
+            "ob2h__session_log",
         ];
         for name in read_only {
             assert!(is_read_only_tool(name), "{name} should be read-only");
@@ -260,9 +299,82 @@ mod tests {
             "ob2h__dream_run",
             "ob2h__session_ingest",
             "ob2h__omnes_backup",
+            // ob2h v1.9.9 write/privileged lifecycle tools (Ф7.3): must never
+            // reach CodeExploration, only EngineeringTask/SystemAdmin.
+            "ob2h__lesson_save",
+            "ob2h__lesson_delete",
+            "ob2h__slot_create",
+            "ob2h__slot_append",
+            "ob2h__slot_replace",
+            "ob2h__slot_delete",
+            "ob2h__session_recap",
+            "ob2h__viewer_open",
+            // ob2h v2.0 write/HITL tools
+            "ob2h__knowledge_reconcile",
+            "ob2h__memory_feedback",
         ];
         for name in mutating {
             assert!(!is_read_only_tool(name), "{name} must not be read-only");
+        }
+    }
+
+    #[test]
+    fn test_ob2h_v199_lifecycle_classification() {
+        // Ф7.3 / Appendix A: the full v1.9.9 lifecycle matrix — read-only
+        // inspection tools stay available in CodeExploration, while write and
+        // privileged tools (lesson/slot writes, recap, viewer spawn) reach only
+        // EngineeringTask/SystemAdmin. A generous MCP budget is used so the test
+        // exercises the intent filter, not the top-K pruning.
+        let read_only = [
+            "ob2h__lesson_recall",
+            "ob2h__lesson_list",
+            "ob2h__slot_list",
+            "ob2h__slot_get",
+            "ob2h__memory_timeline",
+            "ob2h__memory_verify",
+            "ob2h__memory_audit",
+        ];
+        let write_or_privileged = [
+            "ob2h__lesson_save",
+            "ob2h__lesson_delete",
+            "ob2h__slot_create",
+            "ob2h__slot_append",
+            "ob2h__slot_replace",
+            "ob2h__slot_delete",
+            "ob2h__session_recap",
+            "ob2h__viewer_open",
+        ];
+
+        let tools: Vec<ToolSpec> = read_only
+            .iter()
+            .chain(write_or_privileged.iter())
+            .map(|name| dummy_tool(name))
+            .collect();
+
+        let explored = filter_tools_for_intent_with_query(
+            &tools,
+            AgentIntent::CodeExploration,
+            None,
+            Some(64),
+        );
+        let explored_names: Vec<&str> = explored.iter().map(|t| t.name.as_str()).collect();
+        for name in read_only {
+            assert!(
+                explored_names.contains(&name),
+                "{name} must stay in CodeExploration"
+            );
+        }
+        for name in write_or_privileged {
+            assert!(
+                !explored_names.contains(&name),
+                "{name} must not enter CodeExploration"
+            );
+        }
+
+        for intent in [AgentIntent::EngineeringTask, AgentIntent::SystemAdmin] {
+            let filtered =
+                filter_tools_for_intent_with_query(&tools, intent, None, Some(64));
+            assert_eq!(filtered.len(), tools.len(), "all tools retained for {intent:?}");
         }
     }
 

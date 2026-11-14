@@ -569,9 +569,23 @@ PPR v2.0 (столп III/VI).
       из оркестратора уже учитывались на стороне ob2h (собственный `touch_access`).
       **Остаток закрыт:** `omnesagent-kag::graph::service` инструментирован (см. ниже) —
       `search` учитывает прочитанные узлы (включая 1-hop соседей), flush пишет
-      `graph_nodes.access_count`/`last_accessed`. Остаётся отложенным только
-      `omnesagent-memory::prefetch` (не подключён к боевому пути, `saturation_access`
-      там хардкод).
+      `graph_nodes.access_count`/`last_accessed`. Ранее отложенный
+      `omnesagent-memory::prefetch` подключён к боевому пути (см. 5.1-остаток ниже):
+      `Memory::access_counts` читает накопленную телеметрию, а рендерер инъекции памяти
+      под флагом `memory.prefetch_enabled` пересчитывает ранжирование ob2h-blend'ом с
+      реальным access-saturation вместо хардкода `saturation_access(0)`.
+- [x] **5.1-остаток** Access-телеметрия потребляется ранжированием (не только пишется):
+      - `omnesagent-api::memory_traits::Memory::access_counts(&[keys]) -> Vec<i64>` —
+        default-метод (все нули) + реальный override в `SqliteMemory` (SQL `IN` с
+        bound-параметрами), тест `access_counts_reads_persisted_telemetry_by_key`.
+      - `omnesagent-memory::prefetch::rescore_with_access` применяет ob2h 5-factor blend
+        (rel/importance/trust/recency/sat_access) к набору recall'а, `build_memory_context`
+        принимает `access_counts` (хардкод `saturation_access(0)` удалён); тест
+        `test_rescore_with_access_promotes_frequently_used`.
+      - Флаг `memory.prefetch_enabled` (default **off**) в `MemoryConfig`; при включении
+        `render_memory_context` делает финальный access-aware re-rank по прочитанной
+        телеметрии. Off ⇒ ранжирование байт-в-байт как раньше. Тест
+        `prefetch_flag_promotes_frequently_accessed_entry`.
 - [x] **5.2** Пакетный репортер: аккумулятор `AccessTelemetry` перенесён в общий
       `omnesagent-kag::telemetry` (kag не зависит от memory — единый тип для обоих
       хранилищ; memory ре-экспортирует через `omnesagent_kag::telemetry`), flush раз в 10 с

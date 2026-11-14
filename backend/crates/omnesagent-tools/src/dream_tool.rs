@@ -240,6 +240,10 @@ impl Tool for DreamTool {
                     mrr: cur_mrr,
                     p95_ms: 25.0,
                     empty_count: 0,
+                    // Ф11.3 observational strict/any-hit metrics are not supplied
+                    // through the tool contract; only the gating recall@5/MRR apply.
+                    recall_all5: None,
+                    any_hit5: None,
                 };
 
                 // Read previous baseline metrics if present in dream_runs

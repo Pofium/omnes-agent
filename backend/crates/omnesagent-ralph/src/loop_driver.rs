@@ -3,7 +3,9 @@
 //! Conforms to §7.2, §7.3, §7.5, FR-A3 of specification.
 
 use crate::approval::{GateAction, GateManager};
-use crate::ast::{all_labels, changed_labels, diff_snapshots, snapshot_paths, SymbolChange};
+use crate::ast::{
+    all_labels, changed_labels, diff_snapshots, snapshot_paths, SymbolChange, SymbolSnapshot,
+};
 use crate::bridge::Ob2hBridge;
 use crate::debt::DebtLedger;
 use crate::events::RalphEvent;
@@ -17,7 +19,7 @@ use crate::knowledge::RalphKnowledgeService;
 use crate::openspec::OpenSpecWorkspace;
 use crate::plateau::{compute_failure_fingerprint, is_plateau};
 use crate::state::{FailureFingerprint, GateDecision, RalphPhase, RalphState};
-use crate::tasks::TaskList;
+use crate::tasks::{Task, TaskList};
 use crate::verdict::auto_verdict;
 use chrono::Utc;
 use omnesagent_config::ralph::{Ob2hBridgeConfig, RalphConfig};
@@ -142,6 +144,7 @@ fn iteration_finding(
     content: &str,
     verdict: &str,
     symbols: BTreeSet<String>,
+    git_head_sha: Option<String>,
 ) -> FindingRecord {
     FindingRecord {
         finding_id: format!("{slug}:{task}:i{n}"),
@@ -149,6 +152,7 @@ fn iteration_finding(
         content: content.to_string(),
         verdict: verdict.to_string(),
         symbols: symbols.into_iter().collect(),
+        git_head_sha,
         at: Utc::now(),
     }
 }
@@ -267,6 +271,8 @@ pub async fn drive_loop(
     // Debt harvested per committed iteration (Ф3.1). The final working-tree diff
     // is empty once every iteration is committed, so debt is accumulated here.
     let mut debt_ledger = DebtLedger::default();
+    // Ф8.3: report an unreachable ob2h once per run, not once per iteration.
+    let mut lessons_recall_logged = false;
 
     // Apply loop (§7.2)
     while state.phase == RalphPhase::Applying {
@@ -315,7 +321,7 @@ pub async fn drive_loop(
         }
 
         // Build knowledge context (§7.4)
-        let knowledge_ctx = knowledge
+        let mut knowledge_ctx = knowledge
             .build_context(
                 &next_task,
                 &slug,
@@ -324,6 +330,33 @@ pub async fn drive_loop(
                 config.context_max_tokens,
             )
             .await;
+
+        // Symbol snapshot before the executor mutates the working tree (Ф3.2).
+        let snapshot_before = snapshot_paths(&repo_root, &next_task.paths_scope);
+
+        // Петля опыта (Ф8.3, ADR-O8): recall procedural lessons for this task and
+        // inject the `<lessons>` block after the negative-experience section.
+        // Fail-open: an unreachable ob2h logs once per run and never blocks the
+        // iteration.
+        if bridge.enabled && bridge.push_lessons {
+            let query = lessons_query(&next_task, &snapshot_before);
+            let recaller = Ob2hBridge::from_config(bridge.clone());
+            match recaller.recall_lessons(&query, 0.2, 5).await {
+                Ok(Some(block)) => {
+                    knowledge_ctx.push_str("\n\n");
+                    knowledge_ctx.push_str(&block);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if !lessons_recall_logged {
+                        eprintln!(
+                            "ob2h bridge: lesson recall skipped, Ralph cycle continues: {err}"
+                        );
+                        lessons_recall_logged = true;
+                    }
+                }
+            }
+        }
 
         let task_ctx = TaskContext {
             task: &next_task,
@@ -335,9 +368,6 @@ pub async fn drive_loop(
 
         let git_before = git.rev_parse_head().ok();
         let start_time = Instant::now();
-
-        // Symbol snapshot before the executor mutates the working tree (Ф3.2).
-        let snapshot_before = snapshot_paths(&repo_root, &next_task.paths_scope);
 
         // Run executor with configured timeout (§5.2, FR-A14)
         let answer = match executor.run_task(&task_ctx).await {
@@ -534,6 +564,7 @@ pub async fn drive_loop(
                 &it.result.what_done,
                 &it.verdict,
                 all_labels(&changes),
+                it.git_after.clone(),
             );
             Journal::append_finding(&journal_path, &finding)?;
 
@@ -698,10 +729,64 @@ pub async fn drive_loop(
                     ),
                 }
             }
+
+            // Ф10.1 (ADR-O9): publish lessons derived from the archived findings.
+            if bridge.push_lessons {
+                let journal_path = OpenSpecWorkspace::new(&repo_root, &slug).journal_path();
+                match Journal::read_findings(&journal_path) {
+                    Ok(findings) => {
+                        match publisher.publish_lessons(&findings, &slug).await {
+                            Ok(report) => eprintln!(
+                                "ob2h bridge: published {} lesson(s) (skipped {}, failed {})",
+                                report.lessons_published,
+                                report.lessons_skipped,
+                                report.lessons_failed
+                            ),
+                            Err(err) => eprintln!(
+                                "ob2h bridge: lesson publication skipped, Ralph cycle continues: {err}"
+                            ),
+                        }
+                    }
+                    Err(err) => eprintln!(
+                        "ob2h bridge: lesson publication skipped, Ralph cycle continues: {err}"
+                    ),
+                }
+            }
+
+            // Ф10.1 (ADR-O9): ingest the run journal and save a session recap so
+            // the published facts carry provenance. Fail-open.
+            if bridge.recap_on_archive {
+                match publisher
+                    .recap_after_archive(&repo_root, &slug, &state.run_id)
+                    .await
+                {
+                    Ok(report) => eprintln!(
+                        "ob2h bridge: recap {} published ({} failed)",
+                        report.published, report.failed
+                    ),
+                    Err(err) => eprintln!(
+                        "ob2h bridge: recap skipped, Ralph cycle continues: {err}"
+                    ),
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Compose the `lesson_recall` query for `task` from its text and the AST symbol
+/// snapshot of its `paths_scope` (Ф8.3, ADR-O8).
+fn lessons_query(task: &Task, snapshot: &SymbolSnapshot) -> String {
+    let mut parts = vec![task.id.clone(), task.title.clone()];
+    if !task.done_when.is_empty() {
+        parts.push(task.done_when.clone());
+    }
+    let mut labels: Vec<&str> = snapshot.values().map(|sig| sig.label.as_str()).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    parts.extend(labels.into_iter().map(str::to_string));
+    parts.join(" ")
 }
 
 #[cfg(test)]
@@ -719,6 +804,7 @@ mod tests {
                 content: format!("observation {id}"),
                 verdict: "verified".to_string(),
                 symbols: symbols.iter().map(|s| s.to_string()).collect(),
+                git_head_sha: None,
                 at: Utc::now(),
             },
         )
@@ -767,5 +853,31 @@ mod tests {
         // A newly added symbol cannot invalidate a finding that references it.
         let findings = Journal::read_findings(&journal).unwrap();
         assert_eq!(findings[0].verdict, "verified");
+    }
+
+    #[test]
+    fn lessons_query_includes_task_text_and_snapshot_labels() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let snapshot = snapshot_paths(dir.path(), &["src".to_string()]);
+
+        let task = Task {
+            id: "T-001".to_string(),
+            title: "Refactor parser".to_string(),
+            depends: Vec::new(),
+            done_when: "parser tests pass".to_string(),
+            scenarios: Vec::new(),
+            paths_scope: vec!["src".to_string()],
+            test_command: None,
+        };
+
+        let query = lessons_query(&task, &snapshot);
+        assert!(
+            query.starts_with("T-001 Refactor parser parser tests pass"),
+            "got {query:?}"
+        );
+        assert!(query.contains("alpha"), "got {query:?}");
     }
 }

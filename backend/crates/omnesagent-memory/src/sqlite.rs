@@ -68,16 +68,30 @@ fn apply_access_batch(
     batch: &[(String, i64)],
     now: &str,
 ) -> anyhow::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    for (key, count) in batch {
-        tx.execute(
+    if batch.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let res: anyhow::Result<()> = (|| {
+        let mut stmt = conn.prepare_cached(
             "UPDATE memories SET access_count = COALESCE(access_count, 0) + ?1, \
              last_accessed_at = ?2, trust = MIN(1.0, trust + 0.02 * ?1) WHERE key = ?3",
-            params![count, now, key],
         )?;
+        for (key, count) in batch {
+            stmt.execute(params![count, now, key])?;
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
     }
-    tx.commit()?;
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -167,6 +181,7 @@ impl SqliteMemory {
             // `REFERENCES agents(id)` constraint would be unenforced
             // without this. Set it before any writes flow through.
             "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
              PRAGMA mmap_size    = 8388608;
@@ -178,6 +193,13 @@ impl SqliteMemory {
         Self::init_schema(&conn)?;
         omnesagent_kag::schema::migrate(&conn)?;
         Ok(conn)
+    }
+
+    /// Reclaim WAL pages and refresh SQLite planner statistics after maintenance.
+    pub fn wal_checkpoint_and_optimize(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")?;
+        Ok(())
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -407,6 +429,16 @@ impl SqliteMemory {
             conn,
             "meta",
             "ALTER TABLE memories ADD COLUMN meta TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "valid_until",
+            "ALTER TABLE memories ADD COLUMN valid_until TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "bq_mask",
+            "ALTER TABLE memories ADD COLUMN bq_mask BLOB;",
         )?;
         execute_batch_retry(
             conn,
@@ -1989,6 +2021,40 @@ impl Memory for SqliteMemory {
         Ok(())
     }
 
+    async fn access_counts(&self, keys: &[String]) -> anyhow::Result<Vec<i64>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.clone();
+        let keys = keys.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<i64>> {
+            let conn = conn.lock();
+            // Keys are passed as bound parameters, never interpolated, so a
+            // hostile key cannot break out of the `IN` list.
+            let placeholders = std::iter::repeat_n("?", keys.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT key, COALESCE(access_count, 0) FROM memories WHERE key IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut by_key: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::with_capacity(keys.len());
+            for row in rows {
+                let (key, count) = row?;
+                by_key.insert(key, count);
+            }
+            Ok(keys
+                .iter()
+                .map(|key| by_key.get(key).copied().unwrap_or(0))
+                .collect())
+        })
+        .await?
+    }
+
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
@@ -2743,6 +2809,38 @@ mod tests {
 
         assert_eq!(mem.flush_access_telemetry().await.unwrap(), 1);
         assert_eq!(read_access(&mem, "k").0, 1, "recall grew access_count");
+    }
+
+    #[tokio::test]
+    async fn access_counts_reads_persisted_telemetry_by_key() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("hot", "hot fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("cold", "cold fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Nothing recorded yet: every key reports zero, unknown keys included.
+        assert_eq!(
+            mem.access_counts(&["hot".into(), "cold".into(), "missing".into()])
+                .await
+                .unwrap(),
+            vec![0, 0, 0]
+        );
+
+        mem.touch_access(&["hot".to_string()]).await.unwrap();
+        mem.flush_access_telemetry().await.unwrap();
+
+        // Positional alignment follows the requested key order, with the
+        // unknown key in the middle still reporting zero.
+        assert_eq!(
+            mem.access_counts(&["cold".into(), "hot".into(), "missing".into()])
+                .await
+                .unwrap(),
+            vec![0, 1, 0]
+        );
+        assert!(mem.access_counts(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

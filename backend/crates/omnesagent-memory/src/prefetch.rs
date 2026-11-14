@@ -121,10 +121,56 @@ struct ScoredCandidate {
     vec: Option<Vec<f32>>,
 }
 
+/// The ob2h 5-factor blend for one recalled entry (OB2H Ф22): the hybrid score
+/// normalized against the batch maximum, importance, trust, recency, and the
+/// access-saturation factor. `access_count` is the telemetry value recorded by
+/// `Memory::access_counts` (Ф5.1); `0` means "no recorded access".
+fn five_factor_for(
+    entry: &MemoryEntry,
+    max_score: f64,
+    half_life_days: f64,
+    access_count: i64,
+) -> f64 {
+    let rel = (entry.score.unwrap_or(0.5) / max_score).clamp(0.0, 1.0);
+    let imp = entry.importance.unwrap_or(0.5).clamp(0.0, 1.0);
+    let trust = entry.trust.unwrap_or(0.5).clamp(0.0, 1.0);
+    let rec = recency_factor(entry, half_life_days);
+    let sat = saturation_access(access_count);
+    five_factor_score(rel, imp, trust, rec, sat)
+}
+
+/// Rescore recalled entries in place with the ob2h 5-factor blend, consuming
+/// the access telemetry recorded by `Memory::touch_access` (Ф5.1).
+/// `access_counts` is aligned with `entries`; a short or missing slice counts
+/// as zero accesses, so a backend without telemetry leaves the saturation
+/// factor at its floor. Entries are re-sorted by the new score, highest first.
+pub fn rescore_with_access(entries: &mut [MemoryEntry], access_counts: &[i64], half_life_days: f64) {
+    if entries.is_empty() {
+        return;
+    }
+    let max_score = entries
+        .iter()
+        .map(|e| e.score.unwrap_or(0.5))
+        .fold(0.0_f64, f64::max)
+        .max(1e-6);
+    for (idx, entry) in entries.iter_mut().enumerate() {
+        let count = access_counts.get(idx).copied().unwrap_or(0);
+        entry.score = Some(five_factor_for(entry, max_score, half_life_days, count));
+    }
+    entries.sort_by(|a, b| {
+        b.score
+            .unwrap_or(0.0)
+            .partial_cmp(&a.score.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 /// Assemble formatted memory context within budget, returning (context_str, included_keys).
+/// `access_counts` is aligned with `entries` (see [`rescore_with_access`]).
 pub fn build_memory_context(
     entries: Vec<MemoryEntry>,
     vecs: Vec<Option<Vec<f32>>>,
+    access_counts: &[i64],
     opts: &ContextOptions,
 ) -> (String, Vec<String>) {
     if entries.is_empty() {
@@ -140,14 +186,10 @@ pub fn build_memory_context(
     let mut candidates: Vec<ScoredCandidate> = entries
         .into_iter()
         .zip(vecs)
-        .map(|(entry, vec)| {
-            let rel = (entry.score.unwrap_or(0.5) / max_score).clamp(0.0, 1.0);
-            let imp = entry.importance.unwrap_or(0.5).clamp(0.0, 1.0);
-            let trust = entry.trust.unwrap_or(0.5).clamp(0.0, 1.0);
-            let rec = recency_factor(&entry, opts.half_life_days);
-            // Saturation access: default 0 if not tracked
-            let sat = saturation_access(0);
-            let score = five_factor_score(rel, imp, trust, rec, sat);
+        .enumerate()
+        .map(|(idx, (entry, vec))| {
+            let count = access_counts.get(idx).copied().unwrap_or(0);
+            let score = five_factor_for(&entry, max_score, opts.half_life_days, count);
             ScoredCandidate { entry, score, vec }
         })
         .collect();
@@ -291,10 +333,53 @@ mod tests {
             ..Default::default()
         };
 
-        let (ctx, keys) = build_memory_context(vec![entry1, entry2], vec![None, None], &opts);
+        let (ctx, keys) = build_memory_context(vec![entry1, entry2], vec![None, None], &[0, 0], &opts);
         assert!(ctx.contains("[Memory context]"));
         assert!(ctx.contains("rule-1"));
         assert!(ctx.contains("rule-2"));
         assert_eq!(keys, vec!["rule-1", "rule-2"]);
+    }
+
+    /// Ф5.1: access telemetry must feed the recall ranking — a frequently
+    /// recalled entry has to outrank a comparable but never-accessed one.
+    #[test]
+    fn test_rescore_with_access_promotes_frequently_used() {
+        let make = |id: &str, key: &str, score: f64| MemoryEntry {
+            id: id.into(),
+            key: key.into(),
+            content: format!("{key} body"),
+            category: MemoryCategory::Core,
+            timestamp: Utc::now().to_rfc3339(),
+            session_id: None,
+            score: Some(score),
+            namespace: "default".into(),
+            importance: Some(0.5),
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+            trust: Some(0.5),
+            last_feedback_at: None,
+        };
+
+        // Identical on every factor except access; `cold` starts with a slightly
+        // higher hybrid score to prove the access term can flip the order.
+        let mut entries = vec![make("1", "cold", 0.90), make("2", "hot", 0.80)];
+        rescore_with_access(&mut entries, &[0, 50], DEFAULT_PREFETCH_HALF_LIFE_DAYS);
+
+        assert_eq!(entries[0].key, "hot", "frequently accessed entry should rank first");
+        assert!(entries[0].score.unwrap() > entries[1].score.unwrap());
+
+        // A backend without telemetry (all-zero counts) must not manufacture a
+        // promotion: the originally higher hybrid score stays on top.
+        let mut entries = vec![make("1", "cold", 0.90), make("2", "hot", 0.80)];
+        rescore_with_access(&mut entries, &[], DEFAULT_PREFETCH_HALF_LIFE_DAYS);
+        assert_eq!(entries[0].key, "cold");
+
+        let mut empty: Vec<MemoryEntry> = Vec::new();
+        rescore_with_access(&mut empty, &[], DEFAULT_PREFETCH_HALF_LIFE_DAYS);
+        assert!(empty.is_empty());
     }
 }

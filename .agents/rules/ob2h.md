@@ -36,3 +36,31 @@ All AI coding assistants and subagents MUST always use the `ob2h` MCP server too
      `filter_tools_for_intent`).
    - Vault values must never be persisted into memory, RAG chunks, the knowledge
      graph, or tool logs.
+
+5. **Lessons vs facts (ADR-O7/O8)**:
+   - `lesson_save` stores *procedural* experience ("what to do / what to avoid /
+     when it applies"); `memory_save` stores facts and decisions. Do not mix them.
+   - Call `lesson_recall` before a non-trivial decision (query = task text +
+     affected symbols); the Ralph loop does this automatically before each
+     iteration.
+   - Re-saving the same lesson text **reinforces** it (ob2h fingerprint dedup) —
+     never spawn paraphrases. Lessons live only in ob2h; `omnesagent-memory` must
+     not grow a parallel lessons table.
+   - Never write secrets or `#[credential_class]` content into lessons. Do not
+     auto-delete dream decay candidates (ADR-11 ob2h).
+
+6. **Slots are the cross-session project buffer (ADR-O7)**:
+   - `slot_list`/`slot_get` are read-class; `slot_create`/`slot_append`/
+     `slot_replace`/`slot_delete` are write-class (EngineeringTask/SystemAdmin).
+   - On `413` from `slot_append`, compact via `slot_replace` (read → shrink →
+     replace). Never copy slot contents into fork memory, or vice versa
+     (split-brain). Never write secrets into slots.
+
+7. **Provenance, governance, viewer (ADR-O9/O10)**:
+   - Verify a critical fact with `memory_verify` before relying on it; report
+     citations to the owner; `provenance: none` is an honest result, not an error.
+   - Call `memory_forget` **only with `reason`**; use `memory_audit` for read-only
+     operation reports. `memory_timeline` answers "what happened around X".
+   - `viewer_open` is **privileged** (spawns a GUI process): EngineeringTask/
+     SystemAdmin only, never CodeExploration. PINs are never requested in chat or
+     passed as MCP arguments; secret values are never echoed back into chat.

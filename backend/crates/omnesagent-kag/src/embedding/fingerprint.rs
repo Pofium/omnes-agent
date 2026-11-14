@@ -16,30 +16,84 @@ use super::EmbeddingProvider;
 /// Ключ в таблице `kv`, где хранится отпечаток активного векторного пространства.
 pub const KV_KEY: &str = "embedding_fingerprint";
 
-/// Отпечаток векторного пространства: идентификатор модели + размерность.
+fn default_backend() -> String {
+    "candle".to_string()
+}
+
+fn default_quant() -> String {
+    "fp32".to_string()
+}
+
+fn default_prefix_version() -> String {
+    "v1".to_string()
+}
+
+/// Отпечаток векторного пространства: идентификатор модели + бэкенд + квантование + размерность + версия префиксов.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingFingerprint {
     pub model_id: String,
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default = "default_quant")]
+    pub quant: String,
     pub dim: usize,
+    #[serde(default = "default_prefix_version")]
+    pub prefix_version: String,
 }
 
 impl EmbeddingFingerprint {
     pub fn new(model_id: impl Into<String>, dim: usize) -> Self {
         Self {
             model_id: model_id.into(),
+            backend: default_backend(),
+            quant: default_quant(),
             dim,
+            prefix_version: default_prefix_version(),
         }
+    }
+
+    pub fn full(
+        model_id: impl Into<String>,
+        backend: impl Into<String>,
+        quant: impl Into<String>,
+        dim: usize,
+        prefix_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            model_id: model_id.into(),
+            backend: backend.into(),
+            quant: quant.into(),
+            dim,
+            prefix_version: prefix_version.into(),
+        }
+    }
+
+    /// Легаси-конструктор (2 поля).
+    pub fn legacy(model_id: impl Into<String>, dim: usize) -> Self {
+        Self::new(model_id, dim)
     }
 
     /// Отпечаток активного провайдера.
     pub fn of(provider: &dyn EmbeddingProvider) -> Self {
-        Self::new(provider.model_id(), provider.dim())
+        Self::full(
+            provider.model_id(),
+            provider.backend(),
+            provider.quant(),
+            provider.dim(),
+            provider.prefix_version(),
+        )
     }
 
     /// Стабильный короткий ключ (sha256 hex[..16]) — для логов/диагностики.
     pub fn key(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}|{}", self.model_id, self.dim).as_bytes());
+        hasher.update(
+            format!(
+                "{}:{}:{}:{}:{}",
+                self.model_id, self.backend, self.quant, self.dim, self.prefix_version
+            )
+            .as_bytes(),
+        );
         hex::encode(hasher.finalize())[..16].to_string()
     }
 }

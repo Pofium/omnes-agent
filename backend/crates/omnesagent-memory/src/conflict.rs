@@ -3,6 +3,39 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use std::collections::HashSet;
 
+/// Трехуровневая таксономия конфликтов памяти (ob2h v2.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ConflictKind {
+    /// 1. Временное замещение (Temporal Supersession): факт устарел по времени / обновлению.
+    TemporalSupersession,
+    /// 2. Пользовательское исправление (User Correction): пользователь явно скорректировал факт.
+    UserCorrection,
+    /// 3. Контекстное сосуществование (Contextual Coexistence): факты не противоречат, а дополняют друг друга.
+    ContextualCoexistence,
+}
+
+/// Классифицирует отношение между существующей и новой записью памяти.
+pub fn classify_conflict(
+    old: &MemoryEntry,
+    new_content: &str,
+    is_user_correction: bool,
+) -> ConflictKind {
+    if is_user_correction {
+        return ConflictKind::UserCorrection;
+    }
+
+    let old_words: HashSet<&str> = old.content.split_whitespace().collect();
+    let new_words: HashSet<&str> = new_content.split_whitespace().collect();
+
+    // Проверка Entity/Subject Overlap: если нет общих значимых токенов, это разные контексты
+    let common = old_words.intersection(&new_words).count();
+    if common < 2 {
+        return ConflictKind::ContextualCoexistence;
+    }
+
+    ConflictKind::TemporalSupersession
+}
+
 /// Контекст входящей записи для разрешения конфликтов (семантика ob2h v2.0
 /// «Contextual Coexistence»): подавлять можно только кандидатов в том же
 /// пространстве имён и тенанте. Иная область — факты сосуществуют, а не конкурируют.
@@ -70,7 +103,8 @@ pub async fn check_and_resolve_conflicts(
     Ok(superseded)
 }
 
-/// Mark entries as superseded in SQLite by setting their `superseded_by` column.
+/// Mark entries as superseded in SQLite by setting their `superseded_by` column,
+/// with cycle prevention (A -> B -> A).
 pub fn mark_superseded(
     conn: &rusqlite::Connection,
     superseded_ids: &[String],
@@ -80,7 +114,36 @@ pub fn mark_superseded(
         return Ok(());
     }
 
+    // Cycle prevention: verify that `new_id` does not point to any of `superseded_ids`
+    let mut current_target: Option<String> = Some(new_id.to_string());
+    let mut visited: HashSet<String> = HashSet::new();
+
+    while let Some(target) = current_target {
+        if visited.contains(&target) {
+            break;
+        }
+        visited.insert(target.clone());
+        let next: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM memories WHERE id = ?1",
+                rusqlite::params![target],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        current_target = next;
+    }
+
     for id in superseded_ids {
+        if id == new_id || visited.contains(id) {
+            eprintln!(
+                "Обнаружен или предотвращен цикл SUPERSEDES между {} и {}",
+                id,
+                new_id
+            );
+            continue;
+        }
+
         conn.execute(
             "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
             rusqlite::params![new_id, id],

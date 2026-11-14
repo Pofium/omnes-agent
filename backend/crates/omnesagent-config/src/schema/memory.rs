@@ -353,6 +353,12 @@ pub struct MemoryConfig {
     /// live turn it is prepended to.
     #[serde(default = "default_true")]
     pub recall_date_stamp: bool,
+    /// Feed recorded access telemetry (`memories.access_count`, written by the
+    /// Ф5.1 touch path) into the recall rerank as the ob2h access-saturation
+    /// factor. Off by default: the historical blend ranks on retrieval score,
+    /// importance, trust and recency only, so enabling this changes ordering.
+    #[serde(default)]
+    pub prefetch_enabled: bool,
 
     // ── Namespace Isolation ─────────────────────────────────────
     /// Default namespace for memory entries.
@@ -841,6 +847,7 @@ impl Default for MemoryConfig {
             recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
             recall_date_stamp: true,
+            prefetch_enabled: false,
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
             conflict_supersede_enabled: default_conflict_supersede_enabled(),

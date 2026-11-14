@@ -7080,6 +7080,7 @@ version = "0.8.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "candle-core",
  "candle-nn",
  "candle-transformers",

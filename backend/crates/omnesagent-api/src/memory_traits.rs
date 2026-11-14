@@ -428,6 +428,16 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Read the recorded access counts for `keys`, aligned by position.
+    ///
+    /// A key with no recorded access (or an unknown key) reports `0`.
+    /// Default implementation returns all zeros so access-aware recall scoring
+    /// (the ob2h 5-factor "saturation" term wired in Ф5.1) stays a no-op until
+    /// a backend with access telemetry opts in.
+    async fn access_counts(&self, keys: &[String]) -> anyhow::Result<Vec<i64>> {
+        Ok(vec![0; keys.len()])
+    }
+
     /// Store a procedural "how to" trace from a tool-calling turn.
     ///
     /// Default: no-op. Backends that support procedural storage can override.

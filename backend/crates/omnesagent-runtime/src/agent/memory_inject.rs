@@ -74,6 +74,11 @@ pub struct MemoryInjectConfig {
     pub rerank: rerank::RerankConfig,
     /// Prefix each entry with its storage date (`[from YYYY-MM-DD]`).
     pub date_stamp: bool,
+    /// Gate for the Ф5.1 access-aware re-rank: read the recorded access
+    /// telemetry and apply the ob2h five-factor blend as a final scoring
+    /// pass. Off (the default) keeps the renderer telemetry-agnostic, so
+    /// ordering is byte-identical to the pre-prefetch pipeline.
+    pub prefetch_enabled: bool,
 }
 
 impl Default for MemoryInjectConfig {
@@ -88,6 +93,7 @@ impl Default for MemoryInjectConfig {
             candidate_multiplier: 1,
             rerank: rerank::RerankConfig::disabled(DEFAULT_RECALL_LIMIT, 0.0),
             date_stamp: true,
+            prefetch_enabled: false,
         }
     }
 }
@@ -113,6 +119,7 @@ impl MemoryInjectConfig {
             candidate_multiplier: memory.candidate_multiplier.max(1),
             rerank: build_rerank_config(memory, limit),
             date_stamp: memory.recall_date_stamp,
+            prefetch_enabled: memory.prefetch_enabled,
             ..Default::default()
         }
     }
@@ -387,6 +394,21 @@ pub async fn render_memory_context(
         }
     }
 
+    // Ф5.1 access-aware re-rank: consume the access telemetry the touch path
+    // records, so frequently recalled memories climb. Runs as a final scoring
+    // pass so its ordering is what renders; a telemetry read failure leaves the
+    // entries untouched (a memory failure must not fail the turn).
+    if cfg.prefetch_enabled && !entries.is_empty() {
+        let keys: Vec<String> = entries.iter().map(|e| e.key.clone()).collect();
+        if let Ok(counts) = mem.access_counts(&keys).await {
+            omnesagent_memory::prefetch::rescore_with_access(
+                &mut entries,
+                &counts,
+                omnesagent_memory::prefetch::DEFAULT_PREFETCH_HALF_LIFE_DAYS,
+            );
+        }
+    }
+
     let mut context = String::new();
     let mut included = 0usize;
     let mut used_chars = 0usize;
@@ -515,6 +537,9 @@ mod tests {
         fail: bool,
         recalls: std::sync::atomic::AtomicUsize,
         recorded_limits: Mutex<Vec<usize>>,
+        /// Recorded access telemetry (`key -> access_count`) served to the
+        /// Ф5.1 access-aware re-rank; empty means "no telemetry recorded".
+        access: HashMap<String, i64>,
     }
 
     impl FixtureMemory {
@@ -530,6 +555,7 @@ mod tests {
                 fail: false,
                 recalls: std::sync::atomic::AtomicUsize::new(0),
                 recorded_limits: Mutex::new(Vec::new()),
+                access: HashMap::new(),
             }
         }
 
@@ -539,7 +565,14 @@ mod tests {
                 fail: true,
                 recalls: std::sync::atomic::AtomicUsize::new(0),
                 recorded_limits: Mutex::new(Vec::new()),
+                access: HashMap::new(),
             }
+        }
+
+        /// Record `count` accesses for `key` (Ф5.1 telemetry fixture).
+        fn with_access(mut self, key: &str, count: i64) -> Self {
+            self.access.insert(key.to_string(), count);
+            self
         }
     }
 
@@ -631,6 +664,13 @@ mod tests {
             until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             self.recall(query, limit, session_id, since, until).await
+        }
+
+        async fn access_counts(&self, keys: &[String]) -> anyhow::Result<Vec<i64>> {
+            Ok(keys
+                .iter()
+                .map(|k| self.access.get(k).copied().unwrap_or(0))
+                .collect())
         }
     }
 
@@ -2027,5 +2067,59 @@ mod tests {
             .find("supporting_match: ")
             .expect("the weaker relevant entry survives the configured floor");
         assert!(best < supporting, "BM25 relevance order survives blending");
+    }
+
+    /// Ф5.1: with `prefetch_enabled` the renderer must consume the recorded
+    /// access telemetry and lift a frequently recalled memory above a slightly
+    /// higher-scoring but never-accessed one; with the flag off the historical
+    /// score order is preserved untouched.
+    #[tokio::test]
+    async fn prefetch_flag_promotes_frequently_accessed_entry() {
+        let pool = vec![
+            entry("cold_fact", "rarely needed fact", MemoryCategory::Core, Some(0.90)),
+            entry("hot_fact", "often needed fact", MemoryCategory::Core, Some(0.80)),
+        ];
+        let turn = || TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "t",
+            channel_name: "test",
+        };
+
+        // Flag off: telemetry exists but is not consulted, so the higher
+        // hybrid score keeps its lead (byte-identical legacy ordering).
+        let mem = FixtureMemory::with(pool.clone()).with_access("hot_fact", 50);
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            turn(),
+        )
+        .await;
+        let cold = context.find("cold_fact: ").expect("cold fact renders");
+        let hot = context.find("hot_fact: ").expect("hot fact renders");
+        assert!(cold < hot, "flag off keeps score order, got: {context}");
+
+        // Flag on: the access-saturation factor promotes the hot entry.
+        let mem = FixtureMemory::with(pool).with_access("hot_fact", 50);
+        let context = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &MemoryInjectConfig {
+                prefetch_enabled: true,
+                ..Default::default()
+            },
+            false,
+            turn(),
+        )
+        .await;
+        let cold = context.find("cold_fact: ").expect("cold fact renders");
+        let hot = context.find("hot_fact: ").expect("hot fact renders");
+        assert!(hot < cold, "flag on promotes the frequently accessed entry, got: {context}");
     }
 }

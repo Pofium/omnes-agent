@@ -51,6 +51,10 @@ impl EmbeddingProvider for FakeEmbedding {
     fn model_id(&self) -> &str {
         "fake"
     }
+
+    fn backend(&self) -> &str {
+        "fake"
+    }
 }
 
 #[cfg(test)]

@@ -9,8 +9,8 @@ pub mod repomap;
 pub mod service;
 
 pub use analytics::{
-    AffectedNode, CircularDependency, ComponentMetrics, GodNodeInfo, GraphAnalytics, ImpactReport,
-    ProjectReport, RiskLevel,
+    AffectedNode, AffectedTest, CircularDependency, ComponentMetrics, GodNodeInfo, GraphAnalytics,
+    ImpactReport, ProjectReport, RiskLevel,
 };
 pub use blast::{latest_hint, warn_block, BlastHint};
 pub use callpath::{

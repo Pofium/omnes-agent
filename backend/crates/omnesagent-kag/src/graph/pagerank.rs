@@ -119,25 +119,87 @@ pub struct NodeUsage {
     pub since_last_access_secs: Option<f64>,
     /// Доверие `0..=1` (память — `trust`; граф — `confidence`).
     pub trust: f64,
+    /// Является ли узел кодовым символом (для кода λ = 0, т.е. recency decay отключен).
+    pub is_code: bool,
+    /// Входящая степень узла (in-degree) для штрафа структурных хабов.
+    pub in_degree: usize,
+}
+
+impl Default for NodeUsage {
+    fn default() -> Self {
+        Self {
+            access_count: 0,
+            since_last_access_secs: None,
+            trust: 1.0,
+            is_code: false,
+            in_degree: 0,
+        }
+    }
+}
+
+impl NodeUsage {
+    pub fn new(access_count: i64, since_last_access_secs: Option<f64>, trust: f64) -> Self {
+        Self {
+            access_count,
+            since_last_access_secs,
+            trust,
+            is_code: false,
+            in_degree: 0,
+        }
+    }
+
+    pub fn with_code(mut self, is_code: bool) -> Self {
+        self.is_code = is_code;
+        self
+    }
+
+    pub fn with_in_degree(mut self, in_degree: usize) -> Self {
+        self.in_degree = in_degree;
+        self
+    }
+
+    pub fn muted(mut self) -> Self {
+        self.trust = mute_node_trust(self.trust);
+        self
+    }
+}
+
+/// Разовый штраф узла при негативной обратной связи от агента (`trust *= 0.3`).
+pub fn mute_node_trust(current_trust: f64) -> f64 {
+    (current_trust * 0.3).clamp(0.01, 1.0)
 }
 
 /// Множитель Usage-Weighted PPR (столп III ob2h v2.0):
-/// `min(1 + ln(1 + access_count), CAP) · e^{-λ·Δt} · (0.1 + 0.9·trust)`, где
-/// `λ = ln 2 / PPR_RECENCY_HALF_LIFE_SECS` (CATD-lite — экспоненциальный recency-decay).
+/// `min(1 + ln(1 + access_count), CAP) · e^{-λ·Δt} · in_deg_penalty · (0.1 + 0.9·trust)`, где
+/// `λ = ln 2 / PPR_RECENCY_HALF_LIFE_SECS` для памяти, но `λ = 0` для кода (`is_code = true`).
 ///
+/// In-Degree Penalty структурных хабов: `1.0 / ln(1 + in_degree)`.
 /// Grace-period: пока `access_count < `[`PPR_GRACE_ACCESSES`], узел считается
 /// нейтральным (`1.0`) — свежие и редко читаемые записи не искажают ранжирование.
 pub fn usage_weight(u: NodeUsage) -> f64 {
     if u.access_count < PPR_GRACE_ACCESSES {
-        return 1.0;
+        let trust = u.trust.clamp(0.0, 1.0);
+        return 0.1 + 0.9 * trust;
     }
     let accesses = u.access_count.max(0) as f64;
-    let access_factor = (1.0 + (1.0 + accesses).ln()).min(PPR_ACCESS_CAP);
-    let recency_factor = match u.since_last_access_secs {
-        Some(dt) if dt.is_finite() && dt > 0.0 => {
-            (-std::f64::consts::LN_2 * dt / PPR_RECENCY_HALF_LIFE_SECS).exp()
+    let mut access_factor = (1.0 + (1.0 + accesses).ln()).min(PPR_ACCESS_CAP);
+
+    // In-Degree Penalty: предотвращает залипание на структурных хабах
+    if u.in_degree > 1 {
+        let penalty = 1.0 / (1.0 + u.in_degree as f64).ln();
+        access_factor *= penalty.clamp(0.2, 1.0);
+    }
+
+    // Recency decay: λ_code = 0 (код стабилен), λ_memory > 0
+    let recency_factor = if u.is_code {
+        1.0
+    } else {
+        match u.since_last_access_secs {
+            Some(dt) if dt.is_finite() && dt > 0.0 => {
+                (-std::f64::consts::LN_2 * dt / PPR_RECENCY_HALF_LIFE_SECS).exp()
+            }
+            _ => 1.0,
         }
-        _ => 1.0,
     };
     let trust = u.trust.clamp(0.0, 1.0);
     access_factor * recency_factor * (0.1 + 0.9 * trust)
@@ -463,11 +525,7 @@ mod tests {
     }
 
     fn usage(access_count: i64, since: Option<f64>, trust: f64) -> NodeUsage {
-        NodeUsage {
-            access_count,
-            since_last_access_secs: since,
-            trust,
-        }
+        NodeUsage::new(access_count, since, trust)
     }
 
     #[test]
@@ -550,5 +608,23 @@ mod tests {
             score(&weighted, 2) > score(&weighted, 1),
             "hot-узел B обязан обойти cold-узел A: {weighted:?}"
         );
+    }
+
+    #[test]
+    fn code_symbols_do_not_decay_and_in_degree_penalizes_hubs() {
+        // Memory node with decay
+        let mem = NodeUsage::new(10, Some(PPR_RECENCY_HALF_LIFE_SECS), 1.0);
+        // Code node with same age: λ = 0
+        let code = NodeUsage::new(10, Some(PPR_RECENCY_HALF_LIFE_SECS), 1.0).with_code(true);
+        assert!(usage_weight(code) > usage_weight(mem), "code does not suffer recency decay");
+
+        // Hub in-degree penalty
+        let normal = NodeUsage::new(10, None, 1.0).with_in_degree(1);
+        let hub = NodeUsage::new(10, None, 1.0).with_in_degree(50);
+        assert!(usage_weight(normal) > usage_weight(hub), "hubs are penalized");
+
+        // Muted node
+        let muted = NodeUsage::new(10, None, 1.0).muted();
+        assert!(usage_weight(muted) < 0.5 * usage_weight(normal), "muted node is severely suppressed");
     }
 }

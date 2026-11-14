@@ -87,6 +87,7 @@ impl LanguageExtractor {
                                 file_path: rel_path.to_string(),
                                 line_start: cell_index,
                                 line_end: cell_index,
+                                ..Default::default()
                             });
 
                             out.edges.push(AstEdge {
@@ -149,6 +150,7 @@ impl LanguageExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -193,6 +195,7 @@ impl LanguageExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -220,6 +223,7 @@ impl LanguageExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -251,6 +255,7 @@ impl LanguageExtractor {
                     file_path: rel_path.to_string(),
                     line_start: idx + 1,
                     line_end: idx + 1,
+                    ..Default::default()
                 });
 
                 out.edges.push(AstEdge {
@@ -277,6 +282,7 @@ impl LanguageExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -304,6 +310,7 @@ impl LanguageExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -370,6 +377,7 @@ impl LanguageExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
@@ -397,6 +405,7 @@ impl LanguageExtractor {
                         file_path: rel_path.to_string(),
                         line_start: idx + 1,
                         line_end: idx + 1,
+                        ..Default::default()
                     });
 
                     out.edges.push(AstEdge {
