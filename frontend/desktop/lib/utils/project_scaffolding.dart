@@ -304,7 +304,7 @@ class ProjectScaffoldOptions {
     this.runOb2hScan = true,
     this.initCodeGraph = true,
     this.customInstructions,
-    this.colorHex = '#00D2FF',
+    this.colorHex = '#FF6B00',
     this.iconName = 'code',
   });
 }

@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../../../design_system/shadcn_colors.dart';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:get_storage/get_storage.dart';
@@ -145,7 +146,7 @@ class _MicCalibrationCardState extends State<MicCalibrationCard> {
         children: [
           Row(
             children: [
-              const Icon(Icons.mic, color: Color(0xFF00D2FF), size: 18),
+              const Icon(Icons.mic, color: ShadcnColors.primary, size: 18),
               const SizedBox(width: 8),
               Text(
                 DesktopI18n.tr('Микрофон', 'Microphone'),

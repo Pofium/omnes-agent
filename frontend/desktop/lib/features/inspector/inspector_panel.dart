@@ -599,7 +599,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                 color: const Color(0xFF0F131A),
                 borderRadius: BorderRadius.circular(6),
               ),
-              child: Icon(icon, size: 15, color: const Color(0xFF00D2FF)),
+              child: Icon(icon, size: 15, color: DesktopTheme.accentBrand),
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -1007,7 +1007,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(FontAwesomeIcons.globe, size: 36, color: Color(0xFF00D2FF)),
+            const Icon(FontAwesomeIcons.globe, size: 36, color: DesktopTheme.accentBrand),
             const SizedBox(height: 16),
             Text(
               'Microsoft Edge WebView2',
@@ -1027,7 +1027,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
               icon: const Icon(Icons.play_arrow, size: 16),
               label: const Text('Запустить WebView2'),
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF00D2FF),
+                backgroundColor: DesktopTheme.accentBrand,
                 foregroundColor: const Color(0xFF090D12),
               ),
             ),
@@ -1268,7 +1268,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
                   width: 8,
                   height: 8,
                   decoration: BoxDecoration(
-                    color: isWsConnected ? const Color(0xFF10B981) : const Color(0xFF00D2FF),
+                    color: isWsConnected ? const Color(0xFF10B981) : DesktopTheme.accentBrand,
                     shape: BoxShape.circle,
                   ),
                 ),
@@ -1523,7 +1523,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
           ),
           child: Row(
             children: [
-              const Icon(Icons.code, size: 14, color: Color(0xFF00D2FF)),
+              const Icon(Icons.code, size: 14, color: DesktopTheme.accentBrand),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
@@ -1723,7 +1723,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
           children: [
             SelectableText(
               line.substring(2),
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF00D2FF), letterSpacing: 0.3),
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: DesktopTheme.accentBrand, letterSpacing: 0.3),
             ),
             const SizedBox(height: 4),
             const Divider(color: Color(0xFF334155), height: 1),
@@ -1788,7 +1788,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
           children: [
             const Padding(
               padding: EdgeInsets.only(top: 6, right: 8),
-              child: Icon(Icons.circle, size: 5, color: Color(0xFF00D2FF)),
+              child: Icon(Icons.circle, size: 5, color: DesktopTheme.accentBrand),
             ),
             Expanded(
               child: SelectableText(
@@ -1804,7 +1804,7 @@ class _DesktopInspectorPanelState extends State<DesktopInspectorPanel>
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
-          border: const Border(left: BorderSide(color: Color(0xFF00D2FF), width: 3)),
+          border: const Border(left: BorderSide(color: DesktopTheme.accentBrand, width: 3)),
           color: DesktopTheme.bgSurfaceElevated,
         ),
         child: SelectableText(

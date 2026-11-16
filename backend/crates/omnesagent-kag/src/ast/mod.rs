@@ -625,6 +625,8 @@ impl AstCodeExtractor {
                         | "ipynb"
                         | "sol"
                         | "zig"
+                        | "s"
+                        | "asm"
                         | "yaml"
                         | "yml"
                 );
@@ -824,6 +826,7 @@ impl AstCodeExtractor {
             }
             "sol" => self.languages.parse_solidity(rel_path, file_node_id, content, out),
             "zig" => self.languages.parse_zig(rel_path, file_node_id, content, out),
+            "s" | "asm" => self.languages.parse_asm(rel_path, file_node_id, content, out),
             _ => {}
         }
     }

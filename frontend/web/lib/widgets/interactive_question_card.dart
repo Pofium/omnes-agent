@@ -128,12 +128,12 @@ class _InteractiveQuestionCardState extends State<InteractiveQuestionCard> {
         border: Border.all(
           color: answered
               ? const Color(0xFF10B981).withOpacity(0.5)
-              : const Color(0xFF00D2FF).withOpacity(0.6),
+              : DesktopTheme.accentBrand.withOpacity(0.6),
           width: 1.0,
         ),
         boxShadow: [
           BoxShadow(
-            color: (answered ? const Color(0xFF10B981) : const Color(0xFF00D2FF))
+            color: (answered ? const Color(0xFF10B981) : DesktopTheme.accentBrand)
                 .withOpacity(DesktopTheme.isDark ? 0.08 : 0.04),
             blurRadius: 14,
             offset: const Offset(0, 4),
@@ -157,7 +157,7 @@ class _InteractiveQuestionCardState extends State<InteractiveQuestionCard> {
                 Icon(
                   answered ? Icons.check_circle : Icons.help_outline,
                   size: 15,
-                  color: answered ? const Color(0xFF10B981) : const Color(0xFF00D2FF),
+                  color: answered ? const Color(0xFF10B981) : DesktopTheme.accentBrand,
                 ),
                 const SizedBox(width: 8),
                 Text(
@@ -224,12 +224,12 @@ class _InteractiveQuestionCardState extends State<InteractiveQuestionCard> {
                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                         decoration: BoxDecoration(
                           color: isSelected
-                              ? const Color(0xFF00D2FF).withOpacity(0.12)
+                              ? DesktopTheme.accentBrand.withOpacity(0.12)
                               : (answered ? DesktopTheme.bgSurface : DesktopTheme.bgSurfaceElevated),
                           borderRadius: BorderRadius.circular(6),
                           border: Border.all(
                             color: isSelected
-                                ? (answered ? const Color(0xFF10B981) : const Color(0xFF00D2FF))
+                                ? (answered ? const Color(0xFF10B981) : DesktopTheme.accentBrand)
                                 : DesktopTheme.borderSubtle,
                             width: isSelected ? 1.2 : 0.8,
                           ),
@@ -242,12 +242,12 @@ class _InteractiveQuestionCardState extends State<InteractiveQuestionCard> {
                               alignment: Alignment.center,
                               decoration: BoxDecoration(
                                 color: isSelected
-                                    ? (answered ? const Color(0xFF10B981) : const Color(0xFF00D2FF))
+                                    ? (answered ? const Color(0xFF10B981) : DesktopTheme.accentBrand)
                                     : Colors.transparent,
                                 shape: BoxShape.circle,
                                 border: Border.all(
                                   color: isSelected
-                                      ? (answered ? const Color(0xFF10B981) : const Color(0xFF00D2FF))
+                                      ? (answered ? const Color(0xFF10B981) : DesktopTheme.accentBrand)
                                       : DesktopTheme.textMuted,
                                   width: 1.2,
                                 ),
@@ -272,7 +272,7 @@ class _InteractiveQuestionCardState extends State<InteractiveQuestionCard> {
                                   fontSize: 12,
                                   fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
                                   color: isSelected
-                                      ? (answered ? const Color(0xFF10B981) : const Color(0xFF00D2FF))
+                                      ? (answered ? const Color(0xFF10B981) : DesktopTheme.accentBrand)
                                       : (answered ? DesktopTheme.textMuted : DesktopTheme.textSecondary),
                                 ),
                               ),
@@ -325,14 +325,14 @@ class _InteractiveQuestionCardState extends State<InteractiveQuestionCard> {
                   ElevatedButton(
                     onPressed: () => _submitAnswer(_customInputController.text),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF00D2FF).withOpacity(0.18),
-                      foregroundColor: const Color(0xFF00D2FF),
+                      backgroundColor: DesktopTheme.accentBrand.withOpacity(0.18),
+                      foregroundColor: DesktopTheme.accentBrand,
                       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(6),
-                        side: const BorderSide(color: Color(0xFF00D2FF), width: 0.8),
+                        side: const BorderSide(color: DesktopTheme.accentBrand, width: 0.8),
                       ),
                     ),
                     child: const Text('Ответить', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),

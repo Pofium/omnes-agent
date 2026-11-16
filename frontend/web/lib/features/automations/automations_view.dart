@@ -119,7 +119,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                     Icon(
                       isIdleTime ? FontAwesomeIcons.moon : FontAwesomeIcons.clock,
                       size: 16,
-                      color: const Color(0xFF00D2FF),
+                      color: DesktopTheme.accentBrand,
                     ),
                     const SizedBox(width: 10),
                     Text(
@@ -151,7 +151,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                     fillColor: const Color(0xFF131519),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF2B313D))),
-                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF00D2FF))),
+                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: DesktopTheme.accentBrand)),
                   ),
                 ),
                 const SizedBox(height: 14),
@@ -169,7 +169,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                     fillColor: const Color(0xFF131519),
                     contentPadding: const EdgeInsets.all(12),
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF2B313D))),
-                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF00D2FF))),
+                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: DesktopTheme.accentBrand)),
                   ),
                 ),
                 const SizedBox(height: 14),
@@ -178,7 +178,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                 const SizedBox(height: 6),
                 TextField(
                   controller: scheduleController,
-                  style: const TextStyle(fontSize: 12, fontFamily: 'Consolas', color: Color(0xFF00D2FF)),
+                  style: const TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.accentBrand),
                   decoration: InputDecoration(
                     hintText: isIdleTime ? 'Soonest available' : 'Every weekday at 09:00',
                     hintStyle: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
@@ -186,7 +186,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                     fillColor: const Color(0xFF131519),
                     contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF2B313D))),
-                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: Color(0xFF00D2FF))),
+                    focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: DesktopTheme.accentBrand)),
                   ),
                 ),
                 const SizedBox(height: 24),
@@ -228,7 +228,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                         }
                       },
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00D2FF),
+                        backgroundColor: DesktopTheme.accentBrand,
                         foregroundColor: Colors.black,
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -1879,7 +1879,7 @@ class _AutomationsViewState extends State<AutomationsView> {
           children: [
             Row(
               children: [
-                const Icon(FontAwesomeIcons.circleCheck, size: 14, color: Color(0xFF00D2FF)),
+                const Icon(FontAwesomeIcons.circleCheck, size: 14, color: DesktopTheme.accentBrand),
                 const SizedBox(width: 8),
                 Text(
                   '${DesktopI18n.activeTasks} (${scheduledTasks.length})',
@@ -1888,8 +1888,8 @@ class _AutomationsViewState extends State<AutomationsView> {
                 const Spacer(),
                 TextButton.icon(
                   onPressed: () => _showCreateTaskDialog(),
-                  icon: const Icon(Icons.add, size: 14, color: Color(0xFF00D2FF)),
-                  label: Text(DesktopI18n.add, style: const TextStyle(color: Color(0xFF00D2FF), fontSize: 12)),
+                  icon: const Icon(Icons.add, size: 14, color: DesktopTheme.accentBrand),
+                  label: Text(DesktopI18n.add, style: const TextStyle(color: DesktopTheme.accentBrand, fontSize: 12)),
                 ),
               ],
             ),
@@ -1915,7 +1915,7 @@ class _AutomationsViewState extends State<AutomationsView> {
                           ),
                           Text(
                             t['schedule'] as String,
-                            style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: Color(0xFF00D2FF)),
+                            style: const TextStyle(fontSize: 11, fontFamily: 'Consolas', color: DesktopTheme.accentBrand),
                           ),
                         ],
                       ),
@@ -2049,8 +2049,8 @@ class _AutomationsViewState extends State<AutomationsView> {
                 GetStorage().write('keep_awake_enabled', val);
               } catch (_) {}
             },
-            activeColor: const Color(0xFF00D2FF),
-            activeTrackColor: const Color(0xFF00D2FF).withOpacity(0.3),
+            activeColor: DesktopTheme.accentBrand,
+            activeTrackColor: DesktopTheme.accentBrand.withOpacity(0.3),
             inactiveThumbColor: const Color(0xFF64748B),
             inactiveTrackColor: const Color(0xFF242934),
           ),
@@ -2219,7 +2219,7 @@ class _AutomationsViewState extends State<AutomationsView> {
           children: [
             Row(
               children: [
-                Icon(icon, size: 13, color: const Color(0xFF00D2FF)),
+                Icon(icon, size: 13, color: DesktopTheme.accentBrand),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(

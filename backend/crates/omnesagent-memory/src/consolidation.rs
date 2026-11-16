@@ -442,9 +442,47 @@ fn fact_overlaps_primary_update(
     )
 }
 
+/// Extract the first balanced JSON object or array from an LLM response,
+/// ignoring surrounding prose, markdown fences, and braces inside strings.
+fn extract_balanced_json(input: &str) -> Option<&str> {
+    let start = input.find(|c| c == '{' || c == '[')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in input[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&input[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parse the LLM's consolidation response, with fallback for malformed JSON.
 fn parse_consolidation_response(raw: &str, fallback_text: &str) -> ConsolidationResult {
-    // Try to extract JSON from the response (LLM may wrap in markdown code blocks).
+    // Try direct parse after trimming optional markdown code fences, then fall
+    // back to extracting the first balanced JSON value (handles trailing Notes).
     let cleaned = raw
         .trim()
         .trim_start_matches("```json")
@@ -452,7 +490,10 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
         .trim_end_matches("```")
         .trim();
 
-    serde_json::from_str(cleaned).unwrap_or_else(|_| {
+    serde_json::from_str(cleaned)
+        .ok()
+        .or_else(|| extract_balanced_json(cleaned).and_then(|s| serde_json::from_str(s).ok()))
+        .unwrap_or_else(|| {
         // Fallback: use truncated turn text as history entry.
         // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8.
         let summary = if fallback_text.len() > 200 {
@@ -505,6 +546,24 @@ mod tests {
             "```json\n{\"history_entry\": \"Discussed deployment.\", \"memory_update\": null}\n```";
         let result = parse_consolidation_response(raw, "fallback");
         assert_eq!(result.history_entry, "Discussed deployment.");
+    }
+
+    #[test]
+    fn parse_json_with_trailing_note() {
+        let raw = "```json\n{\"history_entry\": \"Merged branch.\", \"memory_update\": \"User merged main.\"}\n```\n\nNote: Kept summary concise as requested.";
+        let result = parse_consolidation_response(raw, "fallback");
+        assert_eq!(result.history_entry, "Merged branch.");
+        assert_eq!(result.memory_update.as_deref(), Some("User merged main."));
+    }
+
+    #[test]
+    fn parse_json_with_leading_prose_and_escaped_braces() {
+        let raw = r#"Sure, here is the result:
+{"history_entry": "Parsed \"}\" safely.", "memory_update": null}
+Hope that helps!"#;
+        let result = parse_consolidation_response(raw, "fallback");
+        assert_eq!(result.history_entry, "Parsed \"}\" safely.");
+        assert!(result.memory_update.is_none());
     }
 
     #[test]

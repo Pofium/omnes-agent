@@ -1,16 +1,17 @@
 <div align="center">
 
-<img src="assets/banner.jpg" alt="Omnes Agent Banner" width="100%" style="border-radius: 12px;" />
+<img src="frontend/assets/Logo/OA_icon.svg" alt="Omnes Agent" width="96" />
 
 # Omnes Agent
 
 **Автономная персональная экосистема AI-агентов нового поколения**  
-*Высокопроизводительный Rust-бэкенд · Мультимодальный Flutter-клиент · Детерминированная KAG и AST-память кодовой базы*
+*Высокопроизводительный Rust-бэкенд · Flutter ADE (Desktop & Web) · Детерминированная KAG и AST-память кодовой базы*
 
-[![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg?logo=rust)](https://www.rust-lang.org/)
-[![Flutter 3.x](https://img.shields.io/badge/Flutter-3.x-02569B.svg?logo=flutter)](https://flutter.dev/)
+[![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-FF6B00.svg?logo=rust)](https://www.rust-lang.org/)
+[![Flutter 3.x](https://img.shields.io/badge/Flutter-3.x-111827.svg?logo=flutter)](https://flutter.dev/)
+[![Brand: OmnesProducts](https://img.shields.io/badge/Brand-OmnesProducts_v1.1-FF6B00.svg)](DESIGN_SYSTEM.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android%20%7C%20iOS-brightgreen.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Web-111827.svg)]()
 
 [**English Version**](README.en.md) | [**Русская версия**](README.md)
 
@@ -22,15 +23,15 @@
 
 **Omnes Agent** — это полнофункциональная среда исполнения и оркестрации автономных AI-ассистентов, объединяющая:
 1. **Ядро агента на чистом Rust**: реактивный асинхронный шлюз (`omnesagent-gateway`), модульная система инструментов (`omnesagent-tools`), поддержка десятков моделей (OpenAI, Anthropic, Gemini, Ollama, DeepSeek, OpenRouter) и множества каналов связи.
-2. **Интеллектуальная память KAG + AST**: детерминированный статический анализ 10 языков программирования без расхода токенов LLM, вычисление радиуса влияния изменений (**Blast Radius**), локальные векторные эмбеддинги **Candle MiniLM** (in-process на CPU) и гибридный поиск **RRF ($k=60$)**.
-3. **Кроссплатформенный клиент Flutter**: десктопное и мобильное приложение с эстетикой **Cyber Zinc & Neon Cyan** (`shadcn/ui + reui`), мониторингом логов в реальном времени, встроенной диагностикой (Doctor) и управлением навыками.
-4. **Консолидация и Дриминг**: фоновый синтез долговременной памяти агента, профилирование пользователя и версионирование рабочей области.
+2. **Интеллектуальная память KAG + AST (`ob2h` v2.0+)**: детерминированный статический анализ (Tree-sitter + regex fallback для 18+ языков, включая Rust, Dart, Python, TS/JS, Go, SQL и Assembler `.s`/`.asm`), **Blast Radius** с `TESTED_BY` и `CO_CHANGES_WITH`, локальные векторные эмбеддинги **Candle** (in-process на CPU) + Mean-Centered Binary Quantization и гибридный поиск **U-PPR + RRF ($k=60$)**.
+3. **Кроссплатформенный клиент Flutter (Desktop & Web)**: дизайн-система **OmnesProducts v1.1** (`Dark Charcoal #111827` 60% / `Off-White #F4F5F7` 30% / `Brand Orange #FF6B00` ≤10%, шрифты **Montserrat + Inter + JetBrains Mono**, векторный знак с оранжевым AR-визором), мониторинг логов, диагностика (Doctor) и управление навыками.
+4. **Консолидация и Дриминг 2.0**: фоновый синтез долговременной памяти (включая `daily`-курсор и устойчивый JSON-парсер), 3-уровневое разрешение конфликтов с `Entity Overlap` и `git_head_sha`-свежестью.
 
 ---
 
 ## 🖥️ Интерфейс приложения
 
-OmnesAgent Desktop ADE — это не чат в окне, а рабочее пространство агента целиком: контекст проекта, диалог, инструменты и артефакты живут на одном экране и не требуют переключения между приложениями. Визуальный слой собран на дизайн-системе **Cyber Zinc & Neon Cyan** (`shadcn/ui + reui`) — тёмная и светлая схемы, циановый акцент, скруглённые панели и токены темы вместо хардкода цветов.
+OmnesAgent Desktop ADE — это не чат в окне, а рабочее пространство агента целиком: контекст проекта, диалог, инструменты и артефакты живут на одном экране и не требуют переключения между приложениями. Визуальный слой собран по единому брендбуку **OmnesProducts v1.1** (`shadcn/ui + reui`) — тёмная (`#111827`) и светлая (`#F4F5F7`) схемы, сигнальный акцент **Brand Orange (`#FF6B00`)**, типографическая триада **Montserrat / Inter / JetBrains Mono** и единая таблица токенов темы (`DesktopTheme` / `ShadcnColors`).
 
 <div align="center">
   <a href="assets/screenshots/01-workspace.png"><img src="assets/screenshots/01-workspace.png" alt="Рабочее пространство OmnesAgent Desktop ADE" width="100%" /></a>
@@ -74,11 +75,10 @@ Omnes-agent/
 │   │   ├── omnesagent-providers/# Провайдеры LLM (OpenAI, Anthropic, Gemini, DeepSeek, Local)
 │   │   └── omnesagent-config/  # Строго типизированные схемы конфигурации
 │   └── xtask/               # Вспомогательные задачи автоматизации и кодогенерации
-├── frontend/                # Кроссплатформенный Flutter-клиент
-│   ├── lib/
-│   │   ├── core/gateway/    # HTTP REST и WebSocket клиенты взаимодействия со шлюзом
-│   │   ├── design_system/   # Кибер-компоненты: shadcn_card, button, badge, dialog, input
-│   │   └── features/        # Tools, Skills, Doctor, Logs, Integrations, Pairing
+├── frontend/                # Кроссплатформенный Flutter-клиент (Desktop & Web)
+│   ├── shared/              # Общие модели, Gateway-клиенты, ShadcnColors/ShadcnTheme
+│   ├── desktop/             # Windows/macOS/Linux Desktop ADE (Montserrat/Inter/JetBrains Mono)
+│   └── web/                 # Flutter Web ADE
 ├── build.ps1 / build.bat    # Скрипт полной сборки (Rust + Flutter)
 ├── run.ps1 / run.bat        # Скрипт запуска шлюза и клиента
 └── check.ps1 / check.bat    # Комплексная проверка целостности и линтинг

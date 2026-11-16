@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../../../design_system/shadcn_colors.dart';
 import 'package:flutter/material.dart';
 import 'package:get_storage/get_storage.dart';
 import '../../../core/gateway/gateway_http.dart';
@@ -253,7 +254,7 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
         children: [
           Row(
             children: [
-              const Icon(Icons.mic, size: 20, color: Color(0xFF00D2FF)),
+              const Icon(Icons.mic, size: 20, color: ShadcnColors.primary),
               const SizedBox(width: 8),
               Text(
                 DesktopI18n.tr('Голосовой ввод и диктовка', 'Voice Input & Dictation'),
@@ -370,7 +371,7 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
         children: [
           Row(
             children: [
-              const Icon(Icons.cloud_outlined, color: Color(0xFF00D2FF), size: 18),
+              const Icon(Icons.cloud_outlined, color: ShadcnColors.primary, size: 18),
               const SizedBox(width: 8),
               Text(
                 DesktopI18n.tr('STT-провайдер (Облако / Сервер)', 'STT Provider (Cloud / Server)'),
@@ -551,7 +552,7 @@ class _VoiceSettingsSectionState extends State<VoiceSettingsSection> {
                     : const Icon(Icons.network_check, size: 16),
                 label: Text(_isSttTesting ? DesktopI18n.tr('Проверка...', 'Testing...') : DesktopI18n.tr('Проверить подключение', 'Test connection')),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF00D2FF),
+                  backgroundColor: ShadcnColors.primary,
                   foregroundColor: const Color(0xFF0F172A),
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),

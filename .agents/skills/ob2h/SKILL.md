@@ -111,6 +111,13 @@ OB2H (OmnesBot to Harness) — локальный «мозг» и граф зн�
   владельцу включай `citations`/`citation_count`. `provenance: none` — честный результат, не
   ошибка. Ограничение контракта: прямой `memory_save` провенанса не даёт (нет `meta`/`source_ids`);
   прослеживаемость — только через цепочку `session_ingest` → `session_recap(save=true)`.
+- **Конец долгой/нетривиальной сессии (Ф78.2):** перед завершением долгой или нетривиальной сессии
+  **всегда** вызывай `session_ingest` (после очистки от секретов), чтобы транскрипт попадал в
+  `daily`-логи и напрямую питал Dream.
+- **Фидбек (`memory_feedback`):** `key` берётся из результата `memory_search`/`memory_save`
+  (`lsn_*` не подходит); для понижения веса узла AST-графа передавай `node_id` (Mute Node) без `key`.
+- **Сейф и PIN:** при `OB2H_PIN_GUI=1` (хелпер `ob2h secrets ask-pin`) закладывай достаточный таймаут;
+  при ответе `ввод PIN отменён пользователем` — **не ретрай** в цикле.
 - **Governance:** `memory_forget` вызывай **только с `reason`**; `memory_audit(operation?, limit?)`
   — read-only отчёт операций (actor=agent виден) для владельца.
 

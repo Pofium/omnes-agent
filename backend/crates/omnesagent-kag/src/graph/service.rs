@@ -61,6 +61,16 @@ pub struct GraphSearchResult {
     pub edges: Vec<EdgeWithLabels>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_mode: Option<String>,
+    /// Оценочное оставшееся время прогрева эмбеддингов в секундах при `degraded_mode = warming_up_embeddings`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warming_seconds_left: Option<u64>,
+}
+
+fn estimate_warming_seconds_left() -> u64 {
+    static WARMUP_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let started = WARMUP_STARTED.get_or_init(std::time::Instant::now);
+    const DEFAULT_WARMUP_SECS: u64 = 15;
+    DEFAULT_WARMUP_SECS.saturating_sub(started.elapsed().as_secs()).max(1)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +289,7 @@ impl GraphService {
 
         // 2. Векторный скоринг с защитой Stale-While-Revalidate (degraded_mode)
         let mut degraded_mode = None;
+        let mut warming_seconds_left = None;
         match self.embedder.embed_query(query).await {
             Ok(q_vec) => {
                 let vec0_hits: Vec<(i64, f32)> = {
@@ -342,6 +353,7 @@ impl GraphService {
             Err(e) => {
                 tracing::warn!("Векторный поиск недоступен ({e}), переход в degraded_mode");
                 degraded_mode = Some("warming_up_embeddings".to_string());
+                warming_seconds_left = Some(estimate_warming_seconds_left());
             }
         }
 
@@ -473,6 +485,7 @@ impl GraphService {
             nodes: nodes_map.into_values().collect(),
             edges,
             degraded_mode,
+            warming_seconds_left,
         })
     }
 

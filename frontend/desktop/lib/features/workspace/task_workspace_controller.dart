@@ -54,7 +54,7 @@ class DesktopTaskWorkspaceController extends GetxController with WidgetsBindingO
   late final activeProject = RxnString(resolveInitialProjectName());
   late final activeProjectPath = RxnString(resolveInitialProjectPath());
   final activeProjectIcon = RxString('code');
-  final activeProjectColor = RxString('#00D2FF');
+  final activeProjectColor = RxString('#FF6B00');
   late final activeBranch = RxnString(readGitHeadBranchSync(resolveInitialProjectPath()) ?? 'main');
   late final availableBranches = <String>[
     ...readGitLocalBranchesSync(resolveInitialProjectPath()).isNotEmpty

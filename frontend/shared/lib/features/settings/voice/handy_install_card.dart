@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../design_system/shadcn_colors.dart';
 import '../../../design_system/shadcn_badge.dart';
 import '../../../design_system/shadcn_button.dart';
 import '../../../utils/desktop_i18n.dart';
@@ -60,7 +61,7 @@ class HandyInstallCard extends StatelessWidget {
           // Header with switch
           Row(
             children: [
-              const Icon(Icons.keyboard_voice, color: Color(0xFF00D2FF), size: 18),
+              const Icon(Icons.keyboard_voice, color: ShadcnColors.primary, size: 18),
               const SizedBox(width: 8),
               Expanded(
                 child: Column(
@@ -86,7 +87,7 @@ class HandyInstallCard extends StatelessWidget {
               ),
               Switch(
                 value: st?.config.enabled ?? false,
-                activeColor: const Color(0xFF00D2FF),
+                activeColor: ShadcnColors.primary,
                 onChanged: inProgress || !isSupported ? null : onToggleEnabled,
               ),
             ],
@@ -129,7 +130,7 @@ class HandyInstallCard extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Icon(Icons.info_outline, color: Color(0xFF00D2FF), size: 16),
+              const Icon(Icons.info_outline, color: ShadcnColors.primary, size: 16),
               const SizedBox(width: 6),
               Text(
                 DesktopI18n.tr('Handy не установлен', 'Handy is not installed'),
@@ -189,7 +190,7 @@ class HandyInstallCard extends StatelessWidget {
               ),
               Text(
                 '$pct%',
-                style: const TextStyle(fontFamily: 'Consolas', fontSize: 12, color: Color(0xFF00D2FF)),
+                style: const TextStyle(fontFamily: 'Consolas', fontSize: 12, color: ShadcnColors.primary),
               ),
             ],
           ),
@@ -197,7 +198,7 @@ class HandyInstallCard extends StatelessWidget {
           LinearProgressIndicator(
             value: pct / 100.0,
             backgroundColor: isLight ? const Color(0xFFE2E8F0) : const Color(0xFF2E2E2E),
-            valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00D2FF)),
+            valueColor: const AlwaysStoppedAnimation<Color>(ShadcnColors.primary),
           ),
           const SizedBox(height: 12),
           if (job.stage == 'download' || job.stage == 'verify') ...[
@@ -330,7 +331,7 @@ class HandyInstallCard extends StatelessWidget {
             children: [
               Checkbox(
                 value: autoStartWithOs,
-                activeColor: const Color(0xFF00D2FF),
+                activeColor: ShadcnColors.primary,
                 checkColor: Colors.black,
                 onChanged: isBusy ? null : (val) => onToggleAutostart?.call(val ?? false),
               ),

@@ -411,7 +411,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                               Icons.folder_outlined,
                               size: 13,
                               color: !isGroupView
-                                  ? (DesktopTheme.isDark ? const Color(0xFF00D2FF) : Colors.white)
+                                  ? (DesktopTheme.isDark ? DesktopTheme.accentBrand : Colors.white)
                                   : DesktopTheme.textMuted,
                             ),
                             const SizedBox(width: 5),
@@ -484,7 +484,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       // AI Grouping button
                       IconButton(
                         tooltip: 'Сгруппировать через ИИ',
-                        icon: const Icon(Icons.auto_awesome, size: 14, color: Color(0xFF00D2FF)),
+                        icon: const Icon(Icons.auto_awesome, size: 14, color: DesktopTheme.accentBrand),
                         onPressed: _showAiGroupingDialog,
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
@@ -501,7 +501,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                       // Add Project (+) button
                       IconButton(
                         tooltip: 'Создать проект',
-                        icon: const Icon(Icons.add, size: 15, color: Color(0xFF00D2FF)),
+                        icon: const Icon(Icons.add, size: 15, color: DesktopTheme.accentBrand),
                         onPressed: _showAddProjectDialog,
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
@@ -570,7 +570,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                           height: 26,
                           decoration: BoxDecoration(
                             gradient: const LinearGradient(
-                              colors: [Color(0xFF00D2FF), Color(0xFF0072FF)],
+                              colors: [DesktopTheme.accentBrand, DesktopTheme.accentBrandDark],
                             ),
                             borderRadius: BorderRadius.circular(13),
                           ),
@@ -598,7 +598,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   // Settings Gear Button
                   IconButton(
                     tooltip: DesktopI18n.settings,
-                    icon: const Icon(Icons.settings_outlined, size: 17, color: Color(0xFF00D2FF)),
+                    icon: const Icon(Icons.settings_outlined, size: 17, color: DesktopTheme.accentBrand),
                     onPressed: widget.onOpenSettings,
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(minWidth: 26, minHeight: 26),
@@ -633,12 +633,12 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
     if (isPrimary) {
       bgColor = isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A);
       fgColor = Colors.white;
-      iconColor = isDark ? const Color(0xFF00D2FF) : Colors.white;
-      border = Border.all(color: isDark ? const Color(0xFF00D2FF).withOpacity(0.3) : const Color(0xFF0F172A));
+      iconColor = isDark ? DesktopTheme.accentBrand : Colors.white;
+      border = Border.all(color: isDark ? DesktopTheme.accentBrand.withOpacity(0.3) : const Color(0xFF0F172A));
     } else if (isSelected) {
       bgColor = isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A);
       fgColor = Colors.white;
-      iconColor = isDark ? const Color(0xFF00D2FF) : Colors.white;
+      iconColor = isDark ? DesktopTheme.accentBrand : Colors.white;
       border = Border.all(color: isDark ? const Color(0xFF3B82F6) : const Color(0xFF0F172A));
     } else {
       bgColor = Colors.transparent;
@@ -721,7 +721,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     color: DesktopTheme.textMuted,
                   ),
                   const SizedBox(width: 4),
-                  Icon(Icons.folder_outlined, size: 13, color: const Color(0xFF00D2FF)),
+                  Icon(Icons.folder_outlined, size: 13, color: DesktopTheme.accentBrand),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
@@ -754,7 +754,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   // Button to browse project file tree
                   IconButton(
                     tooltip: 'Открыть дерево файлов проекта',
-                    icon: const Icon(Icons.folder_open, size: 14, color: Color(0xFF00D2FF)),
+                    icon: const Icon(Icons.folder_open, size: 14, color: DesktopTheme.accentBrand),
                     onPressed: () {
                       setState(() {
                         activeFileTreeProject = proj;
@@ -879,7 +879,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                     color: DesktopTheme.textMuted,
                   ),
                   const SizedBox(width: 4),
-                  Icon(group.icon, size: 12, color: const Color(0xFF00D2FF)),
+                  Icon(group.icon, size: 12, color: DesktopTheme.accentBrand),
                   const SizedBox(width: 7),
                   Expanded(
                     child: Text(
@@ -1018,14 +1018,14 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
               ? (DesktopTheme.isDark ? const Color(0xFF282D37) : const Color(0xFF0F172A).withOpacity(0.1))
               : Colors.transparent,
           borderRadius: BorderRadius.circular(6),
-          border: isSelected ? Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4), width: 0.8) : null,
+          border: isSelected ? Border.all(color: DesktopTheme.accentBrand.withOpacity(0.4), width: 0.8) : null,
         ),
         child: Row(
           children: [
             Icon(
               Icons.chat_bubble_outline,
               size: 11,
-              color: isSelected ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
+              color: isSelected ? DesktopTheme.accentBrand : DesktopTheme.textMuted,
             ),
             const SizedBox(width: 8),
             Expanded(
@@ -1127,7 +1127,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
                   child: Row(
                     children: [
-                      const Icon(Icons.arrow_back, size: 13, color: Color(0xFF00D2FF)),
+                      const Icon(Icons.arrow_back, size: 13, color: DesktopTheme.accentBrand),
                       const SizedBox(width: 5),
                       Text(
                         'К проектам',
@@ -1326,7 +1326,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
       return Icon(
         isExpanded ? Icons.folder_open_outlined : Icons.folder_outlined,
         size: 13,
-        color: const Color(0xFF00D2FF),
+        color: DesktopTheme.accentBrand,
       );
     }
     final lower = name.toLowerCase();
@@ -1432,7 +1432,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 height: 30,
                 child: Row(
                   children: const [
-                    Icon(FontAwesomeIcons.wandMagicSparkles, size: 12, color: Color(0xFF00D2FF)),
+                    Icon(FontAwesomeIcons.wandMagicSparkles, size: 12, color: DesktopTheme.accentBrand),
                     SizedBox(width: 10),
                     Text('Открыть в Холсте', style: TextStyle(fontSize: 11.5, color: Colors.white)),
                   ],
@@ -1489,7 +1489,7 @@ class _DesktopSidebarState extends State<DesktopSidebar> {
                 height: 32,
                 child: Row(
                   children: const [
-                    Icon(Icons.chat_bubble_outline, size: 13, color: Color(0xFF00D2FF)),
+                    Icon(Icons.chat_bubble_outline, size: 13, color: DesktopTheme.accentBrand),
                     SizedBox(width: 10),
                     Text('Добавить в контекст чата', style: TextStyle(fontSize: 12, color: Colors.white)),
                   ],
@@ -1700,7 +1700,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
             ),
             title: Row(
               children: [
-                const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00D2FF), size: 18),
+                const Icon(Icons.create_new_folder_outlined, color: DesktopTheme.accentBrand, size: 18),
                 const SizedBox(width: 8),
                 Text('Создать новый проект', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
               ],
@@ -1742,7 +1742,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                       suffixIcon: Tooltip(
                         message: 'Выбрать папку через проводник',
                         child: IconButton(
-                          icon: const Icon(Icons.folder_open_outlined, color: Color(0xFF00D2FF), size: 18),
+                          icon: const Icon(Icons.folder_open_outlined, color: DesktopTheme.accentBrand, size: 18),
                           onPressed: () async {
                             final picked = await _pickFolderNative(initialPath: pathCtrl.text);
                             if (picked != null && picked.isNotEmpty) {
@@ -1793,7 +1793,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                                   'Папка создана',
                                   'Папка успешно создана на диске',
                                   backgroundColor: const Color(0xFF0F172A),
-                                  colorText: const Color(0xFF00D2FF),
+                                  colorText: DesktopTheme.accentBrand,
                                   snackPosition: SnackPosition.BOTTOM,
                                 );
                               } else {
@@ -1809,21 +1809,21 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                             child: Container(
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                               decoration: BoxDecoration(
-                                color: const Color(0xFF00D2FF).withOpacity(0.15),
+                                color: DesktopTheme.accentBrand.withOpacity(0.15),
                                 borderRadius: BorderRadius.circular(4),
-                                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
+                                border: Border.all(color: DesktopTheme.accentBrand.withOpacity(0.4)),
                               ),
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: const [
-                                  Icon(Icons.create_new_folder_outlined, size: 13, color: Color(0xFF00D2FF)),
+                                  Icon(Icons.create_new_folder_outlined, size: 13, color: DesktopTheme.accentBrand),
                                   SizedBox(width: 4),
                                   Text(
                                     'Создать папку',
                                     style: TextStyle(
                                       fontSize: 11,
                                       fontWeight: FontWeight.w600,
-                                      color: Color(0xFF00D2FF),
+                                      color: DesktopTheme.accentBrand,
                                     ),
                                   ),
                                 ],
@@ -1898,7 +1898,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
               ),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF00D2FF),
+                  backgroundColor: DesktopTheme.accentBrand,
                   foregroundColor: const Color(0xFF0F172A),
                 ),
                 onPressed: () async {
@@ -1916,7 +1916,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                           ),
                           title: Row(
                             children: [
-                              const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00D2FF), size: 18),
+                              const Icon(Icons.create_new_folder_outlined, color: DesktopTheme.accentBrand, size: 18),
                               const SizedBox(width: 8),
                               Text('Создать папку?', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
                             ],
@@ -1932,7 +1932,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                             ),
                             ElevatedButton(
                               style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF00D2FF),
+                                backgroundColor: DesktopTheme.accentBrand,
                                 foregroundColor: const Color(0xFF0F172A),
                               ),
                               onPressed: () => Navigator.of(confirmCtx).pop(true),
@@ -2020,7 +2020,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
         actions: [
           TextButton(onPressed: () => Navigator.of(ctx).pop(), child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted))),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00D2FF), foregroundColor: const Color(0xFF0F172A)),
+            style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentBrand, foregroundColor: const Color(0xFF0F172A)),
             onPressed: () {
               final name = ctrl.text.trim();
               if (name.isNotEmpty) {
@@ -2077,12 +2077,12 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                 borderRadius: BorderRadius.circular(8),
                 child: Container(
                   decoration: BoxDecoration(
-                    color: isSelected ? const Color(0xFF00D2FF).withOpacity(0.2) : DesktopTheme.bgSurfaceElevated,
+                    color: isSelected ? DesktopTheme.accentBrand.withOpacity(0.2) : DesktopTheme.bgSurfaceElevated,
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: isSelected ? const Color(0xFF00D2FF) : DesktopTheme.borderSubtle),
+                    border: Border.all(color: isSelected ? DesktopTheme.accentBrand : DesktopTheme.borderSubtle),
                   ),
                   child: Center(
-                    child: Icon(ic, size: 16, color: isSelected ? const Color(0xFF00D2FF) : DesktopTheme.textSecondary),
+                    child: Icon(ic, size: 16, color: isSelected ? DesktopTheme.accentBrand : DesktopTheme.textSecondary),
                   ),
                 ),
               );
@@ -2258,7 +2258,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
             children: groups.map((g) {
               return ListTile(
                 dense: true,
-                leading: Icon(g.icon, size: 14, color: const Color(0xFF00D2FF)),
+                leading: Icon(g.icon, size: 14, color: DesktopTheme.accentBrand),
                 title: Text(g.name, style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 13)),
                 onTap: () {
                   final ctrl = Get.find<DesktopTaskWorkspaceController>();
@@ -2290,7 +2290,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
             children: projects.map((p) {
               return ListTile(
                 dense: true,
-                leading: const Icon(Icons.folder_outlined, size: 14, color: Color(0xFF00D2FF)),
+                leading: const Icon(Icons.folder_outlined, size: 14, color: DesktopTheme.accentBrand),
                 title: Text(p.name, style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 13, fontWeight: FontWeight.bold)),
                 subtitle: Text(p.path, style: TextStyle(color: DesktopTheme.textMuted, fontSize: 11, fontFamily: 'Consolas')),
                 onTap: () {
@@ -2343,7 +2343,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
           children: [
             Text('Директория артефактов:', style: TextStyle(color: DesktopTheme.textSecondary, fontSize: 12)),
             const SizedBox(height: 6),
-            Text('~/.omnesagent/data/artifacts/${group.id}', style: const TextStyle(fontFamily: 'Consolas', fontSize: 12, color: Color(0xFF00D2FF))),
+            Text('~/.omnesagent/data/artifacts/${group.id}', style: const TextStyle(fontFamily: 'Consolas', fontSize: 12, color: DesktopTheme.accentBrand)),
           ],
         ),
         actions: [
@@ -2399,7 +2399,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
             ),
             title: Row(
               children: [
-                const Icon(Icons.edit_location_alt_outlined, color: Color(0xFF00D2FF), size: 18),
+                const Icon(Icons.edit_location_alt_outlined, color: DesktopTheme.accentBrand, size: 18),
                 const SizedBox(width: 8),
                 Text('Сменить путь к проекту', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
               ],
@@ -2421,7 +2421,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                       suffixIcon: Tooltip(
                         message: 'Выбрать папку через проводник',
                         child: IconButton(
-                          icon: const Icon(Icons.folder_open_outlined, color: Color(0xFF00D2FF), size: 18),
+                          icon: const Icon(Icons.folder_open_outlined, color: DesktopTheme.accentBrand, size: 18),
                           onPressed: () async {
                             final picked = await _pickFolderNative(initialPath: ctrl.text);
                             if (picked != null && picked.isNotEmpty) {
@@ -2463,7 +2463,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                                   'Папка создана',
                                   'Папка успешно создана на диске',
                                   backgroundColor: const Color(0xFF0F172A),
-                                  colorText: const Color(0xFF00D2FF),
+                                  colorText: DesktopTheme.accentBrand,
                                   snackPosition: SnackPosition.BOTTOM,
                                 );
                               } else {
@@ -2476,18 +2476,18 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                             child: Container(
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                               decoration: BoxDecoration(
-                                color: const Color(0xFF00D2FF).withOpacity(0.15),
+                                color: DesktopTheme.accentBrand.withOpacity(0.15),
                                 borderRadius: BorderRadius.circular(4),
-                                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.4)),
+                                border: Border.all(color: DesktopTheme.accentBrand.withOpacity(0.4)),
                               ),
                               child: Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: const [
-                                  Icon(Icons.create_new_folder_outlined, size: 12, color: Color(0xFF00D2FF)),
+                                  Icon(Icons.create_new_folder_outlined, size: 12, color: DesktopTheme.accentBrand),
                                   SizedBox(width: 4),
                                   Text(
                                     'Создать папку',
-                                    style: TextStyle(fontSize: 11, color: Color(0xFF00D2FF), fontWeight: FontWeight.w600),
+                                    style: TextStyle(fontSize: 11, color: DesktopTheme.accentBrand, fontWeight: FontWeight.w600),
                                   ),
                                 ],
                               ),
@@ -2502,7 +2502,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
             actions: [
               TextButton(onPressed: () => Navigator.of(ctx).pop(), child: Text(DesktopI18n.cancel, style: TextStyle(color: DesktopTheme.textMuted))),
               ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00D2FF), foregroundColor: const Color(0xFF0F172A)),
+                style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentBrand, foregroundColor: const Color(0xFF0F172A)),
                 onPressed: () async {
                   final newPath = ctrl.text.trim();
                   if (newPath.isNotEmpty) {
@@ -2517,7 +2517,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                           ),
                           title: Row(
                             children: [
-                              const Icon(Icons.create_new_folder_outlined, color: Color(0xFF00D2FF), size: 18),
+                              const Icon(Icons.create_new_folder_outlined, color: DesktopTheme.accentBrand, size: 18),
                               const SizedBox(width: 8),
                               Text('Создать папку?', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 15)),
                             ],
@@ -2526,7 +2526,7 @@ if (\$dlg.ShowDialog(\$top) -eq [System.Windows.Forms.DialogResult]::OK) {
                           actions: [
                             TextButton(onPressed: () => Navigator.of(c).pop(false), child: Text(DesktopI18n.cancel)),
                             ElevatedButton(
-                              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00D2FF), foregroundColor: const Color(0xFF0F172A)),
+                              style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentBrand, foregroundColor: const Color(0xFF0F172A)),
                               onPressed: () => Navigator.of(c).pop(true),
                               child: const Text('Создать и продолжить', style: TextStyle(fontWeight: FontWeight.bold)),
                             ),

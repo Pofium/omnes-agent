@@ -4,6 +4,7 @@
 
 import 'package:flutter/material.dart';
 
+import '../../theme/desktop_theme.dart';
 /// Тик-маркер одного хода диалога на вертикальной линейке.
 class TurnRail extends StatelessWidget {
   /// Тексты ходов для подсказок (по одному на засечку).
@@ -89,7 +90,7 @@ class _TurnTick extends StatelessWidget {
             height: active ? 3.0 : 2.0,
             decoration: BoxDecoration(
               color: active
-                  ? const Color(0xFF00D2FF)
+                  ? DesktopTheme.accentBrand
                   : Colors.white.withOpacity(0.22),
               borderRadius: BorderRadius.circular(1.5),
             ),

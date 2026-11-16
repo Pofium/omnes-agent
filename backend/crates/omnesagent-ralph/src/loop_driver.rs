@@ -880,4 +880,15 @@ mod tests {
         );
         assert!(query.contains("alpha"), "got {query:?}");
     }
+
+    #[test]
+    fn iteration_finding_preserves_metadata_without_git_head_sha() {
+        let mut syms = BTreeSet::new();
+        syms.insert("fn:alpha".to_string());
+        let f = iteration_finding("feat", "T-21.3", 1, "no git root", "verified", syms, None);
+        assert_eq!(f.finding_id, "feat:T-21.3:i1");
+        assert_eq!(f.verdict, "verified");
+        assert_eq!(f.symbols, vec!["fn:alpha".to_string()]);
+        assert!(f.git_head_sha.is_none());
+    }
 }

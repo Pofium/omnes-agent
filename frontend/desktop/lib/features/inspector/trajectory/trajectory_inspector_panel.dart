@@ -1,4 +1,5 @@
 import 'dart:convert';
+import '../../../theme/desktop_theme.dart';
 import 'package:flutter/material.dart';
 import 'package:omnes_shared/omnes_shared.dart';
 
@@ -42,7 +43,7 @@ class _TrajectoryInspectorPanelState extends State<TrajectoryInspectorPanel> {
   Color _colorForStepType(String type) {
     switch (type) {
       case 's1_gate':
-        return const Color(0xFF00E5FF); // Cyan
+        return DesktopTheme.accentBrand; // Cyan
       case 'context_inject':
         return const Color(0xFFA855F7); // Purple
       case 'cot_thinking':

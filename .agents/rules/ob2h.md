@@ -59,6 +59,10 @@ All AI coding assistants and subagents MUST always use the `ob2h` MCP server too
 7. **Provenance, governance, viewer (ADR-O9/O10)**:
    - Verify a critical fact with `memory_verify` before relying on it; report
      citations to the owner; `provenance: none` is an honest result, not an error.
+   - At the end of long or non-trivial sessions, always call `session_ingest`
+     (after credential redaction) so daily logs directly feed Dream (ob2h Ф78.2).
+   - For `memory_feedback`, pass a memory `key` from `memory_search`/`memory_save`
+     (never `lsn_*`), or pass `node_id` for graph Mute Node.
    - Call `memory_forget` **only with `reason`**; use `memory_audit` for read-only
      operation reports. `memory_timeline` answers "what happened around X".
    - `viewer_open` is **privileged** (spawns a GUI process): EngineeringTask/

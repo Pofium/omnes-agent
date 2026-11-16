@@ -1243,7 +1243,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                           height: 32,
                           decoration: BoxDecoration(
                             gradient: const LinearGradient(
-                              colors: [Color(0xFF00D2FF), Color(0xFF0072FF)],
+                              colors: [DesktopTheme.accentBrand, DesktopTheme.accentBrandDark],
                             ),
                             borderRadius: BorderRadius.circular(16),
                           ),
@@ -1424,7 +1424,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             Icon(
               icon,
               size: 14,
-              color: isSelected ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
+              color: isSelected ? DesktopTheme.accentBrand : DesktopTheme.textMuted,
             ),
             const SizedBox(width: 10),
             Text(
@@ -1543,12 +1543,12 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     width: 140,
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF00D2FF).withOpacity(0.12),
+                      color: DesktopTheme.accentBrand.withOpacity(0.12),
                       borderRadius: BorderRadius.circular(4),
                     ),
                     child: Text(
                       c['cmd']!,
-                      style: const TextStyle(fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: Color(0xFF00D2FF), fontSize: 12),
+                      style: const TextStyle(fontFamily: 'Consolas', fontWeight: FontWeight.bold, color: DesktopTheme.accentBrand, fontSize: 12),
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -1623,7 +1623,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
           subtitle: DesktopI18n.memorySettingSubtitle,
           control: Switch(
             value: memoryEnabled,
-            activeColor: const Color(0xFF00D2FF),
+            activeColor: DesktopTheme.accentBrand,
             onChanged: (val) => setState(() => memoryEnabled = val),
           ),
         ),
@@ -1759,7 +1759,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
           ),
           control: Switch(
             value: enhancedGrep,
-            activeColor: const Color(0xFF00D2FF),
+            activeColor: DesktopTheme.accentBrand,
             onChanged: (val) => setState(() => enhancedGrep = val),
           ),
         ),
@@ -1802,7 +1802,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               label: Text(DesktopI18n.tr('Добавить свой провайдер', 'Add Custom Provider')),
               onPressed: () => setState(() => isAddingProvider = !isAddingProvider),
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF00D2FF),
+                backgroundColor: DesktopTheme.accentBrand,
                 foregroundColor: const Color(0xFF0F172A),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -1819,7 +1819,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             decoration: BoxDecoration(
               color: DesktopTheme.bgSurfaceElevated,
               borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5)),
+              border: Border.all(color: DesktopTheme.accentBrand.withOpacity(0.5)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1877,7 +1877,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     ElevatedButton(
                       onPressed: _saveCustomProvider,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00D2FF),
+                        backgroundColor: DesktopTheme.accentBrand,
                         foregroundColor: const Color(0xFF0F172A),
                       ),
                       child: Text(DesktopI18n.tr('Сохранить провайдера', 'Save Provider'), style: const TextStyle(fontWeight: FontWeight.bold)),
@@ -1905,7 +1905,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               color: DesktopTheme.bgSurfaceElevated,
               borderRadius: BorderRadius.circular(10),
               border: Border.all(
-                color: isExpanded ? const Color(0xFF00D2FF).withOpacity(0.5) : DesktopTheme.borderSubtle,
+                color: isExpanded ? DesktopTheme.accentBrand.withOpacity(0.5) : DesktopTheme.borderSubtle,
               ),
             ),
             child: Column(
@@ -1925,7 +1925,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                           border: Border.all(color: DesktopTheme.borderSubtle),
                         ),
                         child: const Center(
-                          child: Icon(FontAwesomeIcons.brain, size: 15, color: Color(0xFF00D2FF)),
+                          child: Icon(FontAwesomeIcons.brain, size: 15, color: DesktopTheme.accentBrand),
                         ),
                       ),
                       const SizedBox(width: 14),
@@ -1961,10 +1961,10 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                                   Container(
                                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
                                     decoration: BoxDecoration(
-                                      color: const Color(0xFF00D2FF).withOpacity(0.15),
+                                      color: DesktopTheme.accentBrand.withOpacity(0.15),
                                       borderRadius: BorderRadius.circular(4),
                                     ),
-                                    child: const Text('CUSTOM', style: TextStyle(fontSize: 9, color: Color(0xFF00D2FF), fontWeight: FontWeight.bold)),
+                                    child: const Text('CUSTOM', style: TextStyle(fontSize: 9, color: DesktopTheme.accentBrand, fontWeight: FontWeight.bold)),
                                   ),
                                 ],
                               ],
@@ -1981,7 +1981,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       ),
                       Switch(
                         value: isConfigured,
-                        activeColor: const Color(0xFF00D2FF),
+                        activeColor: DesktopTheme.accentBrand,
                         onChanged: (val) {
                           setState(() => p['isConfigured'] = val);
                         },
@@ -1992,7 +1992,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                         icon: Icon(
                           isExpanded ? Icons.keyboard_arrow_up : Icons.tune,
                           size: 18,
-                          color: isExpanded ? const Color(0xFF00D2FF) : DesktopTheme.textMuted,
+                          color: isExpanded ? DesktopTheme.accentBrand : DesktopTheme.textMuted,
                         ),
                         tooltip: isExpanded ? 'Скрыть настройки' : 'Редактировать API ключ и параметры',
                         onPressed: () {
@@ -2118,7 +2118,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                               label: const Text('Сохранить'),
                               onPressed: () => _saveProviderConfig(id),
                               style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF00D2FF),
+                                backgroundColor: DesktopTheme.accentBrand,
                                 foregroundColor: const Color(0xFF0F172A),
                                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                               ),
@@ -2185,7 +2185,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
               label: Text(DesktopI18n.tr('Добавить MCP сервер', 'Add MCP Server')),
               onPressed: () => setState(() => isAddingMcp = !isAddingMcp),
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF00D2FF),
+                backgroundColor: DesktopTheme.accentBrand,
                 foregroundColor: const Color(0xFF0F172A),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -2201,7 +2201,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             decoration: BoxDecoration(
               color: DesktopTheme.bgSurfaceElevated,
               borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5)),
+              border: Border.all(color: DesktopTheme.accentBrand.withOpacity(0.5)),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -2235,7 +2235,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     ElevatedButton(
                       onPressed: _saveNewMcpServer,
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00D2FF),
+                        backgroundColor: DesktopTheme.accentBrand,
                         foregroundColor: const Color(0xFF0F172A),
                       ),
                       child: Text(DesktopI18n.tr('Зарегистрировать', 'Register'), style: const TextStyle(fontWeight: FontWeight.bold)),
@@ -2269,7 +2269,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     border: Border.all(color: DesktopTheme.borderSubtle),
                   ),
                   child: const Center(
-                    child: Icon(Icons.extension, size: 18, color: Color(0xFF00D2FF)),
+                    child: Icon(Icons.extension, size: 18, color: DesktopTheme.accentBrand),
                   ),
                 ),
                 const SizedBox(width: 14),
@@ -2317,7 +2317,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                 ),
                 Switch(
                   value: isEnabled,
-                  activeColor: const Color(0xFF00D2FF),
+                  activeColor: DesktopTheme.accentBrand,
                   onChanged: (val) {
                     setState(() => server['enabled'] = val);
                   },
@@ -2581,9 +2581,9 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     if (!isDark) DesktopThemeController.to.toggleTheme();
                   },
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: isDark ? const Color(0xFF00D2FF).withOpacity(0.2) : DesktopTheme.bgSurface,
-                    foregroundColor: isDark ? const Color(0xFF00D2FF) : DesktopTheme.textPrimary,
-                    side: BorderSide(color: isDark ? const Color(0xFF00D2FF) : DesktopTheme.borderSubtle),
+                    backgroundColor: isDark ? DesktopTheme.accentBrand.withOpacity(0.2) : DesktopTheme.bgSurface,
+                    foregroundColor: isDark ? DesktopTheme.accentBrand : DesktopTheme.textPrimary,
+                    side: BorderSide(color: isDark ? DesktopTheme.accentBrand : DesktopTheme.borderSubtle),
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -2630,7 +2630,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     width: 56,
                     height: 56,
                     decoration: BoxDecoration(
-                      gradient: const LinearGradient(colors: [Color(0xFF00D2FF), Color(0xFF0072FF)]),
+                      gradient: const LinearGradient(colors: [DesktopTheme.accentBrand, DesktopTheme.accentBrandDark]),
                       borderRadius: BorderRadius.circular(28),
                     ),
                     child: Center(
@@ -2659,7 +2659,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       );
                     },
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF00D2FF),
+                      backgroundColor: DesktopTheme.accentBrand,
                       foregroundColor: const Color(0xFF0F172A),
                     ),
                     child: Text(DesktopI18n.tr('Пройти анкету заново', 'Retake questionnaire')),
@@ -2762,7 +2762,7 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                 ? const SizedBox(
                     width: 14,
                     height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00D2FF)),
+                    child: CircularProgressIndicator(strokeWidth: 2, color: DesktopTheme.accentBrand),
                   )
                 : Text(DesktopI18n.tr('Переиндексировать AST', 'Reindex AST')),
           ),

@@ -137,7 +137,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
         ),
         title: Row(
           children: [
-            const Icon(Icons.system_update_alt, color: Color(0xFF00D2FF), size: 20),
+            const Icon(Icons.system_update_alt, color: DesktopTheme.accentBrand, size: 20),
             const SizedBox(width: 8),
             Text('Обновление OmnesAgent', style: TextStyle(color: DesktopTheme.textPrimary, fontSize: 16)),
           ],
@@ -154,7 +154,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('OK', style: TextStyle(color: Color(0xFF00D2FF))),
+            child: const Text('OK', style: TextStyle(color: DesktopTheme.accentBrand)),
           ),
         ],
       ),
@@ -176,7 +176,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
               width: 28,
               height: 28,
               decoration: BoxDecoration(
-                gradient: const LinearGradient(colors: [Color(0xFF00D2FF), Color(0xFF0055FF)]),
+                gradient: const LinearGradient(colors: [DesktopTheme.accentBrand, Color(0xFF0055FF)]),
                 borderRadius: BorderRadius.circular(6),
               ),
               alignment: Alignment.center,
@@ -201,7 +201,7 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Закрыть', style: TextStyle(color: Color(0xFF00D2FF))),
+            child: const Text('Закрыть', style: TextStyle(color: DesktopTheme.accentBrand)),
           ),
         ],
       ),
@@ -604,11 +604,11 @@ class _DesktopShellState extends State<DesktopShell> with WindowListener {
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF00D2FF).withOpacity(0.12),
+                  color: DesktopTheme.accentBrand.withOpacity(0.12),
                   borderRadius: BorderRadius.circular(6),
-                  border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5), width: 1),
+                  border: Border.all(color: DesktopTheme.accentBrand.withOpacity(0.5), width: 1),
                 ),
-                child: const Icon(Icons.view_sidebar_outlined, size: 16, color: Color(0xFF00D2FF)),
+                child: const Icon(Icons.view_sidebar_outlined, size: 16, color: DesktopTheme.accentBrand),
               ),
             ),
           ),

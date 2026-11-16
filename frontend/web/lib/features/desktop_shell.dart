@@ -295,7 +295,7 @@ class _DesktopShellState extends State<DesktopShell> {
         titleSpacing: 0,
         leading: Builder(
           builder: (ctx) => IconButton(
-            icon: const Icon(Icons.menu, size: 20, color: Color(0xFF00D2FF)),
+            icon: const Icon(Icons.menu, size: 20, color: DesktopTheme.accentBrand),
             onPressed: () => Scaffold.of(ctx).openDrawer(),
           ),
         ),
@@ -335,7 +335,7 @@ class _DesktopShellState extends State<DesktopShell> {
           ),
           IconButton(
             tooltip: 'Новая задача',
-            icon: const Icon(Icons.add, size: 20, color: Color(0xFF00D2FF)),
+            icon: const Icon(Icons.add, size: 20, color: DesktopTheme.accentBrand),
             onPressed: _onNewTask,
           ),
         ],
@@ -386,7 +386,7 @@ class _DesktopShellState extends State<DesktopShell> {
       body: SafeArea(child: currentBody),
       bottomNavigationBar: BottomNavigationBar(
         backgroundColor: DesktopTheme.bgSidebar,
-        selectedItemColor: const Color(0xFF00D2FF),
+        selectedItemColor: DesktopTheme.accentBrand,
         unselectedItemColor: const Color(0xFF64748B),
         currentIndex: mobileNavIndex,
         type: BottomNavigationBarType.fixed,
@@ -691,21 +691,21 @@ class _DesktopShellState extends State<DesktopShell> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
-                color: const Color(0xFF00D2FF).withOpacity(0.12),
+                color: DesktopTheme.accentBrand.withOpacity(0.12),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF00D2FF).withOpacity(0.5), width: 1),
+                border: Border.all(color: DesktopTheme.accentBrand.withOpacity(0.5), width: 1),
               ),
               child: const Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.view_sidebar_outlined, size: 15, color: Color(0xFF00D2FF)),
+                  Icon(Icons.view_sidebar_outlined, size: 15, color: DesktopTheme.accentBrand),
                   SizedBox(width: 8),
                   Text(
                     'Открыть рабочую область (650 px)',
                     style: TextStyle(
                       fontSize: 12,
                       fontWeight: FontWeight.bold,
-                      color: Color(0xFF00D2FF),
+                      color: DesktopTheme.accentBrand,
                     ),
                   ),
                 ],

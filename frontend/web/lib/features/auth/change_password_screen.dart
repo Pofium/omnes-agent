@@ -290,7 +290,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                 ElevatedButton(
                   onPressed: _isLoading ? null : _submitChangePassword,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF00D2FF),
+                    backgroundColor: DesktopTheme.accentBrand,
                     foregroundColor: Colors.black,
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),

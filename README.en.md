@@ -1,16 +1,17 @@
 <div align="center">
 
-<img src="assets/banner.jpg" alt="Omnes Agent Banner" width="100%" style="border-radius: 12px;" />
+<img src="frontend/assets/Logo/OA_icon.svg" alt="Omnes Agent" width="96" />
 
 # Omnes Agent
 
 **Next-Generation Autonomous Personal AI Agent Ecosystem**  
-*Ultra-fast Rust Backend · Cyberpunk Flutter Client · Deterministic KAG & AST Code Memory*
+*Ultra-fast Rust Backend · Flutter ADE (Desktop & Web) · Deterministic KAG & AST Code Memory*
 
-[![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg?logo=rust)](https://www.rust-lang.org/)
-[![Flutter 3.x](https://img.shields.io/badge/Flutter-3.x-02569B.svg?logo=flutter)](https://flutter.dev/)
+[![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-FF6B00.svg?logo=rust)](https://www.rust-lang.org/)
+[![Flutter 3.x](https://img.shields.io/badge/Flutter-3.x-111827.svg?logo=flutter)](https://flutter.dev/)
+[![Brand: OmnesProducts](https://img.shields.io/badge/Brand-OmnesProducts_v1.1-FF6B00.svg)](DESIGN_SYSTEM.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android%20%7C%20iOS-brightgreen.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Web-111827.svg)]()
 
 [**English Version**](README.en.md) | [**Русская версия**](README.md)
 
@@ -22,15 +23,15 @@
 
 **Omnes Agent** is a full-featured execution and orchestration environment for autonomous personal AI assistants:
 1. **Pure Rust Core & Gateway**: Reactive async daemon (`omnesagent-gateway`), modular tool execution runtime (`omnesagent-tools`), supporting multi-vendor LLM backends (OpenAI, Anthropic, Gemini, Ollama, DeepSeek, OpenRouter) and cross-channel event processing.
-2. **KAG + AST Intelligence**: Deterministic static analysis for 10 programming languages with zero LLM token cost, **Blast Radius** calculation (`project_impact`), local in-process **Candle BERT MiniLM** vector embeddings (CPU), and hybrid **Reciprocal Rank Fusion (RRF $k=60$)** search.
-3. **Cross-Platform Flutter Client**: Mobile and desktop application designed with a sleek **Cyber Zinc & Neon Cyan** design system (`shadcn/ui + reui`), featuring live log inspection, Gateway Doctor self-diagnostics, and skill bundle management.
-4. **Memory Consolidation & Dreaming**: Background memory synthesis, user persona extraction, and workspace state checkpointing.
+2. **KAG + AST Intelligence (`ob2h` v2.0+)**: Deterministic static analysis (Tree-sitter + regex fallback across 18+ languages including Rust, Dart, Python, TS/JS, Go, SQL, and Assembly `.s`/`.asm`), **Blast Radius** (`project_impact` with `TESTED_BY` & `CO_CHANGES_WITH`), local in-process **Candle** vector embeddings (CPU) + Mean-Centered Binary Quantization, and hybrid **U-PPR + RRF ($k=60$)** search.
+3. **Cross-Platform Flutter Client (Desktop & Web)**: Designed with **OmnesProducts v1.1** (`Dark Charcoal #111827` 60% / `Off-White #F4F5F7` 30% / `Brand Orange #FF6B00` ≤10%, **Montserrat + Inter + JetBrains Mono**, S-Trunk elephant emblem with orange AR visor), featuring live log inspection, Gateway Doctor self-diagnostics, and skill bundle management.
+4. **Memory Consolidation & Dreaming 2.0**: Background memory synthesis (with `daily` cursor and balanced JSON parsing), 3-tier conflict resolution with `Entity Overlap` and `git_head_sha` freshness.
 
 ---
 
 ## 🖥️ Application Interface
 
-OmnesAgent Desktop ADE is not a chat window — it is the agent's entire workspace: project context, conversation, tools and artifacts share a single screen with no app switching. The visual layer is built on the **Cyber Zinc & Neon Cyan** design system (`shadcn/ui + reui`) — dark and light schemes, a cyan accent, rounded panels and theme tokens instead of hard-coded colors.
+OmnesAgent Desktop ADE is not a chat window — it is the agent's entire workspace: project context, conversation, tools and artifacts share a single screen with no app switching. The visual layer follows the **OmnesProducts v1.1** brand system (`shadcn/ui + reui`) — dark (`#111827`) and light (`#F4F5F7`) schemes, **Brand Orange (`#FF6B00`)** accent, **Montserrat / Inter / JetBrains Mono** typography, and semantic theme tokens (`DesktopTheme` / `ShadcnColors`).
 
 <div align="center">
   <a href="assets/screenshots/01-workspace.png"><img src="assets/screenshots/01-workspace.png" alt="OmnesAgent Desktop ADE workspace" width="100%" /></a>

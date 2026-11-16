@@ -159,7 +159,7 @@ class DesktopWebviewController extends ChangeNotifier {
     overlay.id = '__omnes_picker_overlay';
     overlay.style.position = 'fixed';
     overlay.style.pointerEvents = 'none';
-    overlay.style.border = '2px solid #00D2FF';
+    overlay.style.border = '2px solid #FF6B00';
     overlay.style.backgroundColor = 'rgba(0, 210, 255, 0.15)';
     overlay.style.zIndex = '2147483647';
     overlay.style.transition = 'all 0.05s ease';

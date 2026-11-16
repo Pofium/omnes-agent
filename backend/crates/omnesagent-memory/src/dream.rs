@@ -37,6 +37,10 @@ const MAX_SCAN_ROWS: i64 = 5_000;
 /// `(agent_id, namespace, tenant_id)` — the isolation scope a row belongs to.
 type ScopeKey = (Option<String>, String, Option<String>);
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 /// Result of a single consolidation pass.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DreamReport {
@@ -46,18 +50,28 @@ pub struct DreamReport {
     pub scopes: u64,
     /// Rows marked superseded as near-duplicates of a newer sibling.
     pub superseded: u64,
+    /// Daily rows considered since the last successful daily cursor.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub daily_scanned: u64,
+    /// Daily rows marked superseded as near-duplicates of a newer sibling.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub daily_superseded: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct DreamState {
     last_run_at: Option<String>,
     last_report: DreamReport,
+    /// Updated_at watermark of the newest `daily` row processed on a successful run.
+    #[serde(default)]
+    last_daily_cursor: Option<String>,
 }
 
 struct CoreRow {
     id: String,
     content: String,
     scope: ScopeKey,
+    updated_at: String,
 }
 
 /// Run the nightly consolidation if the cadence window has elapsed.
@@ -74,16 +88,16 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<Option<
         return Ok(None);
     }
 
-    let report = consolidate(workspace_dir, config)?;
-    write_state(workspace_dir, &report)?;
+    let (report, next_daily_cursor) = consolidate(workspace_dir, config, load_daily_cursor(workspace_dir).as_deref())?;
+    write_state(workspace_dir, &report, next_daily_cursor)?;
 
-    if report.superseded > 0 {
+    if report.superseded > 0 || report.daily_superseded > 0 {
         ::omnesagent_log::record!(
             INFO,
             ::omnesagent_log::Event::new(module_path!(), ::omnesagent_log::Action::Note),
             &format!(
-                "nightly memory consolidation complete: scanned={} scopes={} superseded={}",
-                report.scanned, report.scopes, report.superseded
+                "nightly memory consolidation complete: scanned={} scopes={} superseded={} daily_scanned={} daily_superseded={}",
+                report.scanned, report.scopes, report.superseded, report.daily_scanned, report.daily_superseded
             )
         );
     }
@@ -95,38 +109,21 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<Option<
 /// manual `dream_tool` trigger. Refreshes the cadence state so a scheduled pass
 /// does not immediately repeat the same work.
 pub fn consolidate_now(config: &MemoryConfig, workspace_dir: &Path) -> Result<DreamReport> {
-    let report = consolidate(workspace_dir, config)?;
-    write_state(workspace_dir, &report)?;
+    let (report, next_daily_cursor) = consolidate(workspace_dir, config, load_daily_cursor(workspace_dir).as_deref())?;
+    write_state(workspace_dir, &report, next_daily_cursor)?;
     Ok(report)
 }
 
-/// The pass itself: scan Core rows and, per scope, mark near-duplicate older
-/// siblings as superseded by the newest matching row.
-fn consolidate(workspace_dir: &Path, config: &MemoryConfig) -> Result<DreamReport> {
-    let db_path = workspace_dir.join("memory").join("brain.db");
-    if !db_path.exists() {
-        return Ok(DreamReport::default());
-    }
-
-    let conn = Connection::open(&db_path)?;
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-
-    let rows = load_core_rows(&conn)?;
-    let scanned = rows.len() as u64;
-
-    // Group row indices by isolation scope; scopes are never crossed.
-    let mut groups: HashMap<ScopeKey, Vec<usize>> = HashMap::new();
+/// Group rows by `(agent, namespace, tenant)` scope and mark older near-duplicate
+/// siblings as superseded by the newest matching row in the same scope.
+fn collect_near_duplicates(rows: &[CoreRow], threshold: f64) -> (u64, HashMap<String, String>) {
+    let mut groups: HashMap<&ScopeKey, Vec<usize>> = HashMap::new();
     for (idx, row) in rows.iter().enumerate() {
-        groups.entry(row.scope.clone()).or_default().push(idx);
+        groups.entry(&row.scope).or_default().push(idx);
     }
 
-    let threshold = config.dedup_jaccard_threshold;
-    // id of the superseded row -> id of the newest near-duplicate that replaces it.
     let mut superseded: HashMap<String, String> = HashMap::new();
-
     for idxs in groups.values() {
-        // `rows` is ordered by `updated_at DESC`, so the earliest index in a
-        // group is the newest row: it becomes the surviving sibling.
         for (pos, &older) in idxs.iter().enumerate() {
             for &newer in &idxs[..pos] {
                 if is_near_duplicate(&rows[older], &rows[newer], threshold) {
@@ -139,17 +136,54 @@ fn consolidate(workspace_dir: &Path, config: &MemoryConfig) -> Result<DreamRepor
         }
     }
 
-    let superseded_count = superseded.len() as u64;
-    if superseded_count == 0 {
-        return Ok(DreamReport {
-            scanned,
-            scopes: groups.len() as u64,
-            superseded: 0,
-        });
+    (groups.len() as u64, superseded)
+}
+
+/// The pass itself: scan Core rows and incremental Daily rows (since `daily_cursor`)
+/// and, per scope, mark near-duplicate older siblings as superseded.
+fn consolidate(
+    workspace_dir: &Path,
+    config: &MemoryConfig,
+    daily_cursor: Option<&str>,
+) -> Result<(DreamReport, Option<String>)> {
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok((DreamReport::default(), daily_cursor.map(str::to_string)));
+    }
+
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+
+    let threshold = config.dedup_jaccard_threshold;
+    let core_rows = load_rows_by_category(&conn, "core", None)?;
+    let scanned = core_rows.len() as u64;
+    let (scopes, core_superseded) = collect_near_duplicates(&core_rows, threshold);
+
+    let daily_rows = load_rows_by_category(&conn, "daily", daily_cursor)?;
+    let daily_scanned = daily_rows.len() as u64;
+    let next_daily_cursor = daily_rows
+        .first()
+        .map(|r| r.updated_at.clone())
+        .or_else(|| daily_cursor.map(str::to_string));
+    let (_, daily_superseded) = collect_near_duplicates(&daily_rows, threshold);
+
+    let superseded_count = core_superseded.len() as u64;
+    let daily_superseded_count = daily_superseded.len() as u64;
+    if superseded_count == 0 && daily_superseded_count == 0 {
+        return Ok((
+            DreamReport {
+                scanned,
+                scopes,
+                superseded: 0,
+                daily_scanned,
+                daily_superseded: 0,
+            },
+            next_daily_cursor,
+        ));
     }
 
     let tx = conn.unchecked_transaction()?;
-    for (id, keeper) in &superseded {
+    for (id, keeper) in core_superseded.iter().chain(daily_superseded.iter()) {
         tx.execute(
             "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
             params![keeper, id],
@@ -157,26 +191,36 @@ fn consolidate(workspace_dir: &Path, config: &MemoryConfig) -> Result<DreamRepor
     }
     tx.commit()?;
 
-    Ok(DreamReport {
-        scanned,
-        scopes: groups.len() as u64,
-        superseded: superseded_count,
-    })
+    Ok((
+        DreamReport {
+            scanned,
+            scopes,
+            superseded: superseded_count,
+            daily_scanned,
+            daily_superseded: daily_superseded_count,
+        },
+        next_daily_cursor,
+    ))
 }
 
-/// Load the Core rows eligible for consolidation: live (not yet superseded) and
-/// not pinned, newest first so a scope's first index is its newest row.
-fn load_core_rows(conn: &Connection) -> Result<Vec<CoreRow>> {
+/// Load live, non-pinned rows for `category`, newest first. When `updated_after`
+/// is supplied, only rows strictly newer than the cursor are returned.
+fn load_rows_by_category(
+    conn: &Connection,
+    category: &str,
+    updated_after: Option<&str>,
+) -> Result<Vec<CoreRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, content, agent_id, namespace, tenant_id \
+        "SELECT id, content, agent_id, namespace, tenant_id, updated_at \
          FROM memories \
-         WHERE category = 'core' AND superseded_by IS NULL AND pinned = 0 \
+         WHERE category = ?1 AND superseded_by IS NULL AND pinned = 0 \
+           AND (?2 IS NULL OR updated_at > ?2) \
          ORDER BY updated_at DESC \
-         LIMIT ?1",
+         LIMIT ?3",
     )?;
 
     let rows = stmt
-        .query_map(params![MAX_SCAN_ROWS], |row| {
+        .query_map(params![category, updated_after, MAX_SCAN_ROWS], |row| {
             Ok(CoreRow {
                 id: row.get(0)?,
                 content: row.get(1)?,
@@ -186,6 +230,7 @@ fn load_core_rows(conn: &Connection) -> Result<Vec<CoreRow>> {
                         .unwrap_or_else(|| "default".into()),
                     row.get::<_, Option<String>>(4)?,
                 ),
+                updated_at: row.get(5)?,
             })
         })?
         .filter_map(|row| row.ok())
@@ -240,7 +285,18 @@ fn should_run_now(workspace_dir: &Path) -> Result<bool> {
     Ok(Utc::now().signed_duration_since(last) >= Duration::hours(DREAM_INTERVAL_HOURS))
 }
 
-fn write_state(workspace_dir: &Path, report: &DreamReport) -> Result<()> {
+fn load_daily_cursor(workspace_dir: &Path) -> Option<String> {
+    let path = state_path(workspace_dir);
+    let raw = fs::read_to_string(path).ok()?;
+    let state: DreamState = serde_json::from_str(&raw).ok()?;
+    state.last_daily_cursor
+}
+
+fn write_state(
+    workspace_dir: &Path,
+    report: &DreamReport,
+    last_daily_cursor: Option<String>,
+) -> Result<()> {
     let path = state_path(workspace_dir);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -249,6 +305,7 @@ fn write_state(workspace_dir: &Path, report: &DreamReport) -> Result<()> {
     let state = DreamState {
         last_run_at: Some(Utc::now().to_rfc3339()),
         last_report: report.clone(),
+        last_daily_cursor,
     };
     let json = serde_json::to_vec_pretty(&state)?;
     fs::write(path, json)?;
@@ -391,5 +448,40 @@ mod tests {
         assert!(first.is_some(), "first pass runs");
         let second = run_if_due(&enabled_cfg(), workspace).unwrap();
         assert!(second.is_none(), "second pass is throttled within the window");
+    }
+
+    #[tokio::test]
+    async fn consolidate_now_processes_daily_rows_and_advances_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store_with_options(
+            "d1",
+            "alpha beta gamma delta",
+            MemoryCategory::Daily,
+            None,
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "d2",
+            "alpha beta gamma delta epsilon",
+            MemoryCategory::Daily,
+            None,
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let first = consolidate_now(&enabled_cfg(), workspace).unwrap();
+        assert_eq!(first.daily_scanned, 2);
+        assert_eq!(first.daily_superseded, 1);
+
+        // Second pass with no new daily rows skips already-processed records via cursor.
+        let second = consolidate_now(&enabled_cfg(), workspace).unwrap();
+        assert_eq!(second.daily_scanned, 0);
+        assert_eq!(second.daily_superseded, 0);
     }
 }

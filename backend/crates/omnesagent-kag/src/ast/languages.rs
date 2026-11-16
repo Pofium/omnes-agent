@@ -21,6 +21,14 @@ pub struct LanguageExtractor {
     zig_import_re: Regex,
     zig_fn_re: Regex,
     zig_type_re: Regex,
+
+    // Assembly (GAS / NASM / MASM)
+    asm_include_re: Regex,
+    asm_macro_re: Regex,
+    asm_equ_re: Regex,
+    asm_proc_re: Regex,
+    asm_label_re: Regex,
+    asm_call_re: Regex,
 }
 
 impl Default for LanguageExtractor {
@@ -45,6 +53,14 @@ impl LanguageExtractor {
             zig_import_re: Regex::new(r#"(?m)^\s*(?:pub\s+)?const\s+([a-zA-Z0-9_]+)\s*=\s*@import\(["']([^"']+)["']\)\s*;"#).unwrap(),
             zig_fn_re: Regex::new(r#"(?m)^\s*(?:pub\s+)?(?:export\s+)?(?:inline\s+)?fn\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)"#).unwrap(),
             zig_type_re: Regex::new(r#"(?m)^\s*(?:pub\s+)?const\s+([a-zA-Z0-9_]+)\s*=\s*(?:packed\s+|extern\s+)?(struct|enum|union|error)\b"#).unwrap(),
+
+            // Assembly patterns (GAS / NASM / MASM)
+            asm_include_re: Regex::new(r#"(?i)^\s*(?:#include|%include|include)\s+["<]?([^">\s]+)[">]?"#).unwrap(),
+            asm_macro_re: Regex::new(r#"(?i)^\s*(?:\.macro|%macro)\s+([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*)|^\s*([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*)\s+MACRO\b"#).unwrap(),
+            asm_equ_re: Regex::new(r#"(?i)^\s*(?:\.equ\s+([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*)\s*,|%define\s+([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*)|([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*)\s+EQU\b)"#).unwrap(),
+            asm_proc_re: Regex::new(r#"(?i)^\s*([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*)\s+PROC\b"#).unwrap(),
+            asm_label_re: Regex::new(r#"^\s*([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*):(?:\s|$|;|#|//)"#).unwrap(),
+            asm_call_re: Regex::new(r#"(?i)^\s*(?:callq?|bl|jal)\s+([a-zA-Z_.$?@][a-zA-Z0-9_.$?@]*)"#).unwrap(),
         }
     }
 
@@ -419,5 +435,205 @@ impl LanguageExtractor {
                 }
             }
         }
+    }
+
+    /// Парсит ассемблерные файлы (`.s`, `.S`, `.asm`) со сниффингом диалекта (GAS / NASM / MASM).
+    pub fn parse_asm(
+        &self,
+        rel_path: &str,
+        file_node_id: &str,
+        content: &str,
+        out: &mut AstScanResult,
+    ) {
+        let dialect = if rel_path.to_ascii_lowercase().ends_with(".s") {
+            "GAS"
+        } else if content.contains("%macro") || content.contains("%include") || content.contains("%define") {
+            "NASM"
+        } else if content.to_ascii_uppercase().contains(" PROC") || content.to_ascii_uppercase().contains(" ENDP") {
+            "MASM"
+        } else {
+            "ASM"
+        };
+
+        let mut current_fn_node_id: Option<String> = None;
+
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with(';')
+                || trimmed.starts_with("//")
+                || (trimmed.starts_with('#') && !trimmed.starts_with("#include"))
+            {
+                continue;
+            }
+
+            if let Some(cap) = self.asm_include_re.captures(trimmed)
+                && let Some(inc) = cap.get(1)
+            {
+                out.edges.push(AstEdge {
+                    source_node_id: file_node_id.to_string(),
+                    target_node_id: format!("module:{}", inc.as_str().trim()),
+                    label: "IMPORTS".to_string(),
+                    weight: 1.0,
+                    context: format!("include {}", inc.as_str().trim()),
+                    provenance: "SYNTAX".to_string(),
+                });
+            }
+
+            if let Some(cap) = self.asm_macro_re.captures(trimmed)
+                && let Some(name_m) = cap.get(1).or_else(|| cap.get(2))
+            {
+                let name = name_m.as_str().trim();
+                let node_id = format!("macro:{}:{}", rel_path, name);
+                out.nodes.push(AstNode {
+                    node_id: node_id.clone(),
+                    label: name.to_string(),
+                    node_type: "Macro".to_string(),
+                    description: format!("{dialect} макрос {name} в {rel_path}"),
+                    file_path: rel_path.to_string(),
+                    line_start: idx + 1,
+                    line_end: idx + 1,
+                    ..Default::default()
+                });
+                out.edges.push(AstEdge {
+                    source_node_id: file_node_id.to_string(),
+                    target_node_id: node_id,
+                    label: "DEFINES".to_string(),
+                    weight: 1.0,
+                    context: format!("{dialect} macro {name}"),
+                    provenance: "SYNTAX".to_string(),
+                });
+                continue;
+            }
+
+            if let Some(cap) = self.asm_equ_re.captures(trimmed)
+                && let Some(name_m) = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3))
+            {
+                let name = name_m.as_str().trim();
+                let node_id = format!("data:{}:{}", rel_path, name);
+                out.nodes.push(AstNode {
+                    node_id: node_id.clone(),
+                    label: name.to_string(),
+                    node_type: "Data".to_string(),
+                    description: format!("{dialect} константа {name} в {rel_path}"),
+                    file_path: rel_path.to_string(),
+                    line_start: idx + 1,
+                    line_end: idx + 1,
+                    ..Default::default()
+                });
+                out.edges.push(AstEdge {
+                    source_node_id: file_node_id.to_string(),
+                    target_node_id: node_id,
+                    label: "DEFINES".to_string(),
+                    weight: 1.0,
+                    context: format!("{dialect} const {name}"),
+                    provenance: "SYNTAX".to_string(),
+                });
+                continue;
+            }
+
+            if let Some(name) = self
+                .asm_proc_re
+                .captures(trimmed)
+                .and_then(|c| c.get(1))
+                .or_else(|| self.asm_label_re.captures(trimmed).and_then(|c| c.get(1)))
+                .map(|m| m.as_str().trim())
+            {
+                if is_skipped_asm_label(name) {
+                    continue;
+                }
+                let node_id = format!("fn:{}:{}", rel_path, name);
+                out.nodes.push(AstNode {
+                    node_id: node_id.clone(),
+                    label: name.to_string(),
+                    node_type: "Function".to_string(),
+                    description: format!("{dialect} процедура {name} в {rel_path}"),
+                    file_path: rel_path.to_string(),
+                    line_start: idx + 1,
+                    line_end: idx + 1,
+                    ..Default::default()
+                });
+                out.edges.push(AstEdge {
+                    source_node_id: file_node_id.to_string(),
+                    target_node_id: node_id.clone(),
+                    label: "DEFINES".to_string(),
+                    weight: 1.0,
+                    context: format!("{dialect} fn {name}"),
+                    provenance: "SYNTAX".to_string(),
+                });
+                current_fn_node_id = Some(node_id);
+                continue;
+            }
+
+            if let Some(cap) = self.asm_call_re.captures(trimmed)
+                && let Some(target_m) = cap.get(1)
+            {
+                let target = target_m.as_str().trim();
+                if is_skipped_asm_call_target(target) {
+                    continue;
+                }
+                let caller = current_fn_node_id.as_deref().unwrap_or(file_node_id);
+                out.edges.push(AstEdge {
+                    source_node_id: caller.to_string(),
+                    target_node_id: format!("fn:{}", target),
+                    label: "CALLS".to_string(),
+                    weight: 1.0,
+                    context: format!("call {target}"),
+                    provenance: "HEURISTIC".to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn is_skipped_asm_label(name: &str) -> bool {
+    name.starts_with(".L")
+        || name.ends_with(".cold")
+        || name.starts_with("__x86.get_pc_thunk.")
+        || name.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_skipped_asm_call_target(target: &str) -> bool {
+    matches!(
+        target.to_ascii_lowercase().as_str(),
+        "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp"
+            | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15"
+            | "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" | "esp"
+            | "dword" | "qword" | "ptr"
+    ) || is_skipped_asm_label(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_asm_extracts_gas_nasm_masm_symbols_and_skips_local_labels() {
+        let ext = LanguageExtractor::new();
+        let mut res = AstScanResult::default();
+        let gas = r#"
+#include "arch_defs.h"
+.macro SAVE_REGS
+.endm
+.equ STACK_SZ, 64
+.Llocal_loop:
+__memcpy_avx:
+    call helper_fn
+    call .Llocal_loop
+"#;
+        ext.parse_asm("arch/memcpy.S", "file:arch/memcpy.S", gas, &mut res);
+        let labels: Vec<&str> = res.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"SAVE_REGS"));
+        assert!(labels.contains(&"STACK_SZ"));
+        assert!(labels.contains(&"__memcpy_avx"));
+        assert!(!labels.contains(&".Llocal_loop"));
+        assert!(res.edges.iter().any(|e| e.label == "IMPORTS" && e.target_node_id == "module:arch_defs.h"));
+        assert!(res.edges.iter().any(|e| e.label == "CALLS" && e.target_node_id == "fn:helper_fn"));
+
+        let mut masm_res = AstScanResult::default();
+        let masm = "my_proc PROC\n  call fast_crc32\nmy_proc ENDP\n";
+        ext.parse_asm("src/crc.asm", "file:src/crc.asm", masm, &mut masm_res);
+        assert!(masm_res.nodes.iter().any(|n| n.label == "my_proc" && n.node_type == "Function"));
+        assert!(masm_res.edges.iter().any(|e| e.label == "CALLS" && e.target_node_id == "fn:fast_crc32"));
     }
 }

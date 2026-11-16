@@ -31,6 +31,11 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
+if(MSVC)
+  # Windows SDK 10.0.19041.0 cppwinrt headers (used by webview_windows) require
+  # two-phase name lookup disabled on newer MSVC 17.10+ toolchains.
+  add_compile_options(/Zc:twoPhase-)
+endif()
 
 # Compilation settings that should be applied to most targets.
 #
