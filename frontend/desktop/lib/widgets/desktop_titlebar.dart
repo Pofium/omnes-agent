@@ -1,7 +1,6 @@
 // Desktop TitleBar with Daemon Status, Active Model Selector, and Command Palette Trigger.
 
 import 'package:flutter/material.dart';
-import 'package:flutter_svg/flutter_svg.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:get/get.dart';
 import '../theme/desktop_theme.dart';
@@ -31,36 +30,7 @@ class DesktopTitleBar extends StatelessWidget {
       ),
       child: Row(
         children: [
-          // 1. Logo and Brand Name
-          Container(
-            width: 26,
-            height: 26,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: DesktopTheme.isDark
-                    ? const Color(0xFFF4F5F7).withOpacity(0.24)
-                    : DesktopTheme.borderSubtle,
-                width: 1,
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: DesktopTheme.accentBrand.withOpacity(0.18),
-                  blurRadius: 8,
-                  offset: const Offset(0, 1),
-                ),
-              ],
-            ),
-            child: ClipOval(
-              child: SvgPicture.asset(
-                'assets/Logo/OA_icon.svg',
-                width: 26,
-                height: 26,
-                fit: BoxFit.contain,
-              ),
-            ),
-          ),
-          const SizedBox(width: 10),
+          // 1. Brand Name
           Text(
             'OmnesAgent',
             style: TextStyle(
