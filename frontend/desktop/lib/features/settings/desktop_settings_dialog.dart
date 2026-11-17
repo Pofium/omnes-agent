@@ -60,14 +60,15 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   Map<String, dynamic>? versionInfo;
   bool isCheckingVersion = false;
 
-  // Devices state
-  List<Map<String, dynamic>> pairedDevices = [];
-
   // Channels state
   final telegramTokenController = TextEditingController();
   final discordTokenController = TextEditingController();
   final slackTokenController = TextEditingController();
   final whatsappPhoneController = TextEditingController();
+  final channelSearchController = TextEditingController();
+  final Map<String, TextEditingController> _extraChannelControllers = {};
+  String selectedChannelCategory = 'all';
+  String channelSearchQuery = '';
   String? channelStatusMsg;
   bool isChannelBinding = false;
   List<Map<String, dynamic>> configuredChannels = [];
@@ -113,12 +114,6 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   List<Map<String, dynamic>> wasmPluginsList = [];
   bool isPluginsLoading = false;
   String? pluginsStatusMsg;
-
-  // WebAuthn state
-  List<Map<String, dynamic>> webauthnCredentials = [];
-  bool isWebauthnLoading = false;
-  final webauthnUsernameController = TextEditingController(text: 'admin');
-  String? webauthnStatusMsg;
 
   // Cron Settings state
   Map<String, dynamic>? cronSettingsData;
@@ -355,14 +350,12 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     startupSessionMode = _storage.read<String>('startup_session_mode') ?? 'last';
     _loadBackendConfig();
     _loadPersonalityFile('SOUL.md');
-    _loadPairedDevices();
     _loadChannels();
     _loadSkills();
     _loadHostFs();
     _loadConfigWizard();
     _loadSecretMaps();
     _loadWasmPlugins();
-    _loadWebauthn();
     _loadCronSettings();
     _initNodesWs();
   }
@@ -411,17 +404,6 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
     } catch (_) {
       if (mounted) setState(() => isCheckingVersion = false);
     }
-  }
-
-  Future<void> _loadPairedDevices() async {
-    try {
-      final list = await _httpClient.getDevices();
-      if (mounted) {
-        setState(() {
-          pairedDevices = list;
-        });
-      }
-    } catch (_) {}
   }
 
   Future<void> _loadChannels() async {
@@ -798,59 +780,6 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
       }
     } catch (_) {
       if (mounted) setState(() => isPluginsLoading = false);
-    }
-  }
-
-  Future<void> _loadWebauthn() async {
-    setState(() => isWebauthnLoading = true);
-    try {
-      final creds = await _httpClient.webauthnListCredentials();
-      if (mounted) {
-        setState(() {
-          webauthnCredentials = creds;
-          isWebauthnLoading = false;
-        });
-      }
-    } catch (_) {
-      if (mounted) setState(() => isWebauthnLoading = false);
-    }
-  }
-
-  Future<void> _registerWebauthn() async {
-    final user = webauthnUsernameController.text.trim();
-    if (user.isEmpty) return;
-    setState(() {
-      isWebauthnLoading = true;
-      webauthnStatusMsg = 'Инициализация регистрации аппаратного ключа...';
-    });
-    final startRes = await _httpClient.webauthnRegisterStart(user);
-    if (startRes != null) {
-      final finishOk = await _httpClient.webauthnRegisterFinish({
-        'credential_id': 'fido2_${DateTime.now().millisecondsSinceEpoch}',
-        'user': user,
-      });
-      if (mounted) {
-        setState(() {
-          webauthnStatusMsg = finishOk ? 'Ключ FIDO2/WebAuthn успешно зарегистрирован' : 'Ошибка верификации ключа';
-        });
-      }
-    } else {
-      if (mounted) {
-        setState(() {
-          webauthnStatusMsg = 'Сервер WebAuthn готов (для физического ключа требуется браузерный TouchID/YubiKey)';
-        });
-      }
-    }
-    await _loadWebauthn();
-  }
-
-  Future<void> _deleteWebauthn(String id) async {
-    final ok = await _httpClient.webauthnDeleteCredential(id);
-    if (mounted) {
-      setState(() {
-        webauthnStatusMsg = ok ? 'Навык-ключ $id удалён' : 'Ошибка удаления ключа';
-      });
-      await _loadWebauthn();
     }
   }
 
@@ -1261,33 +1190,33 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                       children: [
                         _buildSectionHeader(DesktopI18n.mainSettings),
                         _buildNavItem('general', DesktopI18n.general, Icons.tune),
-                        _buildNavItem('providers', DesktopI18n.providers, FontAwesomeIcons.brain),
                         _buildNavItem('appearance', DesktopI18n.appearance, Icons.brightness_6_outlined),
                         _buildNavItem('profile', DesktopI18n.profile, FontAwesomeIcons.userAstronaut),
+                        _buildNavItem('stt', DesktopI18n.tr('Голосовой ввод', 'Voice input'), Icons.mic_none),
 
                         const SizedBox(height: 16),
-                        _buildSectionHeader(DesktopI18n.agentCapabilities),
+                        _buildSectionHeader(DesktopI18n.tr('Модели и агент', 'Models & Agent')),
+                        _buildNavItem('providers', DesktopI18n.providers, FontAwesomeIcons.brain),
                         _buildNavItem('personality', 'Личность агента', FontAwesomeIcons.masksTheater),
                         _buildNavItem('quickstart', 'Мастер Quickstart', FontAwesomeIcons.wandMagicSparkles),
                         _buildNavItem('config_wizard', 'Мастер конфигурации', Icons.auto_mode),
+                        _buildNavItem('commands', DesktopI18n.commands, FontAwesomeIcons.terminal),
+
+                        const SizedBox(height: 16),
+                        _buildSectionHeader(DesktopI18n.tr('Расширения и каналы', 'Extensions & Channels')),
                         _buildNavItem('mcp', DesktopI18n.mcpServers, Icons.extension_outlined),
                         _buildNavItem('skills', DesktopI18n.skills, Icons.auto_awesome),
                         _buildNavItem('plugins', 'WASM Плагины', Icons.extension),
                         _buildNavItem('channels', 'Каналы связи (Channels)', FontAwesomeIcons.paperPlane),
-                        _buildNavItem('commands', DesktopI18n.commands, FontAwesomeIcons.terminal),
 
                         const SizedBox(height: 16),
-                        _buildSectionHeader(DesktopI18n.dataAndAnalysis),
-                        _buildNavItem('nodes', 'Сеть нод и пиры', Icons.hub),
+                        _buildSectionHeader(DesktopI18n.tr('Память и система', 'Memory & System')),
                         _buildNavItem('memory', DesktopI18n.memoryAst, Icons.shield_outlined),
-                        _buildNavItem('stats', DesktopI18n.usageStats, Icons.bar_chart),
                         _buildNavItem('cron', 'Расписание Cron', Icons.schedule),
-                        _buildNavItem('security', 'Безопасность (WebAuthn)', Icons.security),
+                        _buildNavItem('stats', DesktopI18n.usageStats, Icons.bar_chart),
+                        _buildNavItem('nodes', 'Сеть нод и пиры', Icons.hub),
+                        _buildNavItem('system', 'Система и шлюз', Icons.admin_panel_settings_outlined),
                         _buildNavItem('version', 'Версия и обновления', Icons.system_update_alt),
-                        _buildNavItem('devices', 'Устройства (Pairing)', Icons.devices),
-                        _buildNavItem('stt', DesktopI18n.tr('Голосовой ввод', 'Voice input'), Icons.mic_none),
-                        _buildNavItem('system', 'Система и Host FS', Icons.admin_panel_settings_outlined),
-                        _buildNavItem('integrations', 'Интеграции Hub', Icons.hub_outlined),
                       ],
                     ),
                   ),
@@ -1435,20 +1364,14 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         return DesktopI18n.usageStats;
       case 'cron':
         return 'Глобальное расписание планировщика (Cron Settings)';
-      case 'security':
-        return 'Аппаратные ключи безопасности (WebAuthn / FIDO2)';
       case 'version':
         return 'Версия и обновления шлюза';
-      case 'devices':
-        return 'Подключённые устройства (Pairing)';
       case 'stt':
         return DesktopI18n.tr('Голосовой ввод и STT (Handy / Whisper)', 'Voice Input & STT (Handy / Whisper)');
       case 'channels':
         return 'Каналы связи и мессенджеры (Channels Hub)';
       case 'system':
-        return 'Системное администрирование и Host FS Explorer';
-      case 'integrations':
-        return 'Центр интеграций (Integrations Hub)';
+        return 'Система и управление шлюзом';
       default:
         return DesktopI18n.general;
     }
@@ -1535,18 +1458,12 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
         return _buildUsageStatsSection();
       case 'cron':
         return _buildCronSection();
-      case 'security':
-        return _buildWebauthnSection();
       case 'version':
         return _buildVersionSection();
-      case 'devices':
-        return _buildDevicesSection();
       case 'channels':
         return _buildChannelsSection();
       case 'system':
         return _buildSystemSection();
-      case 'integrations':
-        return _buildIntegrationsSection();
       case 'stt':
         return VoiceSettingsSection(httpClient: _httpClient);
       default:
@@ -2715,9 +2632,9 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                     if (isDark) DesktopThemeController.to.toggleTheme();
                   },
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: !isDark ? const Color(0xFF0284C7).withOpacity(0.2) : DesktopTheme.bgSurface,
-                    foregroundColor: !isDark ? const Color(0xFF0284C7) : DesktopTheme.textPrimary,
-                    side: BorderSide(color: !isDark ? const Color(0xFF0284C7) : DesktopTheme.borderSubtle),
+                    backgroundColor: !isDark ? DesktopTheme.accentBrand.withOpacity(0.18) : DesktopTheme.bgSurface,
+                    foregroundColor: !isDark ? DesktopTheme.accentBrandDark : DesktopTheme.textPrimary,
+                    side: BorderSide(color: !isDark ? DesktopTheme.accentBrand : DesktopTheme.borderSubtle),
                   ),
                 ),
               ],
@@ -3296,111 +3213,65 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   // ========================================================
   // SECTION: УСТРОЙСТВА
   // ========================================================
-  Widget _buildDevicesSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Text('Подключённые и сопряжённые устройства', style: TextStyle(fontSize: 13, color: DesktopTheme.textMuted)),
-            const Spacer(),
-            TextButton.icon(
-              icon: const Icon(Icons.refresh, size: 14),
-              label: const Text('Обновить'),
-              onPressed: _loadPairedDevices,
-            ),
-          ],
-        ),
-        const SizedBox(height: 16),
-
-        Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurfaceElevated,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: DesktopTheme.borderSubtle),
-          ),
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.computer, size: 20, color: DesktopTheme.accentCyan),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('Локальная рабочая станция (Windows Desktop)', style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
-                        Text('IP: 127.0.0.1 • Порт: 42617 • Сессия ADE', style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted)),
-                      ],
-                    ),
-                  ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF10B981).withOpacity(0.15),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: const Text('Текущее', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-
-
-  Widget _buildIntegrationsSection() {
-    final hubs = [
-      {'name': 'Telegram Bot', 'desc': 'Интеграция с Telegram каналами и ботами', 'status': 'Готово к привязке'},
-      {'name': 'Discord Bridge', 'desc': 'Бот сообществ и серверов Discord', 'status': 'Готово к привязке'},
-      {'name': 'Jira / GitHub', 'desc': 'Трекинг задач, issue, pull requests и commit reviews', 'status': 'Активно'},
-      {'name': 'Google Workspace / Notion', 'desc': 'Экспорт отчетов и синхронизация документов', 'status': 'Доступно'},
-    ];
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text('Внешние каналы связи и сервисные интеграции', style: TextStyle(fontSize: 13, color: DesktopTheme.textMuted)),
-        const SizedBox(height: 16),
-        ...hubs.map((h) => Container(
-          margin: const EdgeInsets.only(bottom: 10),
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: DesktopTheme.bgSurfaceElevated,
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: DesktopTheme.borderSubtle),
-          ),
-          child: Row(
-            children: [
-              const Icon(Icons.hub_outlined, size: 18, color: DesktopTheme.accentCyan),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(h['name']!, style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary)),
-                    const SizedBox(height: 3),
-                    Text(h['desc']!, style: TextStyle(fontSize: 11.5, color: DesktopTheme.textMuted)),
-                  ],
-                ),
-              ),
-              Text(h['status']!, style: TextStyle(fontSize: 11, color: DesktopTheme.textMuted)),
-            ],
-          ),
-        )),
-      ],
-    );
+  TextEditingController _channelFieldController(String channelId) {
+    return _extraChannelControllers.putIfAbsent(channelId, TextEditingController.new);
   }
 
   // ========================================================
-  // SECTION: КАНАЛЫ СВЯЗИ (Channels Hub)
+  // SECTION: КАНАЛЫ СВЯЗИ (Channels Hub — полный каталог бэкенда)
   // ========================================================
   Widget _buildChannelsSection() {
+    final categories = <Map<String, String>>[
+      {'id': 'all', 'label': 'Все'},
+      {'id': 'messengers', 'label': 'Мессенджеры'},
+      {'id': 'enterprise', 'label': 'Корпоративные / Азия'},
+      {'id': 'email_social', 'label': 'Почта и соцсети'},
+      {'id': 'protocols', 'label': 'Протоколы и голос'},
+    ];
+
+    final extraChannels = <Map<String, dynamic>>[
+      {'id': 'matrix', 'name': 'Matrix', 'cat': 'messengers', 'icon': Icons.grid_view_rounded, 'color': const Color(0xFF10B981), 'desc': 'Федеративный защищённый чат Matrix (Homeserver + Access Token).', 'hint': 'Homeserver URL или Access Token', 'field': 'token'},
+      {'id': 'mattermost', 'name': 'Mattermost', 'cat': 'messengers', 'icon': Icons.forum_outlined, 'color': const Color(0xFF0058CC), 'desc': 'Корпоративный чат Mattermost (Server URL + Bot Token).', 'hint': 'Bot Access Token', 'field': 'token'},
+      {'id': 'signal', 'name': 'Signal', 'cat': 'messengers', 'icon': Icons.lock_outline, 'color': const Color(0xFF3A76F0), 'desc': 'Приватный мессенджер Signal (signal-cli / номер телефона).', 'hint': 'Номер телефона (+7...)', 'field': 'phone', 'relink': true},
+      {'id': 'nextcloud_talk', 'name': 'Nextcloud Talk', 'cat': 'messengers', 'icon': Icons.cloud_queue, 'color': const Color(0xFF0082C9), 'desc': 'Корпоративные звонки и чаты Nextcloud Talk.', 'hint': 'Nextcloud Server URL / Bot Secret', 'field': 'token'},
+      {'id': 'imessage', 'name': 'iMessage (macOS)', 'cat': 'messengers', 'icon': Icons.chat_bubble_outline, 'color': const Color(0xFF34C759), 'desc': 'Интеграция с локальным iMessage Bridge (только macOS).', 'hint': 'Apple ID / Allowlist контакт', 'field': 'identity'},
+      {'id': 'lark', 'name': 'Lark / Feishu', 'cat': 'enterprise', 'icon': Icons.workspaces_outline, 'color': const Color(0xFF00D6B9), 'desc': 'Корпоративная платформа Lark / Feishu (App ID / Secret).', 'hint': 'App ID или Verification Token', 'field': 'token'},
+      {'id': 'line', 'name': 'LINE Messaging', 'cat': 'enterprise', 'icon': Icons.chat_outlined, 'color': const Color(0xFF06C755), 'desc': 'Бот LINE Messaging API (Channel Access Token / привязка ID).', 'hint': 'Channel Access Token или User ID', 'field': 'token'},
+      {'id': 'dingtalk', 'name': 'DingTalk', 'cat': 'enterprise', 'icon': Icons.business_center_outlined, 'color': const Color(0xFF0089FF), 'desc': 'Корпоративный мессенджер DingTalk (Robot Webhook / AppKey).', 'hint': 'AppKey / Robot Access Token', 'field': 'token'},
+      {'id': 'wechat', 'name': 'WeChat (iLink)', 'cat': 'enterprise', 'icon': Icons.wechat, 'color': const Color(0xFF07C160), 'desc': 'Личный и сервисный WeChat iLink Bot (поддерживает QR-привязку).', 'hint': 'WeChat Bot ID / Identity', 'field': 'identity', 'relink': true},
+      {'id': 'wecom', 'name': 'WeCom (Webhook)', 'cat': 'enterprise', 'icon': Icons.apartment_outlined, 'color': const Color(0xFF2B7CE9), 'desc': 'WeChat Enterprise (WeCom) через Webhook.', 'hint': 'WeCom Webhook Key / CorpID', 'field': 'token'},
+      {'id': 'wecom_ws', 'name': 'WeCom WebSocket', 'cat': 'enterprise', 'icon': Icons.bolt_outlined, 'color': const Color(0xFF2B7CE9), 'desc': 'WeChat Enterprise AI Bot через постоянный WebSocket.', 'hint': 'Bot ID / Secret', 'field': 'token'},
+      {'id': 'qq', 'name': 'QQ Official Bot', 'cat': 'enterprise', 'icon': Icons.smart_toy_outlined, 'color': const Color(0xFF12B7F5), 'desc': 'Официальный бот Tencent QQ (AppID + Token).', 'hint': 'QQ AppID / Bot Token', 'field': 'token'},
+      {'id': 'mochat', 'name': 'Mochat', 'cat': 'enterprise', 'icon': Icons.support_agent_outlined, 'color': const Color(0xFFF59E0B), 'desc': 'Канал клиентской поддержки Mochat.', 'hint': 'API Key / Workspace Token', 'field': 'token'},
+      {'id': 'linq', 'name': 'Linq Partner API', 'cat': 'enterprise', 'icon': Icons.link_outlined, 'color': const Color(0xFF6366F1), 'desc': 'Шлюз сообщений Linq Partner API.', 'hint': 'Linq API Token', 'field': 'token'},
+      {'id': 'email', 'name': 'Email (IMAP / SMTP)', 'cat': 'email_social', 'icon': Icons.email_outlined, 'color': const Color(0xFFEA4335), 'desc': 'Полноценный приём и отправка писем по IMAP/SMTP.', 'hint': 'Email адрес (user@domain.com)', 'field': 'email'},
+      {'id': 'gmail_push', 'name': 'Gmail Push (Pub/Sub)', 'cat': 'email_social', 'icon': Icons.mark_email_unread_outlined, 'color': const Color(0xFFDB4437), 'desc': 'Мгновенные push-уведомления входящей почты Gmail через Pub/Sub.', 'hint': 'Pub/Sub Topic / Subscription', 'field': 'topic'},
+      {'id': 'twitter', 'name': 'X / Twitter', 'cat': 'email_social', 'icon': Icons.alternate_email, 'color': const Color(0xFF94A3B8), 'desc': 'Мониторинг упоминаний и публикация через X API.', 'hint': 'Bearer / OAuth Token', 'field': 'token'},
+      {'id': 'bluesky', 'name': 'Bluesky (ATProto)', 'cat': 'email_social', 'icon': Icons.cloud_outlined, 'color': const Color(0xFF0285FF), 'desc': 'Децентрализованная лента и сообщения Bluesky.', 'hint': 'Handle (user.bsky.social) / App Password', 'field': 'token'},
+      {'id': 'reddit', 'name': 'Reddit', 'cat': 'email_social', 'icon': Icons.forum, 'color': const Color(0xFFFF4500), 'desc': 'Мониторинг сабреддитов и ответов Reddit.', 'hint': 'Client ID / Refresh Token', 'field': 'token'},
+      {'id': 'twitch', 'name': 'Twitch Chat', 'cat': 'email_social', 'icon': Icons.live_tv_outlined, 'color': const Color(0xFF9146FF), 'desc': 'Интерактивный чат трансляций Twitch (IRC/OAuth).', 'hint': 'OAuth Token (oauth:...)', 'field': 'token'},
+      {'id': 'irc', 'name': 'IRC', 'cat': 'email_social', 'icon': Icons.terminal, 'color': const Color(0xFF10B981), 'desc': 'Классический IRC-клиент (сервер, никнейм и каналы).', 'hint': 'irc.libera.chat:6697 / #channel', 'field': 'server'},
+      {'id': 'nostr', 'name': 'Nostr', 'cat': 'email_social', 'icon': Icons.key_outlined, 'color': const Color(0xFF8B5CF6), 'desc': 'Зашифрованные сообщения и события по релеям Nostr.', 'hint': 'nsec / Relay URL', 'field': 'token'},
+      {'id': 'webhook', 'name': 'HTTP Webhook', 'cat': 'protocols', 'icon': Icons.webhook, 'color': DesktopTheme.accentBrand, 'desc': 'Входящие/исходящие JSON-вебхуки для внешних сервисов и CI/CD.', 'hint': 'Endpoint Secret / Callback URL', 'field': 'url'},
+      {'id': 'mqtt', 'name': 'MQTT Broker', 'cat': 'protocols', 'icon': Icons.sensors, 'color': const Color(0xFF660066), 'desc': 'Телеметрия и команды умного дома / IoT через MQTT.', 'hint': 'mqtt://host:1883/topic', 'field': 'broker'},
+      {'id': 'amqp', 'name': 'AMQP (RabbitMQ)', 'cat': 'protocols', 'icon': Icons.swap_horiz, 'color': const Color(0xFFFF6600), 'desc': 'Очереди событий и сообщений AMQP 0-9-1.', 'hint': 'amqp://user:pass@host:5672/%2f', 'field': 'url'},
+      {'id': 'git', 'name': 'Git Channel', 'cat': 'protocols', 'icon': Icons.merge_type, 'color': const Color(0xFFF05032), 'desc': 'События и команды через Git-репозиторий.', 'hint': 'Путь или Remote URL репозитория', 'field': 'url'},
+      {'id': 'filesystem', 'name': 'Filesystem Drop', 'cat': 'protocols', 'icon': Icons.folder_open, 'color': const Color(0xFF64748B), 'desc': 'Локальный inbox/outbox каталог для файлового обмена.', 'hint': 'Путь к каталогу обмена', 'field': 'path'},
+      {'id': 'clawdtalk', 'name': 'ClawdTalk Voice', 'cat': 'protocols', 'icon': Icons.record_voice_over_outlined, 'color': DesktopTheme.accentBrand, 'desc': 'Голосовой шлюз ClawdTalk.', 'hint': 'ClawdTalk Endpoint / Token', 'field': 'token'},
+      {'id': 'voice_call', 'name': 'Voice Call', 'cat': 'protocols', 'icon': Icons.call_outlined, 'color': const Color(0xFF10B981), 'desc': 'Голосовые вызовы реального времени (SIP / WebRTC).', 'hint': 'SIP URI / Provider Token', 'field': 'token'},
+    ];
+
+    final q = channelSearchQuery.trim().toLowerCase();
+    bool matches(String cat, String id, String name, String desc) {
+      if (selectedChannelCategory != 'all' && selectedChannelCategory != cat) return false;
+      if (q.isEmpty) return true;
+      return id.contains(q) || name.toLowerCase().contains(q) || desc.toLowerCase().contains(q);
+    }
+
+    final filteredExtra = extraChannels
+        .where((c) => matches(c['cat'] as String, c['id'] as String, c['name'] as String, c['desc'] as String))
+        .toList();
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -3412,12 +3283,12 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Центр каналов связи (Messaging & Ingress Hub)',
+                    'Центр каналов связи (${configuredChannels.length} активн. / ${4 + extraChannels.length} типов)',
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: DesktopTheme.textPrimary),
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Прямая привязка Telegram, WhatsApp, Discord и Slack к шлюзу для приёма команд и взаимодействия.',
+                    'Прямая привязка мессенджеров, почты, соцсетей и транспортных протоколов к шлюзу OmnesAgent.',
                     style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
                   ),
                 ],
@@ -3430,157 +3301,307 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
             ),
           ],
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 14),
+
+        // Живой статус настроенных в шлюзе каналов (GET /api/channels)
+        if (configuredChannels.isNotEmpty) ...[
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: DesktopTheme.bgSurfaceElevated,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: DesktopTheme.borderSubtle),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Настроенные каналы в шлюзе',
+                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: DesktopTheme.textPrimary),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: configuredChannels.map((ch) {
+                    final name = ch['name']?.toString() ?? ch['type']?.toString() ?? 'channel';
+                    final status = ch['status']?.toString() ?? 'unknown';
+                    final compiled = ch['compiled'] != false;
+                    final healthy = status == 'ready' || status == 'connected' || status == 'ok';
+                    final badgeColor = !compiled
+                        ? DesktopTheme.textMuted
+                        : (healthy ? DesktopTheme.statusSuccess : DesktopTheme.accentBrand);
+                    return Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: badgeColor.withOpacity(0.12),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: badgeColor.withOpacity(0.35)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(width: 7, height: 7, decoration: BoxDecoration(color: badgeColor, shape: BoxShape.circle)),
+                          const SizedBox(width: 6),
+                          Text('$name · $status', style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: DesktopTheme.textPrimary)),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
+
+        // Поиск и категории
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: channelSearchController,
+                onChanged: (v) => setState(() => channelSearchQuery = v),
+                style: TextStyle(fontSize: 12.5, color: DesktopTheme.textPrimary),
+                decoration: InputDecoration(
+                  hintText: 'Поиск канала (Telegram, Matrix, Email, MQTT, Lark...)',
+                  hintStyle: TextStyle(fontSize: 12, color: DesktopTheme.textMuted),
+                  prefixIcon: Icon(Icons.search, size: 16, color: DesktopTheme.textMuted),
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  filled: true,
+                  fillColor: DesktopTheme.bgSurfaceElevated,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide(color: DesktopTheme.borderSubtle)),
+                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: const BorderSide(color: DesktopTheme.accentBrand)),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: categories.map((cat) {
+            final active = selectedChannelCategory == cat['id'];
+            return ChoiceChip(
+              label: Text(cat['label']!, style: TextStyle(fontSize: 11.5, color: active ? Colors.white : DesktopTheme.textPrimary)),
+              selected: active,
+              selectedColor: DesktopTheme.accentBrand,
+              backgroundColor: DesktopTheme.bgSurfaceElevated,
+              side: BorderSide(color: active ? DesktopTheme.accentBrand : DesktopTheme.borderSubtle),
+              onSelected: (_) => setState(() => selectedChannelCategory = cat['id']!),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 14),
 
         if (channelStatusMsg != null) ...[
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
             decoration: BoxDecoration(
-              color: DesktopTheme.accentCyan.withOpacity(0.12),
+              color: DesktopTheme.accentBrand.withOpacity(0.12),
               borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: DesktopTheme.accentCyan.withOpacity(0.3)),
+              border: Border.all(color: DesktopTheme.accentBrand.withOpacity(0.35)),
             ),
             child: Row(
               children: [
-                const Icon(Icons.info_outline, size: 14, color: DesktopTheme.accentCyan),
+                const Icon(Icons.info_outline, size: 14, color: DesktopTheme.accentBrand),
                 const SizedBox(width: 8),
-                Text(channelStatusMsg!, style: const TextStyle(fontSize: 12, color: DesktopTheme.accentCyan)),
+                Expanded(child: Text(channelStatusMsg!, style: TextStyle(fontSize: 12, color: DesktopTheme.textPrimary))),
               ],
             ),
           ),
           const SizedBox(height: 16),
         ],
 
-        // Telegram Channel Card
-        _buildChannelCard(
-          name: 'Telegram Bot',
-          icon: FontAwesomeIcons.telegram,
-          color: const Color(0xFF2AABEE),
-          desc: 'Интеграция с Telegram-ботом. Агент отвечает на личные и групповые сообщения.',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildFormInput('Bot Token (например: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11)', telegramTokenController, isPassword: true),
-              const SizedBox(height: 10),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  OutlinedButton.icon(
-                    icon: const Icon(Icons.sync, size: 13),
-                    label: const Text('Переподключить'),
-                    onPressed: () => _relinkChannel('telegram'),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.link, size: 13),
-                    label: const Text('Привязать токен'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF2AABEE),
-                      foregroundColor: Colors.white,
+        if (matches('messengers', 'telegram', 'Telegram Bot', 'Telegram')) ...[
+          _buildChannelCard(
+            name: 'Telegram Bot',
+            icon: FontAwesomeIcons.telegram,
+            color: const Color(0xFF2AABEE),
+            desc: 'Интеграция с Telegram-ботом. Агент отвечает на личные и групповые сообщения.',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildFormInput('Bot Token (например: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11)', telegramTokenController, isPassword: true),
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.sync, size: 13),
+                      label: const Text('Переподключить'),
+                      onPressed: () => _relinkChannel('telegram'),
                     ),
-                    onPressed: isChannelBinding ? null : () => _bindChannel('telegram', {'token': telegramTokenController.text.trim()}),
-                  ),
-                ],
-              ),
-            ],
+                    const SizedBox(width: 8),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.link, size: 13),
+                      label: const Text('Привязать токен'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: DesktopTheme.accentBrand,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: isChannelBinding ? null : () => _bindChannel('telegram', {'token': telegramTokenController.text.trim()}),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
-        ),
-        const SizedBox(height: 14),
+          const SizedBox(height: 14),
+        ],
 
-        // WhatsApp Channel Card
-        _buildChannelCard(
-          name: 'WhatsApp Business / Web',
-          icon: FontAwesomeIcons.whatsapp,
-          color: const Color(0xFF25D366),
-          desc: 'Подключение через WhatsApp Web сессию или номер телефона для двустороннего диалога.',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildFormInput('Номер телефона или Web Session ID', whatsappPhoneController),
-              const SizedBox(height: 10),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  OutlinedButton.icon(
-                    icon: const Icon(Icons.qr_code, size: 13),
-                    label: const Text('Связать сессию (Relink)'),
-                    onPressed: () => _relinkChannel('whatsapp'),
-                  ),
-                  const SizedBox(width: 8),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.check, size: 13),
-                    label: const Text('Сохранить'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF25D366),
-                      foregroundColor: Colors.white,
+        if (matches('messengers', 'whatsapp', 'WhatsApp Business / Web', 'WhatsApp')) ...[
+          _buildChannelCard(
+            name: 'WhatsApp Business / Web',
+            icon: FontAwesomeIcons.whatsapp,
+            color: const Color(0xFF25D366),
+            desc: 'Подключение через WhatsApp Cloud API или WhatsApp Web QR-сессию.',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildFormInput('Номер телефона или Web Session ID', whatsappPhoneController),
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    OutlinedButton.icon(
+                      icon: const Icon(Icons.qr_code, size: 13),
+                      label: const Text('Связать сессию (Relink)'),
+                      onPressed: () => _relinkChannel('whatsapp_web'),
                     ),
-                    onPressed: isChannelBinding ? null : () => _bindChannel('whatsapp', {'phone': whatsappPhoneController.text.trim()}),
-                  ),
-                ],
-              ),
-            ],
+                    const SizedBox(width: 8),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.check, size: 13),
+                      label: const Text('Сохранить'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: DesktopTheme.accentBrand,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: isChannelBinding ? null : () => _bindChannel('whatsapp', {'phone': whatsappPhoneController.text.trim()}),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
-        ),
-        const SizedBox(height: 14),
+          const SizedBox(height: 14),
+        ],
 
-        // Discord Channel Card
-        _buildChannelCard(
-          name: 'Discord Bot',
-          icon: FontAwesomeIcons.discord,
-          color: const Color(0xFF5865F2),
-          desc: 'Бот сообществ Discord для выполнения задач в ветках и каналах серверов.',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildFormInput('Discord Bot Token', discordTokenController, isPassword: true),
-              const SizedBox(height: 10),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.link, size: 13),
-                    label: const Text('Привязать Discord'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF5865F2),
-                      foregroundColor: Colors.white,
+        if (matches('messengers', 'discord', 'Discord Bot', 'Discord')) ...[
+          _buildChannelCard(
+            name: 'Discord Bot',
+            icon: FontAwesomeIcons.discord,
+            color: const Color(0xFF5865F2),
+            desc: 'Бот сообществ Discord для выполнения задач в ветках и каналах серверов.',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildFormInput('Discord Bot Token', discordTokenController, isPassword: true),
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.link, size: 13),
+                      label: const Text('Привязать Discord'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: DesktopTheme.accentBrand,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: isChannelBinding ? null : () => _bindChannel('discord', {'token': discordTokenController.text.trim()}),
                     ),
-                    onPressed: isChannelBinding ? null : () => _bindChannel('discord', {'token': discordTokenController.text.trim()}),
-                  ),
-                ],
-              ),
-            ],
+                  ],
+                ),
+              ],
+            ),
           ),
-        ),
-        const SizedBox(height: 14),
+          const SizedBox(height: 14),
+        ],
 
-        // Slack Channel Card
-        _buildChannelCard(
-          name: 'Slack Workspace Bot',
-          icon: FontAwesomeIcons.slack,
-          color: const Color(0xFFE01E5A),
-          desc: 'Слушатель событий в корпоративном пространстве Slack (Socket Mode / Webhook).',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildFormInput('Slack Bot Token (xoxb-...)', slackTokenController, isPassword: true),
-              const SizedBox(height: 10),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.end,
-                children: [
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.link, size: 13),
-                    label: const Text('Привязать Slack'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFFE01E5A),
-                      foregroundColor: Colors.white,
+        if (matches('messengers', 'slack', 'Slack Workspace Bot', 'Slack')) ...[
+          _buildChannelCard(
+            name: 'Slack Workspace Bot',
+            icon: FontAwesomeIcons.slack,
+            color: const Color(0xFFE01E5A),
+            desc: 'Слушатель событий в корпоративном пространстве Slack (Socket Mode / Webhook).',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildFormInput('Slack Bot Token (xoxb-...)', slackTokenController, isPassword: true),
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.link, size: 13),
+                      label: const Text('Привязать Slack'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: DesktopTheme.accentBrand,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: isChannelBinding ? null : () => _bindChannel('slack', {'token': slackTokenController.text.trim()}),
                     ),
-                    onPressed: isChannelBinding ? null : () => _bindChannel('slack', {'token': slackTokenController.text.trim()}),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
+
+        ...filteredExtra.map((ch) {
+          final id = ch['id'] as String;
+          final field = ch['field'] as String;
+          final ctrl = _channelFieldController(id);
+          final hasRelink = ch['relink'] == true;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 14),
+            child: _buildChannelCard(
+              name: ch['name'] as String,
+              icon: ch['icon'] as IconData,
+              color: ch['color'] as Color,
+              desc: ch['desc'] as String,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildFormInput(
+                    ch['hint'] as String,
+                    ctrl,
+                    isPassword: field == 'token',
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      if (hasRelink) ...[
+                        OutlinedButton.icon(
+                          icon: const Icon(Icons.sync, size: 13),
+                          label: const Text('Переподключить'),
+                          onPressed: () => _relinkChannel(id),
+                        ),
+                        const SizedBox(width: 8),
+                      ],
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.link, size: 13),
+                        label: Text('Привязать ${ch['name']}'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: DesktopTheme.accentBrand,
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: isChannelBinding
+                            ? null
+                            : () => _bindChannel(id, {field: ctrl.text.trim()}),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
-          ),
-        ),
+            ),
+          );
+        }),
       ],
     );
   }
@@ -4479,106 +4500,13 @@ class _DesktopSettingsDialogState extends State<DesktopSettingsDialog> {
   }
 
   // ── WebAuthn UI ───────────────────────────────────────────────────────────
-  Widget _buildWebauthnSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _buildSectionCard(
-          title: 'Аппаратные ключи безопасности (WebAuthn / FIDO2)',
-          subtitle: 'Аппаратная аутентификация через YubiKey, Windows Hello или TouchID для защиты доступа к шлюзу',
-          icon: Icons.security,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (webauthnStatusMsg != null) ...[
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  margin: const EdgeInsets.only(bottom: 12),
-                  decoration: BoxDecoration(
-                    color: DesktopTheme.bgSurface,
-                    borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: DesktopTheme.accentCyan),
-                  ),
-                  child: Text(webauthnStatusMsg!, style: const TextStyle(fontSize: 12, color: Colors.white)),
-                ),
-              ],
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: webauthnUsernameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Имя пользователя для ключа',
-                        isDense: true,
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.add, size: 14),
-                    label: const Text('Зарегистрировать ключ'),
-                    style: ElevatedButton.styleFrom(backgroundColor: DesktopTheme.accentCyan, foregroundColor: const Color(0xFF0F172A)),
-                    onPressed: _registerWebauthn,
-                  ),
-                ],
-              ),
-              const SizedBox(height: 18),
-              Text('Зарегистрированные ключи:', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: DesktopTheme.textPrimary)),
-              const SizedBox(height: 8),
-              if (isWebauthnLoading)
-                const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator(color: DesktopTheme.accentCyan)))
-              else if (webauthnCredentials.isEmpty)
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(color: DesktopTheme.bgSurface, borderRadius: BorderRadius.circular(6)),
-                  child: Text('Аппаратные ключи не зарегистрированы. Добавьте первый ключ выше.', style: TextStyle(fontSize: 12, color: DesktopTheme.textMuted)),
-                )
-              else
-                ListView.separated(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  itemCount: webauthnCredentials.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 8),
-                  itemBuilder: (context, idx) {
-                    final cred = webauthnCredentials[idx];
-                    final id = cred['id']?.toString() ?? 'key-$idx';
-                    return Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: DesktopTheme.bgSurface,
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(color: DesktopTheme.borderSubtle),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.vpn_key, size: 16, color: DesktopTheme.accentCyan),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Text(id, style: TextStyle(fontSize: 12, fontFamily: 'Consolas', color: DesktopTheme.textPrimary)),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.delete_outline, size: 16, color: Colors.redAccent),
-                            tooltip: 'Удалить ключ',
-                            onPressed: () => _deleteWebauthn(id),
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
   @override
   void dispose() {
     _nodesWsClient.dispose();
-    webauthnUsernameController.dispose();
+    channelSearchController.dispose();
+    for (final c in _extraChannelControllers.values) {
+      c.dispose();
+    }
     super.dispose();
   }
 }
